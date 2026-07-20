@@ -228,12 +228,6 @@ Complete surface of `gb10_inference` (same content as `--help`). Square brackets
 | Mode | What it does |
 |---|---|
 | `--server` | OpenAI-compatible HTTP server — the normal way to run (endpoints: `POST /v1/chat/completions`, `GET /v1/models[/:id]`, `GET /health`) |
-| `--quantize` | Offline NVFP4/FP8 quantizer: `--model-dir <bf16-dir> --out <dir> --recipe <r>` |
-| `--perplexity` | Perplexity on held-out text: `--text <file> --window N --max-windows N` |
-| `--bench-mtp` | Greedy losslessness gate + acceptance + tok/s (`--depth N --max-new-tokens N`) |
-| `--bench-verify` | MTP verify == sequential decode, bitwise (`--draws N` to fuzz) |
-| `--bench-accept` | Acceptance diagnosis by target confidence / n-gram run-length |
-| `--bench-batch` | Batched-decode throughput (`--batch N --max-new-tokens N`) |
 | *(no mode)* | Interactive CLI: load model, generate from `--prompt` |
 | `--help`, `-h` | Print help |
 
@@ -288,15 +282,14 @@ cold-admit KV zeroing), `RUST_INFER_PREFILL_SCALAR=1` (scalar prefill path),
 `GB10_NO_DECODE_GRAPHS=1` (disable decode graphs), `RUST_INFER_CPU_SAMPLE=1` (CPU sampling),
 `GB10_TP_TRACE=1` (per-barrier timing histograms at exit).
 
-### Probes and benches (correctness gates)
+### Probes (diagnostics)
 
-`--bench-mtp` (greedy losslessness), `--bench-mtp-sample` (stochastic distribution gate),
-`--bench-verify`, `--bench-accept`, `--bench-tree` (tree verify), `--bench-lanes` (batched
-verify), `--bench-prefill` (TTFT proxy), `--probe-binv` (batch invariance), `--probe-state` (GDN
-state divergence), `--probe-reject` (rollback), `--probe-gemm` (cuBLAS audit),
-`--probe-bandwidth` / `--probe-bandwidth-sustained` (roofline; idle GB10 ≈ 255 GB/s),
-`--tp-barrier-bench` (transport gates, no model), `--net-test` (2-proc transport audit),
-`--sweep-gemm`, `--perplexity`.
+`--bench-mtp-sample` (stochastic distribution gate), `--bench-tree` (tree verify),
+`--bench-lanes` (batched verify), `--bench-prefill` (TTFT proxy), `--probe-binv` (batch
+invariance), `--probe-state` (GDN state divergence), `--probe-reject` (rollback),
+`--probe-gemm` (cuBLAS audit), `--probe-bandwidth` / `--probe-bandwidth-sustained` (roofline;
+idle GB10 ≈ 255 GB/s), `--tp-barrier-bench` (transport gates, no model), `--net-test` (2-proc
+transport audit), `--sweep-gemm`.
 
 ## Requirements
 
