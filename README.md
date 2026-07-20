@@ -199,7 +199,6 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 |---|---:|---:|
 | 27B (full) | **29–36** | **42–43** |
 | 35B MoE (full) | **91.5–112** | **105.5–108.8** |
-| 35B MoE (mixed) | — pending | — pending |
 
 **Notes.** "Pending" cells land with the full benchmark run (tool-eval-bench `--perf`);
 ranges are across 0–8K context. ¹ TP=2 on the small models (0.8B, 2B, 4B) is unoptimized —
