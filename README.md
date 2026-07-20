@@ -171,7 +171,7 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 
 | Model (recipe) | Single node | TP=2 |
 |---|---:|---:|
-| 0.8B (mixed) | — pending | **206–217** |
+| 0.8B (mixed) | **182–217** | **206–217** |
 | 2B (mixed) | — pending | **161** (d2) |
 | 4B (mixed) | — pending | **125** (d2) |
 | 9B (full) | **~71** | **90–102** |
