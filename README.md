@@ -84,6 +84,20 @@ ships weights, settings, and calibration at sync):
   --nodes <peer-ip>:29500 --port=9000 --max-seq-len=32768 --prefix-cache=on   # on the head
 ```
 
+**Where the node's copy of the model lives:** on first sync the node fetches the model from the
+head into a content-addressed cache at `~/.cache/gb10_tp/` on the node machine:
+
+- `blobs/` — the model artifacts, each named by its SHA-256. Identical blobs are stored once and
+  shared across models.
+- `models/<model-name>/` — symlinks into `blobs/`; this directory is what the node presents to the
+  loader as the model. The `[node] manifest '<model>': N artifacts, X cached, Y to fetch` log line
+  counts exactly these blobs.
+- `hashcache.json` — memoized file hashes so later syncs skip re-hashing the model.
+
+Only missing blobs are transferred, so the second start of the same model syncs nothing. The cache
+is safe to delete (it just re-fetches over the network) — but keep an eye on disk headroom: a 122B
+recipe is ~76 GB.
+
 ---
 
 ## Purpose
