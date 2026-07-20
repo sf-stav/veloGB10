@@ -86,8 +86,10 @@ def main():
 
     corpus = a.prompt_file
     if not corpus:
-        for c in ("ppl_holdout.txt",):
-            if os.path.exists(c): corpus = c; break
+        for c in ("ppl_holdout.txt", os.environ.get("GB10_PPL_HOLDOUT", ""), "AGENTS.md"):
+            if c and os.path.exists(c): corpus = c; break
+    if not corpus:
+        raise SystemExit("no perplexity corpus found — pass --prompt-file, set GB10_PPL_HOLDOUT, or run from the repo root")
     text = open(corpus).read()
     if len(text) < 60000:
         text = text * (60000 // max(len(text), 1) + 1)

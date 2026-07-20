@@ -2028,7 +2028,7 @@ extern "C" __global__ __launch_bounds__(256, 6) void gemm_mma_fp4_b(
     const float* __restrict__ gs, const __nv_bfloat16* __restrict__ X, int M, int K, int N,
     float* Cf)
 {
-    const int ntm = M >> 4, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int mt = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3, nblk = K >> 4;
 
     // The two X rows this lane's B-fragments read. Columns >= N are padding: clamp them onto a valid
@@ -2037,6 +2037,7 @@ extern "C" __global__ __launch_bounds__(256, 6) void gemm_mma_fp4_b(
     const long long xr0 = (long long)(g     < N ? g     : N - 1) * K;
     const long long xr1 = (long long)(g + 8 < N ? g + 8 : N - 1) * K;
 
+    float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
     const uint32_t* Wt32 = reinterpret_cast<const uint32_t*>(Wt);
 
     // A warp takes an ADJACENT PAIR of k-blocks per iteration. The pairing is not for unrolling --
@@ -2064,55 +2065,40 @@ extern "C" __global__ __launch_bounds__(256, 6) void gemm_mma_fp4_b(
     // N-INDEPENDENT, so column 0 is bit-identical at every N and batch-invariance is untouched. Gate:
     // --probe-binv. K % 32 == 0 for every tensor in this family (asserted host-side).
     const int npair = nblk >> 1;
+    for (int p = warp; p < npair; p += MMA_NW) {
+        const long long tile = (long long)mt * nblk + (p << 1);   // tiles 2p and 2p+1
+        const uint32_t wq0 = Wt32[tile * 32 + lane];              // 128 contiguous B
+        const uint32_t wq1 = Wt32[tile * 32 + 32 + lane];         // the next 128, back-to-back
+        const uint8_t* sct = Sct + tile * 16;                     // 32 contiguous B = ONE sector
+        const float s0lo = e4m3_f(sct[g]),      s0hi = e4m3_f(sct[g + 8]);
+        const float s1lo = e4m3_f(sct[g + 16]), s1hi = e4m3_f(sct[g + 24]);
+
+        const int k0 = (p << 5);                                  // 2 k-blocks = 32 elements of K
+        const uint32_t* Xl = reinterpret_cast<const uint32_t*>(X + xr0 + k0);
+        const uint32_t* Xh = reinterpret_cast<const uint32_t*>(X + xr1 + k0);
+
+        uint32_t ra[4];
+        ra[0] = fp4_pair_bf16(wq0,        s0lo);
+        ra[1] = fp4_pair_bf16(wq0 >>  8,  s0hi);
+        ra[2] = fp4_pair_bf16(wq0 >> 16,  s0lo);
+        ra[3] = fp4_pair_bf16(wq0 >> 24,  s0hi);
+        uint32_t rb0[2] = { Xl[t], Xl[t + 4] };
+        uint32_t rb1[2] = { Xh[t], Xh[t + 4] };
+        mma_m16n8k16(acc[0], ra, rb0);        // block 2p,   columns 0..7
+        mma_m16n8k16(acc[1], ra, rb1);        // block 2p,   columns 8..15
+
+        ra[0] = fp4_pair_bf16(wq1,        s1lo);
+        ra[1] = fp4_pair_bf16(wq1 >>  8,  s1hi);
+        ra[2] = fp4_pair_bf16(wq1 >> 16,  s1lo);
+        ra[3] = fp4_pair_bf16(wq1 >> 24,  s1hi);
+        uint32_t rb2[2] = { Xl[t + 8], Xl[t + 12] };
+        uint32_t rb3[2] = { Xh[t + 8], Xh[t + 12] };
+        mma_m16n8k16(acc[0], ra, rb2);        // block 2p+1, columns 0..7
+        mma_m16n8k16(acc[1], ra, rb3);        // block 2p+1, columns 8..15
+    }
 
     __shared__ float sh[MMA_SMEM];
-    // Persistent output tiles: the grid is capped at the resident-block capacity (48 SMs x the 6
-    // blocks/SM __launch_bounds__ asserts) and block b computes tiles b, b+gridDim.x, ... . Every
-    // tile's arithmetic is self-contained — the k-loop visits k-blocks in the same fixed order and
-    // mma_epilogue reduces the warps in the same fixed order — so WHICH block runs a tile, and in
-    // what order tiles are consumed, cannot change any tile's result. The tile->block map is a
-    // function of the weight shape (ntm, gridDim.x) only, never of N: column 0 stays bit-identical
-    // at every N and batch-invariance is untouched. Gate: --probe-binv.
-    for (int mt = blockIdx.x; mt < ntm; mt += gridDim.x) {
-        // `sh` is reused across tiles: mma_epilogue syncs write->read but NOT read->next-write, so
-        // barrier here or a fast warp could overwrite sh while a slow one still reads the last tile.
-        __syncthreads();
-        float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
-
-        for (int p = warp; p < npair; p += MMA_NW) {
-            const long long tile = (long long)mt * nblk + (p << 1);   // tiles 2p and 2p+1
-            const uint32_t wq0 = Wt32[tile * 32 + lane];              // 128 contiguous B
-            const uint32_t wq1 = Wt32[tile * 32 + 32 + lane];         // the next 128, back-to-back
-            const uint8_t* sct = Sct + tile * 16;                     // 32 contiguous B = ONE sector
-            const float s0lo = e4m3_f(sct[g]),      s0hi = e4m3_f(sct[g + 8]);
-            const float s1lo = e4m3_f(sct[g + 16]), s1hi = e4m3_f(sct[g + 24]);
-
-            const int k0 = (p << 5);                                  // 2 k-blocks = 32 elements of K
-            const uint32_t* Xl = reinterpret_cast<const uint32_t*>(X + xr0 + k0);
-            const uint32_t* Xh = reinterpret_cast<const uint32_t*>(X + xr1 + k0);
-
-            uint32_t ra[4];
-            ra[0] = fp4_pair_bf16(wq0,        s0lo);
-            ra[1] = fp4_pair_bf16(wq0 >>  8,  s0hi);
-            ra[2] = fp4_pair_bf16(wq0 >> 16,  s0lo);
-            ra[3] = fp4_pair_bf16(wq0 >> 24,  s0hi);
-            uint32_t rb0[2] = { Xl[t], Xl[t + 4] };
-            uint32_t rb1[2] = { Xh[t], Xh[t + 4] };
-            mma_m16n8k16(acc[0], ra, rb0);        // block 2p,   columns 0..7
-            mma_m16n8k16(acc[1], ra, rb1);        // block 2p,   columns 8..15
-
-            ra[0] = fp4_pair_bf16(wq1,        s1lo);
-            ra[1] = fp4_pair_bf16(wq1 >>  8,  s1hi);
-            ra[2] = fp4_pair_bf16(wq1 >> 16,  s1lo);
-            ra[3] = fp4_pair_bf16(wq1 >> 24,  s1hi);
-            uint32_t rb2[2] = { Xl[t + 8], Xl[t + 12] };
-            uint32_t rb3[2] = { Xh[t + 8], Xh[t + 12] };
-            mma_m16n8k16(acc[0], ra, rb2);        // block 2p+1, columns 0..7
-            mma_m16n8k16(acc[1], ra, rb3);        // block 2p+1, columns 8..15
-        }
-
-        mma_epilogue(sh, acc, C, nullptr, gs, mt, M, N, Cf);
-    }
+    mma_epilogue(sh, acc, C, nullptr, gs, mt, M, N, Cf);
 }
 
 // ---- FP8 E4M3. Scales are per output ROW, constant over K, so nothing folds into the fragment and

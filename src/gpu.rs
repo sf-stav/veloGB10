@@ -20,10 +20,6 @@ pub struct GpuModel {
     cfg: Config,
     embed: W,
     lm_head: Option<W>,  // None = tied (use embed)
-    /// TP=2 vocab-parallel: set by `tp_shard_weights` when `lm_head` was col-sharded to this rank's
-    /// half of the vocab rows [rank*v/2, +v/2). `logits_batch` then computes only this half and
-    /// gathers the peer's via one zero-fill + sum all-reduce (bitwise-identical to the full head).
-    lm_head_sharded: bool,
     final_norm: S,
     layers: Vec<GpuLayer>,
     mtp: Option<GpuMtpLayer>,
@@ -102,13 +98,6 @@ pub struct GpuModel {
 
 /// Widest verify the persistent stochastic scratch is sized for (matches GEMM_BINV_NMAX).
 pub const MAX_VERIFY: usize = 16;
-/// SM count of the GB10 (DGX Spark) — the "48-SM GPU" of the launch-geometry notes throughout.
-/// The persistent-grid serving GEMM (`gemm_mma_fp4_b`) sizes its grid from it.
-pub const GB10_SMS: usize = 48;
-/// Resident blocks per SM for `gemm_mma_fp4_b`, asserted by its `__launch_bounds__(256, 6)`.
-/// The persistent grid launches exactly GB10_SMS * this many blocks (capped at the tile count)
-/// so every launch is a single full wave with no partial-wave stranding (AGENTS.md §7, lever 2).
-const MMA_FP4_BLOCKS_PER_SM: usize = 6;
 /// Query positions per gqa_attn_prefill block (== warps per block). The 8 warps sweep the SAME keys,
 /// so one K/V fetch from L2 serves 8 queries. MUST match `QT` in the kernel.
 pub const GQA_PF_QT: usize = 8;
@@ -456,7 +445,7 @@ impl GpuModel {
         // Load MTP head if present
         let mtp = Self::load_mtp_gpu(&host, &dev)?;
         dev.synchronize()?;
-        Ok(Self { dev, blas, stream, cfg, embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_p, sv_r, mr_tok, mr_pos, deq_scratch, mtp_sids, draft_head: None, draft_ids: Vec::new(), lm_head_sharded: false, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None })
+        Ok(Self { dev, blas, stream, cfg, embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_p, sv_r, mr_tok, mr_pos, deq_scratch, mtp_sids, draft_head: None, draft_ids: Vec::new(), tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None })
     }
 
     /// Stream-load from safetensors directly as bf16 — no f32 intermediate.
@@ -931,7 +920,7 @@ impl GpuModel {
         drop(gpu_f32);
         dev.synchronize()?;
 
-        Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_p, sv_r, mr_tok, mr_pos, deq_scratch, mtp_sids, draft_head, draft_ids, lm_head_sharded: false, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None }, cfg))
+        Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_p, sv_r, mr_tok, mr_pos, deq_scratch, mtp_sids, draft_head, draft_ids, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None }, cfg))
     }
 
     fn init_ptx(dev: &Arc<CudaDevice>) -> anyhow::Result<()> {
@@ -1409,10 +1398,7 @@ impl GpuModel {
 
         match w {
             W::Nvfp4 { qweight, scales, gs, .. } if batch <= MAX_VERIFY => {
-                // Persistent grid: one block per resident slot, each looping over 16-row tiles.
-                // The tile->block map depends on the weight shape only, never on N (probe-binv).
-                let grid = (outn / 16).min(GB10_SMS * MMA_FP4_BLOCKS_PER_SM) as u32;
-                blaunch!(self, "gemm_mma_fp4_b", (grid,1,1), (256,1,1), 0,
+                blaunch!(self, "gemm_mma_fp4_b", ((outn / 16) as u32,1,1), (256,1,1), 0,
                     (d(out), *qweight.device_ptr() as u64, *scales.device_ptr() as u64,
                      d(gs), d(x), outn as i32, inn as i32, batch as i32, 0u64));
                 return;
@@ -1767,28 +1753,6 @@ impl GpuModel {
             }
         }
         self.layers = layers;
-
-        // LM-head vocab-parallel (27B kernel-ladder item 1): the head is the largest REPLICATED
-        // tensor left (636 MB/rank on 27B-full) and a decode reads it in full on both boxes. Shard
-        // it exactly like the FFN gate/up col-shard — rank r keeps vocab rows [r*v/2, +v/2), a
-        // contiguous 16-row tile band, byte-exact — and `logits_batch` gathers the halves with one
-        // all-reduce. Row-independent GEMM rows + the peer's exact zeros make the summed result
-        // bitwise-identical to the replicated head (NOT a reassociation-class change). Guards:
-        // tied embeddings keep lm_head = None (`embed` is the INPUT embedding and must NOT be
-        // sharded), and a head that is neither NVFP4 nor FP8 stays replicated (bf16 is not the
-        // serving path). Same flag as the mixer/expert sharding: attach_tp + GB10_TP_SHARD_MIXERS.
-        if shard_mixers {
-            let m = match &self.lm_head {
-                Some(W::Nvfp4 { m, .. }) | Some(W::Fp8 { m, .. }) => *m,
-                _ => 0,
-            };
-            if m > 0 {
-                let lh = self.lm_head.take().unwrap();
-                self.lm_head = Some(self.shard_col_segs(&lh, &[(0, m, true)], rank));
-                self.lm_head_sharded = true;
-                eprintln!("[tp] rank {rank} — lm_head vocab-sharded ({m} -> {} rows/rank)", m / 2);
-            }
-        }
     }
 
     /// Column-parallel split of a packed NVFP4 weight [M,K] → rank-local [M/2, K]. The kernel packs
@@ -2158,10 +2122,7 @@ impl GpuModel {
     fn gemm_act_f32(&self, w: &W, x: &B, out: &mut S, inn: usize, outn: usize, batch: usize) {
         match w {
             W::Nvfp4 { qweight, scales, gs, .. } if batch <= MAX_VERIFY => {
-                // Same persistent grid as gemm_act: the FP32 partial is written per tile
-                // (Cf offsets are functions of mt/m/n only), so the loop changes no numerics.
-                let grid = (outn / 16).min(GB10_SMS * MMA_FP4_BLOCKS_PER_SM) as u32;
-                blaunch!(self, "gemm_mma_fp4_b", (grid,1,1), (256,1,1), 0,
+                blaunch!(self, "gemm_mma_fp4_b", ((outn / 16) as u32,1,1), (256,1,1), 0,
                     (0u64, *qweight.device_ptr() as u64, *scales.device_ptr() as u64,
                      d(gs), d(x), outn as i32, inn as i32, batch as i32, d(out)));
             }
@@ -2806,46 +2767,6 @@ impl GpuModel {
 
     pub fn logits_batch(&self, pool: &mut Pool, hidden: &B, batch: usize) -> B {
         let (v, h) = (self.cfg.vocab_size, self.cfg.hidden_size);
-        // TP=2 vocab-parallel head: compute THIS rank's half of the vocab rows, place it at
-        // [rank*v/2) of every batch column of a ZEROED full buffer (logits layout C[n*v + m]), then
-        // sum all-reduce. The peer's rows here are exact +0.0 (and vice versa), so the elementwise
-        // sum IS the gather: bitwise-identical to the replicated head's full logits, never a
-        // reassociation. The memset is explicit — pool reuse does NOT re-zero (see Pool), and a
-        // stale value where a zero is required would corrupt the sum. One extra all-reduce per
-        // main-head forward; its barrier count is a pure function of (v, batch, payload), identical
-        // on both ranks by construction (SPMD). Non-TP / tied / unsharded paths are untouched.
-        if self.tp_world == 2 && self.lm_head_sharded {
-            if let Some(w) = &self.lm_head {
-                let hv = v / 2;
-                let mut half = pool.get_bf16(hv * batch);
-                self.gemm_act(w, hidden, &mut half, h, hv, batch);
-                let mut logits = pool.get_bf16(v * batch);
-                let full = *logits.device_ptr() as u64;
-                self.memset_compute_stream(full, v * batch * 2);
-                let rank = self.tp_rank.max(0) as usize;
-                // Strided D2D: per batch column n, copy half[n*hv .. +hv] to
-                // logits[n*v + rank*hv .. +hv]. One 2D copy, queued on the compute stream.
-                let cp = cudarc::driver::sys::CUDA_MEMCPY2D {
-                    srcXInBytes: 0, srcY: 0,
-                    srcMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                    srcHost: std::ptr::null(), srcDevice: *half.device_ptr() as u64,
-                    srcArray: std::ptr::null_mut(), srcPitch: hv * 2,
-                    dstXInBytes: rank * hv * 2, dstY: 0,
-                    dstMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                    dstHost: std::ptr::null_mut(), dstDevice: full,
-                    dstArray: std::ptr::null_mut(), dstPitch: v * 2,
-                    WidthInBytes: hv * 2, Height: batch,
-                };
-                unsafe {
-                    let r = cudarc::driver::sys::cuMemcpy2DAsync_v2(&cp, self.stream.stream);
-                    assert!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-                            "lm_head gather 2D copy failed: {r:?}");
-                }
-                pool.release_bf16(half, hv * batch);
-                self.tp_all_reduce_bf16(&mut logits, v * batch);
-                return logits;
-            }
-        }
         let mut logits = pool.get_bf16(v*batch);
         let w = self.lm_head.as_ref().unwrap_or(&self.embed);
         self.gemm_act(w, hidden, &mut logits, h, v, batch);
@@ -4343,18 +4264,12 @@ impl GpuModel {
     /// ever called to pick a draft token -- never to emit one -- so restricting its vocabulary cannot
     /// affect the output, only the acceptance rate.
     pub fn argmax_hidden(&self, pool: &mut Pool, hidden: &B) -> u32 {
-        // The no-draft-head arm goes through `logits_batch` so a TP vocab-sharded head is GATHERED
-        // before the argmax — a direct gemm on the shard would read out of bounds and argmax only
-        // half the vocab. Unsharded, logits_batch is the same gemm as before, byte for byte.
-        let (mut logits, vocab) = match &self.draft_head {
-            Some(dh) => {
-                let vocab = self.draft_ids.len();
-                let mut lg = pool.get_bf16(vocab);
-                self.gemm_act(dh, hidden, &mut lg, self.cfg.hidden_size, vocab, 1);
-                (lg, vocab)
-            }
-            None => (self.logits_batch(pool, hidden, 1), self.cfg.vocab_size),
+        let (w, vocab) = match &self.draft_head {
+            Some(dh) => (dh, self.draft_ids.len()),
+            None => (self.lm_head.as_ref().unwrap_or(&self.embed), self.cfg.vocab_size),
         };
+        let mut logits = pool.get_bf16(vocab);
+        self.gemm_act(w, hidden, &mut logits, self.cfg.hidden_size, vocab, 1);
         let block = 1024u32;
         blaunch!(self, "argmax_b", (1,1,1), (block,1,1), (block*8),
             (*self.sc_tok.device_ptr() as u64, d(&logits), vocab as i32, 1));
@@ -4377,16 +4292,12 @@ impl GpuModel {
     /// argmax lands in the head's top-2/top-3 — i.e. what a fork at that position could rescue. NOT on
     /// any serving path.
     pub fn topk_hidden(&self, pool: &mut Pool, hidden: &B, k: usize) -> Vec<u32> {
-        // Same gather rule as argmax_hidden: the no-draft-head arm must not gemm a TP-sharded head.
-        let (logits, vocab) = match &self.draft_head {
-            Some(dh) => {
-                let vocab = self.draft_ids.len();
-                let mut lg = pool.get_bf16(vocab);
-                self.gemm_act(dh, hidden, &mut lg, self.cfg.hidden_size, vocab, 1);
-                (lg, vocab)
-            }
-            None => (self.logits_batch(pool, hidden, 1), self.cfg.vocab_size),
+        let (w, vocab) = match &self.draft_head {
+            Some(dh) => (dh, self.draft_ids.len()),
+            None => (self.lm_head.as_ref().unwrap_or(&self.embed), self.cfg.vocab_size),
         };
+        let mut logits = pool.get_bf16(vocab);
+        self.gemm_act(w, hidden, &mut logits, self.cfg.hidden_size, vocab, 1);
         self.sync_stream();
         let lg: Vec<half::bf16> = self.dev.dtoh_sync_copy(&logits).unwrap();
         pool.release_bf16(logits, vocab);
@@ -4645,16 +4556,12 @@ impl GpuModel {
         // What would be WRONG is to restrict the draft but report `q` from the full softmax: then the
         // accept ratio uses a `q` the drafter never sampled from, and the output distribution is
         // quietly skewed. The two must be the same distribution.
-        let (mut logits, vocab) = match &self.draft_head {
-            Some(dh) => {
-                let vocab = self.draft_ids.len();
-                let mut lg = pool.get_bf16(vocab);
-                self.gemm_act(dh, &mhidden, &mut lg, self.cfg.hidden_size, vocab, 1);
-                (lg, vocab)
-            }
-            // TP vocab-sharded head: gather via logits_batch (see argmax_hidden).
-            None => (self.logits_batch(pool, &mhidden, 1), self.cfg.vocab_size),
+        let (dw, vocab) = match &self.draft_head {
+            Some(dh) => (dh, self.draft_ids.len()),
+            None => (self.lm_head.as_ref().unwrap_or(&self.embed), self.cfg.vocab_size),
         };
+        let mut logits = pool.get_bf16(vocab);
+        self.gemm_act(dw, &mhidden, &mut logits, self.cfg.hidden_size, vocab, 1);
         if let Some(p) = draft_penalty {
             blaunch!(self, "rep_penalty_b", (1,1,1), (256,1,1), 0,
                 (d(&logits), p.tokens_ptr, p.counts_ptr, MAX_PEN_TOKENS as i32,

@@ -9,8 +9,9 @@
 # Overrides:  MODEL_DIR=/path  PORT=9000  NODE=<peer-ip>:29500  SEQ=32768  BATCH=1
 #             PREFIX=on|off  SHARD=on|off  MTP=on|off  ./run_tp_server.sh
 # Examples:
-#   MODEL_DIR=/models/3.6-27b-nvfp4-full NODE=10.0.0.2:29500 ./run_tp_server.sh
-#   BATCH=4 SEQ=32768 MODEL_DIR=/models/3.5-122b-nvfp4-mixed NODE=10.0.0.2:29500 ./run_tp_server.sh
+#   ./run_tp_server.sh                                   # 27B dense, sharded, batch 1
+#   MODEL_DIR=/models/3.5-122b-nvfp4-gdn4 ./run_tp_server.sh
+#   BATCH=4 SEQ=32768 MODEL_DIR=/models/3.5-122b-nvfp4-mixed ./run_tp_server.sh
 set -euo pipefail
 SDIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -x "$SDIR/gb10_inference" ]; then cd "$SDIR"; BIN="./gb10_inference"          # deployed dir
@@ -19,7 +20,7 @@ else cd "$SDIR/.."; BIN="./target/release/gb10_inference"; fi                   
 
 MODEL_DIR="${MODEL_DIR:?set MODEL_DIR=/path/to/model}"
 PORT=${PORT:-9000}
-NODE="${NODE:?set NODE=<peer-ip>:29500 (the machine running run_tp_node.sh)}"
+NODE="${NODE:?set NODE=<peer-ip>:29500}"
 SEQ=${SEQ:-32768}
 BATCH=${BATCH:-1}
 PREFIX=${PREFIX:-on}
