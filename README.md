@@ -191,7 +191,7 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 | 9B (full) | **71–83** | **83–90** |
 | 27B (full) | **31–32** | **40–42** |
 | 122B MoE (mixed) | **40–43** | **46–51** |
-| 122B MoE (gdn4) | **~43** | **50.4** |
+| 122B MoE (gdn4) | **39–48** | **49.5–54** |
 
 ### Qwen3.6 family (tok/s, greedy, MTP auto unless noted)
 
