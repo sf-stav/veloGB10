@@ -13,6 +13,13 @@ choice, and scheduling decision is specialized for the GB10 (Grace Blackwell, sm
 unified LPDDR5x @ 255 GB/s measured) and for two GB10s linked over ConnectX-7. One binary serves
 every supported model via `--model-dir`. No Python runtime, no framework serving stack.
 
+**Headline** (greedy, MTP-speculative, bitwise-lossless — full tables in
+[Benchmarks](#benchmarks)): Qwen3.6 27B at **~40 tok/s** on one GB10 and **~50 tok/s on two** ·
+Qwen3.6 35B MoE at **~112 tok/s** · Qwen3.5 122B MoE at **~39 tok/s** on one GB10 and **~57
+tok/s on two**. And the two-node mode is a **performance** feature, not just a memory expander:
+TP=2 exists to make a *single request* decode faster than one machine can — capacity is the side
+effect, speed is the point.
+
 ```
 cargo build --release
 ./gb10_inference --server --model-dir /path/to/model        # single node
@@ -22,6 +29,31 @@ cargo build --release
 
 Prebuilt binaries (binary + the required PTX kernels + SHA256 checksums + provenance notes) are on
 this repository's **Releases** page — no build needed if you're on a GB10.
+
+## Building from source
+
+**System prerequisites** (on the GB10 itself):
+
+- **NVIDIA DGX Spark (GB10, sm_121)** with the CUDA toolkit — `nvcc` available (`CUDA_HOME` is
+  honored). The build compiles the two kernel modules to PTX and **fails loudly** if nvcc fails;
+  on a machine without nvcc it falls back to the checked-in PTX in `src/ptx/` with a warning, so
+  the Rust side can still be compiled anywhere.
+- **Rust stable toolchain** (`rustup`).
+- **libibverbs + rdma-core dev headers** (for the TP=2 transport shim):
+  `sudo apt install libibverbs-dev rdma-core`
+
+**Build:**
+
+```bash
+cargo build --release
+```
+
+This produces `target/release/gb10_inference` plus the two PTX kernel artifacts in `src/ptx/`.
+**The binary is not self-contained — it loads `src/ptx/*.ptx` relative to its working directory**,
+so run it from a directory that has both (a build-fingerprint handshake refuses to run mismatched
+binary/PTX pairs, so the two never silently drift apart).
+
+Don't want to build? Use the prebuilt package on the **Releases** page instead.
 
 ## Running
 
@@ -180,6 +212,85 @@ large-model + long-context + multi-lane combinations fit.
 | Qwen3.6 27B | 93/100 | 92/100 |
 | Qwen3.5 122B | 88/100 | 88/100 |
 
+## Command-line reference
+
+Complete surface of `gb10_inference` (same content as `--help`). Square brackets show defaults.
+
+### Modes
+
+| Mode | What it does |
+|---|---|
+| `--server` | OpenAI-compatible HTTP server — the normal way to run (endpoints: `POST /v1/chat/completions`, `GET /v1/models[/:id]`, `GET /health`) |
+| `--quantize` | Offline NVFP4/FP8 quantizer: `--model-dir <bf16-dir> --out <dir> --recipe <r>` |
+| `--perplexity` | Perplexity on held-out text: `--text <file> --window N --max-windows N` |
+| `--bench-mtp` | Greedy losslessness gate + acceptance + tok/s (`--depth N --max-new-tokens N`) |
+| `--bench-verify` | MTP verify == sequential decode, bitwise (`--draws N` to fuzz) |
+| `--bench-accept` | Acceptance diagnosis by target confidence / n-gram run-length |
+| `--bench-batch` | Batched-decode throughput (`--batch N --max-new-tokens N`) |
+| *(no mode)* | Interactive CLI: load model, generate from `--prompt` |
+| `--help`, `-h` | Print help |
+
+### Server flags (`--server`)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--model-dir <DIR>` | required | Model directory (`config.json` + safetensors + tokenizer). The normal way to load |
+| `--model-name <NAME>` | dir name | Name reported by `/v1/models` |
+| `--model <FILE>` | — | Legacy: single `.safetensors` file (use `--model-dir`) |
+| `--tokenizer <FILE>` | — | Legacy: tokenizer.json path (implied by `--model-dir`) |
+| `--port <N>` | 8000 | Listen port |
+| `--max-batch <N>` | 8 | Max concurrent sequences (lanes) |
+| `--max-tokens <N>` | 8192 | Generation cap when a request omits `max_tokens` |
+| `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
+| `--mtp <auto\|on\|off>` | auto | MTP speculative decoding. `auto` measures whether it pays and self-tunes depth from live acceptance; greedy verify is bitwise-lossless, temp>0 distribution-exact. `on`/`off` force it (benchmarking) |
+| `--mtp-depth <N>` | auto | Pin draft depth instead of auto-picking (benchmarking) |
+| `--ngram-draft <N>` | 0 | EXPERIMENTAL prompt-lookup drafting, n-gram order N (0 = off) |
+| `--prefix-cache <on\|off>` | off | Reuse a conversation's cached prefix (~3× faster follow-up turns). Not bit-exact across reuse; greedy MTP stays lossless |
+| `--default-repetition-penalty <F>` | 1.0 | Repetition penalty (1.0 = off) |
+| `--default-presence-penalty <F>` | 1.5 (2.0 on 2B) | Presence penalty |
+| `--default-frequency-penalty <F>` | 0.0 | Frequency penalty |
+
+`temperature` / `top_p` / `top_k` / `seed` are **per-request** only (defaults 0.7 / 0.8 / 20) —
+every request may override in its JSON body. There are no MTP env vars; speculation is auto-tuned
+per request.
+
+### TP=2 flags (head) and node mode
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--node [--port 29500] [--rdma-dev d1[,d2]] [--once]` | — | Run the **node** (peer) side: resident supervisor, zero configuration — model, config, cost table and stop tokens ship from the head at sync |
+| `--tp` | off | Enable TP=2 on `--server` (sync + RDMA bring-up first) |
+| `--nodes <ip[:port],...>` | — | Explicit node address(es); skips UDP discovery |
+| `--discover-wait <S>` | 3 | Discovery broadcast window (instead of `--nodes`) |
+| `--rdma-dev <d1[,d2]>` | platform defaults | RoCE devices (also `GB10_RDMA_DEV`) |
+| `--head --model-dir <DIR>` | — | One-shot bench/generate head (use `--server --tp` for serving) |
+
+TP environment variables (read on the head, shipped to the node at sync; a node never needs them):
+
+| Env var | Meaning |
+|---|---|
+| `GB10_TP_SHARD_MIXERS=1` | Shard attention/GDN mixers **and** MoE experts (~half weight bytes per rank — the win). Default: FFN-only |
+| `GB10_TP_GRAPH=1` | CUDA-graph the TP decode (bench path) |
+| `GB10_TP_FP32_PARTIALS=1` | FP32 all-reduce partials (~2× barrier payload; kills the bf16-partial acceptance dip on small models) |
+| `GB10_TP_MTP=1`, `GB10_TP_MTP_DEPTH=N` | Bench rig: run `--bench-mtp` under TP |
+| `GB10_TP_CACHE=<dir>` | Node's model blob cache (`~/.cache/gb10_tp`) |
+| `GB10_TP_TAIL_DRILL=1`, `GB10_TP_AGREE_DRILL=N` | Fault-injection drills for the transport/agree guard |
+
+Other single-node env vars: `GB10_RDMA_DEV` (device override), `RUST_INFER_ZERO_KV=1` (restore
+cold-admit KV zeroing), `RUST_INFER_PREFILL_SCALAR=1` (scalar prefill path),
+`GB10_NO_DECODE_GRAPHS=1` (disable decode graphs), `RUST_INFER_CPU_SAMPLE=1` (CPU sampling),
+`GB10_TP_TRACE=1` (per-barrier timing histograms at exit).
+
+### Probes and benches (correctness gates)
+
+`--bench-mtp` (greedy losslessness), `--bench-mtp-sample` (stochastic distribution gate),
+`--bench-verify`, `--bench-accept`, `--bench-tree` (tree verify), `--bench-lanes` (batched
+verify), `--bench-prefill` (TTFT proxy), `--probe-binv` (batch invariance), `--probe-state` (GDN
+state divergence), `--probe-reject` (rollback), `--probe-gemm` (cuBLAS audit),
+`--probe-bandwidth` / `--probe-bandwidth-sustained` (roofline; idle GB10 ≈ 255 GB/s),
+`--tp-barrier-bench` (transport gates, no model), `--net-test` (2-proc transport audit),
+`--sweep-gemm`, `--perplexity`.
+
 ## Requirements
 
 - 1–2× NVIDIA DGX Spark (GB10); TP=2 uses the ConnectX-7 interconnect between them
@@ -220,3 +331,24 @@ via the TP=2 runtime:
 - **New Qwen and DeepSeek releases** — tracked as they land; the engine's kernel family (NVFP4
   tensor-core GEMM, grouped-MoE GEMM, batch-invariant verify, TP=2) is built to absorb new
   family members quickly.
+
+## Sponsorship & support
+
+veloGB10 is a **one-man project** — kernels, scheduler, transport, gates, docs, and releases are
+all done in one person's limited time. Bug reports and well-formed issues are always free and
+welcome. If you need something specific and soon — a model port, a feature, tuning for your
+workload, TP>2 — **special work requests are taken on at a price**: open an issue describing the
+work and it will be quoted. This is also the most direct way to make the "next areas of research"
+above happen faster.
+
+## Acknowledgements
+
+- [`cudarc`](https://github.com/coreylowman/cudarc) — the Rust CUDA driver-API bindings the whole
+  engine's GPU control plane is built on.
+- Hugging Face `tokenizers` and `safetensors`; `minijinja` (chat templates); `axum` + `tokio`
+  (serving).
+- Alibaba's Qwen team — the Qwen3.5/3.6 model family this engine exists to serve, and the hybrid
+  GatedDeltaNet architecture that shapes its best ideas.
+- [`tool-eval-bench`](https://github.com/SeraphimSerapis/tool-eval-bench/) — the benchmark
+  harness behind every number in this README.
+- NVIDIA — the DGX Spark. One (or two) of them is all it takes.
