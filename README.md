@@ -4,31 +4,35 @@
 
 # veloGB10
 
-**An inference engine optimized to the absolute maximum for one NVIDIA DGX Spark (GB10) — and for
-a pair of them (TP=2). Nothing else is targeted; nothing is generic.**
+**A GB10-specific inference engine for one or two GB10-based systems — NVIDIA DGX Spark and
+compatible OEM machines built around the NVIDIA GB10 chipset.**
 
 veloGB10 (`gb10_inference`) is a from-scratch Rust + CUDA inference engine for the Qwen3.5/3.6
-model family — hybrid GatedDeltaNet + GQA architectures, dense and MoE. Every kernel, precision
-choice, and scheduling decision is specialized for the GB10 (Grace Blackwell, sm_121, 128 GB
-unified LPDDR5x @ 255 GB/s measured) and for two GB10s linked over ConnectX-7. One binary serves
-every supported model via `--model-dir`. No Python runtime, no framework serving stack.
+model family, including hybrid GatedDeltaNet + GQA architectures, dense models, and MoE models.
+
+The implementation is intentionally specialized for GB10 systems:
+
+- **One GB10 machine** — single-node inference
+- **Two GB10 machines** — tensor-parallel inference (TP=2) **for performance**, not just
+  capacity: two machines decode a single request measurably faster than one can
+- NVIDIA DGX Spark and compatible GB10 OEM systems (Grace Blackwell, sm_121)
+- 128 GB unified LPDDR5x memory, ~255 GB/s measured sustained bandwidth
+- ConnectX-7 networking for two-node inference
+- GB10-specific kernels, precision paths, memory management, and scheduling
+
+This project does not aim to provide generic GPU portability or support arbitrary hardware. The
+same binary supports all supported models through `--model-dir`; no Python runtime or framework
+serving stack is required.
 
 **Headline** (greedy, MTP-speculative, bitwise-lossless — full tables in
 [Benchmarks](#benchmarks)): Qwen3.6 27B at **~40 tok/s** on one GB10 and **~50 tok/s on two** ·
 Qwen3.6 35B MoE at **~112 tok/s** · Qwen3.5 122B MoE at **~39 tok/s** on one GB10 and **~57
-tok/s on two**. And the two-node mode is a **performance** feature, not just a memory expander:
-TP=2 exists to make a *single request* decode faster than one machine can — capacity is the side
-effect, speed is the point.
+tok/s on two**.
 
-```
-cargo build --release
-./gb10_inference --server --model-dir /path/to/model        # single node
-./gb10_inference --server --model-dir /path/to/model --tp --nodes <peer-ip>   # head, TP=2
-./gb10_inference --node                                     # second node: that's it
-```
-
-Prebuilt binaries (binary + the required PTX kernels + SHA256 checksums + provenance notes) are on
-this repository's **Releases** page — no build needed if you're on a GB10.
+Prebuilt binaries for GB10 systems are on the **Releases** page — each release includes the
+inference binary, the required PTX kernels, SHA-256 checksums, and build provenance notes. If you
+run an NVIDIA DGX Spark or a compatible OEM GB10 machine, you can use a release binary without
+compiling anything.
 
 ## Building from source
 
