@@ -176,7 +176,7 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 | 4B (mixed) | **97–112** | **112–115** ¹ |
 | 9B (full) | **71–83** | **83–90** |
 | 27B (full) | **31–32** | **40–42** |
-| 122B MoE (mixed) | **~39** (26.2 without speculation) | **49.5–56.6** |
+| 122B MoE (mixed) | **40–43** | **46–51** |
 | 122B MoE (gdn4) | **~43** | **50.4** |
 
 ### Qwen3.6 family (tok/s, greedy, MTP auto unless noted)
@@ -191,7 +191,7 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 ranges are across 0–8K context. ¹ TP=2 on the small models (0.8B, 2B, 4B) is unoptimized —
 barriers dominate at these sizes: TTFT is several times slower for little or no decode gain; run
 them single-node. **TP=2 vs single**, same harness: 27B **1.2–1.6×** (ratio grows
-with context — a matched-depth comparison is 1.42–1.51× at 6–10K); 122B **1.30–1.34×**; 9B is
+with context — a matched-depth comparison is 1.42–1.51× at 6–10K); 122B **1.1–1.3×**; 9B is
 wash at short context but **~1.26× at 8K** (TP decode *rises* with context there); 35B
 ~1.15× (at this size the barriers eat most of the win — TP's value on the 35B is memory, not
 speed). MTP acceptance is workload-dependent (~35–85% across the family; prose accepts higher
