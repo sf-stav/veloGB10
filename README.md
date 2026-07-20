@@ -342,8 +342,8 @@ Beyond new models:
 
 ## Sponsorship & support
 
-veloGB10 is a **one-man project** — kernels, scheduler, transport, gates, docs, and releases are
-all done in one person's limited time. Bug reports and well-formed issues are always free and
+veloGB10 is a **one-man project by [Stav Katsoulis](https://github.com/sf-stav)** — kernels,
+scheduler, transport, gates, docs, and releases are all done in one person's limited time. Bug reports and well-formed issues are always free and
 welcome. If you need something specific and soon — a model port, a feature, tuning for your
 workload, TP>2 — **special work requests are taken on at a price**: open an issue describing the
 work and it will be quoted. This is also the most direct way to make the "next areas of research"
