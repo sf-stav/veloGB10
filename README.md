@@ -163,8 +163,8 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 
 > **Preliminary.** All throughput and TTFT numbers below were measured with
 > **[`tool-eval-bench --perf`](https://github.com/SeraphimSerapis/tool-eval-bench/)** (OpenAI
-> server path, pp2048 + tg128, 3 runs per cell) and veloGB10's own gate benches. A full uniform
-> sweep across all models × modes × contexts is in progress; these tables will be regenerated
+> server path, pp2048 + tg128, 3 runs per cell) and veloGB10's own built-in benchmarks. A full benchmark
+> run across all models × modes × contexts is in progress; these tables will be regenerated
 > from it. Single-stream decode, greedy, NVFP4, unless noted.
 
 ### Qwen3.5 family (tok/s, greedy, MTP auto unless noted)
@@ -172,13 +172,13 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 | Model (recipe) | Single node | TP=2 |
 |---|---:|---:|
 | 0.8B (mixed) | **182–217** | **182–201** ¹ |
-| 2B (mixed) | — pending | **161** (d2) |
-| 4B (mixed) | — pending | **125** (d2) |
+| 2B (mixed) | — pending | **161** |
+| 4B (mixed) | — pending | **125** |
 | 9B (full) | **~71** | **90–102** |
-| 9B (mixed) | — pending | **82** (d2) |
+| 9B (mixed) | — pending | **82** |
 | 27B (full / mixed) | — pending | — pending |
-| 122B MoE (mixed) | **~39** (26.2 plain) | **49.5–56.6** |
-| 122B MoE (gdn4) | **~43** | **50.4** (d2) |
+| 122B MoE (mixed) | **~39** (26.2 without speculation) | **49.5–56.6** |
+| 122B MoE (gdn4) | **~43** | **50.4** |
 
 ### Qwen3.6 family (tok/s, greedy, MTP auto unless noted)
 
@@ -186,13 +186,13 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 |---|---:|---:|
 | 27B (full) | **32–40** | **44–50** |
 | 27B (mixed) | — pending | **43–48** |
-| 35B MoE (full) | **91.5** (d2) · **~112** (auto) | **105.5** (d2) · **108.8** (d4) |
+| 35B MoE (full) | **91.5–112** | **105.5–108.8** |
 | 35B MoE (mixed) | — pending | — pending |
 
-**Notes.** "Pending" cells land with the uniform sweep (tool-eval-bench `--perf`, pp2048+tg128);
+**Notes.** "Pending" cells land with the full benchmark run (tool-eval-bench `--perf`);
 ranges are across 0–8K context. ¹ TP=2 on the 0.8B is unoptimized — barriers dominate at this
 size; run it single-node. **TP=2 vs single**, same harness: 27B **1.2–1.6×** (ratio grows
-with context — depth-matched like-for-like is 1.42–1.51× at 6–10K); 122B **1.30–1.34×**; 35B
+with context — a matched-depth comparison is 1.42–1.51× at 6–10K); 122B **1.30–1.34×**; 35B
 ~1.15× (at this size the barriers eat most of the win — TP's value on the 35B is memory, not
 speed). MTP acceptance is workload-dependent (~35–85% across the family; prose accepts higher
 than code).
