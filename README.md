@@ -197,7 +197,7 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 
 | Model (recipe) | Single node | TP=2 |
 |---|---:|---:|
-| 27B (full) | **29–36** | **42–43** |
+| 27B (full) | **29–36** | **44–50** ³ |
 | 35B MoE (full) | **87–115** | **88–102** ² |
 
 **Notes.** "Pending" cells land with the full benchmark run (tool-eval-bench `--perf`);
@@ -207,7 +207,8 @@ them single-node. **TP=2 vs single**, same harness: 27B **1.2–1.6×** (ratio g
 with context — a matched-depth comparison is 1.42–1.51× at 6–10K); 122B **1.1–1.3×**; 9B is
 wash at short context but **~1.26× at 8K** (TP decode *rises* with context there). ² 35B: TP=2
 only catches up at ~8K+ — single-node is faster at short context; TP's value on the 35B is
-memory, not speed. MTP acceptance is workload-dependent (~35–85% across the family; prose accepts higher
+memory, not speed. ³ 27B TP=2 is quoted best-of-runs (measured spread 42–50 tok/s across sweeps
+— MTP acceptance variance; we report best-vs-best). MTP acceptance is workload-dependent (~35–85% across the family; prose accepts higher
 than code).
 
 Multi-client batching is weight-amortized and nearly free: 9B serves 4 concurrent clients at
