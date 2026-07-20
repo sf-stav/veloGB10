@@ -198,16 +198,16 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 | Model (recipe) | Single node | TP=2 |
 |---|---:|---:|
 | 27B (full) | **29–36** | **42–43** |
-| 35B MoE (full) | **91.5–112** | **105.5–108.8** |
+| 35B MoE (full) | **87–115** | **88–102** ² |
 
 **Notes.** "Pending" cells land with the full benchmark run (tool-eval-bench `--perf`);
 ranges are across 0–8K context. ¹ TP=2 on the small models (0.8B, 2B, 4B) is unoptimized —
 barriers dominate at these sizes: TTFT is several times slower for little or no decode gain; run
 them single-node. **TP=2 vs single**, same harness: 27B **1.2–1.6×** (ratio grows
 with context — a matched-depth comparison is 1.42–1.51× at 6–10K); 122B **1.1–1.3×**; 9B is
-wash at short context but **~1.26× at 8K** (TP decode *rises* with context there); 35B
-~1.15× (at this size the barriers eat most of the win — TP's value on the 35B is memory, not
-speed). MTP acceptance is workload-dependent (~35–85% across the family; prose accepts higher
+wash at short context but **~1.26× at 8K** (TP decode *rises* with context there). ² 35B: TP=2
+only catches up at ~8K+ — single-node is faster at short context; TP's value on the 35B is
+memory, not speed. MTP acceptance is workload-dependent (~35–85% across the family; prose accepts higher
 than code).
 
 Multi-client batching is weight-amortized and nearly free: 9B serves 4 concurrent clients at
