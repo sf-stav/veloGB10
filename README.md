@@ -25,7 +25,7 @@ same binary supports all supported models through `--model-dir`; no Python runti
 serving stack is required.
 
 **Headline** (greedy, MTP-speculative, bitwise-lossless — full tables in
-[Benchmarks](#benchmarks)): Qwen3.6 27B at **~40 tok/s** on one GB10 and **~50 tok/s on two** ·
+[Benchmarks](#benchmarks)): Qwen3.6 27B at **~42 tok/s** on one GB10 and **~53 tok/s on two** ·
 Qwen3.6 35B MoE at **~112 tok/s** · Qwen3.5 122B MoE at **~39 tok/s** on one GB10 and **~57
 tok/s on two**.
 
@@ -197,17 +197,17 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 
 | Model (recipe) | Single node | TP=2 |
 |---|---:|---:|
-| 27B (full) | **29–36** | **44–50** ³ |
+| 27B (full) | **33–42** | **42–53** ³ |
 | 35B MoE (full) | **87–115** | **88–102** ² |
 
 **Notes.** "Pending" cells land with the full benchmark run (tool-eval-bench `--perf`);
 ranges are across 0–8K context. ¹ TP=2 on the small models (0.8B, 2B, 4B) is unoptimized —
 barriers dominate at these sizes: TTFT is several times slower for little or no decode gain; run
-them single-node. **TP=2 vs single**, same harness: 27B **1.2–1.6×** (ratio grows
-with context — a matched-depth comparison is 1.42–1.51× at 6–10K); 122B **1.1–1.3×**; 9B is
+them single-node. **TP=2 vs single**, same harness: 27B **1.1–1.3×** (best-vs-best 1.26×;
+a matched-depth comparison measured 1.42–1.51× at 6–10K); 122B **1.1–1.3×**; 9B is
 wash at short context but **~1.26× at 8K** (TP decode *rises* with context there). ² 35B: TP=2
 only catches up at ~8K+ — single-node is faster at short context; TP's value on the 35B is
-memory, not speed. ³ 27B TP=2 is quoted best-of-runs (measured spread 42–50 tok/s across sweeps
+memory, not speed. ³ 27B TP=2 is quoted best-of-runs (measured spread 42–53 tok/s across sweeps
 — MTP acceptance variance; we report best-vs-best). MTP acceptance is workload-dependent (~35–85% across the family; prose accepts higher
 than code).
 
@@ -225,7 +225,7 @@ large-model + long-context + multi-lane combinations fit.
 | Model | tok/s | Note |
 |---|---:|---|
 | Qwen3.5 122B | **702** | grouped-MoE GEMM with N=16 weight reuse |
-| Qwen3.6 27B | ~730 | 2.8 s TTFT on a 2048-token prompt |
+| Qwen3.6 27B | ~721 | 2.7 s TTFT on a 2048-token prompt |
 
 ### Quality ([tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench/), agentic scenario suite)
 
