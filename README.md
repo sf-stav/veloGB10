@@ -336,6 +336,14 @@ via the TP=2 runtime:
   tensor-core GEMM, grouped-MoE GEMM, batch-invariant verify, TP=2) is built to absorb new
   family members quickly.
 
+Beyond new models:
+
+- **Advanced KV-cache handling** — rotated/codebook KV-cache quantization in the TurboQuant
+  family (deterministic variant, so greedy speculative decoding stays bitwise-lossless), aimed
+  at much longer effective contexts and faster long-context decode. Most relevant to the fat-KV
+  architectures (full-GQA models like Hy3) and to multi-lane long-context serving; the GDN
+  hybrids need it least — which is exactly what makes it portable upside.
+
 ## Sponsorship & support
 
 veloGB10 is a **one-man project** — kernels, scheduler, transport, gates, docs, and releases are
