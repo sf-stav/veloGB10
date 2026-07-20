@@ -172,7 +172,7 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 | Model (recipe) | Single node | TP=2 |
 |---|---:|---:|
 | 0.8B (mixed) | **182–217** | **182–201** ¹ |
-| 2B (mixed) | — pending | **161** |
+| 2B (mixed) | **150–169** | **159–166** ¹ |
 | 4B (mixed) | — pending | **125** |
 | 9B (full) | **~71** | **90–102** |
 | 9B (mixed) | — pending | **82** |
@@ -190,8 +190,8 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 | 35B MoE (mixed) | — pending | — pending |
 
 **Notes.** "Pending" cells land with the full benchmark run (tool-eval-bench `--perf`);
-ranges are across 0–8K context. ¹ TP=2 on the 0.8B is unoptimized — barriers dominate at this
-size; run it single-node. **TP=2 vs single**, same harness: 27B **1.2–1.6×** (ratio grows
+ranges are across 0–8K context. ¹ TP=2 on the small models (0.8B, 2B) is unoptimized — barriers
+dominate at these sizes; run them single-node. **TP=2 vs single**, same harness: 27B **1.2–1.6×** (ratio grows
 with context — a matched-depth comparison is 1.42–1.51× at 6–10K); 122B **1.30–1.34×**; 35B
 ~1.15× (at this size the barriers eat most of the win — TP's value on the 35B is memory, not
 speed). MTP acceptance is workload-dependent (~35–85% across the family; prose accepts higher
