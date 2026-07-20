@@ -1,0 +1,49 @@
+[package]
+name = "gb10_inference"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# CUDA bindings - required, driver API for sm_121 control
+cudarc = { version = "0.9", features = ["driver", "nvrtc", "cublas", "cublaslt", "f16"] }
+# Model loading/conversion (optional utility, not inference runtime)
+tch = { version = "0.15", optional = true }
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# Serialization
+safetensors = "0.8"
+anyhow = "1.0"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+# Math types
+half = { version = "2.4", features = ["bytemuck"] }
+serde_json = "1"
+bytemuck = "1.14"
+# Random generation
+rand = "0.8"
+# Tokenizer
+tokenizers = "0.19"
+# Chat template rendering (loads each model's own chat_template.jinja)
+minijinja = "2.21"
+# HTTP server
+axum = { version = "0.7", features = ["ws"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio-stream = "0.1"
+tower-http = { version = "0.5", features = ["cors"] }
+async-stream = "0.3"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+# Content-addressed artifact hashing for --head/--node shard distribution
+sha2 = "0.10"
+
+[dev-dependencies]
+criterion = "0.5"
+zip = "2.2"
+
+[build-dependencies]
+cc = "1.0"
+
+[features]
+default = []
