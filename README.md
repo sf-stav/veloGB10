@@ -175,8 +175,7 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 | 2B (mixed) | **150–169** | **159–166** ¹ |
 | 4B (mixed) | **97–112** | **112–115** ¹ |
 | 9B (full) | **71–83** | **83–90** |
-| 9B (mixed) | — pending | **82** |
-| 27B (full / mixed) | — pending | — pending |
+| 27B (full) | — pending | — pending |
 | 122B MoE (mixed) | **~39** (26.2 without speculation) | **49.5–56.6** |
 | 122B MoE (gdn4) | **~43** | **50.4** |
 
@@ -185,7 +184,6 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 | Model (recipe) | Single node | TP=2 |
 |---|---:|---:|
 | 27B (full) | **32–40** | **44–50** |
-| 27B (mixed) | — pending | **43–48** |
 | 35B MoE (full) | **91.5–112** | **105.5–108.8** |
 | 35B MoE (mixed) | — pending | — pending |
 
