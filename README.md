@@ -197,7 +197,7 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 
 | Model (recipe) | Single node | TP=2 |
 |---|---:|---:|
-| 27B (full) | **32–40** | **44–50** |
+| 27B (full) | **29–36** | **42–43** |
 | 35B MoE (full) | **91.5–112** | **105.5–108.8** |
 | 35B MoE (mixed) | — pending | — pending |
 
