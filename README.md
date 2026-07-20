@@ -167,34 +167,37 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 > sweep across all models × modes × contexts is in progress; these tables will be regenerated
 > from it. Single-stream decode, greedy, NVFP4, unless noted.
 
-### Single-node decode (tok/s, greedy)
+### Qwen3.5 family (tok/s, greedy, MTP auto unless noted)
 
-| Model | Plain | MTP (auto depth) | Source |
-|---|---:|---:|---|
-| Qwen3.6 27B | ~12 | **32.1 / 39.9 / 36.9** @ d0 / 4K / 8K | server sweep, pp2048+tg128 ×3 |
-| Qwen3.6 35B (MoE) | — | **91.5** (d2) · ~112 (server auto) | gate bench |
-| Qwen3.5 122B (MoE) | 26.2 | **37.6** (d2) · 37.3 (d4) | gate bench |
-| Qwen3.5 9B | ~41 | **70.9** (auto) | gate bench |
-| Qwen3.5 0.8B–4B | — | sweep pending | — |
+| Model (recipe) | Single node | TP=2 |
+|---|---:|---:|
+| 0.8B (mixed) | — pending | **206–217** |
+| 2B (mixed) | — pending | **161** (d2) |
+| 4B (mixed) | — pending | **125** (d2) |
+| 9B (full) | **~71** | **90–102** |
+| 9B (mixed) | — pending | **82** (d2) |
+| 27B (full / mixed) | — pending | — pending |
+| 122B MoE (mixed) | **~39** (26.2 plain) | **49.5–56.6** |
+| 122B MoE (gdn4) | **~43** | **50.4** (d2) |
 
-MTP acceptance is workload-dependent (~35–85% across the family; prose accepts higher than code).
+### Qwen3.6 family (tok/s, greedy, MTP auto unless noted)
+
+| Model (recipe) | Single node | TP=2 |
+|---|---:|---:|
+| 27B (full) | **32–40** | **44–50** |
+| 27B (mixed) | — pending | **43–48** |
+| 35B MoE (full) | **91.5** (d2) · **~112** (auto) | **105.5** (d2) · **108.8** (d4) |
+| 35B MoE (mixed) | — pending | — pending |
+
+**Notes.** "Pending" cells land with the uniform sweep (tool-eval-bench `--perf`, pp2048+tg128);
+ranges are across 0–8K context. **TP=2 vs single**, same harness: 27B **1.2–1.6×** (ratio grows
+with context — depth-matched like-for-like is 1.42–1.51× at 6–10K); 122B **1.30–1.34×**; 35B
+~1.15× (at this size the barriers eat most of the win — TP's value on the 35B is memory, not
+speed). MTP acceptance is workload-dependent (~35–85% across the family; prose accepts higher
+than code).
 
 Multi-client batching is weight-amortized and nearly free: 9B serves 4 concurrent clients at
 34 tok/s *each* (~136 tok/s aggregate, 3.2× single-stream) with byte-identical output.
-
-### TP=2 decode (server path, pp2048 + tg128, greedy)
-
-| Model | tg tok/s @ d0 | @ 4K ctx | @ 8K ctx | TTFT (s) @ d0 / 4K / 8K |
-|---|---:|---:|---:|---|
-| Qwen3.6 27B (nvfp4-full) | **50.2** | **46.6** | **44.1** | 6.8 / 19.6 / 33.0 |
-| Qwen3.6 27B (nvfp4-mixed) | **42.7** | **47.5** | **43.4** | 6.8 / 19.6 / 33.0 |
-| Qwen3.5 122B | **56.6** | **54.7** | **49.5** | 5.0 / 14.4 / 24.6 |
-| Qwen3.5 9B | **90.4** | **102.3** | **97.0** | 2.9 / 8.6 / 14.4 |
-| Qwen3.5 0.8B | **206.5** | **217.1** | **211.3** | 1.5 / 4.3 / 7.2 |
-
-Against single-node 27B on the same harness (32.1 / 39.9 / 36.9): **TP=2 is 1.2–1.6×**. On the
-depth-matched bench harness the like-for-like ratio is 1.42–1.51× at 6–10K context (35B: 1.15×,
-122B: 1.30–1.34×) — every leg greedy-lossless verified.
 
 *"Greedy-lossless verified" (`LOSSLESS_OK` in the engine's gates): speculative output bit-identical
 to non-speculative decoding — speculation changes speed, never the tokens.*
