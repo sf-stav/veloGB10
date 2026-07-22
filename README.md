@@ -29,7 +29,7 @@ serving stack is required.
 Qwen3.6 35B MoE at **~111 tok/s** on one GB10 and **~130 tok/s on two** · Qwen3.5 122B MoE at **~39 tok/s** on one GB10 and **~57
 tok/s on two**.
 
-Prebuilt binaries for GB10 systems are on the **Releases** page — each release includes the
+Prebuilt binaries for GB10 systems are on the [**Releases** page](https://github.com/sf-stav/veloGB10/releases) — each release includes the
 inference binary, the required PTX kernels, SHA-256 checksums, and build provenance notes. If you
 run an NVIDIA DGX Spark or a compatible OEM GB10 machine, you can use a release binary without
 compiling anything.
@@ -57,7 +57,7 @@ This produces `target/release/gb10_inference` plus the two PTX kernel artifacts 
 so run it from a directory that has both (a build-fingerprint handshake refuses to run mismatched
 binary/PTX pairs, so the two never silently drift apart).
 
-Don't want to build? Use the prebuilt package on the **Releases** page instead.
+Don't want to build? Use the prebuilt package on the [**Releases** page](https://github.com/sf-stav/veloGB10/releases) instead.
 
 ## Running
 
