@@ -375,3 +375,11 @@ above happen faster.
 - [`tool-eval-bench`](https://github.com/SeraphimSerapis/tool-eval-bench/) — the benchmark
   harness behind every number in this README.
 - NVIDIA — the DGX Spark. One (or two) of them is all it takes.
+
+## AI full disclosure
+
+This software is developed with strong assistance from open source LLM models (GLM & Kimi) and with experienced software architect humans (i.e. me) leading the technical direction, many ideas, testing, and extensive debugging over a long time. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without existing knowledge and source code written by hand by actual humans.
+
+## Acknowledgements to the general community
+
+This project does not link extensively against any other project (other than the obvious and documented usages). However, due to the fact that LLM code generation does not occur in a vacuum, this project exists thanks to the path opened by the many other projects and the kernels, quantization formats, open source AI/LLM ecosystem, and hard-won engineering knowledge developed there. We are thankful and indebted to everyone who contributed to this area of computing and its contributors. Their implementations, experiments, code, ideas, kernels, tests, and design choices were, even if implicit through the weight encoded memory of the models we use, an essential reference while building this specific inference source code.
