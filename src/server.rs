@@ -79,7 +79,8 @@ fn esc(t: &str) -> String {
     t.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
-const THINK_CLOSE: &str = "</think>";
+/// (The think close marker is resolved per-request from the model's vocab — see
+/// QwenTokenizer::think_tags. Qwen: `</think>`; hy_v3: `</think:opensource>`.)
 
 /// Longest suffix of `s` that is a proper (partial) prefix of `marker` — text that could be the start
 /// of the marker arriving across decode chunks, and so must be held back rather than forwarded.
@@ -87,23 +88,25 @@ fn partial_overlap(s: &str, marker: &str) -> usize {
     (1..marker.len()).rev().find(|&k| s.ends_with(&marker[..k])).unwrap_or(0)
 }
 
-fn partial_think_overlap(s: &str) -> usize { partial_overlap(s, THINK_CLOSE) }
+fn partial_think_overlap(s: &str, marker: &str) -> usize { partial_overlap(s, marker) }
 
 /// The opening marker of a tool call. While streaming we must never forward this (or a partial prefix
 /// of it) to the client as CONTENT: a harness would render raw XML in the chat and never invoke the
 /// tool. Once it appears, content emission stops and the rest is buffered for the tool_calls delta.
-const TOOL_OPEN: &str = "<tool_call>";
+/// `<tool_call` is the shared PREFIX of qwen's `<tool_call>` and hy_v3's `<tool_call:opensource>` /
+/// `<tool_calls:opensource>`, so one constant covers both families.
+const TOOL_OPEN: &str = "<tool_call";
 
-/// Split a completed generation into (reasoning, answer). If `</think>` is present, everything
-/// before it is reasoning (a leading `<think>` is stripped) and everything after (trimmed) is the
+/// Split a completed generation into (reasoning, answer). If the close marker is present, everything
+/// before it is reasoning (a leading think-open is stripped) and everything after (trimmed) is the
 /// answer. If the marker never appears, the whole text is returned as the answer content.
-fn split_think(s: &str) -> (Option<String>, String) {
-    match s.find(THINK_CLOSE) {
+fn split_think(s: &str, think_open: &str, think_close: &str) -> (Option<String>, String) {
+    match s.find(think_close) {
         Some(idx) => {
             let mut r = s[..idx].to_string();
-            if let Some(rest) = r.strip_prefix("<think>") { r = rest.to_string(); }
+            if let Some(rest) = r.strip_prefix(think_open) { r = rest.to_string(); }
             let r = r.trim().to_string();
-            let c = s[idx + THINK_CLOSE.len()..].trim_start_matches(['\n', '\r', ' ', '\t']).to_string();
+            let c = s[idx + think_close.len()..].trim_start_matches(['\n', '\r', ' ', '\t']).to_string();
             (if r.is_empty() { None } else { Some(r) }, c)
         }
         None => (None, s.to_string()),
@@ -322,6 +325,10 @@ async fn chat_completions(
         let created = chrono::Utc::now().timestamp();
         let t0 = std::time::Instant::now();
         let req_tools = req.tools.clone();
+        // Think markers + the initial reasoning/content state, from the model's vocab: qwen is
+        // primed into a think block (starts in reasoning); hy_v3's no_think prompt closes the empty
+        // block itself (starts as content).
+        let (think_open, think_close, starts_in_reasoning) = tokenizer.think_tags();
 
         let stream = async_stream::stream! {
             yield Ok::<Event, axum::Error>(Event::default().data(
@@ -331,11 +338,12 @@ async fn chat_completions(
             let mut n = 0usize;
             let mut stop_hit = false;
             let mut finish = "length".to_string();
-            // Thinking-model split: prompt is primed with `<think>\n`, so the generated stream
+            // Thinking-model split: qwen's prompt is primed with `<think>\n`, so the generated stream
             // is `…reasoning…</think>\n\nanswer`. Pre-close text -> reasoning_content, post-close
-            // -> content. The `</think>` marker may span decode chunks, so we hold back a tail
-            // that could be its prefix until more text arrives.
-            let mut content_start: Option<usize> = None;
+            // -> content. hy_v3's no_think prompt already closed the (empty) block, so it starts as
+            // content. The close marker may span decode chunks, so we hold back a tail that could be
+            // its prefix until more text arrives.
+            let mut content_start: Option<usize> = if starts_in_reasoning { None } else { Some(0) };
             let mut reason_emitted: usize = 0;
             let mut content_emitted: usize = 0;
             while let Some(ev) = rx.recv().await {
@@ -347,11 +355,11 @@ async fn chat_completions(
                                 acc.push_str(&text);
                                 match content_start {
                                     None => {
-                                        if let Some(idx) = acc.find(THINK_CLOSE) {
+                                        if let Some(idx) = acc.find(think_close) {
                                             if idx > reason_emitted {
                                                 yield Ok(Event::default().data(reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..idx])));
                                             }
-                                            let cs = idx + THINK_CLOSE.len();
+                                            let cs = idx + think_close.len();
                                             let mut lead = cs;
                                             while lead < acc.len() && matches!(acc.as_bytes()[lead], b'\n' | b'\r' | b' ' | b'\t') { lead += 1; }
                                             content_start = Some(lead);
@@ -360,7 +368,7 @@ async fn chat_completions(
                                             }
                                             content_emitted = acc.len();
                                         } else {
-                                            let overlap = partial_think_overlap(&acc);
+                                            let overlap = partial_think_overlap(&acc, think_close);
                                             let safe = acc.len() - overlap;
                                             if safe > reason_emitted {
                                                 yield Ok(Event::default().data(reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..safe])));
@@ -399,7 +407,7 @@ async fn chat_completions(
             }
             // The call was buffered, not streamed (see the hold-back above). Emit it as one
             // tool_calls delta and flip finish_reason -- that is the flag every harness branches on.
-            let (_, done_content) = split_think(&acc);
+            let (_, done_content) = split_think(&acc, think_open, think_close);
             let parsed = crate::tools::parse(&done_content, req_tools.as_deref());
             if req_tools.is_some() {
                 let dump = std::env::var("RUST_INFER_DUMP_TOOLS").is_ok();
@@ -456,7 +464,8 @@ async fn chat_completions(
         }
         eprintln!("[req] done   tok={} ({:.1} tok/s wall) finish={}", tokens.len(), if dt>1e-6 {tokens.len() as f32/dt} else {0.0}, finish);
         let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
-        let (reasoning, content) = split_think(&text);
+        let (think_open, think_close, _) = state.tokenizer.think_tags();
+        let (reasoning, content) = split_think(&text, think_open, think_close);
 
         // The model emits calls as <tool_call><function=..><parameter=..>..  -- NOT as JSON. Turn them
         // into OpenAI tool_calls, or the harness just sees XML in the content and never invokes

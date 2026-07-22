@@ -336,7 +336,9 @@ pub fn group_of(name: &str) -> Group {
     // MTP-head routers/shared-gates bf16. A quantized MTP router mis-routes the DRAFTER → tanks
     // speculative acceptance while output quality stays perfect (verify corrects it) — the invisible bug.
     if name.contains(".mlp.gate.weight") || name.contains(".shared_expert_gate.") { return Group::Router; }
+    if name.contains(".router.") { return Group::Router; }   // hy_v3: mlp.router.gate.weight
     if name.starts_with("mtp.") { return Group::Mtp; }
+    if name.contains(".eh_proj") { return Group::Mtp; }   // hy_v3: layer-80 MTP embed→hidden projection
     if name.contains("lm_head") { return Group::LmHead; }
     if name.contains("embed_tokens") { return Group::Embed; }
     // MoE — test BEFORE the generic `.mlp.`: the stacked routed experts are their own group (the
@@ -638,7 +640,10 @@ pub fn subset_rows_fp8(qw: &[u8], rs: &[f32], k: usize, rows: &[u32]) -> (Vec<u8
 /// a zero row would have logit 0 and could WIN an argmax against all-negative logits.
 pub fn draft_vocab_rows(top: usize, vocab: usize) -> Vec<u32> {
     const TAIL: usize = 512;                       // covers every special/added token, with margin
-    let tail_start = vocab.saturating_sub(TAIL);
+    // hy_v3's specials start at 120000 (`<｜hy_eos…｜>`, think/tool markers) — the generic
+    // 512-row tail (120320+) would miss them all, and a drafter that cannot propose hy_eos
+    // can never draft the end of a chat turn. Cover the whole special block for that vocab.
+    let tail_start = if vocab == 120832 { 120000 } else { vocab.saturating_sub(TAIL) };
     let mut top = top.min(tail_start);
     // grow `top` (with real, more-frequent tokens) until the total is a multiple of 16
     while (top + (vocab - tail_start)) % MMA_M != 0 { top += 1; }

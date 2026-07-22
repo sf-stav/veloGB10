@@ -471,8 +471,8 @@ pub struct BatchScheduler {
     /// Decides for itself whether MTP pays, from a measured cost ratio plus live acceptance.
     /// Greedy vs stochastic verify is NOT part of this — that follows from the request's temperature.
     mtp: MtpPolicy,
-    /// Per-physical-slot MTP KV cache: `[nkv, kv_stride, hd]` bf16 each. Indexed by `Lane::phys`.
-    /// Empty when MTP is disabled.
+    /// Per-physical-slot MTP KV cache: `[nkv, kv_stride, hd]` bf16 each (packed `[nkv, kv_stride,
+    /// hd/16×9]` bytes under the 4-bit KV cache). Indexed by `Lane::phys`. Empty when MTP is disabled.
     mtp_kc: Vec<B>,
     mtp_vc: Vec<B>,
     /// Per-physical-slot MTP hidden cursor `[h]` bf16: the pre-norm backbone hidden at the last
@@ -645,7 +645,8 @@ impl BatchScheduler {
                 let h = cfg.hidden_size;
                 let nkv = cfg.num_kv_heads;
                 let hd = cfg.head_dim;
-                let kv_bytes = nkv * kv_stride * hd * 2; // bf16
+                let kv_bytes = nkv * kv_stride * hd * 2; // bf16 — the DRAFT cache stays bf16 even
+                // under the 4-bit main KV cache (quantized draft KV costs real acceptance).
                 let dev = gpu.dev().clone();
                 let mut kc: Vec<B> = Vec::with_capacity(max_batch);
                 let mut vc: Vec<B> = Vec::with_capacity(max_batch);

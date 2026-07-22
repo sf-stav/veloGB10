@@ -139,25 +139,27 @@ fn print_help() {
     println!("    --discover-wait <S>      Discovery broadcast window instead of --nodes      [3]");
     println!("    --rdma-dev <d1[,d2]>     RoCE devices if the defaults (rocep1s0f1, roceP2p1s0f1)");
     println!("                             don't match the platform (also GB10_RDMA_DEV)");
+    println!("    --no-shard-mixers        Escape hatch: DON'T shard attention/GDN mixers + KV");
+    println!("                             (default is ON under --tp/--head — it's where the speed is)");
+    println!("    --tp-graph               CUDA-graph the TP decode (bench path)");
+    println!("    --tp-fp32-partials       FP32 all-reduce partials (kills the bf16-partial dip)");
+    println!("    --tp-trace               Per-barrier timing histograms at exit");
+    println!("    --tp-cache <dir>         Node's model blob cache        [~/.cache/gb10_tp]");
     println!("    --head --model-dir <DIR> One-shot bench/generate head (tp_serve proof path;");
     println!("                             use --server --tp for serving)");
     println!();
-    println!("  TP ENV VARS (read on the HEAD and shipped to the node in the sync config — set");
-    println!("  on both boxes ONLY for benches; a node never needs them)");
-    println!("    GB10_TP_SHARD_MIXERS=1   Shard attention/GDN mixers AND MoE experts (the win:");
-    println!("                             ~half weight bytes per rank). Default: FFN-only");
-    println!("    GB10_TP_GRAPH=1          CUDA-graph the TP decode (bench path)");
-    println!("    GB10_TP_FP32_PARTIALS=1  FP32 all-reduce partials (kills the bf16-partial");
-    println!("                             acceptance dip on small models; ~2x barrier payload)");
-    println!("    GB10_TP_MTP=1 + GB10_TP_MTP_DEPTH=N   Bench rig: run bench_mtp under TP");
-    println!("    GB10_TP_CACHE=<dir>      Node's model blob cache        [~/.cache/gb10_tp]");
+    println!("  TP ENV-VAR ALIASES (the CLI flags above are preferred; env stays for back-compat.");
+    println!("  Set on the HEAD only — the sync ships the config to the node, which needs nothing):");
+    println!("    GB10_TP_SHARD_MIXERS=1 ↔ default-on under --tp/--head (--no-shard-mixers turns off)");
+    println!("    GB10_TP_GRAPH=1 ↔ --tp-graph    GB10_TP_FP32_PARTIALS=1 ↔ --tp-fp32-partials");
+    println!("    GB10_TP_TRACE=1 ↔ --tp-trace    GB10_TP_CACHE=<dir> ↔ --tp-cache <dir>");
+    println!("    GB10_TP_MTP=1 ↔ --mtp=on (bench rig)   GB10_TP_MTP_DEPTH=N ↔ --mtp-depth N");
     println!("    GB10_TP_TAIL_DRILL=1     TEST: invert commit/payload every 4096th epoch");
     println!("    GB10_TP_AGREE_DRILL=N    TEST: corrupt this rank's agree hash at step N");
     println!();
     println!("  TYPICAL");
     println!("    peer: ./gb10_inference --node --port 29500");
-    println!("    head: GB10_TP_SHARD_MIXERS=1 ./gb10_inference --server \\");
-    println!("          --model-dir /models/3.5-122b-nvfp4-gdn4 --tp \\");
+    println!("    head: ./gb10_inference --server --model-dir /models/3.5-122b-nvfp4-gdn4 --tp \\");
     println!("          --nodes <peer-ip>:29500 --port 9000 --max-seq-len 32768");
     println!("  See TP2_SERVING_RUNBOOK.md for the full runbook + troubleshooting table.");
     println!();
@@ -184,17 +186,21 @@ fn print_help() {
     println!("  --sweep-gemm             GEMM shape sweep");
     println!("  --perplexity             PPL on held-out text (--text <file> --window N --max-windows N)");
     println!("  --quantize               bf16 dir -> NVFP4/FP8 artifact (--model-dir <in> --out <dir> --recipe <r>)");
+    println!("  --capture-layers         Dump per-layer hidden states for raw token ids (--ids <f> --out <f>)");
     println!();
     println!("════════════════════════════════════════════════════════════════════════════════");
-    println!("  OTHER ENV VARS (single-node knobs you may legitimately need)");
+    println!("  SESSION BEHAVIOR FLAGS (env aliases in parentheses, back-compat; CLI wins)");
     println!("════════════════════════════════════════════════════════════════════════════════");
     println!();
-    println!("  GB10_RDMA_DEV=<d1[,d2]>   RoCE device override (see --rdma-dev)");
-    println!("  RUST_INFER_ZERO_KV=1      Restore cold-admit KV zeroing (default skips it for TTFT)");
-    println!("  RUST_INFER_PREFILL_SCALAR=1  Scalar (non-tiled) attention prefill path");
-    println!("  GB10_NO_DECODE_GRAPHS=1   Disable decode CUDA graphs (default: captured per batch)");
-    println!("  RUST_INFER_CPU_SAMPLE=1   Sample on CPU instead of GPU (numerically different path)");
-    println!("  GB10_TP_TRACE=1           Per-barrier timing histograms at exit");
+    println!("  --kv-cache bf16|q4       KV cache format (q4 = 4-bit;  GB10_KV_QUANT)");
+    println!("  --no-decode-graphs       Disable decode CUDA graphs    (GB10_NO_DECODE_GRAPHS)");
+    println!("  --no-gqpack              Per-head q4 attention fallback  (GB10_NO_GQPACK)");
+    println!("  --fuse-residual          Fused residual+norm epilogue    (GB10_FUSE_RESIDUAL)");
+    println!("  --cpu-sample             Sample on CPU instead of GPU    (RUST_INFER_CPU_SAMPLE)");
+    println!("  --prefill-scalar         Scalar (non-tiled) attn prefill (RUST_INFER_PREFILL_SCALAR)");
+    println!("  --zero-kv                Restore cold-admit KV zeroing   (RUST_INFER_ZERO_KV)");
+    println!("  --draft-vocab N          FR-Spec draft vocab subset; 0=off (RUST_INFER_DRAFT_VOCAB)");
+    println!("  GB10_RDMA_DEV=<d1[,d2]>  RoCE device override (see --rdma-dev)");
     println!();
     println!("Note: there are NO MTP on/off env vars — speculation is auto-tuned per request");
     println!("(greedy => argmax verify, bitwise lossless; temp>0 => speculative rejection");
@@ -204,6 +210,7 @@ fn print_help() {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    cli_env_bridge(&args);
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
@@ -358,6 +365,12 @@ fn main() {
         return;
     }
 
+    // DEBUG CAPTURE: per-layer hidden states for one prompt of raw token ids (oracle validation).
+    if args.iter().any(|a| a == "--capture-layers") {
+        run_capture_layers(&args);
+        return;
+    }
+
     // Per-phase timing of one stochastic-MTP step (where the acceptance win is being lost).
     if args.iter().any(|a| a == "--profile-mtp") {
         run_profile_mtp(&args);
@@ -398,6 +411,58 @@ fn main() {
 
     // CLI mode
     run_cli(&args);
+}
+
+/// Maps operator-facing CLI flags onto the env vars the engine reads internally (the
+/// `--rdma-dev` pattern). Every session option is a CLI flag; the env vars remain as
+/// back-compat aliases, and an explicit CLI flag always wins (it sets/removes the env
+/// before anything reads it). Dev/debug probes stay env-only by design. Under TP the
+/// head ships the resulting config to the node (TpConfig), so flags only need to exist
+/// on the head/serve path and the node stays zero-config.
+fn cli_env_bridge(args: &[String]) {
+    fn set(args: &[String], flag: &str, var: &str) {
+        if args.iter().any(|a| a == flag) { std::env::set_var(var, "1"); }
+    }
+    // TP feature flags.
+    set(args, "--tp-fp32-partials", "GB10_TP_FP32_PARTIALS");
+    set(args, "--tp-graph", "GB10_TP_GRAPH");
+    set(args, "--tp-trace", "GB10_TP_TRACE");
+    // Serving behavior.
+    set(args, "--no-decode-graphs", "GB10_NO_DECODE_GRAPHS");
+    set(args, "--no-gqpack", "GB10_NO_GQPACK");
+    set(args, "--fuse-residual", "GB10_FUSE_RESIDUAL");
+    set(args, "--cpu-sample", "RUST_INFER_CPU_SAMPLE");
+    set(args, "--prefill-scalar", "RUST_INFER_PREFILL_SCALAR");
+    set(args, "--zero-kv", "RUST_INFER_ZERO_KV");
+    // KV cache format.
+    if let Some(v) = parse_arg(args, "--kv-cache") {
+        match v {
+            "q4" => std::env::set_var("GB10_KV_QUANT", "1"),
+            "bf16" => std::env::remove_var("GB10_KV_QUANT"),
+            other => { eprintln!("--kv-cache must be bf16|q4 (got '{other}')"); std::process::exit(1); }
+        }
+    }
+    // MTP: unify the bench-path GB10_TP_MTP env with the server CLI (`--mtp=on|off`, `--mtp-depth`).
+    if let Some(v) = parse_arg(args, "--mtp") {
+        match v {
+            "on" => std::env::set_var("GB10_TP_MTP", "1"),
+            "off" => std::env::remove_var("GB10_TP_MTP"),
+            _ => {}   // auto: nothing to translate
+        }
+    }
+    if let Some(d) = parse_arg(args, "--mtp-depth") { std::env::set_var("GB10_TP_MTP_DEPTH", d); }
+    // FR-Spec draft vocabulary subset size (0 = full-vocab draft).
+    if let Some(n) = parse_arg(args, "--draft-vocab") { std::env::set_var("RUST_INFER_DRAFT_VOCAB", n); }
+    // Node blob cache dir.
+    if let Some(d) = parse_arg(args, "--tp-cache") { std::env::set_var("GB10_TP_CACHE", d); }
+    // Mixer sharding: DEFAULT ON under --tp/--head — Hy3 requires it, and it is where TP's speed
+    // comes from on every model (halved mixer bytes + halved KV). --no-shard-mixers is the escape
+    // hatch (and also wins over an inherited env, so a stale shell cannot surprise a bench).
+    if args.iter().any(|a| a == "--no-shard-mixers") {
+        std::env::remove_var("GB10_TP_SHARD_MIXERS");
+    } else if args.iter().any(|a| a == "--tp" || a == "--head") {
+        std::env::set_var("GB10_TP_SHARD_MIXERS", "1");
+    }
 }
 
 fn parse_arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
@@ -827,6 +892,46 @@ fn run_bench_accept(args: &[String]) {
     }
 }
 
+/// Compact acceptance discriminator, shared by --bench-accept and the TP=2 variant
+/// (GB10_TP_ACCEPT in tp_serve): overall rate, the target-confidence buckets that separate
+/// HARD TEXT (target unsure where the head misses) from a WEAK HEAD (misses even when the
+/// target is confident), and top-2/3 fork coverage by draft depth.
+fn bench_accept_report(depth: usize, s: &[gb10_inference::gpu::AcceptSample]) {
+    if s.is_empty() { println!("bench_accept: NO samples"); return; }
+    let acc = s.iter().filter(|x| x.accepted).count() as f32 / s.len() as f32;
+    println!("\n=== {} draft positions on the correct prefix, acceptance {:.1}%", s.len(), 100.0 * acc);
+    println!("  acceptance bucketed by the TARGET's own top-1 probability:");
+    for (lo, hi) in [(0.0f32, 0.3f32), (0.3, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 0.99), (0.99, 1.01)] {
+        let b: Vec<_> = s.iter().filter(|x| x.target_top1_p >= lo && x.target_top1_p < hi).collect();
+        if b.is_empty() { continue; }
+        let a = b.iter().filter(|x| x.accepted).count() as f32 / b.len() as f32;
+        println!("    {lo:.2}-{hi:.2}      {:5}     {:5.1}%", b.len(), 100.0 * a);
+    }
+    let confident: Vec<_> = s.iter().filter(|x| x.target_top1_p >= 0.9).collect();
+    let uncertain: Vec<_> = s.iter().filter(|x| x.target_top1_p < 0.5).collect();
+    if !confident.is_empty() {
+        println!("  CONFIDENT target (p>=0.9): {:5} positions, {:.1}% accepted", confident.len(),
+                 100.0 * confident.iter().filter(|x| x.accepted).count() as f32 / confident.len() as f32);
+    }
+    if !uncertain.is_empty() {
+        println!("  UNSURE target    (p< 0.5): {:5} positions, {:.1}% accepted ({:.0}% of all)", uncertain.len(),
+                 100.0 * uncertain.iter().filter(|x| x.accepted).count() as f32 / uncertain.len() as f32,
+                 100.0 * uncertain.len() as f32 / s.len() as f32);
+    }
+    println!("  HARD TEXT => target unsure a lot, acceptance high where sure.  WEAK HEAD => poor even when sure.");
+    println!("  fork coverage (target argmax in head top-k) by draft depth:");
+    for d in 1..depth {
+        let b: Vec<_> = s.iter().filter(|x| x.depth_idx == d).collect();
+        if b.is_empty() { continue; }
+        let n = b.len() as f32;
+        let (t1, t2, t3) = (b.iter().filter(|x| x.accepted).count() as f32 / n,
+                            b.iter().filter(|x| x.covered_top2).count() as f32 / n,
+                            b.iter().filter(|x| x.covered_top3).count() as f32 / n);
+        println!("    pos {d:<2}  {:5}  top1 {:5.1}%  top2 {:5.1}%  top3 {:5.1}%  (fork rescue +{:4.1}%)",
+                 b.len(), 100.0*t1, 100.0*t2, 100.0*t3, 100.0*(t2-t1));
+    }
+}
+
 fn run_bench_verify(args: &[String]) {
     let (model_path, tokenizer_path) = if let Some(dir) = parse_arg(args, "--model-dir") {
         (dir.to_string(), format!("{}/tokenizer.json", dir.trim_end_matches('/')))
@@ -1171,7 +1276,19 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
     ctx.sanity()?;
     println!("NODE (rank 1/2) — TP LINK UP (serving mode)");
 
-    let (mut gpu, _cfg) = gb10_inference::gpu::GpuModel::load_from_dir(&dir.to_string_lossy())?;
+    // These are read as ENV at model LOAD (GB10_KV_QUANT selects the 4-bit KV cache layout and the
+    // q4 attention path at GpuModel::load_from_dir_tp) and inside BatchScheduler::new (graph capture,
+    // gpu-sample probes). The head ships its values in the config and the node installs them
+    // process-wide BEFORE THE LOAD — this used to sit below load_from_dir_tp, so a serve-mode node
+    // silently built a bf16 KV cache + bf16 per-head attention while the head ran q4: the node
+    // became the straggler (the "32K anomaly" — 34.6 GB/token of bf16 per-head re-reads at 26K)
+    // and every serve-mode "q4" number was really a mixed q4-head/bf16-node number.
+    if tpc.no_decode_graphs { std::env::set_var("GB10_NO_DECODE_GRAPHS", "1"); }
+    if tpc.cpu_sample { std::env::set_var("RUST_INFER_CPU_SAMPLE", "1"); }
+    // The 4-bit KV cache must match on BOTH ranks (the caches are all-reduced-consistent).
+    if tpc.kv_quant { std::env::set_var("GB10_KV_QUANT", "1"); }
+
+    let (mut gpu, _cfg) = gb10_inference::gpu::GpuModel::load_from_dir_tp(&dir.to_string_lossy(), ctx.rank)?;
     let (rank, world, link) = ctx.into_parts();
     gpu.attach_tp(rank, world, link);
 
@@ -1180,13 +1297,6 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
     if world == 2 && !gb10_inference::net::pin_thread(9) {
         panic!("FATAL: launch thread failed to pin to core 9 — TP refuses to run unpinned");
     }
-
-    // These two are read as ENV inside BatchScheduler::new (batch.rs graph-capture + gpu-sample
-    // probes, first-use at scheduler build). The head ships its values in the config and the node
-    // installs them process-wide BEFORE the scheduler is built — that is the only window where both
-    // ranks can be made to agree, and a disagreement desyncs the graph-capture forward count.
-    if tpc.no_decode_graphs { std::env::set_var("GB10_NO_DECODE_GRAPHS", "1"); }
-    if tpc.cpu_sample { std::env::set_var("RUST_INFER_CPU_SAMPLE", "1"); }
 
     // SPMD calibration. The node MUST execute the identical forward sequence — the all-reduces are
     // barriers the head waits on — but DISCARDS its table: both ranks drive MtpPolicy from the
@@ -1226,7 +1336,10 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
 fn run_cluster_head(args: &[String]) {
     if let Some(d) = parse_arg(args, "--rdma-dev") { std::env::set_var("GB10_RDMA_DEV", d); }
     let model_dir = parse_arg(args, "--model-dir").expect("--head requires --model-dir <DIR>").to_string();
-    let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is").to_string();
+    let prompt_text = match parse_arg(args, "--prompt-file") {
+        Some(f) => std::fs::read_to_string(f).expect("read --prompt-file"),   // verbatim — `$(cat)` strips trailing newlines and changes the last token
+        None => parse_arg(args, "--prompt").unwrap_or("The capital of France is").to_string(),
+    };
     let max_new: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(64);
     let explicit = parse_arg(args, "--nodes").map(|s| {
         s.split(',').map(|p| {
@@ -1276,9 +1389,16 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
         head_payload.as_ref().map(|(ids, m)| (ids.as_slice(), *m)))?;
     println!("{role} — SPMD decode: {} prompt tokens, max_new {max_new}", prompt.len());
 
+    // Node-side TP env that must agree with the head before load (the 4-bit KV cache changes the
+    // cache layout on BOTH ranks; the head ships it in the TpConfig).
+    if gb10_inference::tp::tp_config().map(|c| c.kv_quant).unwrap_or(false) {
+        std::env::set_var("GB10_KV_QUANT", "1");
+    }
+
     // Load the (whole, replicated) model and attach the TP link → the forward runs the sharded FFN
-    // all-reduce (world==2). Same binary/model on both boxes, so the compute is identical.
-    let (mut gpu, _cfg) = gb10_inference::gpu::GpuModel::load_from_dir(model_dir)?;
+    // all-reduce (world==2). Same binary/model on both boxes, so the compute is identical. (hy_v3:
+    // the loader shards to ctx.rank host-side — the full model does not fit one node.)
+    let (mut gpu, _cfg) = gb10_inference::gpu::GpuModel::load_from_dir_tp(model_dir, ctx.rank)?;
     let (rank, world, link) = ctx.into_parts();
     gpu.attach_tp(rank, world, link);
 
@@ -1292,7 +1412,60 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
         panic!("FATAL: launch thread failed to pin to core 9 — TP refuses to run unpinned");
     }
 
+    // TP-aware per-layer capture (hy_v3 oracle localization): BOTH ranks run the identical batched
+    // prefill in SPMD lockstep (the all-reduces fire inside), and each writes its own dump — the two
+    // files must be bit-identical to each other (SPMD check) and comparable to the oracle per layer
+    // per position (scripts/compare_hy3_oracle.py). `GB10_TP_CAPTURE=<out.safetensors>`.
+    if let Ok(cap_out) = std::env::var("GB10_TP_CAPTURE") {
+        use safetensors::{Dtype, tensor::TensorView};
+        let n = prompt.len();
+        let h = gpu.cfg().hidden_size;
+        let nlayers = gpu.cfg().num_layers;
+        let kv_stride = n.max(16);
+        let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+        let mut state = gpu.new_batch_state(1, 1, kv_stride);
+        let dumps = gpu.capture_prefill(&mut pool, &prompt, &mut state, kv_stride);
+        // GB10_CAP_DEBUG interleaves mixer/mlp_out dumps per layer (count check only without it).
+        if std::env::var("GB10_CAP_DEBUG").is_err() {
+            assert_eq!(dumps.len(), nlayers + 2, "capture count: embed + L layers + final_norm");
+        }
+        let mut named: Vec<(String, Vec<half::bf16>)> = Vec::with_capacity(dumps.len());
+        let dbg = std::env::var("GB10_CAP_DEBUG").is_ok();
+        for (i, dmp) in dumps.into_iter().enumerate() {
+            // Debug mode: mixer/mlp_out dumps are interleaved per layer — name by index (unique).
+            let name = if dbg { format!("dump.{i:03}") }
+                       else if i == 0 { "layer.00.in".to_string() }
+                       else if i <= nlayers { format!("layer.{:02}.out", i - 1) }
+                       else { "final_norm".to_string() };
+            named.push((name, dmp));
+        }
+        let views: Vec<(String, TensorView)> = named.iter()
+            .map(|(name, dmp)| {
+                let bytes: &[u8] = bytemuck::cast_slice(&dmp[..]);
+                (name.clone(), TensorView::new(Dtype::BF16, vec![n, h], bytes).expect("view"))
+            }).collect();
+        safetensors::serialize_to_file(views, None, std::path::Path::new(&cap_out)).expect("write safetensors");
+        println!("{role} — TP capture: {n} tokens x {nlayers} layers -> {cap_out}");
+        return Ok(());
+    }
+
     let max_seq_len = (prompt.len() + max_new + 16).next_power_of_two().max(256);
+
+    // TP=2 acceptance diagnosis (GB10_TP_ACCEPT=<depth>): both ranks run bench_accept in SPMD
+    // (the main forwards barrier; the replicated drafter cannot diverge), rank 0 prints the
+    // discriminator report. This is the instrument for "is the draft head weak or is the text hard".
+    if let Ok(depth_s) = std::env::var("GB10_TP_ACCEPT") {
+        let depth: usize = depth_s.parse().unwrap_or(2);
+        let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+        let mut state = gpu.new_batch_state(1, 2 + depth, max_seq_len);
+        let (s, generated) = gpu.bench_accept(&mut pool, &mut state, &prompt, max_seq_len, depth, max_new, 0);
+        if is_head {
+            assert!(!s.is_empty(), "bench_accept produced NO samples");
+            assert!(generated.len() > 8, "bench_accept generated almost nothing");
+            bench_accept_report(depth, &s);
+        }
+        return Ok(());
+    }
 
     // Q6 probe: does "a batch-N forward costs ~= a batch-1 forward" survive TP? Runs INSTEAD of decode.
     // v1 MTP under TP: run the real speculative loop on the sharded model.
@@ -1514,22 +1687,64 @@ fn run_quantize(args: &[String]) {
         }
     };
 
-    // Some checkpoints (Qwen3.5-122B) store the MTP head's routed experts UN-FUSED and per-expert
-    // (`mtp.layers.L.mlp.experts.<i>.{gate,up,down}_proj.weight`) while the main layers ship them
-    // fused-and-stacked. Our loader/kernels only ingest the fused layout, so FUSE the per-expert MTP
-    // tensors before quantizing: stash across shards keyed by (base, proj) with a BTreeMap over the
-    // INTEGER expert index (a lexical sort would permute 0,1,10,100,… → silent wrong-expert drafts).
+    // Some checkpoints store routed experts UN-FUSED and per-expert (`...mlp.experts.<i>.{gate,up,down}_proj.weight`):
+    // the 122B's MTP head, and Hy3 (hy_v3) for EVERY MoE layer (79 + the layer-80 MTP block). Our
+    // loader/kernels only ingest the fused layout (`...mlp.experts.gate_up_proj` / `.down_proj`), so FUSE
+    // per-expert tensors before quantizing: stash keyed by (base, proj) with a BTreeMap over the INTEGER
+    // expert index (a lexical sort would permute 0,1,10,100,… → silent wrong experts). Fusion happens
+    // ON-COMPLETE (gate/up/down each holding a contiguous 0..E set) so a 295B model's stash never exceeds
+    // ~1 layer of experts in RAM; anything left unfused at the end is a loud error, not silent garbage.
     type ExpertMap = std::collections::BTreeMap<usize, (Vec<usize>, Vec<u8>)>;
-    let mut mtp_parts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, ExpertMap>>
-        = std::collections::BTreeMap::new();
-    let parse_mtp_expert = |name: &str| -> Option<(String, String, usize)> {
-        if !name.starts_with("mtp.") { return None; }
+    type Pending = std::collections::BTreeMap<String, std::collections::BTreeMap<String, ExpertMap>>;
+    let mut pending: Pending = std::collections::BTreeMap::new();
+    let n_experts: Option<usize> = std::fs::read_to_string(ind.join("config.json")).ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|c| c.get("num_experts").or_else(|| c.get("n_routed_experts")).and_then(|v| v.as_u64()))
+        .map(|v| v as usize);
+    let parse_expert = |name: &str| -> Option<(String, String, usize)> {
         let stem = name.strip_suffix(".weight")?;
-        let (base_prefix, tail) = stem.split_once(".experts.")?;   // "mtp.layers.0.mlp" , "<i>.<proj>"
+        let (base_prefix, tail) = stem.split_once(".experts.")?;   // "...layers.L.mlp" , "<i>.<proj>"
         let (idx_s, proj) = tail.split_once('.')?;
         if proj != "gate_proj" && proj != "up_proj" && proj != "down_proj" { return None; }
         let idx: usize = idx_s.parse().ok()?;
         Some((format!("{}.experts", base_prefix), proj.to_string(), idx))
+    };
+    let complete = |projs: &std::collections::BTreeMap<String, ExpertMap>, e: usize| -> bool {
+        ["gate_proj", "up_proj", "down_proj"].iter().all(|p| projs.get(*p)
+            .map(|m| m.len() == e && (0..e).all(|i| m.contains_key(&i))).unwrap_or(false))
+    };
+    // Fuse one base's per-expert tensors into the stacked layout the loader expects, then run it through
+    // the SAME `emit` (quantize or copy-through per recipe). Ordering is load-bearing in BOTH dims:
+    // gate_up = concat([gate, up], dim=0); experts stacked in INTEGER order.
+    let fuse_base = |base: &String, projs: &std::collections::BTreeMap<String, ExpertMap>,
+                     outs: &mut Vec<Out>, n_q4: &mut usize, n_q8: &mut usize, n_copy: &mut usize,
+                     bytes_out: &mut u64| {
+        let gate = projs.get("gate_proj").unwrap_or_else(|| panic!("{base}: no gate_proj experts"));
+        let up   = projs.get("up_proj").unwrap_or_else(|| panic!("{base}: no up_proj experts"));
+        let down = projs.get("down_proj").unwrap_or_else(|| panic!("{base}: no down_proj experts"));
+        let e = gate.len();
+        // Every projection must have the SAME contiguous 0..E expert set (assert one per expert).
+        for (nm, m) in [("gate", gate), ("up", up), ("down", down)] {
+            assert_eq!(m.len(), e, "{base}: {nm} has {} experts, gate has {e}", m.len());
+            for i in 0..e { assert!(m.contains_key(&i), "{base}: {nm} missing expert {i}"); }
+        }
+        let (inter, hidden) = { let s = &gate[&0].0; assert_eq!(s.len(), 2, "gate not 2-D"); (s[0], s[1]) };
+        // Shape guard — catches a transposed/permuted export before it becomes silent garbage.
+        for i in 0..e {
+            assert_eq!(gate[&i].0, vec![inter, hidden], "{base}: gate[{i}] shape");
+            assert_eq!(up[&i].0,   vec![inter, hidden], "{base}: up[{i}] shape");
+            assert_eq!(down[&i].0, vec![hidden, inter], "{base}: down[{i}] shape");
+        }
+        // gate_up[e] = concat([gate[e], up[e]], dim=0) → [2·inter, hidden]; stack over e → [E,2·inter,hidden].
+        let mut gu = Vec::<u8>::with_capacity(e * 2 * inter * hidden * 2);
+        for i in 0..e { gu.extend_from_slice(&gate[&i].1); gu.extend_from_slice(&up[&i].1); }
+        emit(format!("{base}.gate_up_proj"), Dtype::BF16, vec![e, 2 * inter, hidden], &gu,
+             outs, n_q4, n_q8, n_copy, bytes_out);
+        let mut dn = Vec::<u8>::with_capacity(e * hidden * inter * 2);
+        for i in 0..e { dn.extend_from_slice(&down[&i].1); }
+        emit(format!("{base}.down_proj"), Dtype::BF16, vec![e, hidden, inter], &dn,
+             outs, n_q4, n_q8, n_copy, bytes_out);
+        println!("  fused experts: {base} → gate_up_proj [{e},{},{hidden}] + down_proj [{e},{hidden},{inter}]", 2 * inter);
     };
 
     // STREAM the output to disk in ~12 GB shards as we go, so peak RAM is ~one shard + one input shard.
@@ -1566,10 +1781,18 @@ fn run_quantize(args: &[String]) {
         for (name, view) in st.tensors() {
             let data = view.data();
             bytes_in += data.len() as u64;
-            // Un-fused MTP expert weight? stash for fusion, don't emit yet.
-            if let Some((base, proj, idx)) = parse_mtp_expert(&name) {
-                mtp_parts.entry(base).or_default().entry(proj).or_default()
+            // Un-fused expert weight? stash for fusion, don't emit yet. Fuse ON-COMPLETE (a full
+            // contiguous 0..E set for all three projections) so the stash stays ~1 layer deep in RAM.
+            if let Some((base, proj, idx)) = parse_expert(&name) {
+                pending.entry(base.clone()).or_default().entry(proj).or_default()
                     .insert(idx, (view.shape().to_vec(), data.to_vec()));
+                if let Some(e) = n_experts {
+                    if complete(pending.get(&base).unwrap(), e) {
+                        let projs = pending.remove(&base).unwrap();
+                        fuse_base(&base, &projs, &mut outs, &mut n_q4, &mut n_q8, &mut n_copy, &mut bytes_out);
+                        if outs_bytes(&outs) >= SHARD_BYTES { write_shard(&mut outs, &mut weight_map, &mut shard_idx); }
+                    }
+                }
                 continue;
             }
             emit(name.clone(), view.dtype(), view.shape().to_vec(), data,
@@ -1579,40 +1802,16 @@ fn run_quantize(args: &[String]) {
         // shard bytes dropped here â peak memory is one shard + the (much smaller) output
     }
 
-    // Fuse each collected per-expert MTP block into the stacked layout the loader expects, then run it
-    // through the SAME `emit` (quantize or copy-through per recipe). The 35B ships its MTP experts
-    // already fused, so `mtp_parts` is empty there and this is a no-op. Both experts confirmed the
-    // ordering: gate_up = concat([gate, up], dim=0); the MTP fc input is concat([embed, hidden]) — that
-    // second one is the loader/forward's job, not this repacker's.
-    for (base, projs) in &mtp_parts {
-        let gate = projs.get("gate_proj").unwrap_or_else(|| panic!("{base}: no gate_proj experts"));
-        let up   = projs.get("up_proj").unwrap_or_else(|| panic!("{base}: no up_proj experts"));
-        let down = projs.get("down_proj").unwrap_or_else(|| panic!("{base}: no down_proj experts"));
-        let e = gate.len();
-        // Every projection must have the SAME contiguous 0..E expert set (assert one per expert).
-        for (nm, m) in [("gate", gate), ("up", up), ("down", down)] {
-            assert_eq!(m.len(), e, "{base}: {nm} has {} experts, gate has {e}", m.len());
-            for i in 0..e { assert!(m.contains_key(&i), "{base}: {nm} missing expert {i}"); }
-        }
-        let (inter, hidden) = { let s = &gate[&0].0; assert_eq!(s.len(), 2, "gate not 2-D"); (s[0], s[1]) };
-        // Shape guard — catches a transposed/permuted export before it becomes silent garbage drafts.
-        for i in 0..e {
-            assert_eq!(gate[&i].0, vec![inter, hidden], "{base}: gate[{i}] shape");
-            assert_eq!(up[&i].0,   vec![inter, hidden], "{base}: up[{i}] shape");
-            assert_eq!(down[&i].0, vec![hidden, inter], "{base}: down[{i}] shape");
-        }
-        // gate_up[e] = concat([gate[e], up[e]], dim=0) → [2·inter, hidden]; stack over e → [E,2·inter,hidden].
-        let mut gu = Vec::<u8>::with_capacity(e * 2 * inter * hidden * 2);
-        for i in 0..e { gu.extend_from_slice(&gate[&i].1); gu.extend_from_slice(&up[&i].1); }
-        emit(format!("{base}.gate_up_proj"), Dtype::BF16, vec![e, 2 * inter, hidden], &gu,
-             &mut outs, &mut n_q4, &mut n_q8, &mut n_copy, &mut bytes_out);
-        let mut dn = Vec::<u8>::with_capacity(e * hidden * inter * 2);
-        for i in 0..e { dn.extend_from_slice(&down[&i].1); }
-        emit(format!("{base}.down_proj"), Dtype::BF16, vec![e, hidden, inter], &dn,
-             &mut outs, &mut n_q4, &mut n_q8, &mut n_copy, &mut bytes_out);
+    // Drain any bases still pending at the end (e.g. the 122B's single MTP block, whose fusion triggers
+    // here when `n_experts` was absent or the set only completed on the last shard). They MUST be
+    // complete — an incomplete set means a broken checkpoint (missing expert), and emitting anything
+    // would produce a wrong-expert model. Loud, not silent.
+    for (base, projs) in pending.iter() {
+        let e = n_experts.unwrap_or_else(|| projs["gate_proj"].len());
+        assert!(complete(projs, e),
+                "{base}: incomplete expert set ({e} expected) — cannot fuse; the checkpoint is broken");
+        fuse_base(base, projs, &mut outs, &mut n_q4, &mut n_q8, &mut n_copy, &mut bytes_out);
         if outs_bytes(&outs) >= SHARD_BYTES { write_shard(&mut outs, &mut weight_map, &mut shard_idx); }
-        println!("  fused MTP experts: {base} → gate_up_proj [{e},{},{hidden}] + down_proj [{e},{hidden},{inter}]",
-                 2 * inter);
     }
 
     // FINALIZE. If nothing was flushed mid-run (small model < SHARD_BYTES), collapse to one
@@ -1861,12 +2060,20 @@ fn run_probe_moe(args: &[String]) {
 
     let (gpu, cfg) = gb10_inference::gpu::GpuModel::load_from_dir(&dir).expect("gpu load");
     let h = cfg.hidden_size;
-    // Deterministic reproducible input in [-0.5, 0.5], col-major [h, batch].
+    // Input: --in-x <file> (whitespace floats, token-major [batch, h]) or the deterministic
+    // reproducible default in [-0.5, 0.5], col-major [h, batch].
     let mut xh = vec![bf16::from_f32(0.0); h * batch];
-    for b in 0..batch { for j in 0..h {
-        let v = ((j * 7 + b * 131) % 211) as f32 / 211.0 - 0.5; // in [-0.5, 0.5)
-        xh[j + b * h] = bf16::from_f32(v);
-    }}
+    if let Some(in_x) = parse_arg(args, "--in-x") {
+        let vals: Vec<f32> = std::fs::read_to_string(in_x).expect("read --in-x")
+            .split_whitespace().map(|t| t.parse().expect("float")).collect();
+        assert_eq!(vals.len(), h * batch, "--in-x must hold hidden*batch floats (token-major)");
+        for (i, v) in vals.iter().enumerate() { xh[i] = bf16::from_f32(*v); }
+    } else {
+        for b in 0..batch { for j in 0..h {
+            let v = ((j * 7 + b * 131) % 211) as f32 / 211.0 - 0.5; // in [-0.5, 0.5)
+            xh[j + b * h] = bf16::from_f32(v);
+        }}
+    }
     let (li, out) = gpu.probe_moe(&xh, batch);
     eprintln!("probe-moe: first MoE layer = {}, batch = {}, hidden = {}", li, batch, h);
     let fmt = |v: &[bf16]| v.iter().map(|x| format!("{:.6}", x.to_f32())).collect::<Vec<_>>().join(" ");
@@ -1874,6 +2081,55 @@ fn run_probe_moe(args: &[String]) {
     std::fs::write(&out_y, fmt(&out)).expect("write y");
     eprintln!("probe-moe: wrote input->{} output->{} (layer {})", out_x, out_y, li);
     println!("MOE_PROBE_LAYER={}", li);
+}
+
+/// DEBUG CAPTURE: `--capture-layers --model-dir <D> --ids <f> --out <f>` — teacher-force one prompt
+/// of RAW token ids (whitespace-separated, NOT re-tokenized text) through the prefill path and dump
+/// the hidden state at every layer boundary as a safetensors file of bf16 [seq, hidden] tensors:
+/// `layer.00.in` (embed out), `layer.NN.out` (residual after layer NN), `final_norm`. This is the
+/// engine side of the Hy3 oracle comparison (scripts/compare_hy3_oracle.py consumes these dumps).
+fn run_capture_layers(args: &[String]) {
+    use safetensors::{Dtype, tensor::TensorView};
+    let dir = parse_arg(args, "--model-dir").expect("--capture-layers requires --model-dir").to_string();
+    let ids_path = parse_arg(args, "--ids").expect("--capture-layers requires --ids <file>").to_string();
+    let out_path = parse_arg(args, "--out").expect("--capture-layers requires --out <file>").to_string();
+
+    let ids_txt = std::fs::read_to_string(&ids_path).expect("read --ids file");
+    let ids: Vec<u32> = ids_txt.split_whitespace()
+        .map(|t| t.parse().expect("token id")).collect();
+    assert!(!ids.is_empty(), "empty --ids file");
+    let n = ids.len();
+
+    let (gpu, cfg) = gb10_inference::gpu::GpuModel::load_from_dir(&dir).expect("gpu load");
+    let h = cfg.hidden_size;
+    let nlayers = gpu.cfg().num_layers;
+    let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+    let kv_stride = n.max(16);
+    let mut state = gpu.new_batch_state(1, 1, kv_stride);
+
+    let dumps = gpu.capture_prefill(&mut pool, &ids, &mut state, kv_stride);
+    let debug = std::env::var("GB10_CAP_DEBUG").is_ok();
+    if !debug {
+        assert_eq!(dumps.len(), nlayers + 2, "capture count: embed + L layers + final_norm");
+    }
+
+    // Name per the oracle convention and serialize as bf16 [seq, hidden] (token-major — the
+    // engine's [h, n] column-major activations are byte-identical to [n, h] row-major rows).
+    let mut named: Vec<(String, Vec<half::bf16>)> = Vec::with_capacity(dumps.len());
+    for (i, dmp) in dumps.into_iter().enumerate() {
+        let name = if debug { format!("dump.{i:03}") } else if i == 0 { "layer.00.in".to_string() }
+                   else if i <= nlayers { format!("layer.{:02}.out", i - 1) }
+                   else { "final_norm".to_string() };
+        named.push((name, dmp));
+    }
+    let views: Vec<(String, TensorView)> = named.iter()
+        .map(|(name, dmp)| {
+            let bytes: &[u8] = bytemuck::cast_slice(&dmp[..]);
+            (name.clone(), TensorView::new(Dtype::BF16, vec![n, h], bytes).expect("view"))
+        }).collect();
+    safetensors::serialize_to_file(views, None, std::path::Path::new(&out_path)).expect("write safetensors");
+    eprintln!("capture-layers: {} tokens x {} layers -> {} ({} tensors)", n, nlayers, out_path, named.len());
+    println!("CAPTURE_OK {}", out_path);
 }
 
 fn run_dump_argmax(args: &[String]) {
@@ -2149,7 +2405,17 @@ fn run_server(args: &[String]) {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        if has_leading_version(&dir_name) { format!("qwen{}", dir_name) }
+        // The family comes from the model's OWN config.json, not the directory name: only
+        // qwen-family models get the "qwen" prefix. hy_v3's model_type is "hy_v3", so Hy3 must
+        // not become "qwen3.5-hy3-nvfp4" (its dir carries no version number and fell into the
+        // prepend branch). Unreadable/missing config keeps the old behavior (qwen).
+        let model_type = std::fs::read_to_string(format!("{}/config.json", model_path.trim_end_matches('/')))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("model_type").and_then(|m| m.as_str()).map(|s| s.to_string()));
+        let is_qwen = model_type.as_deref().map(|m| m.starts_with("qwen")).unwrap_or(true);
+        if !is_qwen { dir_name }
+        else if has_leading_version(&dir_name) { format!("qwen{}", dir_name) }
         else { format!("qwen3.5-{}", dir_name) }
     });
     let default_max_tokens = parse_arg(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()).unwrap_or(8192);
@@ -2169,7 +2435,13 @@ fn run_server(args: &[String]) {
         let is_dir = std::path::Path::new(&model_path).is_dir();
         let (mut gpu, cfg) = if is_dir {
             println!("Loading model from {} (streaming bf16)...", model_path);
-            gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load")
+            if tp {
+                // TP=2 head = rank 0. hy_v3 shards host-side in the loader (full model > one node);
+                // qwen loads whole and shards at attach_tp, unchanged.
+                gb10_inference::gpu::GpuModel::load_from_dir_tp(&model_path, 0).expect("gpu load")
+            } else {
+                gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load")
+            }
         } else {
             println!("Loading model from {} ...", model_path);
             let host = gb10_inference::qwen::Model::load(&model_path).expect("load model");

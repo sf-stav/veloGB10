@@ -15,8 +15,7 @@ pub struct QwenTokenizer {
 
 impl QwenTokenizer {
     pub fn from_file(path: &str) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        let tokenizer = load_tokenizer(path)?;
         let chat_env = load_chat_env(path);
         let model_dir = Path::new(path).parent().map(|p| p.to_path_buf());
         Ok(Self { tokenizer, chat_env, model_dir })
@@ -36,6 +35,19 @@ impl QwenTokenizer {
 
     pub fn eos_token_id(&self) -> u32 {
         self.tokenizer.get_vocab(true).get("<|endoftext|>").copied().unwrap_or(151643) as u32
+    }
+
+    /// The think-block markers for this model's chat format, and whether a fresh generation starts
+    /// INSIDE a think block. Qwen templates prime `<think>\n` (starts in reasoning, closes with
+    /// `</think>`). hy_v3's no_think prompt renders `<think:opensource></think:opensource>` INTO the
+    /// prompt (the empty block is already closed), so generation starts as CONTENT; its markers are
+    /// the `:opensource`-suffixed forms. Resolved from the vocab, never hardcoded per family.
+    pub fn think_tags(&self) -> (&'static str, &'static str, bool) {
+        if self.tokenizer.get_vocab(true).contains_key("</think:opensource>") {
+            ("<think:opensource>", "</think:opensource>", false)
+        } else {
+            ("<think>", "</think>", true)
+        }
     }
 
     /// EVERY token that ends an assistant turn — read from the MODEL'S OWN FILES, not hardcoded.
@@ -88,6 +100,20 @@ impl QwenTokenizer {
                     if let Some(&id) = vocab.get(n) { push(&mut ids, id as u32); }
                 }
             }
+        }
+
+        // 2b. config.json fields beyond eos_token_id (already covered by the caller): hy_v3
+        //     declares eod_token_id (120026) as a second advertised terminator.
+        if let Ok(raw) = std::fs::read_to_string(dir.join("config.json")) {
+            if let Ok(cj) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(i) = cj["eod_token_id"].as_u64() { push(&mut ids, i as u32); }
+            }
+        }
+
+        // 2c. Turn terminators no config field advertises — hy_v3's `<｜hy_EOT｜>` (120008) ends a
+        //     chat turn but lives only in the vocab. Name-resolved: fires only on models that have it.
+        for n in ["<｜hy_EOT｜>"] {
+            if let Some(&id) = vocab.get(n) { push(&mut ids, id); }
         }
 
         // 3. Last resort: the model declared nothing usable beyond config.json. Fall back to the
@@ -316,6 +342,37 @@ mod tests {
     }
 }
 
+/// Load a tokenizer.json, transparently upgrading the pair-array merges form (`[["a","b"], ...]`)
+/// to the space-joined string form (`["a b", ...]`) that tokenizers 0.19's BPE deserializer
+/// expects (`merges: Vec<String>` in its BPE visitor). hy_v3's tokenizer.json ships the
+/// pair-array form (HF's newer serialization default); qwen's ships strings. Detection is by
+/// shape, not family — the fast path (no upgrade needed) costs nothing extra.
+fn load_tokenizer(path: &str) -> Result<Tokenizer> {
+    match Tokenizer::from_file(path) {
+        Ok(t) => Ok(t),
+        Err(e0) => {
+            let raw = std::fs::read(path)?;
+            let mut v: serde_json::Value = serde_json::from_slice(&raw)
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e0} (file is not valid JSON either: {e})"))?;
+            let ok = v.get_mut("model").and_then(|m| m.get_mut("merges")).and_then(|m| m.as_array_mut())
+                .filter(|merges| merges.first().map_or(false, |m| m.is_array()))
+                .map(|merges| {
+                    for m in merges.iter_mut() {
+                        let pair: Vec<String> = m.as_array().unwrap().iter()
+                            .map(|x| x.as_str().unwrap_or("").to_string()).collect();
+                        *m = serde_json::Value::String(pair.join(" "));
+                    }
+                });
+            if ok.is_none() {
+                return Err(anyhow::anyhow!("Failed to load tokenizer: {e0}"));
+            }
+            let bytes = serde_json::to_vec(&v)?;
+            Tokenizer::from_bytes(bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer (after pair-merge upgrade): {e}"))
+        }
+    }
+}
+
 /// Load the chat template that sits beside the tokenizer file and compile it into
 /// a minijinja environment. Looks for `chat_template.jinja` first, then falls back
 /// to the `chat_template` string inside `tokenizer_config.json`. Returns `None`
@@ -415,6 +472,44 @@ fn register_pycompat(env: &mut minijinja::Environment<'static>) {
                 Ok(chars) => minijinja::value::Value::from(s.trim_matches(|c| chars.contains(c))),
                 Err(()) => minijinja::value::Value::from(s.trim()),
             }),
+            // Python str.format — NOT minijinja's printf-style `format` filter (%s). The hy_v3
+            // template builds EVERY special token this way ('<｜hy_eos{}｜>'.format(HYTK)); letting
+            // the call fall through to the built-in renders the string unchanged and plants
+            // literal `{}` in the prompt. `{}` takes the next positional arg, `{N}` the Nth;
+            // anything richer (format specs) is out of scope and delegates to the built-in.
+            ("format", Some(s)) => {
+                let render = |v: &minijinja::value::Value| match v.as_str() {
+                    Some(x) => x.to_string(),
+                    None => v.to_string(),
+                };
+                let mut out = String::with_capacity(s.len() + 8);
+                let mut rest = s;
+                let mut next = 0usize;
+                let mut py_ok = true;
+                while let Some(p) = rest.find('{') {
+                    out.push_str(&rest[..p]);
+                    match rest[p..].find('}') {
+                        Some(q) => {
+                            let spec = &rest[p + 1..p + q];
+                            let idx = if spec.is_empty() {
+                                let i = next; next += 1; i
+                            } else if let Ok(i) = spec.parse::<usize>() {
+                                next = i + 1; i
+                            } else { py_ok = false; break; };   // a format spec — not Python-simple
+                            match args.get(idx) {
+                                Some(v) => out.push_str(&render(v)),
+                                None => { py_ok = false; break; }
+                            }
+                            rest = &rest[p + q + 1..];
+                        }
+                        None => { py_ok = false; break; }
+                    }
+                }
+                if py_ok {
+                    out.push_str(rest);
+                    Some(minijinja::value::Value::from(out))
+                } else { None }
+            },
             _ => None,
         };
         match res {

@@ -15,8 +15,12 @@ pub enum LayerType {
     FullAttention,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Family { Qwen35, HyV3 }
+
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub family: Family,
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub num_layers: usize,
@@ -51,6 +55,18 @@ pub struct Config {
     pub moe_intermediate_size: usize,     // per-expert FFN width
     pub shared_expert_intermediate_size: usize,
     pub mlp_only_layers: Vec<usize>,      // layers that are DENSE despite is_moe (empty on the 35B)
+    // hy_v3 (Hy3). Pure-GQA MoE — no GDN at all. Config lives at the ROOT of config.json (no
+    // text_config nesting). Router is NOT the qwen3_5_moe one: sigmoid scores + a learned per-expert
+    // bias used for SELECTION ONLY (noaux_tc), top-k renormalized (route_norm), output × router_scaling
+    // (2.826). Tensor names differ too: mlp.router.gate.weight, mlp.expert_bias [E],
+    // mlp.shared_mlp.{gate,up,down}_proj (NOT shared_expert.*). Per-head qk_norm on q,k pre-RoPE.
+    // LM head accumulation must be fp32 (enable_lm_head_fp32).
+    pub qk_norm: bool,
+    pub router_sigmoid: bool,
+    pub router_expert_bias: bool,
+    pub route_norm: bool,
+    pub router_scaling: f32,
+    pub lm_head_fp32: bool,
 }
 
 impl Config {
@@ -58,20 +74,41 @@ impl Config {
     pub fn from_config_json(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
         let root: serde_json::Value = serde_json::from_str(&raw)?;
-        let tc = &root["text_config"];
+
+        // Family detection. hy_v3 keeps everything at the ROOT of config.json (no text_config);
+        // the qwen3.5 family nests under text_config.
+        let model_type = root["model_type"].as_str().unwrap_or("");
+        let family = if model_type == "hy_v3" { Family::HyV3 } else { Family::Qwen35 };
+        let tc_owned;
+        let tc: &serde_json::Value = if family == Family::HyV3 {
+            tc_owned = root.clone(); &tc_owned
+        } else {
+            &root["text_config"]
+        };
 
         let hidden_size = tc["hidden_size"].as_u64().unwrap_or(2048) as usize;
 
-        // MoE detection: qwen3_5_moe carries `num_experts` (the dense qwen3_5 family does not).
+        // MoE detection: qwen3_5_moe and hy_v3 carry `num_experts` (the dense qwen3_5 family does not).
         let num_experts = tc["num_experts"].as_u64().unwrap_or(0) as usize;
         let is_moe = num_experts > 0;
         let num_experts_per_tok = tc["num_experts_per_tok"].as_u64().unwrap_or(0) as usize;
         let moe_intermediate_size = tc["moe_intermediate_size"].as_u64().unwrap_or(0) as usize;
+        // hy_v3's config.json OMITS `shared_expert_intermediate_size`; the HF reference derives it
+        // as moe_intermediate_size * num_shared_experts (Hy3: 1536 * 1). Defaulting to 0 there sized
+        // the shared expert to NOTHING — a silently-dead shared MLP on every MoE layer.
+        let num_shared_experts = tc["num_shared_experts"].as_u64().unwrap_or(1) as usize;
         let shared_expert_intermediate_size =
-            tc["shared_expert_intermediate_size"].as_u64().unwrap_or(0) as usize;
-        let mlp_only_layers: Vec<usize> = tc["mlp_only_layers"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect())
-            .unwrap_or_default();
+            tc["shared_expert_intermediate_size"].as_u64().map(|x| x as usize)
+            .unwrap_or(if is_moe { moe_intermediate_size * num_shared_experts } else { 0 });
+        let mlp_only_layers: Vec<usize> = if family == Family::HyV3 {
+            // first_k_dense_replace=N → the first N layers are DENSE (Hy3: layer 0, inter 13312).
+            let k = tc["first_k_dense_replace"].as_u64().unwrap_or(0) as usize;
+            (0..k).collect()
+        } else {
+            tc["mlp_only_layers"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect())
+                .unwrap_or_default()
+        };
 
         // Dense-FFN width. MoE checkpoints OMIT `intermediate_size` (they use moe_intermediate_size);
         // fall back to the MoE width, not the 6144 default, so nothing sizes a buffer to a wrong value.
@@ -94,25 +131,41 @@ impl Config {
         // Parse RoPE
         let rope_theta = tc["rope_parameters"]["rope_theta"]
             .as_f64().unwrap_or(1e7) as f32;
-        let partial_rotary = tc["rope_parameters"]["partial_rotary_factor"]
-            .as_f64().unwrap_or(0.25) as f32;
-        let rotary_dim = (head_dim as f32 * partial_rotary) as usize;
+        let rotary_dim = if family == Family::HyV3 {
+            head_dim   // rope_type "default" = full-dim rotary (no partial_rotary_factor in hy_v3)
+        } else {
+            let partial_rotary = tc["rope_parameters"]["partial_rotary_factor"]
+                .as_f64().unwrap_or(0.25) as f32;
+            (head_dim as f32 * partial_rotary) as usize
+        };
 
-        // Parse layer types
-        let layer_types: Vec<LayerType> = tc["layer_types"].as_array()
-            .map(|arr| arr.iter().map(|v| {
-                let s = v.as_str().unwrap_or("");
-                if s.contains("full") { LayerType::FullAttention }
-                else { LayerType::LinearAttention }
-            }).collect())
-            .unwrap_or_else(|| {
-                // Fallback: derive from full_attention_interval
-                let interval = tc["full_attention_interval"].as_u64().unwrap_or(4) as usize;
-                (0..num_layers).map(|i| {
-                    if i % interval == interval - 1 { LayerType::FullAttention }
+        // Parse layer types. hy_v3 is PURE GQA (no GDN anywhere) — every layer is full_attention.
+        let layer_types: Vec<LayerType> = if family == Family::HyV3 {
+            vec![LayerType::FullAttention; num_layers]
+        } else {
+            tc["layer_types"].as_array()
+                .map(|arr| arr.iter().map(|v| {
+                    let s = v.as_str().unwrap_or("");
+                    if s.contains("full") { LayerType::FullAttention }
                     else { LayerType::LinearAttention }
-                }).collect()
-            });
+                }).collect())
+                .unwrap_or_else(|| {
+                    // Fallback: derive from full_attention_interval
+                    let interval = tc["full_attention_interval"].as_u64().unwrap_or(4) as usize;
+                    (0..num_layers).map(|i| {
+                        if i % interval == interval - 1 { LayerType::FullAttention }
+                        else { LayerType::LinearAttention }
+                    }).collect()
+                })
+        };
+
+        // hy_v3 router / qk_norm / lm-head fields (defaults reproduce the qwen3_5_moe behavior).
+        let qk_norm = tc["qk_norm"].as_bool().unwrap_or(false);
+        let router_sigmoid = tc["moe_router_use_sigmoid"].as_bool().unwrap_or(false);
+        let router_expert_bias = tc["moe_router_enable_expert_bias"].as_bool().unwrap_or(false);
+        let route_norm = tc["route_norm"].as_bool().unwrap_or(true);
+        let router_scaling = tc["router_scaling_factor"].as_f64().unwrap_or(1.0) as f32;
+        let lm_head_fp32 = tc["enable_lm_head_fp32"].as_bool().unwrap_or(false);
 
         // tie_word_embeddings
         let tie = tc["tie_word_embeddings"].as_bool()
@@ -120,6 +173,7 @@ impl Config {
             .unwrap_or(true);
 
         Ok(Self {
+            family,
             hidden_size, intermediate_size, num_layers, num_heads, num_kv_heads,
             head_dim, lin_num_k_heads, lin_num_v_heads, lin_k_dim, lin_v_dim,
             conv_kernel, vocab_size, rms_eps, rope_theta, rotary_dim,
@@ -127,6 +181,7 @@ impl Config {
             tie_word_embeddings: tie,
             is_moe, num_experts, num_experts_per_tok, moe_intermediate_size,
             shared_expert_intermediate_size, mlp_only_layers,
+            qk_norm, router_sigmoid, router_expert_bias, route_norm, router_scaling, lm_head_fp32,
         })
     }
 
@@ -138,6 +193,11 @@ impl Config {
         self.is_moe && !self.mlp_only_layers.contains(&i)
     }
 
+    /// Does full-attention fuse an output sigmoid-gate into q_proj (output rows [q|gate] per head)?
+    /// qwen3_5 full-attn does; hy_v3's q_proj is bare [num_heads*head_dim, hidden] (plain GQA).
+    /// Drives the qkv output width everywhere: nh*hd*(1 + gate) + 2*nkv*hd.
+    pub fn attn_out_gate(&self) -> bool { self.family != Family::HyV3 }
+
     /// Placeholder for auto-detect fallback (no config.json available).
     fn from_config_json_placeholder() -> Self {
         let mut lt = Vec::new();
@@ -145,6 +205,7 @@ impl Config {
             lt.push(if i % 4 == 3 { LayerType::FullAttention } else { LayerType::LinearAttention });
         }
         Self {
+            family: Family::Qwen35,
             hidden_size: 0, intermediate_size: 0, num_layers: 24,
             num_heads: 8, num_kv_heads: 2, head_dim: 256,
             lin_num_k_heads: 16, lin_num_v_heads: 16, lin_k_dim: 128, lin_v_dim: 128,
@@ -153,6 +214,8 @@ impl Config {
             layer_types: lt, tie_word_embeddings: true,
             is_moe: false, num_experts: 0, num_experts_per_tok: 0, moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0, mlp_only_layers: Vec::new(),
+            qk_norm: false, router_sigmoid: false, router_expert_bias: false,
+            route_norm: true, router_scaling: 1.0, lm_head_fp32: false,
         }
     }
 }

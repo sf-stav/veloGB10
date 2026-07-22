@@ -39,6 +39,22 @@ static CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 const CALL_OPEN: &str = "<tool_call>";
 const CALL_CLOSE: &str = "</tool_call>";
 
+// hy_v3's tool-call markup (its chat template instructs this form; the `:opensource` suffix is the
+// family signature). A call is:
+//   <tool_calls:opensource>
+//   <tool_call:opensource>get_weather<tool_sep:opensource>
+//   <arg_key:opensource>city</arg_key:opensource>
+//   <arg_value:opensource>Paris</arg_value:opensource>
+//   </tool_call:opensource>
+//   </tool_calls:opensource>
+const HY_CALL_OPEN: &str = "<tool_call:opensource>";
+const HY_CALL_CLOSE: &str = "</tool_call:opensource>";
+const HY_SEP: &str = "<tool_sep:opensource>";
+const HY_AK: &str = "<arg_key:opensource>";
+const HY_AK_END: &str = "</arg_key:opensource>";
+const HY_AV: &str = "<arg_value:opensource>";
+const HY_AV_END: &str = "</arg_value:opensource>";
+
 /// Everything the model produced, split into the prose it wrote and the calls it made.
 pub struct ParsedOutput {
     /// Text outside any `<tool_call>` block. The template explicitly permits reasoning BEFORE a call.
@@ -47,14 +63,19 @@ pub struct ParsedOutput {
 }
 
 /// True if `s` contains the start of a tool call — used by the streaming path to decide whether it
-/// must hold text back rather than forward it to the client as content.
+/// must hold text back rather than forward it to the client as content. `<tool_call` is the shared
+/// prefix of both families' tags.
 pub fn has_tool_call(s: &str) -> bool {
-    s.contains(CALL_OPEN)
+    s.contains("<tool_call")
 }
 
 /// Parse a completed generation. `tools` is the request's `tools` array, used only to type-coerce
-/// arguments; parsing still works (as strings) when it is absent.
+/// arguments; parsing still works (as strings) when it is absent. Format dispatch is by content:
+/// hy_v3's `:opensource` markup or qwen's `<function=…>` markup.
 pub fn parse(text: &str, tools: Option<&[Value]>) -> ParsedOutput {
+    if text.contains(HY_CALL_OPEN) {
+        return parse_hy3(text, tools);
+    }
     let mut content = String::new();
     let mut tool_calls = Vec::new();
     let mut rest = text;
@@ -75,6 +96,59 @@ pub fn parse(text: &str, tools: Option<&[Value]>) -> ParsedOutput {
     content.push_str(rest);
 
     ParsedOutput { content: content.trim().to_string(), tool_calls }
+}
+
+/// hy_v3 variant: prose is everything before the wrapper; every `<tool_call:opensource>…</…>`
+/// block inside it becomes a call. A truncated block is dropped (same half-call rule as qwen).
+fn parse_hy3(text: &str, tools: Option<&[Value]>) -> ParsedOutput {
+    let mut tool_calls = Vec::new();
+    // The wrapper `<tool_calls:opensource>` and the first call block start one char apart —
+    // prose ends at whichever comes first, so the wrapper never leaks into the content.
+    let first = ["<tool_calls:opensource>", HY_CALL_OPEN].iter()
+        .filter_map(|t| text.find(t)).min().unwrap();
+    let prose = &text[..first];
+    let mut rest = &text[first..];
+    while let Some(open) = rest.find(HY_CALL_OPEN) {
+        let after = &rest[open + HY_CALL_OPEN.len()..];
+        let Some(close) = after.find(HY_CALL_CLOSE) else { break };
+        if let Some(tc) = parse_one_hy3(&after[..close], tools) {
+            tool_calls.push(tc);
+        }
+        rest = &after[close + HY_CALL_CLOSE.len()..];
+    }
+    ParsedOutput { content: prose.trim().to_string(), tool_calls }
+}
+
+/// Parse one hy_v3 call body: `NAME<tool_sep:opensource>` then
+/// `<arg_key:opensource>K</arg_key:opensource><arg_value:opensource>V</arg_value:opensource>` pairs.
+fn parse_one_hy3(body: &str, tools: Option<&[Value]>) -> Option<ToolCall> {
+    let sep = body.find(HY_SEP)?;
+    let name = body[..sep].trim().to_string();
+    if name.is_empty() { return None; }
+    let schema = tools.and_then(|ts| param_schema(ts, &name));
+    let mut args = serde_json::Map::new();
+    let mut rest = &body[sep + HY_SEP.len()..];
+    loop {
+        let Some(k0) = rest.find(HY_AK) else { break };
+        let a = &rest[k0 + HY_AK.len()..];
+        let Some(k1) = a.find(HY_AK_END) else { break };
+        let key = a[..k1].trim().to_string();
+        let v = &a[k1 + HY_AK_END.len()..];
+        let Some(v0) = v.find(HY_AV) else { break };
+        let v = &v[v0 + HY_AV.len()..];
+        let Some(v1) = v.find(HY_AV_END) else { break };
+        let raw = v[..v1].trim_matches('\n');
+        args.insert(key.clone(), coerce(raw, schema.and_then(|s| s.get(&key))));
+        rest = &v[v1 + HY_AV_END.len()..];
+    }
+    Some(ToolCall {
+        id: format!("call_{}", CALL_SEQ.fetch_add(1, Ordering::Relaxed)),
+        kind: "function".to_string(),
+        function: FunctionCall {
+            name,
+            arguments: serde_json::to_string(&Value::Object(args)).unwrap_or_else(|_| "{}".into()),
+        },
+    })
 }
 
 /// Parse the inside of one `<tool_call>…</tool_call>`.
@@ -214,5 +288,28 @@ mod tests {
                          </function>\n</tool_call>", None);
         let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
         assert_eq!(a["code"], "line1\n  line2");
+    }
+
+    #[test]
+    fn hy_v3_opensource_markup() {
+        let out = parse("Let me check.\n<tool_calls:opensource>\n\
+                         <tool_call:opensource>get_weather<tool_sep:opensource>\n\
+                         <arg_key:opensource>city</arg_key:opensource>\n\
+                         <arg_value:opensource>Paris</arg_value:opensource>\n\
+                         <arg_key:opensource>days</arg_key:opensource>\n\
+                         <arg_value:opensource>3</arg_value:opensource>\n\
+                         </tool_call:opensource>\n</tool_calls:opensource>", Some(&tools()));
+        assert_eq!(out.content, "Let me check.");
+        assert_eq!(out.tool_calls.len(), 1);
+        let tc = &out.tool_calls[0];
+        assert_eq!(tc.function.name, "get_weather");
+        let a: Value = serde_json::from_str(&tc.function.arguments).unwrap();
+        assert_eq!(a["city"], "Paris");
+        assert_eq!(a["days"], 3);   // coerced to the schema's integer
+        // A truncated hy_v3 call drops cleanly too.
+        let out2 = parse("thinking\n<tool_call:opensource>get_weather<tool_sep:opensource>\n\
+                          <arg_key:opensource>city", Some(&tools()));
+        assert!(out2.tool_calls.is_empty());
+        assert_eq!(out2.content, "thinking");
     }
 }

@@ -53,6 +53,7 @@ pub struct TpConfig {
     pub mtp_depth_pin: Option<usize>, // head's --mtp-depth
     pub no_decode_graphs: bool,       // head's GB10_NO_DECODE_GRAPHS (env-read; node installs as env)
     pub cpu_sample: bool,             // head's RUST_INFER_CPU_SAMPLE (env-read; node installs as env)
+    pub kv_quant: bool,               // head's GB10_KV_QUANT (4-bit KV cache; node installs as env)
     pub eos: Vec<u32>,                // head's stop-token set (node has no tokenizer)
     pub calib_prompt: Vec<u32>,       // head-encoded "The capital of France is" probe ids
 }
@@ -82,6 +83,7 @@ impl TpConfig {
             mtp_depth_pin: None,
             no_decode_graphs: false,
             cpu_sample: false,
+            kv_quant: std::env::var("GB10_KV_QUANT").is_ok(),
             eos: Vec::new(),
             calib_prompt: Vec::new(),
         }
