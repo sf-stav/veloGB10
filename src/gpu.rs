@@ -448,6 +448,10 @@ enum LoadShardOp {
     Row,
 }
 
+/// Key for the parallel-assembly results map: the `gwn` name-group joined by a control char that
+/// never appears in tensor names. One entry per fused (or single) weight the pipeline produced.
+fn akey(names: &[String]) -> String { names.join("\u{1f}") }
+
 /// hy_v3 main-layer stacked expert tensor? (`model.layers.<i>.mlp.experts.*`, i < num_layers).
 /// The MTP block at `model.layers.80` is deliberately excluded — the loader skips it wholesale.
 fn is_hy3_main_expert(stem: &str, cfg: &Config) -> bool {
@@ -636,6 +640,30 @@ impl GpuModel {
 
     fn load_from_dir_impl(model_dir: &str, tp_rank: Option<i32>) -> anyhow::Result<(Self, crate::qwen::Config)> {
         use safetensors::{SafeTensors, Dtype};
+        // Read-ahead hint for the NEXT shard: the kernel starts pulling it into the page cache
+        // while we process this one, so the serial `std::fs::read` finds its pages already in
+        // flight. No mmap, no extra memory — WILLNEED is a self-throttling kernel hint. Declared
+        // by hand (no libc dep): glibc has had it forever.
+        extern "C" { fn posix_fadvise(fd: std::os::raw::c_int, offset: i64, len: i64,
+                                      advice: std::os::raw::c_int) -> std::os::raw::c_int; }
+        const POSIX_FADV_WILLNEED: std::os::raw::c_int = 3;
+        let readahead = |p: &std::path::Path| {
+            if let Ok(f) = std::fs::File::open(p) {
+                use std::os::fd::AsRawFd;
+                unsafe { posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_WILLNEED); }
+            }
+        };
+        // Phase timers for the [load] summary (load-speed campaign Phase 0): every phase of the
+        // load accounted, one line at the end. Zero behavior change — Instant reads only.
+        let t_load0 = std::time::Instant::now();
+        let mut t_read = std::time::Duration::ZERO;      // shard file reads (disk/page-cache)
+        let mut t_up_shard = std::time::Duration::ZERO;  // htod uploads inside the shard loop
+        let mut t_shard_loop = std::time::Duration::ZERO;// whole shard loop (cpu = loop - read - upload)
+        let mut t_repack_inline = std::time::Duration::ZERO; // hy3 shard-at-load inline expert repack (in-loop)
+        let mut t_fuse = std::time::Duration::ZERO;      // fuse_nvfp4/fuse_fp8 concat copies
+        let mut t_repack = std::time::Duration::ZERO;    // repack_*_mma (call-site wall time, assembly phase)
+        let mut t_hshard = std::time::Duration::ZERO;    // host-side TP shard of repacked weights
+        let mut t_up_post = std::time::Duration::ZERO;   // htod uploads inside `gwn`
         let config_path = format!("{}/config.json", model_dir.trim_end_matches('/'));
         let cfg = crate::qwen::Config::from_config_json(&config_path)?;
         // The attention kernels take hd at launch but size per-lane register slices for hd/32 <= 16
@@ -700,9 +728,13 @@ impl GpuModel {
         let stream = fork_blocking_stream(&dev);
         let blas = CudaBlas::new(dev.clone())?;
         unsafe { blas.set_stream(Some(&stream))?; }
+        let t_ptx0 = std::time::Instant::now();
         Self::init_ptx(&dev)?;
         let (k, bk) = Self::load_batch_kernels(&dev)?;
+        let t_ptx = t_ptx0.elapsed();
+        let t_rope0 = std::time::Instant::now();
         let (cos_table, sin_table) = Self::build_rope_tables(&dev, &cfg)?;
+        let t_rope = t_rope0.elapsed();
         let sc_pos = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
         let sc_rope = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
         let sc_slot = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
@@ -785,11 +817,19 @@ impl GpuModel {
         let mut gpu_q4_sharded: std::collections::HashMap<String, W> = std::collections::HashMap::new();
 
         for (i, sf_path) in safetensors_files.iter().enumerate() {
+            let t_iter0 = std::time::Instant::now();
             if safetensors_files.len() > 1 {
                 println!("  Shard {}/{}: {}", i+1, safetensors_files.len(),
                          sf_path.file_name().unwrap_or_default().to_string_lossy());
             }
-            let raw = std::fs::read(sf_path)?;
+            // Overlap the next shard's disk read with this shard's CPU work (see `readahead`).
+            if let Some(next) = safetensors_files.get(i + 1) { readahead(next); }
+            let raw = {
+                let t = std::time::Instant::now();
+                let r = std::fs::read(sf_path)?;
+                t_read += t.elapsed();
+                r
+            };
             let st = SafeTensors::deserialize(&raw)?;
 
             // --- NVFP4 groups: upload PACKED. Keeping them packed IS the speedup; dequantizing
@@ -809,7 +849,9 @@ impl GpuModel {
                         qweight: pv.data().to_vec(), scales: sv.data().to_vec(),
                         global_scale: gs, m, k };
                     let bv = crate::quant::dequantize_nvfp4(&q);
+                    let t = std::time::Instant::now();
                     gpu_bf16.insert(format!("{}.weight", stem), dev.htod_sync_copy(&bv).unwrap());
+                    t_up_shard += t.elapsed();
                 } else if sal.is_some() && is_hy3_main_expert(stem, &cfg) {
                     // TP=2 shard-at-load: rank `r` owns the expert band [r·ne/2, +ne/2) of the
                     // stacked [ne·me, K] tensor — a contiguous ROW range (rows are contiguous
@@ -822,15 +864,19 @@ impl GpuModel {
                     let me = m / ne;
                     assert!(me % 16 == 0, "hy3 expert stack {stem}: {me} rows/expert not tile-aligned");
                     let (r0, rn) = (rank * (ne / 2) * me, (ne / 2) * me);
+                    let t = std::time::Instant::now();
                     let (wt, st2) = crate::quant::repack_nvfp4_mma(
                         &pv.data()[r0 * (k / 2)..(r0 + rn) * (k / 2)],
                         &sv.data()[r0 * (k / 16)..(r0 + rn) * (k / 16)], rn, k);
+                    t_repack_inline += t.elapsed();
                     let gsv = vec![1.0f32 / gs; rn / 16];
+                    let t = std::time::Instant::now();
                     gpu_q4_sharded.insert(format!("{}.weight", stem), W::Nvfp4 {
                         qweight: dev.htod_sync_copy(&wt).unwrap(),
                         scales:  dev.htod_sync_copy(&st2).unwrap(),
                         gs:      dev.htod_sync_copy(&gsv).unwrap(),
                         m: rn, k });
+                    t_up_shard += t.elapsed();
                 } else {
                     host_q4.insert(format!("{}.weight", stem), (
                         pv.data().to_vec(), sv.data().to_vec(),
@@ -855,7 +901,9 @@ impl GpuModel {
                     let q = crate::quant::Fp8Tensor {
                         qweight: wv.data().to_vec(), row_scale, m, k };
                     let bv = crate::quant::dequantize_fp8(&q);
+                    let t = std::time::Instant::now();
                     gpu_bf16.insert(wname.clone(), dev.htod_sync_copy(&bv).unwrap());
+                    t_up_shard += t.elapsed();
                 } else {
                     host_q8.insert(wname.clone(), (wv.data().to_vec(), row_scale, m, k));
                 }
@@ -884,7 +932,9 @@ impl GpuModel {
                         && name.contains("norm") && name.ends_with(".weight") {
                         for x in fv.iter_mut() { *x -= 1.0; }
                     }
+                    let t = std::time::Instant::now();
                     gpu_f32.insert(name, dev.htod_sync_copy(&fv).unwrap());
+                    t_up_shard += t.elapsed();
                 } else {
                     // Upload bf16 directly — no Vec copy needed for bf16 source data
                     let owned: Option<Vec<half::bf16>> = if dt == "BF16" || dt == "F16" {
@@ -911,13 +961,18 @@ impl GpuModel {
                         crate::quant::fake_quant(&mut q, m, k, fmt);
                         let (rel, mx) = crate::quant::roundtrip_error(bv, &q);
                         fq_stats.push((name.clone(), rel, mx));
+                        let t = std::time::Instant::now();
                         gpu_bf16.insert(name, dev.htod_sync_copy(&q).unwrap());
+                        t_up_shard += t.elapsed();
                     } else {
+                        let t = std::time::Instant::now();
                         gpu_bf16.insert(name, dev.htod_sync_copy(bv).unwrap());
+                        t_up_shard += t.elapsed();
                     }
                 }
             }
             // raw dropped here
+            t_shard_loop += t_iter0.elapsed();
         }
         if n_dq4 + n_dq8 > 0 {
             println!("  QUANTIZED artifact: {} NVFP4 + {} FP8 tensors ({})", n_dq4, n_dq8,
@@ -954,6 +1009,8 @@ impl GpuModel {
         // hy_v3's MTP block is `model.layers.<num_layers>.*` (80): eh_proj (=fc), enorm/hnorm
         // (=pre_fc norms), final_layernorm (=mtp.norm), and a full decoder layer underneath —
         // one-to-one with GpuMtpLayer (P6).
+        let t_asm0 = std::time::Instant::now();   // whole post-shard assembly phase
+        let mut t_gwn = std::time::Duration::ZERO; // sum of whole `gwn` calls (gwn-cpu = gwn - its parts)
         let is_hy3 = cfg.family == crate::qwen::Family::HyV3;
         let hy3_mtp_prefix = format!("model.layers.{}", cfg.num_layers);
         let mtp_present = if is_hy3 {
@@ -1003,6 +1060,7 @@ impl GpuModel {
             .and_then(|v| v.parse().ok()).unwrap_or(DRAFT_VOCAB_TOP);
         let head_name = if cfg.tie_word_embeddings { format!("{}.embed_tokens.weight", pref) }
                         else { "lm_head.weight".to_string() };
+        let t_draft0 = std::time::Instant::now();
         let (draft_head, draft_ids) = if draft_top == 0 {
             (None, Vec::new())
         } else {
@@ -1047,6 +1105,7 @@ impl GpuModel {
                 None => (None, Vec::new()),
             }
         };
+        let t_draft = t_draft0.elapsed();
 
 
         // A bf16 MTP head (recipe `-mtp`, to fix speculative acceptance) inside an otherwise-quantized
@@ -1061,241 +1120,499 @@ impl GpuModel {
             host_q4.contains_key("mtp.fc.weight") || host_q8.contains_key("mtp.fc.weight")
         };
 
+        // ---- PARALLEL ASSEMBLY (load-speed campaign, Phase 1 item 3) ----
+        // The weight assembly runs the SAME code twice:
+        //   1. a RECORD pass whose gwn only notes the call sequence (dummy weights; maps untouched);
+        //   2. the REAL pass whose gwn looks up finished weights.
+        // In between, a worker pool (<=8 std threads) runs fuse+repack(+host TP shard) per weight —
+        // weights are independent and each output byte is a pure function of the input parts, so
+        // per-weight bytes are unchanged — feeding ONE uploader thread that owns every CUDA call
+        // during the pipeline (NULL-stream htod, like everywhere else; the blocking compute stream
+        // is untouched). This overlaps the CPU assembly with the uploads, and the big host-buffer
+        // frees land on the workers instead of serializing on the main thread.
+        // Fuse if the artifact is quantized (`gwn` concatenates along M); leave bf16 split.
+        let quantized = n_dq4 + n_dq8 > 0 && !dequant_at_load;
+        let hy3 = cfg.family == crate::qwen::Family::HyV3;
+        let mut assemble = |mut gwn: &mut dyn FnMut(&[String]) -> W,
+                            mut gf: &mut dyn FnMut(&str) -> S|
+            -> (W, S, Option<W>, Vec<GpuLayer>, Option<GpuMtpLayer>)
+        {
+            let attn_in = |gwn: &mut dyn FnMut(&[String]) -> W, lp: &str, fuse: bool| -> AttnIn {
+                let n = |s: &str| format!("{}.self_attn.{}.weight", lp, s);
+                if fuse { AttnIn::Fused(gwn(&[n("q_proj"), n("k_proj"), n("v_proj")])) }
+                else { AttnIn::Split { q: gwn(&[n("q_proj")]), k: gwn(&[n("k_proj")]), v: gwn(&[n("v_proj")]) } }
+            };
+            let gdn_in = |gwn: &mut dyn FnMut(&[String]) -> W, lp: &str| -> GdnIn {
+                let n = |s: &str| format!("{}.linear_attn.{}.weight", lp, s);
+                if quantized { GdnIn::Fused(gwn(&[n("in_proj_qkv"), n("in_proj_z"), n("in_proj_b"), n("in_proj_a")])) }
+                else { GdnIn::Split { qkv: gwn(&[n("in_proj_qkv")]), z: gwn(&[n("in_proj_z")]),
+                                      b: gwn(&[n("in_proj_b")]), a: gwn(&[n("in_proj_a")]) } }
+            };
+            // FFN loader: dense MLP (qwen3_5, hy_v3 layer 0) or the MoE block (qwen3_5_moe, hy_v3).
+            // Expert tensors are STACKED and gate+up FUSED, stored WITHOUT a `.weight` suffix; router and
+            // shared-MLP carry `.weight`. hy_v3 names differ from qwen3_5_moe: `mlp.router.gate.weight`
+            // (not `mlp.gate.weight`), `mlp.expert_bias` [E] fp32, `mlp.shared_mlp.*` (not
+            // `shared_expert.*`), and NO `shared_expert_gate` (the shared expert is ungated).
+            let load_ffn = |gwn: &mut dyn FnMut(&[String]) -> W, gf: &mut dyn FnMut(&str) -> S,
+                            lp: &str, is_moe: bool, q: bool| -> Ffn {
+                // The bf16 checkpoint names the stacked experts WITHOUT a `.weight` suffix; the quantizer
+                // packs them as `<name>.weight_packed`, which the packed-ingestion keys as `<name>.weight`.
+                // `q` = are THESE experts quantized (per-head, so a bf16 MTP head in a quantized model works).
+                let esuf = if q { ".weight" } else { "" };
+                if is_moe {
+                    if hy3 {
+                        // The shared expert's gate/up are FUSED at load into one [2*si, h] tensor
+                        // (quantized path only — bf16 tensors can't fuse): two [si, h] GEMMs at
+                        // si=1536 run at ~115 GB/s (small-M latency); the fused one shares the
+                        // experts' layout and `moe_silu_bf16_b` (== silu_mul_b bitwise).
+                        // shared.gate/up are never read when shared_gate_up is Some — placeholders.
+                        let (smlp, sgu) = if q {
+                            (GpuMlp {
+                                gate: W::Bf16(dev.alloc_zeros::<half::bf16>(1).unwrap()),
+                                up:   W::Bf16(dev.alloc_zeros::<half::bf16>(1).unwrap()),
+                                down: gwn(&[format!("{}.mlp.shared_mlp.down_proj.weight", lp)]),
+                            },
+                            Some(gwn(&[format!("{}.mlp.shared_mlp.gate_proj.weight", lp),
+                                       format!("{}.mlp.shared_mlp.up_proj.weight", lp)])))
+                        } else {
+                            (GpuMlp {
+                                gate: gwn(&[format!("{}.mlp.shared_mlp.gate_proj.weight", lp)]),
+                                up:   gwn(&[format!("{}.mlp.shared_mlp.up_proj.weight", lp)]),
+                                down: gwn(&[format!("{}.mlp.shared_mlp.down_proj.weight", lp)]),
+                            }, None)
+                        };
+                        return Ffn::Moe(GpuMoe {
+                            router:      gwn(&[format!("{}.mlp.router.gate.weight", lp)]),
+                            gate_up:     gwn(&[format!("{}.mlp.experts.gate_up_proj{}", lp, esuf)]),
+                            down:        gwn(&[format!("{}.mlp.experts.down_proj{}", lp, esuf)]),
+                            shared: smlp,
+                            shared_gate: None,   // hy_v3's shared expert is UNGATED
+                            shared_gate_up: sgu,
+                            expert_bias: Some(gf(&format!("{}.mlp.expert_bias", lp))),
+                            // Set at load ONLY under shard-at-load (hy_v3 TP) and only for MAIN layers —
+                            // the MTP block (layers.80) is replicated (barrier-free drafting) even under
+                            // shard-at-load; the qwen TP path still flips it in `tp_shard_weights`.
+                            experts_sharded: sal.is_some() && lp != &hy3_mtp_prefix,
+                        });
+                    }
+                    Ffn::Moe(GpuMoe {
+                        router:      gwn(&[format!("{}.mlp.gate.weight", lp)]),
+                        gate_up:     gwn(&[format!("{}.mlp.experts.gate_up_proj{}", lp, esuf)]),
+                        down:        gwn(&[format!("{}.mlp.experts.down_proj{}", lp, esuf)]),
+                        shared: GpuMlp {
+                            gate: gwn(&[format!("{}.mlp.shared_expert.gate_proj.weight", lp)]),
+                            up:   gwn(&[format!("{}.mlp.shared_expert.up_proj.weight", lp)]),
+                            down: gwn(&[format!("{}.mlp.shared_expert.down_proj.weight", lp)]),
+                        },
+                        shared_gate: Some(gwn(&[format!("{}.mlp.shared_expert_gate.weight", lp)])),
+                        shared_gate_up: None,
+                        expert_bias: None,
+                        experts_sharded: false,
+                    })
+                } else {
+                    Ffn::Dense(GpuMlp {
+                        gate: gwn(&[format!("{}.mlp.gate_proj.weight", lp)]),
+                        up:   gwn(&[format!("{}.mlp.up_proj.weight", lp)]),
+                        down: gwn(&[format!("{}.mlp.down_proj.weight", lp)]),
+                    })
+                }
+            };
+
+            let embed = gwn(&[format!("{}.embed_tokens.weight", pref)]);
+            let final_norm = gf(&format!("{}.norm.weight", pref));
+            let lm_head = if cfg.tie_word_embeddings { None } else { Some(gwn(&["lm_head.weight".to_string()])) };
+
+            let mut layers = Vec::with_capacity(cfg.num_layers);
+            for i in 0..cfg.num_layers {
+                let lpref = format!("{}.layers.{}", pref, i);
+                let lt = cfg.layer_types[i];
+                let (la, fa) = match lt {
+                    crate::qwen::LayerType::LinearAttention => {
+                        let la = GpuLinearAttn {
+                            in_proj: gdn_in(&mut *gwn, &lpref),
+                            conv1d: gf(&format!("{}.linear_attn.conv1d.weight", lpref)),
+                            a_log: gf(&format!("{}.linear_attn.A_log", lpref)),
+                            dt_bias: gf(&format!("{}.linear_attn.dt_bias", lpref)),
+                            norm: gf(&format!("{}.linear_attn.norm.weight", lpref)),
+                            out_proj: gwn(&[format!("{}.linear_attn.out_proj.weight", lpref)]),
+                        };
+                        (Some(la), None)
+                    }
+                    crate::qwen::LayerType::FullAttention => {
+                        let fa = GpuFullAttn {
+                            qkv: attn_in(&mut *gwn, &lpref, quantized),
+                            o_proj: gwn(&[format!("{}.self_attn.o_proj.weight", lpref)]),
+                            q_norm: gf(&format!("{}.self_attn.q_norm.weight", lpref)),
+                            k_norm: gf(&format!("{}.self_attn.k_norm.weight", lpref)),
+                        };
+                        (None, Some(fa))
+                    }
+                };
+                layers.push(GpuLayer {
+                    layer_type: lt, la, fa,
+                    mlp: load_ffn(&mut *gwn, &mut *gf, &lpref, cfg.is_moe_layer(i), quantized),
+                    input_ln: gf(&format!("{}.input_layernorm.weight", lpref)),
+                    post_ln: gf(&format!("{}.post_attention_layernorm.weight", lpref)),
+                });
+            }
+
+            // Load MTP if present
+            let mtp = if has_mtp {
+                println!("Loading MTP head...");
+                if is_hy3 {
+                    // hy_v3's MTP block is `model.layers.80.*`: eh_proj (=fc), enorm/hnorm (=pre_fc
+                    // norms), final_layernorm (=mtp.norm), and a full MoE decoder layer. One-to-one
+                    // with GpuMtpLayer; the head it feeds is the MAIN lm_head (shared), as in HF.
+                    let mp = &hy3_mtp_prefix;
+                    Some(GpuMtpLayer {
+                        fc: gwn(&[format!("{mp}.eh_proj.weight")]),
+                        pre_fc_norm_hidden: gf(&format!("{mp}.hnorm.weight")),
+                        pre_fc_norm_embedding: gf(&format!("{mp}.enorm.weight")),
+                        input_ln: gf(&format!("{mp}.input_layernorm.weight")),
+                        post_ln: gf(&format!("{mp}.post_attention_layernorm.weight")),
+                        fa: GpuFullAttn {
+                            qkv: attn_in(&mut *gwn, mp, mtp_quant),
+                            o_proj: gwn(&[format!("{mp}.self_attn.o_proj.weight")]),
+                            q_norm: gf(&format!("{mp}.self_attn.q_norm.weight")),
+                            k_norm: gf(&format!("{mp}.self_attn.k_norm.weight")),
+                        },
+                        mlp: load_ffn(&mut *gwn, &mut *gf, mp, cfg.is_moe, mtp_quant),
+                        final_norm: gf(&format!("{mp}.final_layernorm.weight")),
+                    })
+                } else {
+                Some(GpuMtpLayer {
+                    fc: gwn(&["mtp.fc.weight".to_string()]),
+                    pre_fc_norm_hidden: gf("mtp.pre_fc_norm_hidden.weight"),
+                    pre_fc_norm_embedding: gf("mtp.pre_fc_norm_embedding.weight"),
+                    input_ln: gf("mtp.layers.0.input_layernorm.weight"),
+                    post_ln: gf("mtp.layers.0.post_attention_layernorm.weight"),
+                    fa: GpuFullAttn {
+                        qkv: attn_in(&mut *gwn, "mtp.layers.0", mtp_quant),
+                        o_proj: gwn(&["mtp.layers.0.self_attn.o_proj.weight".to_string()]),
+                        q_norm: gf("mtp.layers.0.self_attn.q_norm.weight"),
+                        k_norm: gf("mtp.layers.0.self_attn.k_norm.weight"),
+                    },
+                    mlp: load_ffn(&mut *gwn, &mut *gf, "mtp.layers.0", cfg.is_moe, mtp_quant),
+                    final_norm: gf("mtp.norm.weight"),
+                })
+                }
+            } else { None };
+
+            (embed, final_norm, lm_head, layers, mtp)
+        };
+
+        // 1) RECORD pass: note the gwn call sequence. Dummy weights of the right VARIANT (the
+        // assembly's own variant checks must see the shape the real weight will have); products
+        // dropped immediately. gf is cheap map reads in the real pass — dummy here too.
+        let mut recorded: Vec<Vec<String>> = Vec::new();
+        {
+            let mut rec_gwn = |names: &[String]| -> W {
+                recorded.push(names.to_vec());
+                if host_q4.contains_key(&names[0]) || gpu_q4_sharded.contains_key(&names[0]) {
+                    W::Nvfp4 { qweight: dev.alloc_zeros::<u8>(1).unwrap(),
+                               scales:  dev.alloc_zeros::<u8>(1).unwrap(),
+                               gs:      dev.alloc_zeros::<f32>(1).unwrap(), m: 16, k: 16 }
+                } else if host_q8.contains_key(&names[0]) {
+                    W::Fp8 { data:      dev.alloc_zeros::<u8>(1).unwrap(),
+                             row_scale: dev.alloc_zeros::<f32>(1).unwrap(), m: 16, k: 16 }
+                } else {
+                    W::Bf16(dev.alloc_zeros::<half::bf16>(1).unwrap())
+                }
+            };
+            let mut rec_gf = |_: &str| -> S { dev.alloc_zeros::<f32>(1).unwrap() };
+            drop(assemble(&mut rec_gwn, &mut rec_gf));
+        }
+
+        // 2) Jobs: the recorded name-groups (+ shard op + an in-flight-bytes estimate). Parts stay
+        //    in the host maps until a worker picks the job up — pulling them ALL out here would
+        //    hold ~35 GB (122B) in `jobs` ON TOP of the workers' working sets, which OOM-killed
+        //    the 122B load on a 121 GB box (~138 GB peak, measured). The lazy pull keeps the peak
+        //    at the serial path's plus one bounded gate. bf16 weights need no assembly — the real
+        //    gwn serves them from gpu_bf16.
+        enum AssembleJob {
+            Q4 { names: Vec<String>, shard_op: Option<LoadShardOp>, est: usize },
+            Q8 { names: Vec<String>, est: usize },
+        }
+        const PIPE_CAP_BYTES: usize = 24 << 30;   // bound the pool's in-flight NEW allocations
+        let mut jobs: Vec<AssembleJob> = Vec::new();
+        for names in &recorded {
+            if gpu_q4_sharded.contains_key(&names[0]) { continue; }   // hy3 inline bands: already final
+            if host_q4.contains_key(&names[0]) {
+                let shard_op = if sal.is_some() { Some(hy3_load_shard_op(names, &cfg, true)) } else { None };
+                let bytes: usize = names.iter().map(|n| {
+                    let p = host_q4.get(n).unwrap_or_else(|| panic!("missing nvfp4 tensor: {}", n));
+                    p.0.len() + p.1.len()
+                }).sum();
+                // est ~= fused copy + repacked copy (the parts themselves are a move, not new memory)
+                let est = (bytes * 2 + 1).min(PIPE_CAP_BYTES);
+                jobs.push(AssembleJob::Q4 { names: names.clone(), shard_op, est });
+            } else if host_q8.contains_key(&names[0]) {
+                let shard_op = if sal.is_some() { Some(hy3_load_shard_op(names, &cfg, true)) } else { None };
+                assert!(matches!(shard_op, None | Some(LoadShardOp::None)),
+                        "shard-at-load: FP8 tensor sharding is not implemented (hy_v3 is an all-NVFP4 recipe)");
+                let bytes: usize = names.iter().map(|n| {
+                    let p = host_q8.get(n).unwrap_or_else(|| panic!("missing fp8 tensor: {}", n));
+                    p.0.len() + p.1.len() * 4
+                }).sum();
+                let est = (bytes * 2 + 1).min(PIPE_CAP_BYTES);
+                jobs.push(AssembleJob::Q8 { names: names.clone(), est });
+            }
+        }
+
+        // 3) The pipeline: workers assemble host-side (fuse -> repack -> optional host shard) and
+        //    hand host buffers to the ONE uploader thread. The handoff is bounded by a bytes gate
+        //    (the working set is the peak host memory this adds) and a 2-deep output channel.
+        struct AssembledW { names: Vec<String>, est: usize, w: AssembledInner }
+        enum AssembledInner {
+            Q4 { wt: Vec<u8>, st: Vec<u8>, gsv: Vec<f32>, m: usize, k: usize },
+            Q8 { wt: Vec<u8>, rs: Vec<f32>, m: usize, k: usize },
+        }
+        // RAII gate charge: the worker holds it for the job's lifetime, so a PANICKING worker
+        // releases its charge on unwind instead of leaking it and hanging every other worker at
+        // the gate (a corrupt artifact must fail the load loudly, like the serial path, never hang).
+        struct GateGuard(std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>, usize);
+        impl GateGuard {
+            fn acquire(gate: &std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+                       est: usize, cap: usize) -> Self {
+                let (lock, cvar) = &**gate;
+                let mut g = lock.lock().unwrap();
+                while *g + est > cap { g = cvar.wait(g).unwrap(); }
+                *g += est;
+                GateGuard(gate.clone(), est)
+            }
+        }
+        impl Drop for GateGuard {
+            fn drop(&mut self) {
+                let (lock, cvar) = &*self.0;
+                let mut g = lock.lock().unwrap();
+                *g = g.saturating_sub(self.1);
+                cvar.notify_all();
+            }
+        }
+        let mut results: std::collections::HashMap<String, W> = std::collections::HashMap::new();
+        // Workers pull their job's parts out of these (one short lock per job) — see (2).
+        let host_q4 = std::sync::Mutex::new(host_q4);
+        let host_q8 = std::sync::Mutex::new(host_q8);
+        let nworkers = jobs.len()
+            .min(std::env::var("GB10_LOAD_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8))
+            .min(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        if nworkers > 0 {
+            let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (tx, rx) = std::sync::mpsc::sync_channel::<AssembledW>(2);
+            let gate = std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+            let dev_ref = &dev;
+            let jobs_ref = &jobs;
+            let sal_c = sal;
+            let hq4 = &host_q4;
+            let hq8 = &host_q8;
+            std::thread::scope(|s| {
+                // Bounded async uploads (Phase 1 item 4): issue async htod on the NULL stream and
+                // sync every ~2 GB / 64 copies instead of per weight. Pageable async htod reads
+                // the source AT EXECUTION, so the source Vecs sit in `keep` until each sync point
+                // (the lifetime rule — dropping them early corrupts the upload). The env var is
+                // the escape hatch back to per-weight sync copies.
+                let sync_uploads = std::env::var("GB10_LOAD_SYNC_UPLOAD").is_ok();
+                let up = s.spawn(move || -> (std::collections::HashMap<String, W>, std::time::Duration) {
+                    let mut out = std::collections::HashMap::new();
+                    let mut t_up = std::time::Duration::ZERO;
+                    let mut keep: Vec<AssembledInner> = Vec::new();
+                    let mut queued_bytes = 0usize;
+                    let mut queued_copies = 0usize;
+                    while let Ok(a) = rx.recv() {
+                        let t = std::time::Instant::now();
+                        let w = match a.w {
+                            AssembledInner::Q4 { wt, st, gsv, m, k } => {
+                                if sync_uploads {
+                                    W::Nvfp4 {
+                                        qweight: dev_ref.htod_sync_copy(&wt).unwrap(),
+                                        scales:  dev_ref.htod_sync_copy(&st).unwrap(),
+                                        gs:      dev_ref.htod_sync_copy(&gsv).unwrap(), m, k }
+                                } else {
+                                    let qweight = unsafe { dev_ref.alloc::<u8>(wt.len()).unwrap() };
+                                    let scales  = unsafe { dev_ref.alloc::<u8>(st.len()).unwrap() };
+                                    let gs      = unsafe { dev_ref.alloc::<f32>(gsv.len()).unwrap() };
+                                    unsafe {
+                                        cudarc::driver::result::memcpy_htod_async(
+                                            *qweight.device_ptr(), &wt, std::ptr::null_mut()).unwrap();
+                                        cudarc::driver::result::memcpy_htod_async(
+                                            *scales.device_ptr(), &st, std::ptr::null_mut()).unwrap();
+                                        cudarc::driver::result::memcpy_htod_async(
+                                            *gs.device_ptr(), &gsv, std::ptr::null_mut()).unwrap();
+                                    }
+                                    queued_bytes += wt.len() + st.len() + gsv.len() * 4;
+                                    queued_copies += 3;
+                                    keep.push(AssembledInner::Q4 { wt, st, gsv, m, k });
+                                    W::Nvfp4 { qweight, scales, gs, m, k }
+                                }
+                            }
+                            AssembledInner::Q8 { wt, rs, m, k } => {
+                                if sync_uploads {
+                                    W::Fp8 {
+                                        data:      dev_ref.htod_sync_copy(&wt).unwrap(),
+                                        row_scale: dev_ref.htod_sync_copy(&rs).unwrap(), m, k }
+                                } else {
+                                    let data = unsafe { dev_ref.alloc::<u8>(wt.len()).unwrap() };
+                                    let row_scale = unsafe { dev_ref.alloc::<f32>(rs.len()).unwrap() };
+                                    unsafe {
+                                        cudarc::driver::result::memcpy_htod_async(
+                                            *data.device_ptr(), &wt, std::ptr::null_mut()).unwrap();
+                                        cudarc::driver::result::memcpy_htod_async(
+                                            *row_scale.device_ptr(), &rs, std::ptr::null_mut()).unwrap();
+                                    }
+                                    queued_bytes += wt.len() + rs.len() * 4;
+                                    queued_copies += 2;
+                                    keep.push(AssembledInner::Q8 { wt, rs, m, k });
+                                    W::Fp8 { data, row_scale, m, k }
+                                }
+                            }
+                        };
+                        t_up += t.elapsed();
+                        out.insert(akey(&a.names), w);
+                        if !sync_uploads && (queued_bytes >= (2 << 30) || queued_copies >= 64) {
+                            let t = std::time::Instant::now();
+                            dev_ref.synchronize().unwrap();
+                            keep.clear();           // every queued copy has executed: sources consumed
+                            queued_bytes = 0;
+                            queued_copies = 0;
+                            t_up += t.elapsed();
+                        }
+                    }
+                    if !sync_uploads {
+                        dev_ref.synchronize().unwrap();
+                        drop(keep);
+                    }
+                    (out, t_up)
+                });
+                let mut handles = Vec::new();
+                for _ in 0..nworkers {
+                    let gate_w = gate.clone();
+                    let tx_w = tx.clone();
+                    let next_w = next.clone();
+                    let hq4_w = hq4;
+                    let hq8_w = hq8;
+                    handles.push(s.spawn(move || -> (std::time::Duration, std::time::Duration, std::time::Duration) {
+                        // The pool is the parallelism — no nested repack threads (see quant.rs).
+                        crate::quant::set_repack_threading(false);
+                        let (mut tf, mut tr, mut th) =
+                            (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+                        loop {
+                            let idx = next_w.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if idx >= jobs_ref.len() { break; }
+                            let job = &jobs_ref[idx];
+                            let est = match job { AssembleJob::Q4 { est, .. } => *est,
+                                                  AssembleJob::Q8 { est, .. } => *est };
+                            // Held until the job is sent (and released on panic unwind).
+                            let _charge = GateGuard::acquire(&gate_w, est, PIPE_CAP_BYTES);
+                            let a = match job {
+                                AssembleJob::Q4 { names, shard_op, est } => {
+                                    // The parts move out of the shared map HERE (see (2)) — their
+                                    // memory is freed on this worker as the job completes.
+                                    let parts: Vec<Q4H> = {
+                                        let mut m4 = hq4_w.lock().unwrap();
+                                        names.iter()
+                                            .map(|n| m4.remove(n).unwrap_or_else(|| panic!("missing nvfp4 tensor: {}", n)))
+                                            .collect()
+                                    };
+                                    let k = parts[0].4;
+                                    let m: usize = parts.iter().map(|p| p.3).sum();
+                                    let refs: Vec<(&[u8], &[u8], f32, usize)> =
+                                        parts.iter().map(|p| (&p.0[..], &p.1[..], p.2, p.3)).collect();
+                                    let t = std::time::Instant::now();
+                                    let (qw, sc, gsv) = crate::quant::fuse_nvfp4(&refs, k);
+                                    tf += t.elapsed();
+                                    let t = std::time::Instant::now();
+                                    let (wt, st) = crate::quant::repack_nvfp4_mma(&qw, &sc, m, k);
+                                    tr += t.elapsed();
+                                    let t = std::time::Instant::now();
+                                    // Shard-at-load: slice the MMA-repacked host triple before upload
+                                    // (byte math identical to the post-load sharders).
+                                    let (wt, st, gsv, m, k) = match shard_op {
+                                        Some(LoadShardOp::Col) => {
+                                            let (q, s2, g, ml) = host_shard_nvfp4_col_segs(&wt, &st, &gsv, k, &[(0, m, true)], sal_c.unwrap());
+                                            (q, s2, g, ml, k)
+                                        }
+                                        Some(LoadShardOp::ColSegs(segs)) => {
+                                            let (q, s2, g, ml) = host_shard_nvfp4_col_segs(&wt, &st, &gsv, k, segs, sal_c.unwrap());
+                                            (q, s2, g, ml, k)
+                                        }
+                                        Some(LoadShardOp::Row) => {
+                                            let (q, s2, kl) = host_shard_nvfp4_row(&wt, &st, m, k, sal_c.unwrap());
+                                            (q, s2, gsv, m, kl)
+                                        }
+                                        _ => (wt, st, gsv, m, k),
+                                    };
+                                    th += t.elapsed();
+                                    AssembledW { names: names.clone(), est: *est,
+                                                 w: AssembledInner::Q4 { wt, st, gsv, m, k } }
+                                }
+                                AssembleJob::Q8 { names, est } => {
+                                    let parts: Vec<Q8H> = {
+                                        let mut m8 = hq8_w.lock().unwrap();
+                                        names.iter()
+                                            .map(|n| m8.remove(n).unwrap_or_else(|| panic!("missing fp8 tensor: {}", n)))
+                                            .collect()
+                                    };
+                                    let k = parts[0].3;
+                                    let m: usize = parts.iter().map(|p| p.2).sum();
+                                    let refs: Vec<(&[u8], &[f32], usize)> =
+                                        parts.iter().map(|p| (&p.0[..], &p.1[..], p.2)).collect();
+                                    let t = std::time::Instant::now();
+                                    let (qw, rs) = crate::quant::fuse_fp8(&refs, k);
+                                    tf += t.elapsed();
+                                    let t = std::time::Instant::now();
+                                    let wt = crate::quant::repack_fp8_mma(&qw, m, k);
+                                    tr += t.elapsed();
+                                    AssembledW { names: names.clone(), est: *est,
+                                                 w: AssembledInner::Q8 { wt, rs, m, k } }
+                                }
+                            };
+                            // Backpressure lives here too: the channel is 2 deep.
+                            let _ = tx_w.send(a);
+                        }
+                        (tf, tr, th)
+                    }));
+                }
+                drop(tx);   // the uploader's recv ends once the workers' senders drop
+                let (res, t_up) = up.join().unwrap();
+                results = res;
+                t_up_post += t_up;
+                for h in handles {
+                    let (tf, tr, th) = h.join().unwrap();
+                    t_fuse += tf; t_repack += tr; t_hshard += th;
+                }
+            });
+        }
+
+        // 4) REAL pass: the same assembly, gwn now a lookup over the pipeline results (identical
+        //    dispatch to the old serial gwn: hy3 inline bands -> assembled q4/q8 -> bf16 map).
         let mut gwn = |names: &[String]| -> W {
+            let t_g = std::time::Instant::now();
             // TP=2 shard-at-load (hy_v3): the expert bands were sliced + repacked + uploaded INLINE
             // during the shard-file loop; nothing fuses across them (names.len() == 1 by construction).
             if let Some(w) = gpu_q4_sharded.remove(&names[0]) {
                 assert_eq!(names.len(), 1, "shard-at-load expert tensors are never fused");
+                t_gwn += t_g.elapsed();
                 return w;
             }
-            if host_q4.contains_key(&names[0]) {
-                // The load-time shard for this tensor (hy_v3 + TP only; None everywhere else).
-                let shard_op = if sal.is_some() { Some(hy3_load_shard_op(names, &cfg, true)) } else { None };
-                let parts: Vec<Q4H> = names.iter()
-                    .map(|n| host_q4.remove(n).unwrap_or_else(|| panic!("missing nvfp4 tensor: {}", n)))
-                    .collect();
-                let k = parts[0].4;
-                let m: usize = parts.iter().map(|p| p.3).sum();
-                let refs: Vec<(&[u8], &[u8], f32, usize)> =
-                    parts.iter().map(|p| (&p.0[..], &p.1[..], p.2, p.3)).collect();
-                let (qw, sc, gsv) = crate::quant::fuse_nvfp4(&refs, k);
-                let (wt, st) = crate::quant::repack_nvfp4_mma(&qw, &sc, m, k);
-                // Shard-at-load: slice the MMA-repacked host triple before upload (byte math
-                // identical to the post-load sharders; peak GPU memory is the SHARD, not the whole).
-                let (wt, st, gsv, m, k) = match shard_op {
-                    Some(LoadShardOp::Col) => {
-                        let (q, s, g, ml) = host_shard_nvfp4_col_segs(&wt, &st, &gsv, k, &[(0, m, true)], sal.unwrap());
-                        (q, s, g, ml, k)
-                    }
-                    Some(LoadShardOp::ColSegs(segs)) => {
-                        let (q, s, g, ml) = host_shard_nvfp4_col_segs(&wt, &st, &gsv, k, &segs, sal.unwrap());
-                        (q, s, g, ml, k)
-                    }
-                    Some(LoadShardOp::Row) => {
-                        let (q, s, kl) = host_shard_nvfp4_row(&wt, &st, m, k, sal.unwrap());
-                        (q, s, gsv, m, kl)
-                    }
-                    _ => (wt, st, gsv, m, k),
-                };
-                return W::Nvfp4 {
-                    qweight: dev.htod_sync_copy(&wt).unwrap(),
-                    scales:  dev.htod_sync_copy(&st).unwrap(),
-                    gs:      dev.htod_sync_copy(&gsv).unwrap(),
-                    m, k };
-            }
-            if host_q8.contains_key(&names[0]) {
-                let shard_op = if sal.is_some() { Some(hy3_load_shard_op(names, &cfg, true)) } else { None };
-                assert!(matches!(shard_op, None | Some(LoadShardOp::None)),
-                        "shard-at-load: FP8 tensor sharding is not implemented (hy_v3 is an all-NVFP4 recipe)");
-                let parts: Vec<Q8H> = names.iter()
-                    .map(|n| host_q8.remove(n).unwrap_or_else(|| panic!("missing fp8 tensor: {}", n)))
-                    .collect();
-                let k = parts[0].3;
-                let m: usize = parts.iter().map(|p| p.2).sum();
-                let refs: Vec<(&[u8], &[f32], usize)> =
-                    parts.iter().map(|p| (&p.0[..], &p.1[..], p.2)).collect();
-                let (qw, rs) = crate::quant::fuse_fp8(&refs, k);
-                let wt = crate::quant::repack_fp8_mma(&qw, m, k);
-                return W::Fp8 {
-                    data:      dev.htod_sync_copy(&wt).unwrap(),
-                    row_scale: dev.htod_sync_copy(&rs).unwrap(),
-                    m, k };
+            if let Some(w) = results.remove(&akey(names)) {
+                t_gwn += t_g.elapsed();
+                return w;
             }
             let shard_op = if sal.is_some() { Some(hy3_load_shard_op(names, &cfg, false)) } else { None };
             assert!(matches!(shard_op, None | Some(LoadShardOp::None)),
                     "shard-at-load: bf16 tensor sharding is not implemented (the hy3 sharded set is all NVFP4)");
             assert_eq!(names.len(), 1, "bf16 weights are not fused (see GdnIn/AttnIn)");
-            W::Bf16(gpu_bf16.remove(&names[0]).unwrap_or_else(|| panic!("missing tensor: {}", names[0])))
+            let w = W::Bf16(gpu_bf16.remove(&names[0]).unwrap_or_else(|| panic!("missing tensor: {}", names[0])));
+            t_gwn += t_g.elapsed();
+            w
         };
         let mut gf = |n: &str| -> S { gpu_f32.remove(n).unwrap_or_else(|| panic!("missing f32 tensor: {}", n)) };
+        let (embed, final_norm, lm_head, layers, mtp) = assemble(&mut gwn, &mut gf);
 
-        // Fuse if the artifact is quantized (`gwn` concatenates along M); leave bf16 split.
-        let quantized = n_dq4 + n_dq8 > 0 && !dequant_at_load;
-        let attn_in = |gwn: &mut dyn FnMut(&[String]) -> W, lp: &str, fuse: bool| -> AttnIn {
-            let n = |s: &str| format!("{}.self_attn.{}.weight", lp, s);
-            if fuse { AttnIn::Fused(gwn(&[n("q_proj"), n("k_proj"), n("v_proj")])) }
-            else { AttnIn::Split { q: gwn(&[n("q_proj")]), k: gwn(&[n("k_proj")]), v: gwn(&[n("v_proj")]) } }
-        };
-        let gdn_in = |gwn: &mut dyn FnMut(&[String]) -> W, lp: &str| -> GdnIn {
-            let n = |s: &str| format!("{}.linear_attn.{}.weight", lp, s);
-            if quantized { GdnIn::Fused(gwn(&[n("in_proj_qkv"), n("in_proj_z"), n("in_proj_b"), n("in_proj_a")])) }
-            else { GdnIn::Split { qkv: gwn(&[n("in_proj_qkv")]), z: gwn(&[n("in_proj_z")]),
-                                  b: gwn(&[n("in_proj_b")]), a: gwn(&[n("in_proj_a")]) } }
-        };
-        // FFN loader: dense MLP (qwen3_5, hy_v3 layer 0) or the MoE block (qwen3_5_moe, hy_v3).
-        // Expert tensors are STACKED and gate+up FUSED, stored WITHOUT a `.weight` suffix; router and
-        // shared-MLP carry `.weight`. hy_v3 names differ from qwen3_5_moe: `mlp.router.gate.weight`
-        // (not `mlp.gate.weight`), `mlp.expert_bias` [E] fp32, `mlp.shared_mlp.*` (not
-        // `shared_expert.*`), and NO `shared_expert_gate` (the shared expert is ungated).
-        let hy3 = cfg.family == crate::qwen::Family::HyV3;
-        let load_ffn = |gwn: &mut dyn FnMut(&[String]) -> W, gf: &mut dyn FnMut(&str) -> S,
-                        lp: &str, is_moe: bool, q: bool| -> Ffn {
-            // The bf16 checkpoint names the stacked experts WITHOUT a `.weight` suffix; the quantizer
-            // packs them as `<name>.weight_packed`, which the packed-ingestion keys as `<name>.weight`.
-            // `q` = are THESE experts quantized (per-head, so a bf16 MTP head in a quantized model works).
-            let esuf = if q { ".weight" } else { "" };
-            if is_moe {
-                if hy3 {
-                    // The shared expert's gate/up are FUSED at load into one [2*si, h] tensor
-                    // (quantized path only — bf16 tensors can't fuse): two [si, h] GEMMs at
-                    // si=1536 run at ~115 GB/s (small-M latency); the fused one shares the
-                    // experts' layout and `moe_silu_bf16_b` (== silu_mul_b bitwise).
-                    // shared.gate/up are never read when shared_gate_up is Some — placeholders.
-                    let (smlp, sgu) = if q {
-                        (GpuMlp {
-                            gate: W::Bf16(dev.alloc_zeros::<half::bf16>(1).unwrap()),
-                            up:   W::Bf16(dev.alloc_zeros::<half::bf16>(1).unwrap()),
-                            down: gwn(&[format!("{}.mlp.shared_mlp.down_proj.weight", lp)]),
-                        },
-                        Some(gwn(&[format!("{}.mlp.shared_mlp.gate_proj.weight", lp),
-                                   format!("{}.mlp.shared_mlp.up_proj.weight", lp)])))
-                    } else {
-                        (GpuMlp {
-                            gate: gwn(&[format!("{}.mlp.shared_mlp.gate_proj.weight", lp)]),
-                            up:   gwn(&[format!("{}.mlp.shared_mlp.up_proj.weight", lp)]),
-                            down: gwn(&[format!("{}.mlp.shared_mlp.down_proj.weight", lp)]),
-                        }, None)
-                    };
-                    return Ffn::Moe(GpuMoe {
-                        router:      gwn(&[format!("{}.mlp.router.gate.weight", lp)]),
-                        gate_up:     gwn(&[format!("{}.mlp.experts.gate_up_proj{}", lp, esuf)]),
-                        down:        gwn(&[format!("{}.mlp.experts.down_proj{}", lp, esuf)]),
-                        shared: smlp,
-                        shared_gate: None,   // hy_v3's shared expert is UNGATED
-                        shared_gate_up: sgu,
-                        expert_bias: Some(gf(&format!("{}.mlp.expert_bias", lp))),
-                        // Set at load ONLY under shard-at-load (hy_v3 TP) and only for MAIN layers —
-                        // the MTP block (layers.80) is replicated (barrier-free drafting) even under
-                        // shard-at-load; the qwen TP path still flips it in `tp_shard_weights`.
-                        experts_sharded: sal.is_some() && lp != &hy3_mtp_prefix,
-                    });
-                }
-                Ffn::Moe(GpuMoe {
-                    router:      gwn(&[format!("{}.mlp.gate.weight", lp)]),
-                    gate_up:     gwn(&[format!("{}.mlp.experts.gate_up_proj{}", lp, esuf)]),
-                    down:        gwn(&[format!("{}.mlp.experts.down_proj{}", lp, esuf)]),
-                    shared: GpuMlp {
-                        gate: gwn(&[format!("{}.mlp.shared_expert.gate_proj.weight", lp)]),
-                        up:   gwn(&[format!("{}.mlp.shared_expert.up_proj.weight", lp)]),
-                        down: gwn(&[format!("{}.mlp.shared_expert.down_proj.weight", lp)]),
-                    },
-                    shared_gate: Some(gwn(&[format!("{}.mlp.shared_expert_gate.weight", lp)])),
-                    shared_gate_up: None,
-                    expert_bias: None,
-                    experts_sharded: false,
-                })
-            } else {
-                Ffn::Dense(GpuMlp {
-                    gate: gwn(&[format!("{}.mlp.gate_proj.weight", lp)]),
-                    up:   gwn(&[format!("{}.mlp.up_proj.weight", lp)]),
-                    down: gwn(&[format!("{}.mlp.down_proj.weight", lp)]),
-                })
-            }
-        };
-
-        let embed = gwn(&[format!("{}.embed_tokens.weight", pref)]);
-        let final_norm = gf(&format!("{}.norm.weight", pref));
-        let lm_head = if cfg.tie_word_embeddings { None } else { Some(gwn(&["lm_head.weight".to_string()])) };
         // Mirror of attach_tp's rule: a QUANTIZED untied head was vocab-sharded at load (hy3's is
         // bf16 → replicated). bf16 under shard-at-load hits the None op above and stays whole.
         let lm_head_sharded_lc = sal.is_some()
             && matches!(lm_head, Some(W::Nvfp4 { .. }) | Some(W::Fp8 { .. }));
-
-        let mut layers = Vec::with_capacity(cfg.num_layers);
-        for i in 0..cfg.num_layers {
-            let lpref = format!("{}.layers.{}", pref, i);
-            let lt = cfg.layer_types[i];
-            let (la, fa) = match lt {
-                crate::qwen::LayerType::LinearAttention => {
-                    let la = GpuLinearAttn {
-                        in_proj: gdn_in(&mut gwn, &lpref),
-                        conv1d: gf(&format!("{}.linear_attn.conv1d.weight", lpref)),
-                        a_log: gf(&format!("{}.linear_attn.A_log", lpref)),
-                        dt_bias: gf(&format!("{}.linear_attn.dt_bias", lpref)),
-                        norm: gf(&format!("{}.linear_attn.norm.weight", lpref)),
-                        out_proj: gwn(&[format!("{}.linear_attn.out_proj.weight", lpref)]),
-                    };
-                    (Some(la), None)
-                }
-                crate::qwen::LayerType::FullAttention => {
-                    let fa = GpuFullAttn {
-                        qkv: attn_in(&mut gwn, &lpref, quantized),
-                        o_proj: gwn(&[format!("{}.self_attn.o_proj.weight", lpref)]),
-                        q_norm: gf(&format!("{}.self_attn.q_norm.weight", lpref)),
-                        k_norm: gf(&format!("{}.self_attn.k_norm.weight", lpref)),
-                    };
-                    (None, Some(fa))
-                }
-            };
-            layers.push(GpuLayer {
-                layer_type: lt, la, fa,
-                mlp: load_ffn(&mut gwn, &mut gf, &lpref, cfg.is_moe_layer(i), quantized),
-                input_ln: gf(&format!("{}.input_layernorm.weight", lpref)),
-                post_ln: gf(&format!("{}.post_attention_layernorm.weight", lpref)),
-            });
-        }
-
-        // Load MTP if present
-        let mtp = if has_mtp {
-            println!("Loading MTP head...");
-            if is_hy3 {
-                // hy_v3's MTP block is `model.layers.80.*`: eh_proj (=fc), enorm/hnorm (=pre_fc
-                // norms), final_layernorm (=mtp.norm), and a full MoE decoder layer. One-to-one
-                // with GpuMtpLayer; the head it feeds is the MAIN lm_head (shared), as in HF.
-                let mp = &hy3_mtp_prefix;
-                Some(GpuMtpLayer {
-                    fc: gwn(&[format!("{mp}.eh_proj.weight")]),
-                    pre_fc_norm_hidden: gf(&format!("{mp}.hnorm.weight")),
-                    pre_fc_norm_embedding: gf(&format!("{mp}.enorm.weight")),
-                    input_ln: gf(&format!("{mp}.input_layernorm.weight")),
-                    post_ln: gf(&format!("{mp}.post_attention_layernorm.weight")),
-                    fa: GpuFullAttn {
-                        qkv: attn_in(&mut gwn, mp, mtp_quant),
-                        o_proj: gwn(&[format!("{mp}.self_attn.o_proj.weight")]),
-                        q_norm: gf(&format!("{mp}.self_attn.q_norm.weight")),
-                        k_norm: gf(&format!("{mp}.self_attn.k_norm.weight")),
-                    },
-                    mlp: load_ffn(&mut gwn, &mut gf, mp, cfg.is_moe, mtp_quant),
-                    final_norm: gf(&format!("{mp}.final_layernorm.weight")),
-                })
-            } else {
-            Some(GpuMtpLayer {
-                fc: gwn(&["mtp.fc.weight".to_string()]),
-                pre_fc_norm_hidden: gf("mtp.pre_fc_norm_hidden.weight"),
-                pre_fc_norm_embedding: gf("mtp.pre_fc_norm_embedding.weight"),
-                input_ln: gf("mtp.layers.0.input_layernorm.weight"),
-                post_ln: gf("mtp.layers.0.post_attention_layernorm.weight"),
-                fa: GpuFullAttn {
-                    qkv: attn_in(&mut gwn, "mtp.layers.0", mtp_quant),
-                    o_proj: gwn(&["mtp.layers.0.self_attn.o_proj.weight".to_string()]),
-                    q_norm: gf("mtp.layers.0.self_attn.q_norm.weight"),
-                    k_norm: gf("mtp.layers.0.self_attn.k_norm.weight"),
-                },
-                mlp: load_ffn(&mut gwn, &mut gf, "mtp.layers.0", cfg.is_moe, mtp_quant),
-                final_norm: gf("mtp.norm.weight"),
-            })
-            }
-        } else { None };
 
         // HashMaps now empty (all weights consumed). Drop explicitly.
         drop(gpu_bf16);
@@ -1306,6 +1623,24 @@ impl GpuModel {
                 "shard-at-load: {} expert tensors were never consumed by a layer", gpu_q4_sharded.len());
         drop(gpu_q4_sharded);
         dev.synchronize()?;
+
+        // [load] summary — every phase accounted (Phase-0 instrumentation of the load-speed
+        // campaign). `shards cpu` = the shard loop minus its reads and uploads (parse + host
+        // copies + f32 converts); `other` = everything unaccounted (device allocs, map churn).
+        {
+            let total = t_load0.elapsed().as_secs_f64();
+            let shard_cpu = t_shard_loop.saturating_sub(t_read + t_up_shard + t_repack_inline).as_secs_f64();
+            let gwn_cpu = t_gwn.saturating_sub(t_fuse + t_repack + t_hshard + t_up_post).as_secs_f64();
+            let accounted = t_ptx + t_rope + t_shard_loop + t_asm0.elapsed();
+            let other = t_load0.elapsed().saturating_sub(accounted).as_secs_f64();
+            eprintln!(
+                "[load] total {:.1}s | ptx+jit {:.1}s rope {:.1}s | shards: read {:.1}s cpu {:.1}s repack-inline {:.1}s upload {:.1}s | assemble {:.1}s (draft {:.1}s fuse {:.1}s repack {:.1}s host-shard {:.1}s upload {:.1}s gwn-cpu {:.1}s) | other {:.1}s",
+                total, t_ptx.as_secs_f64(), t_rope.as_secs_f64(),
+                t_read.as_secs_f64(), shard_cpu, t_repack_inline.as_secs_f64(), t_up_shard.as_secs_f64(),
+                t_asm0.elapsed().as_secs_f64(), t_draft.as_secs_f64(),
+                t_fuse.as_secs_f64(), t_repack.as_secs_f64(), t_hshard.as_secs_f64(),
+                t_up_post.as_secs_f64(), gwn_cpu, other);
+        }
 
         Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_p, sv_r, mr_tok, mr_pos, deq_scratch, mtp_sids, draft_head, draft_ids, lm_head_sharded: lm_head_sharded_lc, tp_sharded_at_load: sal.is_some(), kv_quant: std::env::var("GB10_KV_QUANT").is_ok(), tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None }, cfg))
     }
@@ -1372,7 +1707,7 @@ impl GpuModel {
             "moe_count_b","moe_offsets_b","moe_scatter_b","moe_tilemap_b","moe_gather_x_b",
             "gemm_moe_grouped_mma_fp4","moe_combine_grouped_b",
             "write_kv_b_q4","write_kv_prefill_q4","compact_kv_q4","dequant_kv_q4","gqa_attn_splitk_q4",
-            "gqa_attn_splitk_q4_gq",
+            "gqa_attn_splitk_q4_gq","gqa_attn_splitk_gq",
             "tp_mask_rows","tp_gate_copy_signal","tp_wait_add",
             "tp_bench_fill","tp_bench_validate","tp_bench_stall",
             "kernel_build_id"];
@@ -3072,16 +3407,17 @@ impl GpuModel {
         // 12-arg launch cap; ranges: stride<=262144<2^19, ns_grid<=32<2^6, batch<2^6.
         debug_assert!(stride < (1<<19) && ns_grid < (1<<6) && batch < (1<<6), "bs_packed field overflow");
         let bs_packed = ((batch as i32) << 25) | ((ns_grid as i32) << 19) | (stride as i32);
+        // GQA ratio and escape hatch are shared by the q4 and bf16 dispatch below.
+        let gqa_ratio = nh / nkv.max(1);
+        // A/B + escape hatch: GB10_NO_GQPACK=1 forces the per-head kernel. Read per call (the
+        // H16/GB10_NO_DECODE_GRAPHS pattern); under graph capture it is bound at capture time.
+        let no_gqpack = std::env::var("GB10_NO_GQPACK").is_ok();
         if kv_q4 {
             // GQA-packed split-K (E1): one block per (kv head, split) reads the chunk ONCE for the
             // whole query group — the per-head kernel re-reads it gqa_ratio times (8× at Hy3, the
             // "32K anomaly": 53.6 ms/token of re-reads at 26K ctx). Bit-identical per head, so
             // decode == verify col-0 is preserved. hd==128 && ratio in 2..=8 only; else per-head.
-            let gqa_ratio = nh / nkv.max(1);
-            // A/B + escape hatch: GB10_NO_GQPACK=1 forces the per-head kernel. Read per call (the
-            // H16/GB10_NO_DECODE_GRAPHS pattern); under graph capture it is bound at capture time.
-            let no_gqpack = std::env::var("GB10_NO_GQPACK").is_ok();
-            if hd == 128 && (2..=8).contains(&gqa_ratio) && !no_gqpack {
+            if (hd == 128 || hd == 256) && (2..=8).contains(&gqa_ratio) && !no_gqpack {
                 blaunch!(self, "gqa_attn_splitk_q4_gq", ((batch * nkv * ns_grid) as u32,1,1), (hd as u32,1,1), smem,
                     (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
                      logical_ptr, bs_packed, nh_packed, slot_ids_ptr, path_ptr, col_pos_start_ptr));
@@ -3091,9 +3427,18 @@ impl GpuModel {
                  logical_ptr, bs_packed, nh_packed, slot_ids_ptr, path_ptr, col_pos_start_ptr));
             }
         } else {
+            // GQA-packed bf16 split-K (E1c): same re-read pathology as q4 — the per-head kernel
+            // reads each group's KV chunk gqa_ratio times (the bf16 "32K anomaly"). Packed reads it
+            // ONCE per (kvh, split); per-head bit-identical. hd in {128,256} && ratio 2..=8.
+            if (hd == 128 || hd == 256) && (2..=8).contains(&gqa_ratio) && !no_gqpack {
+                blaunch!(self, "gqa_attn_splitk_gq", ((batch * nkv * ns_grid) as u32,1,1), (hd as u32,1,1), smem,
+                    (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
+                     logical_ptr, bs_packed, nh_packed, slot_ids_ptr, path_ptr, col_pos_start_ptr));
+            } else {
             blaunch!(self, "gqa_attn_splitk", ((batch * nh * ns_grid) as u32,1,1), (hd as u32,1,1), smem,
                 (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
                  logical_ptr, bs_packed, nh_packed, slot_ids_ptr, path_ptr, col_pos_start_ptr));
+            }
         }
         blaunch!(self, "gqa_attn_reduce", ((batch*nh) as u32,1,1), (hd as u32,1,1), 0,
             (d(&attn), d(&pm), d(&pl), d(&pa), logical_ptr, ns_grid as i32, batch as i32, nh_packed));

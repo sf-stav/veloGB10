@@ -23,7 +23,7 @@
 
 	ld.param.u64 	%rd1, [kernel_build_id_param_0];
 	cvta.to.global.u64 	%rd2, %rd1;
-	mov.b64 	%rd3, -5007270168904075763;
+	mov.b64 	%rd3, -4647128754165733752;
 	st.global.u64 	[%rd2], %rd3;
 	ret;
 

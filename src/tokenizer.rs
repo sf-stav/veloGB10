@@ -139,8 +139,9 @@ impl QwenTokenizer {
     /// exist and simply answers in prose. We used to drop it on the floor (the field did not exist on
     /// the request struct, so serde discarded it silently), which is why every agent harness failed.
     pub fn apply_chat_template(&self, messages: &[ChatMessage],
-                               tools: Option<&[serde_json::Value]>) -> Result<String> {
-        self.render_chat(messages, tools, true)
+                               tools: Option<&[serde_json::Value]>,
+                               reasoning_effort: Option<&str>) -> Result<String> {
+        self.render_chat(messages, tools, true, reasoning_effort)
     }
 
     /// The same prompt WITHOUT the trailing `<|im_start|>assistant\n<think>\n`.
@@ -153,20 +154,27 @@ impl QwenTokenizer {
     /// Checkpointing the GDN state one token later than this made the prefix cache miss by exactly one
     /// token: `879 of 880 matched`. That single token cost a full re-prefill of the entire conversation.
     pub fn apply_chat_template_no_gen(&self, messages: &[ChatMessage],
-                                      tools: Option<&[serde_json::Value]>) -> Result<String> {
-        self.render_chat(messages, tools, false)
+                                      tools: Option<&[serde_json::Value]>,
+                                      reasoning_effort: Option<&str>) -> Result<String> {
+        self.render_chat(messages, tools, false, reasoning_effort)
     }
 
     fn render_chat(&self, messages: &[ChatMessage], tools: Option<&[serde_json::Value]>,
-                   add_generation_prompt: bool) -> Result<String> {
+                   add_generation_prompt: bool, reasoning_effort: Option<&str>) -> Result<String> {
         if let Some(env) = &self.chat_env {
             let msgs: Vec<serde_json::Value> = messages.iter().map(|m| m.to_template_json()).collect();
-            let ctx = serde_json::json!({
+            let mut ctx = serde_json::json!({
                 "messages": msgs,
                 "tools": tools,
                 "add_generation_prompt": add_generation_prompt,
                 "enable_thinking": true,
             });
+            // hy_v3 optional reasoning: the template's `reasoning_effort` knob ('no_think'|'low'|
+            // 'high'; undefined => 'no_think'). Passed as a STRING only — a JSON null raises in the
+            // template. Other families' templates ignore the variable.
+            if let Some(e) = reasoning_effort {
+                ctx["reasoning_effort"] = serde_json::Value::String(e.to_string());
+            }
             let rendered = env.get_template("chat")
                 .map_err(|e| anyhow::anyhow!("minijinja get_template: {}", e))?
                 .render(&ctx)
@@ -312,7 +320,7 @@ mod tests {
             },
             ChatMessage::user("Continue it for another 1000 words."),
         ];
-        let rendered = tok.apply_chat_template(&messages, None).expect("render");
+        let rendered = tok.apply_chat_template(&messages, None, None).expect("render");
 
         eprintln!("===== RENDERED PROMPT START =====\n{}\n===== RENDERED PROMPT END =====", rendered);
 

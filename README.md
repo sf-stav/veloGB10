@@ -7,8 +7,11 @@
 **A GB10-specific inference engine for one or two GB10-based systems — NVIDIA DGX Spark and
 compatible OEM machines built around the NVIDIA GB10 chipset.**
 
-veloGB10 (`gb10_inference`) is a from-scratch Rust + CUDA inference engine for the Qwen3.5/3.6
-model family, including hybrid GatedDeltaNet + GQA architectures, dense models, and MoE models.
+veloGB10 (`gb10_inference`) is a from-scratch Rust + CUDA inference engine for a hand-selected
+set of large language models — currently including the Qwen3.5/3.6 family and Tencent Hy3 — with
+support for hybrid GatedDeltaNet + GQA architectures, dense models, and MoE models. More model
+families are added deliberately rather than generically; each one is ported, measured, and gated
+on real GB10 hardware before it ships.
 
 The implementation is intentionally specialized for GB10 systems:
 
@@ -129,7 +132,8 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
   model-context up to 256K on the 27B. The hybrid GDN layers carry a fixed-size recurrent state,
   so KV memory grows only on the periodic full-attention layers.
 - **Model coverage** — Qwen3.5 0.8B/2B/4B/9B, Qwen3.6 27B (dense hybrid), Qwen3.6 35B (MoE),
-  Qwen3.5 122B (MoE hybrid). One binary; the model is a directory, not a build.
+  Qwen3.5 122B (MoE hybrid), Tencent Hy3 (295B-A21B MoE). One binary; the model is a directory,
+  not a build.
 
 ## Unique aspects
 
@@ -370,8 +374,9 @@ above happen faster.
   engine's GPU control plane is built on.
 - Hugging Face `tokenizers` and `safetensors`; `minijinja` (chat templates); `axum` + `tokio`
   (serving).
-- Alibaba's Qwen team — the Qwen3.5/3.6 model family this engine exists to serve, and the hybrid
-  GatedDeltaNet architecture that shapes its best ideas.
+- Alibaba's Qwen team — the Qwen3.5/3.6 model family that shaped the engine's early design, and
+  the hybrid GatedDeltaNet architecture that shapes its best ideas.
+- Tencent — the Hy3 model family and its pure-GQA MoE architecture.
 - [`tool-eval-bench`](https://github.com/SeraphimSerapis/tool-eval-bench/) — the benchmark
   harness behind every number in this README.
 - NVIDIA — the DGX Spark. One (or two) of them is all it takes.

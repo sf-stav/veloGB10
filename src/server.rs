@@ -25,6 +25,9 @@ pub struct AppState {
     pub default_rep_penalty: f32,
     pub default_presence_penalty: f32,
     pub default_frequency_penalty: f32,
+    /// Default hy_v3 reasoning effort for the chat template ('no_think'|'low'|'high'), from
+    /// --reasoning-effort; a request's `reasoning_effort` field overrides per request.
+    pub reasoning_effort: String,
     /// KV cache depth, in positions. NOTHING used to check a prompt against it: an over-long prompt
     /// ran `write_kv_prefill` straight past the end of the cache and corrupted the next allocation.
     pub max_seq_len: usize,
@@ -148,6 +151,20 @@ struct ChatCompletionRequest {
     /// need constrained decoding, and quietly pretending to honour it is worse than not claiming it.
     #[serde(default)]
     tool_choice: Option<serde_json::Value>,
+    /// hy_v3 optional reasoning: 'no_think'|'low'|'high', forwarded to the model's chat template.
+    /// Per-request override of the server's --reasoning-effort default (which is 'no_think').
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    /// OpenAI streaming options. Only meaningful with stream=true; serde used to drop it silently,
+    /// so a client asking for include_usage got nothing and no [DONE] sentinel either.
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Deserialize)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
 }
 
 fn default_temperature() -> f32 { 0.7 }
@@ -173,6 +190,8 @@ struct ChatCompletionResponse {
     model: String,
     choices: Vec<ChatChoice>,
     usage: Usage,
+    /// Extension (llama.cpp naming). Strict clients ignore unknown top-level fields.
+    timings: Timings,
 }
 
 #[derive(Serialize)]
@@ -200,6 +219,47 @@ struct Usage {
     total_tokens: usize,
 }
 
+/// llama.cpp-compatible timing block, emitted as a top-level extension next to `usage`.
+/// `prompt_*` spans request-submit -> first token (i.e. TTFT including queueing); `predicted_*`
+/// spans first-token -> end. This is what lets a client show TTFT and tok/s without timing the
+/// stream itself. All inputs are already on the CPU in the handler — no GPU sync, no extra reads.
+#[derive(Serialize)]
+struct Timings {
+    prompt_ms: f64,
+    predicted_ms: f64,
+    prompt_per_second: f64,
+    predicted_per_second: f64,
+}
+
+fn make_timings(
+    t0: std::time::Instant,
+    first_tok: Option<std::time::Instant>,
+    prompt_len: usize,
+    n: usize,
+) -> Timings {
+    let end = std::time::Instant::now();
+    let (prompt_ms, predicted_ms) = match first_tok {
+        Some(ft) => (
+            ft.duration_since(t0).as_secs_f64() * 1e3,
+            end.duration_since(ft).as_secs_f64() * 1e3,
+        ),
+        // No token ever arrived (rejected prompt, immediate stop): everything was "prompt".
+        None => (end.duration_since(t0).as_secs_f64() * 1e3, 0.0),
+    };
+    Timings {
+        prompt_ms,
+        predicted_ms,
+        prompt_per_second: if prompt_ms > 0.0 { prompt_len as f64 * 1e3 / prompt_ms } else { 0.0 },
+        predicted_per_second: if predicted_ms > 0.0 { n as f64 * 1e3 / predicted_ms } else { 0.0 },
+    }
+}
+
+/// The scheduler's internal backstop reason (batch.rs) is not an OpenAI value — the spec is
+/// stop|length|tool_calls|content_filter. Map it to what it means: generation ran out of room.
+fn spec_finish_reason(reason: &str) -> &str {
+    if reason == "context_length_exceeded" { "length" } else { reason }
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
@@ -216,7 +276,22 @@ async fn chat_completions(
             .filter_map(|x| x.pointer("/function/name").and_then(|v| v.as_str())).collect();
         eprintln!("[req] tools   {} offered: {:?} tool_choice={:?}", t.len(), names, req.tool_choice);
     }
-    let prompt = match state.tokenizer.apply_chat_template(&req.messages, req.tools.as_deref()) {
+    // hy_v3's template accepts only no_think|low|high and RAISES on anything else, but clients
+    // send the OpenAI convention (minimal|low|medium|high) — normalize instead of forwarding
+    // blindly: medium maps onto Hy3's nearest level (high), minimal/off/none onto no_think,
+    // anything unknown falls back to no_think (a silent 500 is never the right answer).
+    let effort = req.reasoning_effort.as_deref().map(|e| {
+        let n = match e {
+            "high" | "medium" => "high",
+            "low" => "low",
+            _ => "no_think",
+        };
+        if n != e && !matches!(e, "minimal" | "no_think" | "none" | "off" | "") {
+            eprintln!("[req] reasoning_effort '{e}' normalized to '{n}' (hy_v3 accepts no_think|low|high)");
+        }
+        n
+    }).unwrap_or(state.reasoning_effort.as_str());
+    let prompt = match state.tokenizer.apply_chat_template(&req.messages, req.tools.as_deref(), Some(effort)) {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -244,7 +319,7 @@ async fn chat_completions(
     // generation prompt. Everything up to here is what the NEXT turn replays verbatim. Rendering the
     // template a second time costs microseconds and saves a whole re-prefill per turn.
     let ckpt_at = state.tokenizer
-        .apply_chat_template_no_gen(&req.messages, req.tools.as_deref()).ok()
+        .apply_chat_template_no_gen(&req.messages, req.tools.as_deref(), Some(effort)).ok()
         .and_then(|s| state.tokenizer.encode(&s, true).ok())
         .map(|t| t.len())
         .filter(|&n| n > 0 && n < prompt_len);
@@ -325,10 +400,13 @@ async fn chat_completions(
         let created = chrono::Utc::now().timestamp();
         let t0 = std::time::Instant::now();
         let req_tools = req.tools.clone();
+        let include_usage = req.stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false);
         // Think markers + the initial reasoning/content state, from the model's vocab: qwen is
         // primed into a think block (starts in reasoning); hy_v3's no_think prompt closes the empty
-        // block itself (starts as content).
-        let (think_open, think_close, starts_in_reasoning) = tokenizer.think_tags();
+        // block itself (starts as content) — but with reasoning_effort low|high the hy3 template
+        // primes `…assistant<think:opensource>` too, so the stream also starts INSIDE the block.
+        let (think_open, think_close, family_primed) = tokenizer.think_tags();
+        let starts_in_reasoning = family_primed || matches!(effort, "low" | "high");
 
         let stream = async_stream::stream! {
             yield Ok::<Event, axum::Error>(Event::default().data(
@@ -338,6 +416,7 @@ async fn chat_completions(
             let mut n = 0usize;
             let mut stop_hit = false;
             let mut finish = "length".to_string();
+            let mut first_tok: Option<std::time::Instant> = None;
             // Thinking-model split: qwen's prompt is primed with `<think>\n`, so the generated stream
             // is `…reasoning…</think>\n\nanswer`. Pre-close text -> reasoning_content, post-close
             // -> content. hy_v3's no_think prompt already closed the (empty) block, so it starts as
@@ -350,12 +429,15 @@ async fn chat_completions(
                 match ev {
                     TokEvent::Tok(t) => {
                         n += 1;
+                        if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                         if let Ok(text) = tokenizer.decode(&[t], true) {
                             if !text.is_empty() {
                                 acc.push_str(&text);
                                 match content_start {
                                     None => {
-                                        if let Some(idx) = acc.find(think_close) {
+                                        // Search the close tag from reason_emitted, not from 0:
+                                        // a second think block must not match the first one's close.
+                                        if let Some(idx) = acc[reason_emitted..].find(think_close).map(|i| reason_emitted + i) {
                                             if idx > reason_emitted {
                                                 yield Ok(Event::default().data(reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..idx])));
                                             }
@@ -377,17 +459,33 @@ async fn chat_completions(
                                         }
                                     }
                                     Some(cs) => {
+                                        // If the model OPENS a think block (hy_v3 with
+                                        // reasoning_effort low|high), hand off to the reasoning
+                                        // branch: emit the content before the marker, then split
+                                        // reasoning until the close tag. Without this the raw
+                                        // think tags would leak into `content`.
+                                        let region = &acc[cs..];
+                                        if let Some(tp) = region.find(think_open) {
+                                            let upto = cs + tp;
+                                            if upto > content_emitted {
+                                                yield Ok(Event::default().data(content_chunk(&completion_id, created, &model_name, &acc[content_emitted..upto])));
+                                            }
+                                            content_start = None;
+                                            reason_emitted = upto + think_open.len();
+                                        } else {
                                         // Hold back anything that is, or could become, a tool call.
                                         // Forwarding `<tool_call>` as content makes the harness render
-                                        // XML in the chat and never invoke the tool.
-                                        let region = &acc[cs..];
+                                        // XML in the chat and never invoke the tool. Same hold-back
+                                        // for a think-open prefix spanning decode chunks.
                                         let safe_end = match region.find(TOOL_OPEN) {
                                             Some(i) => cs + i,          // a call has started: emit nothing more
-                                            None => acc.len() - partial_overlap(region, TOOL_OPEN),
+                                            None => acc.len() - partial_overlap(region, TOOL_OPEN)
+                                                .max(partial_overlap(region, think_open)),
                                         };
                                         if safe_end > content_emitted {
                                             yield Ok(Event::default().data(content_chunk(&completion_id, created, &model_name, &acc[content_emitted..safe_end])));
                                             content_emitted = safe_end;
+                                        }
                                         }
                                     }
                                 }
@@ -427,8 +525,23 @@ async fn chat_completions(
                 finish = "tool_calls".to_string();
             }
             let final_chunk = format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"}}]}}",
-                completion_id, created, model_name, finish);
+                completion_id, created, model_name, spec_finish_reason(&finish));
             yield Ok(Event::default().data(final_chunk));
+            if include_usage {
+                // Spec stream-usage chunk: empty choices, top-level usage. `timings` rides along
+                // as the extension field (strict clients ignore it).
+                let usage_chunk = serde_json::json!({
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name, "choices": [],
+                    "usage": {"prompt_tokens": prompt_len, "completion_tokens": n,
+                              "total_tokens": prompt_len + n},
+                    "timings": make_timings(t0, first_tok, prompt_len, n),
+                });
+                yield Ok(Event::default().data(usage_chunk.to_string()));
+            }
+            // The OpenAI SSE terminator. Without it a strict client sits on an open stream
+            // waiting for more events after the finish chunk.
+            yield Ok(Event::default().data("[DONE]"));
             let dt = t0.elapsed().as_secs_f32();
             eprintln!("[req] done   tok={} ({:.1} tok/s wall) finish={} stop_hit={}", n, if dt>1e-6 {n as f32/dt} else {0.0}, finish, stop_hit);
         };
@@ -438,10 +551,12 @@ async fn chat_completions(
         let t0 = std::time::Instant::now();
         let mut tokens = Vec::new();
         let mut finish = "length".to_string();
+        let mut first_tok: Option<std::time::Instant> = None;
         while let Some(ev) = rx.recv().await {
             match ev {
                 TokEvent::Tok(t) => {
                     tokens.push(t);
+                    if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                     // Apply stop strings LIVE, not just post-hoc: on a hit, break AND let rx drop —
                     // the scheduler sees the closed channel and cancels the lane instead of decoding
                     // to EOS/max_new. Only the tail is searched (a stop string spans a few tokens;
@@ -507,13 +622,14 @@ async fn chat_completions(
                     role: "assistant".to_string(), content,
                     reasoning_content: reasoning, tool_calls,
                 },
-                finish_reason: finish,
+                finish_reason: spec_finish_reason(&finish).to_string(),
             }],
             usage: Usage {
                 prompt_tokens: prompt_len,
                 completion_tokens: tokens.len(),
                 total_tokens: prompt_len + tokens.len(),
             },
+            timings: make_timings(t0, first_tok, prompt_len, tokens.len()),
         };
         Json(response).into_response()
     }

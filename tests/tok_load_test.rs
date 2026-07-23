@@ -25,18 +25,23 @@ fn hy3_chat_template_renders_with_tools() {
                       tool_calls: None, tool_call_id: None, name: None, reasoning_content: None },
         ChatMessage::user("What is 2+2?"),
     ];
-    let plain = tok.apply_chat_template(&msgs, None).expect("template without tools");
+    let plain = tok.apply_chat_template(&msgs, None, None).expect("template without tools");
     assert!(!plain.contains("{}"), "Python .format must interpolate (no literal braces): {plain}");
     assert!(plain.contains("<｜hy_begin_of_sentence:opensource｜>"),
             "the :opensource suffix must be formatted in: {plain}");
     println!("--- plain ---\n{plain}");
+
+    // hy_v3 optional reasoning: effort must reach the template ('no_think' default vs 'high').
+    let thinking = tok.apply_chat_template(&msgs, None, Some("high")).expect("template with effort");
+    assert!(thinking.contains("reasoning_effort:high"),
+            "reasoning_effort=high must render into the prompt: {thinking}");
 
     let tools = vec![serde_json::json!({
         "type": "function",
         "function": {"name": "calc", "description": "calculator",
                      "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}}}
     })];
-    let with_tools = tok.apply_chat_template(&msgs, Some(&tools))
+    let with_tools = tok.apply_chat_template(&msgs, Some(&tools), None)
         .expect("template WITH tools (tojson/raise_exception path)");
     assert!(with_tools.contains("calc"), "tool block must render the tool name");
     println!("--- with tools (first 500 chars) ---\n{}", &with_tools[..with_tools.len().min(500)]);

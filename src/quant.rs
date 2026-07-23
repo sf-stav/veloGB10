@@ -487,23 +487,29 @@ pub fn repack_nvfp4_mma(qw: &[u8], sc: &[u8], m: usize, k: usize) -> (Vec<u8>, V
     let (ntm, nblk) = (m / MMA_M, k / MMA_K);
     let mut wt = vec![0u8; ntm * nblk * MMA_TILE_FP4];
     let mut st = vec![0u8; ntm * nblk * MMA_M];
-    for mt in 0..ntm {
-        for kb in 0..nblk {
-            let base = (mt * nblk + kb) * MMA_TILE_FP4;
-            for r in 0..MMA_M {
-                let row = mt * MMA_M + r;
-                st[(mt * nblk + kb) * MMA_M + r] = sc[row * nblk + kb];
-                // Copy a byte at a time: source and destination pack the same (even,odd) column pair
-                // into the same nibble positions, so whole bytes move without re-nibbling.
-                for cp in 0..(MMA_K / 2) {
-                    let c = cp * 2;
-                    let (off, _) = fp4_tile_slot(r, c);
-                    wt[base + off] = qw[row * (k / 2) + (kb * MMA_K + c) / 2];
-                }
-            }
+    repack_driver(ntm * nblk, |t, wtc, stc| {
+        let (mt, kb) = (t / nblk, t % nblk);
+        repack_fp4_tile(qw, sc, k, nblk, mt, kb, wtc, stc);
+    }, &mut wt, &mut st);
+    (wt, st)
+}
+
+/// One (mt, kb) tile of the NVFP4 repack: 128 B of packed weights + 16 B of scales. Factored out so
+/// the sequential and threaded drivers emit the same bytes through the SAME code path.
+#[inline]
+fn repack_fp4_tile(qw: &[u8], sc: &[u8], k: usize, nblk: usize, mt: usize, kb: usize,
+                   wt_tile: &mut [u8], st_tile: &mut [u8]) {
+    for r in 0..MMA_M {
+        let row = mt * MMA_M + r;
+        st_tile[r] = sc[row * nblk + kb];
+        // Copy a byte at a time: source and destination pack the same (even,odd) column pair
+        // into the same nibble positions, so whole bytes move without re-nibbling.
+        for cp in 0..(MMA_K / 2) {
+            let c = cp * 2;
+            let (off, _) = fp4_tile_slot(r, c);
+            wt_tile[off] = qw[row * (k / 2) + (kb * MMA_K + c) / 2];
         }
     }
-    (wt, st)
 }
 
 /// Permute a row-major FP8 tensor [M, K] into MMA tile order. Row scales are unchanged: FP8 scales
@@ -512,18 +518,80 @@ pub fn repack_fp8_mma(qw: &[u8], m: usize, k: usize) -> Vec<u8> {
     assert!(m % MMA_M == 0 && k % MMA_K == 0, "MMA repack needs M,K % 16 == 0 (got {}x{})", m, k);
     let (ntm, nblk) = (m / MMA_M, k / MMA_K);
     let mut wt = vec![0u8; ntm * nblk * MMA_TILE_FP8];
-    for mt in 0..ntm {
-        for kb in 0..nblk {
-            let base = (mt * nblk + kb) * MMA_TILE_FP8;
-            for r in 0..MMA_M {
-                let row = mt * MMA_M + r;
-                for c in 0..MMA_K {
-                    wt[base + fp8_tile_slot(r, c)] = qw[row * k + kb * MMA_K + c];
-                }
-            }
+    repack_driver(ntm * nblk, |t, wtc, _| {
+        let (mt, kb) = (t / nblk, t % nblk);
+        repack_fp8_tile(qw, k, mt, kb, wtc);
+    }, &mut wt, &mut []);
+    wt
+}
+
+/// One (mt, kb) tile of the FP8 repack: 256 B of weights (no per-tile scales — see above).
+#[inline]
+fn repack_fp8_tile(qw: &[u8], k: usize, mt: usize, kb: usize, wt_tile: &mut [u8]) {
+    for r in 0..MMA_M {
+        let row = mt * MMA_M + r;
+        for c in 0..MMA_K {
+            wt_tile[fp8_tile_slot(r, c)] = qw[row * k + kb * MMA_K + c];
         }
     }
-    wt
+}
+
+/// Don't spawn a thread for less work than this: a thread costs tens of µs, 4096 tiles (~0.5 MB)
+/// costs ~2-3 ms single-core — below that the spawn overhead is the optimization.
+const REPACK_MIN_TILES_PER_THREAD: usize = 4096;
+
+thread_local! {
+    static REPACK_THREADING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Kill switch for the per-call threading, per thread. The load pipeline's WORKERS set this off:
+/// the worker pool IS the parallelism there — 8 workers each spawning 16 inner threads is a
+/// 6x-oversubscribed thrash on 20 cores (measured: pipeline crawls). The shard-loop inline repack
+/// and any serial caller keep the default (threaded, GPU idle during load).
+pub fn set_repack_threading(on: bool) { REPACK_THREADING.with(|c| c.set(on)); }
+
+/// Drive a per-tile repack body over `total_tiles` tiles. Small inputs run sequentially on the
+/// caller; big inputs partition the tiles into disjoint contiguous ranges across `std::thread::scope`
+/// workers. Every output byte is a pure function of the input bytes and the tile index, so the
+/// threaded result is BYTE-IDENTICAL to the sequential one — that is the load-correctness contract.
+fn repack_driver<F: Fn(usize, &mut [u8], &mut [u8]) + Sync>(
+    total_tiles: usize, body: F, wt: &mut [u8], st: &mut [u8],
+) {
+    let wt_tile = wt.len() / total_tiles.max(1);
+    let st_tile = st.len() / total_tiles.max(1);
+    let max_t = if REPACK_THREADING.with(|c| c.get()) {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16)
+    } else { 1 };
+    let nthreads = max_t.min(total_tiles.div_ceil(REPACK_MIN_TILES_PER_THREAD)).max(1);
+    if nthreads <= 1 {
+        for t in 0..total_tiles {
+            body(t, &mut wt[t * wt_tile..(t + 1) * wt_tile],
+                 if st_tile > 0 { &mut st[t * st_tile..(t + 1) * st_tile] } else { &mut [] });
+        }
+        return;
+    }
+    let per = total_tiles.div_ceil(nthreads);
+    std::thread::scope(|s| {
+        let mut wt_rest: &mut [u8] = wt;
+        let mut st_rest: &mut [u8] = st;
+        let mut begin = 0usize;
+        while begin < total_tiles {
+            let n = per.min(total_tiles - begin);
+            let (wtc, wtl) = wt_rest.split_at_mut(n * wt_tile);
+            let (stc, stl) = st_rest.split_at_mut(n * st_tile);
+            wt_rest = wtl;
+            st_rest = stl;
+            let body = &body;
+            s.spawn(move || {
+                for t in begin..begin + n {
+                    let i = t - begin;
+                    body(t, &mut wtc[i * wt_tile..(i + 1) * wt_tile],
+                         if st_tile > 0 { &mut stc[i * st_tile..(i + 1) * st_tile] } else { &mut [] });
+                }
+            });
+            begin += n;
+        }
+    });
 }
 
 // ================================ Weight FUSION ================================

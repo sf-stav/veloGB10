@@ -1824,24 +1824,57 @@ __device__ __forceinline__ void gqa_splitk_q4_gq_impl(
     const long long kvbase = ((long long)slot * nkv + kvh) * (long long)stride * rb;
     const unsigned char* kb = k_cache + kvbase + lane_blk * 12;
     const unsigned char* vb = v_cache + kvbase + lane_blk * 12;
-    for (int r = start + warp; r < end; r += NW) {
+    // E1b 2-row software pipeline: at long context this loop is LATENCY-bound (each row's K-then-V
+    // dependent loads ~1.9K cycles back-to-back, only 4 warps/SM to hide them). Process rows in
+    // pairs with ALL loads issued up front — one memory round-trip per pair instead of two —
+    // then apply the two online-softmax updates sequentially in the same ascending order as
+    // before. Every per-head FP expression keeps its exact form and order (dot, tree, scale,
+    // m/a, acc), so the result is BIT-IDENTICAL to the unpipelined loop (and to gqa_attn_splitk_q4).
+    for (int r = start + warp; r < end; r += 2 * NW) {
+        const int r2 = r + NW;
+        const bool has2 = r2 < end;
         const int dd = r - pos_start;
-        const int t = (!path || dd < 0) ? r : pos_start + (int)path[b * MAX_VERIFY + dd];
-        const unsigned char* krow = kb + (long long)t * rb;
-        const float ksc = e4m3_f(krow[8]);
-        const unsigned short* kcodes = (const unsigned short*)(krow + lane_off / 2);
-        float kdq[DPL_T];
+        const int t  = (!path || dd < 0) ? r  : pos_start + (int)path[b * MAX_VERIFY + dd];
+        const int t2 = has2 ? ((!path || (r2 - pos_start) < 0) ? r2 : pos_start + (int)path[b * MAX_VERIFY + (r2 - pos_start)]) : 0;
+        // up-front loads for BOTH rows (independent — latency paid once)
+        const unsigned char* krow  = kb + (long long)t * rb;
+        const unsigned char* krow2 = kb + (long long)t2 * rb;
+        const unsigned char* vrow  = vb + (long long)t * rb;
+        const unsigned char* vrow2 = vb + (long long)t2 * rb;
+        const float ksc  = e4m3_f(krow[8]);
+        const float ksc2 = has2 ? e4m3_f(krow2[8]) : 0.0f;
+        const float vsc  = e4m3_f(vrow[8]);
+        const float vsc2 = has2 ? e4m3_f(vrow2[8]) : 0.0f;
+        const unsigned short* kcodes  = (const unsigned short*)(krow  + lane_off / 2);
+        const unsigned short* kcodes2 = (const unsigned short*)(krow2 + lane_off / 2);
+        const unsigned short* vcodes  = (const unsigned short*)(vrow  + lane_off / 2);
+        const unsigned short* vcodes2 = (const unsigned short*)(vrow2 + lane_off / 2);
+        float kdq[DPL_T], kdq2[DPL_T], vdq[DPL_T], vdq2[DPL_T];
         #pragma unroll
         for (int u = 0; u < DPL_T / 4; u++) {
-            const int pk = (int)kcodes[u];   // SIGNED: `(pk & 0xF) - 7` in unsigned wraps nibble<7 to ~4.3e9
-            kdq[u * 4 + 0] = (float)((pk & 0xF) - 7) * ksc;
-            kdq[u * 4 + 1] = (float)(((pk >> 4) & 0xF) - 7) * ksc;
-            kdq[u * 4 + 2] = (float)(((pk >> 8) & 0xF) - 7) * ksc;
-            kdq[u * 4 + 3] = (float)(((pk >> 12) & 0xF) - 7) * ksc;
+            const int pk  = (int)kcodes[u];    // SIGNED: unsigned nibble math wraps nibble<7 to ~4.3e9
+            const int pk2 = has2 ? (int)kcodes2[u] : 0;
+            const int pv  = (int)vcodes[u];
+            const int pv2 = has2 ? (int)vcodes2[u] : 0;
+            kdq[u * 4 + 0]  = (float)((pk & 0xF) - 7) * ksc;
+            kdq[u * 4 + 1]  = (float)(((pk >> 4) & 0xF) - 7) * ksc;
+            kdq[u * 4 + 2]  = (float)(((pk >> 8) & 0xF) - 7) * ksc;
+            kdq[u * 4 + 3]  = (float)(((pk >> 12) & 0xF) - 7) * ksc;
+            kdq2[u * 4 + 0] = (float)((pk2 & 0xF) - 7) * ksc2;
+            kdq2[u * 4 + 1] = (float)(((pk2 >> 4) & 0xF) - 7) * ksc2;
+            kdq2[u * 4 + 2] = (float)(((pk2 >> 8) & 0xF) - 7) * ksc2;
+            kdq2[u * 4 + 3] = (float)(((pk2 >> 12) & 0xF) - 7) * ksc2;
+            vdq[u * 4 + 0]  = (float)((pv & 0xF) - 7) * vsc;
+            vdq[u * 4 + 1]  = (float)(((pv >> 4) & 0xF) - 7) * vsc;
+            vdq[u * 4 + 2]  = (float)(((pv >> 8) & 0xF) - 7) * vsc;
+            vdq[u * 4 + 3]  = (float)(((pv >> 12) & 0xF) - 7) * vsc;
+            vdq2[u * 4 + 0] = (float)((pv2 & 0xF) - 7) * vsc2;
+            vdq2[u * 4 + 1] = (float)(((pv2 >> 4) & 0xF) - 7) * vsc2;
+            vdq2[u * 4 + 2] = (float)(((pv2 >> 8) & 0xF) - 7) * vsc2;
+            vdq2[u * 4 + 3] = (float)(((pv2 >> 12) & 0xF) - 7) * vsc2;
         }
-        // one K row, all heads' dots — the per-head sequence (sum, halving tree, scale) is the
-        // per-head kernel's exact one.
-        float s[SK_GQA_MAX];
+        // dots for both rows (independent of the running softmax state)
+        float s[SK_GQA_MAX], s2[SK_GQA_MAX];
         #pragma unroll
         for (int g = 0; g < SK_GQA_MAX; g++) {
             s[g] = 0.0f;
@@ -1851,18 +1884,16 @@ __device__ __forceinline__ void gqa_splitk_q4_gq_impl(
             for (int off = 16; off > 0; off >>= 1) s[g] += __shfl_xor_sync(0xffffffffu, s[g], off);
             s[g] *= scale;
         }
-        const unsigned char* vrow = vb + (long long)t * rb;
-        const float vsc = e4m3_f(vrow[8]);
-        const unsigned short* vcodes = (const unsigned short*)(vrow + lane_off / 2);
-        float vdq[DPL_T];
         #pragma unroll
-        for (int u = 0; u < DPL_T / 4; u++) {
-            const int pk = (int)vcodes[u];   // SIGNED: `(pk & 0xF) - 7` in unsigned wraps nibble<7 to ~4.3e9
-            vdq[u * 4 + 0] = (float)((pk & 0xF) - 7) * vsc;
-            vdq[u * 4 + 1] = (float)(((pk >> 4) & 0xF) - 7) * vsc;
-            vdq[u * 4 + 2] = (float)(((pk >> 8) & 0xF) - 7) * vsc;
-            vdq[u * 4 + 3] = (float)(((pk >> 12) & 0xF) - 7) * vsc;
+        for (int g = 0; g < SK_GQA_MAX; g++) {
+            s2[g] = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < DPL_T; i++) s2[g] += qv[g][i] * kdq2[i];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) s2[g] += __shfl_xor_sync(0xffffffffu, s2[g], off);
+            s2[g] *= scale;
         }
+        // then the two state updates, ascending — identical sequence to the unpipelined loop.
         #pragma unroll
         for (int g = 0; g < SK_GQA_MAX; g++) {
             if (g >= gqa_ratio) break;
@@ -1872,6 +1903,18 @@ __device__ __forceinline__ void gqa_splitk_q4_gq_impl(
             for (int i = 0; i < DPL_T; i++) acc[g][i] = acc[g][i] * a_old + a_cur * vdq[i];
             m[g] = m_new;
             l[g] = l[g] * a_old + a_cur;
+        }
+        if (has2) {
+            #pragma unroll
+            for (int g = 0; g < SK_GQA_MAX; g++) {
+                if (g >= gqa_ratio) break;
+                const float m_new = fmaxf(m[g], s2[g]);
+                const float a_old = __expf(m[g] - m_new), a_cur = __expf(s2[g] - m_new);
+                #pragma unroll
+                for (int i = 0; i < DPL_T; i++) acc[g][i] = acc[g][i] * a_old + a_cur * vdq2[i];
+                m[g] = m_new;
+                l[g] = l[g] * a_old + a_cur;
+            }
         }
     }
 
@@ -1915,6 +1958,189 @@ extern "C" __global__ void gqa_attn_splitk_q4_gq(
     if (hd == 128) {
         gqa_splitk_q4_gq_impl<4>(out_m, out_l, out_acc, q, k_cache, v_cache,
                                  pos, bs_packed, nh_packed, slot_ids, path, col_pos_start);
+    } else if (hd == 256) {
+        gqa_splitk_q4_gq_impl<8>(out_m, out_l, out_acc, q, k_cache, v_cache,
+                                 pos, bs_packed, nh_packed, slot_ids, path, col_pos_start);
+    }
+    // other hd: never launched — attn_dispatch falls back to the per-head kernel.
+}
+
+// ===================================================================================================
+// gqa_attn_splitk_gq — GQA-PACKED twin of the bf16 gqa_attn_splitk (the E1 fix generalized, E1c).
+// The per-head bf16 kernel has the same re-read pathology as the q4 one: one block per QUERY head
+// reads its GQA group's KV chunk gqa_ratio times (4× at qwen's 16Q/4KV, 8× at 122B's 16Q/2KV —
+// at 32K+ ctx that is the whole "32K anomaly" again, in bf16). One block per (kv head, split)
+// reads the chunk ONCE for the whole group. Per-head bit-identical by the same construction as
+// the q4 packed kernel (same splits, same lane slices, same shfl trees, same merge), including
+// the 2-row latency pipeline. hd ∈ {128, 256}, gqa_ratio ≤ SK_GQA_MAX.
+template<int DPL_T>
+__device__ __forceinline__ void gqa_splitk_gq_impl(
+    float* out_m, float* out_l, float* out_acc,
+    const __nv_bfloat16* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+    const int* pos, int bs_packed, int nh_packed, const int* slot_ids,
+    const unsigned char* path, const int* col_pos_start) {
+    const int nh  = nh_packed >> 20;
+    const int hd  = (nh_packed >> 10) & 0x3FF;   // == DPL_T*32 by launch contract
+    const int nkv = nh_packed & 0x3FF;
+    const float scale = 1.0f / sqrtf((float)hd);
+    const int gqa_ratio = nh / nkv;
+    const int stride  = bs_packed & 0x7FFFF;
+    const int ns_grid = (bs_packed >> 19) & 0x3F;
+    const int B       = (bs_packed >> 25) & 0x3F;
+
+    const int blk = blockIdx.x;
+    const int b = blk / (nkv * ns_grid);
+    if (b >= B) return;
+    const int rem = blk % (nkv * ns_grid);
+    const int kvh = rem / ns_grid;
+    const int split = rem % ns_grid;
+    const int pc = pos[b] + 1;
+    const int pos_start = col_pos_start ? col_pos_start[b] : pos[0];
+    const int slot = slot_ids[b];
+
+    const int ns = sk_nsplits(pc);
+    if (split >= ns) return;
+    const int split_size = (pc + ns - 1) / ns;
+    const int start = split * split_size;
+    const int end = min(start + split_size, pc);
+
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int NW = blockDim.x >> 5;
+
+    if (start >= pc) {                          // empty split: zero partials for the whole group
+        #pragma unroll
+        for (int g = 0; g < SK_GQA_MAX; g++) {
+            if (g >= gqa_ratio) break;
+            const long long idx = ((long long)b * nh + (kvh * gqa_ratio + g)) * ns_grid + split;
+            if (threadIdx.x == 0) { out_m[idx] = -1e30f; out_l[idx] = 0.0f; }
+            if (threadIdx.x < hd) out_acc[idx * hd + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
+
+    float qv[SK_GQA_MAX][DPL_T];
+    #pragma unroll
+    for (int g = 0; g < SK_GQA_MAX; g++) {
+        const int gs = min(g, gqa_ratio - 1);
+        const __nv_bfloat16* qrow = q + (long long)b * (nh * hd) + (long long)(kvh * gqa_ratio + gs) * hd + lane * DPL_T;
+        #pragma unroll
+        for (int i = 0; i < DPL_T; i++) qv[g][i] = (g < gqa_ratio) ? b2f(qrow[i]) : 0.0f;
+    }
+
+    float m[SK_GQA_MAX], l[SK_GQA_MAX];
+    float acc[SK_GQA_MAX][DPL_T];
+    #pragma unroll
+    for (int g = 0; g < SK_GQA_MAX; g++) {
+        m[g] = -1e30f; l[g] = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < DPL_T; i++) acc[g][i] = 0.0f;
+    }
+
+    const long long kvbase = ((long long)slot * nkv + kvh) * (long long)stride;
+    const __nv_bfloat16* kb = k_cache + kvbase * hd + lane * DPL_T;
+    const __nv_bfloat16* vb = v_cache + kvbase * hd + lane * DPL_T;
+    for (int r = start + warp; r < end; r += 2 * NW) {
+        const int r2 = r + NW;
+        const bool has2 = r2 < end;
+        const int dd = r - pos_start;
+        const int t  = (!path || dd < 0) ? r  : pos_start + (int)path[b * MAX_VERIFY + dd];
+        const int t2 = has2 ? ((!path || (r2 - pos_start) < 0) ? r2 : pos_start + (int)path[b * MAX_VERIFY + (r2 - pos_start)]) : 0;
+        const __nv_bfloat16* krow  = kb + (long long)t * hd;
+        const __nv_bfloat16* krow2 = kb + (long long)t2 * hd;
+        const __nv_bfloat16* vrow  = vb + (long long)t * hd;
+        const __nv_bfloat16* vrow2 = vb + (long long)t2 * hd;
+        float kdq[DPL_T], kdq2[DPL_T], vdq[DPL_T], vdq2[DPL_T];
+        #pragma unroll
+        for (int i = 0; i < DPL_T; i++) {
+            kdq[i]  = b2f(krow[i]);
+            kdq2[i] = has2 ? b2f(krow2[i]) : 0.0f;
+            vdq[i]  = b2f(vrow[i]);
+            vdq2[i] = has2 ? b2f(vrow2[i]) : 0.0f;
+        }
+        float s[SK_GQA_MAX], s2[SK_GQA_MAX];
+        #pragma unroll
+        for (int g = 0; g < SK_GQA_MAX; g++) {
+            s[g] = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < DPL_T; i++) s[g] += qv[g][i] * kdq[i];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) s[g] += __shfl_xor_sync(0xffffffffu, s[g], off);
+            s[g] *= scale;
+        }
+        #pragma unroll
+        for (int g = 0; g < SK_GQA_MAX; g++) {
+            s2[g] = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < DPL_T; i++) s2[g] += qv[g][i] * kdq2[i];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) s2[g] += __shfl_xor_sync(0xffffffffu, s2[g], off);
+            s2[g] *= scale;
+        }
+        #pragma unroll
+        for (int g = 0; g < SK_GQA_MAX; g++) {
+            if (g >= gqa_ratio) break;
+            const float m_new = fmaxf(m[g], s[g]);
+            const float a_old = __expf(m[g] - m_new), a_cur = __expf(s[g] - m_new);
+            #pragma unroll
+            for (int i = 0; i < DPL_T; i++) acc[g][i] = acc[g][i] * a_old + a_cur * vdq[i];
+            m[g] = m_new;
+            l[g] = l[g] * a_old + a_cur;
+        }
+        if (has2) {
+            #pragma unroll
+            for (int g = 0; g < SK_GQA_MAX; g++) {
+                if (g >= gqa_ratio) break;
+                const float m_new = fmaxf(m[g], s2[g]);
+                const float a_old = __expf(m[g] - m_new), a_cur = __expf(s2[g] - m_new);
+                #pragma unroll
+                for (int i = 0; i < DPL_T; i++) acc[g][i] = acc[g][i] * a_old + a_cur * vdq2[i];
+                m[g] = m_new;
+                l[g] = l[g] * a_old + a_cur;
+            }
+        }
+    }
+
+    extern __shared__ float sh[];
+    float* sacc = sh;                     // NW * hd
+    float* sm   = sh + NW * hd;           // NW
+    float* sl   = sm + NW;                // NW
+    #pragma unroll
+    for (int g = 0; g < SK_GQA_MAX; g++) {
+        if (g >= gqa_ratio) break;
+        #pragma unroll
+        for (int i = 0; i < DPL_T; i++) sacc[warp * hd + lane * DPL_T + i] = acc[g][i];
+        if (lane == 0) { sm[warp] = m[g]; sl[warp] = l[g]; }
+        __syncthreads();
+        const long long idx = ((long long)b * nh + (kvh * gqa_ratio + g)) * ns_grid + split;
+        if (threadIdx.x < hd) {
+            const int d = threadIdx.x;
+            float mg = -1e30f;
+            for (int w = 0; w < NW; w++) mg = fmaxf(mg, sm[w]);
+            float num = 0.0f, den = 0.0f;
+            for (int w = 0; w < NW; w++) {
+                const float a = __expf(sm[w] - mg);
+                num += sacc[w * hd + d] * a;
+                den += sl[w] * a;
+            }
+            out_acc[idx * hd + d] = num;
+            if (d == 0) { out_m[idx] = mg; out_l[idx] = den; }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void gqa_attn_splitk_gq(
+    float* out_m, float* out_l, float* out_acc,
+    const __nv_bfloat16* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+    const int* pos, int bs_packed, int nh_packed, const int* slot_ids,
+    const unsigned char* path, const int* col_pos_start) {
+    const int hd = (nh_packed >> 10) & 0x3FF;
+    if (hd == 128) {
+        gqa_splitk_gq_impl<4>(out_m, out_l, out_acc, q, k_cache, v_cache,
+                              pos, bs_packed, nh_packed, slot_ids, path, col_pos_start);
+    } else if (hd == 256) {
+        gqa_splitk_gq_impl<8>(out_m, out_l, out_acc, q, k_cache, v_cache,
+                              pos, bs_packed, nh_packed, slot_ids, path, col_pos_start);
     }
     // other hd: never launched — attn_dispatch falls back to the per-head kernel.
 }

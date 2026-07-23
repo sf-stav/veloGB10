@@ -193,6 +193,8 @@ fn print_help() {
     println!("════════════════════════════════════════════════════════════════════════════════");
     println!();
     println!("  --kv-cache bf16|q4       KV cache format (q4 = 4-bit;  GB10_KV_QUANT)");
+    println!("  --reasoning-effort <e>   hy_v3 reasoning in the chat template: no_think|low|high");
+    println!("                           (default no_think; request field `reasoning_effort` overrides)");
     println!("  --no-decode-graphs       Disable decode CUDA graphs    (GB10_NO_DECODE_GRAPHS)");
     println!("  --no-gqpack              Per-head q4 attention fallback  (GB10_NO_GQPACK)");
     println!("  --fuse-residual          Fused residual+norm epilogue    (GB10_FUSE_RESIDUAL)");
@@ -2433,6 +2435,93 @@ fn run_server(args: &[String]) {
     rt.block_on(async {
         // Use streaming loader for all models (reads bf16 directly, no f32 intermediate)
         let is_dir = std::path::Path::new(&model_path).is_dir();
+
+        // TP=2 PARALLEL LOAD (head serve path). Everything the head session needs is derivable
+        // from config.json + the tokenizer (KBs, no weights): the --max-seq-len clamp needs
+        // max_position_embeddings, tpc.eos/calib_prompt need the tokenizer. So: pre-read, build
+        // + install the TpConfig, run the session (manifest + blob transfer + Config ship —
+        // pure TCP/UDP/fs) on a thread, and — critically — bring up the RDMA link BEFORE the
+        // heavy load. The node handshakes its QP immediately after the sync, ahead of ITS load
+        // (net_shim retries the connect for ~20 s), so a post-load bring-up either serializes
+        // both loads (the old order: node idles through the whole head load) or kills the node
+        // outright (head load > 20 s retry window → connection refused, verified). With the
+        // handshake up front BOTH ranks load CONCURRENTLY; the first all-reduce (calibration)
+        // remains the rendezvous the watchdog already tolerates multi-minute load skew on.
+        // Warm-cache bring-up becomes max(head_load, node_load) instead of head_load + node_load.
+        let mut pre_tokenizer: Option<QwenTokenizer> = None;
+        // (max_position_embeddings, eos_token_id) as the pre-read saw them — the post-load
+        // guardrail asserts the loaded cfg agrees (the reorder must not change any value).
+        let mut pre_cfg_check: Option<(usize, u32)> = None;
+        // Parallel-load path only: the completed QP handshake + the retained control stream,
+        // both established BEFORE the weight load.
+        let mut pre_tp: Option<(gb10_inference::tp::TpContext, std::net::TcpStream)> = None;
+        if tp && is_dir {
+            let pre = gb10_inference::qwen::Config::from_config_json(
+                &format!("{}/config.json", model_path.trim_end_matches('/')))
+                .expect("pre-read config.json");
+            let max_seq_pre = if max_seq_len > pre.max_position_embeddings {
+                pre.max_position_embeddings
+            } else { max_seq_len };
+            println!("Loading tokenizer from {}...", tokenizer_path);
+            let tok_pre = QwenTokenizer::from_file(&tokenizer_path).expect("Failed to load tokenizer");
+            // Same parses as their post-load counterparts below (idempotent; needed here for tpc).
+            let mtp_depth_pre = parse_arg(args, "--mtp-depth").and_then(|s| s.parse::<usize>().ok());
+            let mtp_force_pre = match parse_arg(args, "--mtp").unwrap_or("auto") {
+                "on"  | "1" | "true"  => Some(true),
+                "off" | "0" | "false" => Some(false),
+                "auto" => None,
+                other => { eprintln!("--mtp must be auto|on|off (got {:?})", other); std::process::exit(1); }
+            };
+            let explicit = parse_arg(args, "--nodes").map(|s| {
+                s.split(',').map(|p| {
+                    let p = p.trim();
+                    if p.contains(':') { p.parse::<std::net::SocketAddr>().expect("bad --nodes addr (ip:port)") }
+                    else { std::net::SocketAddr::new(p.parse::<std::net::IpAddr>().expect("bad --nodes ip"), 29500) }
+                }).collect::<Vec<_>>()
+            });
+            let wait = std::time::Duration::from_secs(
+                parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
+            let mut tpc = gb10_inference::tp::TpConfig::from_env();
+            tpc.mode_serve = true;
+            tpc.max_seq_len = max_seq_pre;
+            tpc.max_batch = max_batch;
+            tpc.prefix_cache = matches!(parse_arg(args, "--prefix-cache").unwrap_or("off"),
+                                        "on" | "true" | "1" | "yes");
+            tpc.ngram_draft = parse_arg(args, "--ngram-draft").and_then(|s| s.parse().ok()).unwrap_or(0);
+            tpc.tree_draft = matches!(parse_arg(args, "--tree-draft").unwrap_or("off"), "on"|"true"|"1"|"yes");
+            tpc.mtp_lanes = matches!(parse_arg(args, "--mtp-lanes").unwrap_or("off"), "on"|"true"|"1"|"yes");
+            tpc.mtp_force = mtp_force_pre;
+            tpc.mtp_depth_pin = mtp_depth_pre;
+            tpc.no_decode_graphs = std::env::var("GB10_NO_DECODE_GRAPHS").is_ok();
+            tpc.cpu_sample = std::env::var("RUST_INFER_CPU_SAMPLE").is_ok();
+            tpc.eos = tok_pre.stop_token_ids(pre.eos_token_id);
+            tpc.calib_prompt = tok_pre.encode("The capital of France is", true)
+                .expect("probe encode");
+            tpc.batch_probe = Some(max_batch);
+            // Installing before the load is behavior-neutral: the only loader consumer
+            // (gpu.rs shard-at-load shard_mixers) ORs tp_config with the very env var
+            // TpConfig::from_env mirrors, so it reads the same value either way.
+            gb10_inference::tp::set_tp_config(tpc.clone());
+            // The session overlaps our pre-load CPU work (config/tokenizer above); the transfer
+            // itself is 0 bytes warm. On a cold first sync it serializes ahead of the load —
+            // the old order was just as serialized cold (documented out of scope in the plan).
+            let path_for_session = model_path.clone();
+            let session = std::thread::spawn(move || {
+                gb10_inference::cluster::run_head_session(
+                    std::path::Path::new(&path_for_session), explicit, wait, &tpc)
+            });
+            // Join + handshake NOW (see the big comment above). A session error (node
+            // unreachable) surfaces here with the same fatality as before — just EARLIER.
+            let (_nodes, stream) = session.join()
+                .expect("TP head session thread panicked")
+                .expect("TP head session sync");
+            let mut ctx = gb10_inference::tp::TpContext::bring_up_head().expect("TP bring-up");
+            ctx.sanity().expect("TP sanity");
+            pre_tp = Some((ctx, stream));
+            pre_cfg_check = Some((pre.max_position_embeddings, pre.eos_token_id));
+            pre_tokenizer = Some(tok_pre);
+        }
+
         let (mut gpu, cfg) = if is_dir {
             println!("Loading model from {} (streaming bf16)...", model_path);
             if tp {
@@ -2448,6 +2537,17 @@ fn run_server(args: &[String]) {
             let gpu = gb10_inference::gpu::GpuModel::new(&host).expect("gpu init");
             (gpu, host.config)
         };
+        // Guardrail on the TP parallel-load reorder: the pre-read values drove the TpConfig shipped
+        // to the node (and our own clamp); the loaded cfg MUST agree, or head and node would run
+        // with different context limits / stop tokens.
+        if let Some((mpe, eos_id)) = pre_cfg_check {
+            assert_eq!(cfg.max_position_embeddings, mpe,
+                       "TP parallel load: pre-read max_position_embeddings {mpe} != loaded cfg's {}",
+                       cfg.max_position_embeddings);
+            assert_eq!(cfg.eos_token_id, eos_id,
+                       "TP parallel load: pre-read eos_token_id {eos_id} != loaded cfg's {}",
+                       cfg.eos_token_id);
+        }
         let config_eos = cfg.eos_token_id;
 
         // Clamp --max-seq-len to what the model actually supports. The RoPE cos/sin tables are sized to
@@ -2494,8 +2594,14 @@ fn run_server(args: &[String]) {
             }
         }
 
-        println!("Loading tokenizer from {}...", tokenizer_path);
-        let tokenizer = QwenTokenizer::from_file(&tokenizer_path).expect("Failed to load tokenizer");
+        let tokenizer = match pre_tokenizer {
+            // The TP parallel-load path already loaded it (and printed) before the weight load.
+            Some(t) => t,
+            None => {
+                println!("Loading tokenizer from {}...", tokenizer_path);
+                QwenTokenizer::from_file(&tokenizer_path).expect("Failed to load tokenizer")
+            }
+        };
 
         // STOP ON EVERY TURN TERMINATOR, not just the one config.json advertises. Qwen3.5 declares
         // eos_token_id = <|endoftext|> (248044), but a CHAT turn ends with <|im_end|> (248046) â which
@@ -2523,39 +2629,48 @@ fn run_server(args: &[String]) {
                 eprintln!("[tp] WARNING: --prefix-cache on under TP — a known TP issue is open on \
                            prefix reuse; v1 serving configs keep it off");
             }
-            let explicit = parse_arg(args, "--nodes").map(|s| {
-                s.split(',').map(|p| {
-                    let p = p.trim();
-                    if p.contains(':') { p.parse::<std::net::SocketAddr>().expect("bad --nodes addr (ip:port)") }
-                    else { std::net::SocketAddr::new(p.parse::<std::net::IpAddr>().expect("bad --nodes ip"), 29500) }
-                }).collect::<Vec<_>>()
-            });
-            let wait = std::time::Duration::from_secs(
-                parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
-            // TpConfig v2: env snapshot for the bench knobs, serving fields from the server args.
-            // batch_probe = max_batch so attach_tp sizes the all-reduce payload for batched decode.
-            let mut tpc = gb10_inference::tp::TpConfig::from_env();
-            tpc.mode_serve = true;
-            tpc.max_seq_len = max_seq_len;
-            tpc.max_batch = max_batch;
-            tpc.prefix_cache = prefix_cache;
-            tpc.ngram_draft = ngram_draft;
-            tpc.tree_draft = tree_draft;
-            tpc.mtp_lanes = mtp_lanes;
-            tpc.mtp_force = mtp_force;
-            tpc.mtp_depth_pin = mtp_depth;
-            tpc.no_decode_graphs = std::env::var("GB10_NO_DECODE_GRAPHS").is_ok();
-            tpc.cpu_sample = std::env::var("RUST_INFER_CPU_SAMPLE").is_ok();
-            tpc.eos = eos.clone();
-            tpc.calib_prompt = tokenizer.encode("The capital of France is", true)
-                .expect("probe encode");
-            tpc.batch_probe = Some(max_batch);
-            gb10_inference::tp::set_tp_config(tpc.clone());
-            let (_nodes, stream) = gb10_inference::cluster::run_head_session(
-                std::path::Path::new(&model_path), explicit, wait, &tpc)
-                .expect("TP head session sync");
-            let mut ctx = gb10_inference::tp::TpContext::bring_up_head().expect("TP bring-up");
-            ctx.sanity().expect("TP sanity");
+            // The session + RDMA handshake either already happened BEFORE the weight load (the
+            // --model-dir parallel-load path above — the node has been loading concurrently with
+            // us since then) or — the legacy --model <file> path — happen here, serialized as before.
+            let (stream, ctx) = match pre_tp {
+                Some((ctx, stream)) => (stream, ctx),
+                None => {
+                    let explicit = parse_arg(args, "--nodes").map(|s| {
+                        s.split(',').map(|p| {
+                            let p = p.trim();
+                            if p.contains(':') { p.parse::<std::net::SocketAddr>().expect("bad --nodes addr (ip:port)") }
+                            else { std::net::SocketAddr::new(p.parse::<std::net::IpAddr>().expect("bad --nodes ip"), 29500) }
+                        }).collect::<Vec<_>>()
+                    });
+                    let wait = std::time::Duration::from_secs(
+                        parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
+                    // TpConfig v2: env snapshot for the bench knobs, serving fields from the server args.
+                    // batch_probe = max_batch so attach_tp sizes the all-reduce payload for batched decode.
+                    let mut tpc = gb10_inference::tp::TpConfig::from_env();
+                    tpc.mode_serve = true;
+                    tpc.max_seq_len = max_seq_len;
+                    tpc.max_batch = max_batch;
+                    tpc.prefix_cache = prefix_cache;
+                    tpc.ngram_draft = ngram_draft;
+                    tpc.tree_draft = tree_draft;
+                    tpc.mtp_lanes = mtp_lanes;
+                    tpc.mtp_force = mtp_force;
+                    tpc.mtp_depth_pin = mtp_depth;
+                    tpc.no_decode_graphs = std::env::var("GB10_NO_DECODE_GRAPHS").is_ok();
+                    tpc.cpu_sample = std::env::var("RUST_INFER_CPU_SAMPLE").is_ok();
+                    tpc.eos = eos.clone();
+                    tpc.calib_prompt = tokenizer.encode("The capital of France is", true)
+                        .expect("probe encode");
+                    tpc.batch_probe = Some(max_batch);
+                    gb10_inference::tp::set_tp_config(tpc.clone());
+                    let (_nodes, stream) = gb10_inference::cluster::run_head_session(
+                        std::path::Path::new(&model_path), explicit, wait, &tpc)
+                        .expect("TP head session sync");
+                    let mut ctx = gb10_inference::tp::TpContext::bring_up_head().expect("TP bring-up");
+                    ctx.sanity().expect("TP sanity");
+                    (stream, ctx)
+                }
+            };
             println!("HEAD (rank 0/2) — TP LINK UP (serving mode)");
             let (rank, world, link) = ctx.into_parts();
             gpu.attach_tp(rank, world, link);
@@ -2723,6 +2838,15 @@ fn run_server(args: &[String]) {
             default_rep_penalty,
             default_presence_penalty,
             default_frequency_penalty,
+            reasoning_effort: parse_arg(args, "--reasoning-effort").map(|s| s.to_string())
+                .map(|e| match e.as_str() {
+                    "no_think" | "low" | "high" => e,
+                    other => {
+                        eprintln!("--reasoning-effort must be no_think|low|high (got '{other}')");
+                        std::process::exit(1);
+                    }
+                })
+                .unwrap_or_else(|| "no_think".to_string()),
             max_seq_len,
         };
 
