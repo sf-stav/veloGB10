@@ -135,15 +135,15 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
 
   | Model | HF artifact | Architecture / recipe |
   |---|---|---|
-  | Qwen3.5 0.8B | [doth4580/0.8b-nvfp4-mixed](https://huggingface.co/doth4580/0.8b-nvfp4-mixed) | dense hybrid, `nvfp4-mixed` |
-  | Qwen3.5 2B | [doth4580/2b-nvfp4-mixed](https://huggingface.co/doth4580/2b-nvfp4-mixed) | dense hybrid, `nvfp4-mixed` |
-  | Qwen3.5 4B | [doth4580/4b-nvfp4-mixed](https://huggingface.co/doth4580/4b-nvfp4-mixed) | dense hybrid, `nvfp4-mixed` |
-  | Qwen3.5 9B | [doth4580/9b-nvfp4-full](https://huggingface.co/doth4580/9b-nvfp4-full) | dense hybrid, `nvfp4-full` |
-  | Qwen3.6 27B | [doth4580/3.6-27b-nvfp4-full](https://huggingface.co/doth4580/3.6-27b-nvfp4-full) | dense hybrid, `nvfp4-full` |
-  | Qwen3.6 35B MoE | [doth4580/3.6-35b-nvfp4-full](https://huggingface.co/doth4580/3.6-35b-nvfp4-full) | MoE hybrid, `nvfp4-full` |
-  | Qwen3.5 122B MoE | [doth4580/3.5-122b-nvfp4-mixed](https://huggingface.co/doth4580/3.5-122b-nvfp4-mixed) / [gdn4](https://huggingface.co/doth4580/3.5-122b-nvfp4-gdn4) | MoE hybrid, `nvfp4-mixed` or `gdn4` |
-  | Tencent Hy3 | [doth4580/hy3-nvfp4](https://huggingface.co/doth4580/hy3-nvfp4) | 295B-A21B pure-GQA MoE |
-  | KAT-Coder-V2.5-Dev | [doth4580/kat-coder-v2.5-dev-nvfp4-mixed](https://huggingface.co/doth4580/kat-coder-v2.5-dev-nvfp4-mixed) | 35B-A3B MoE hybrid, code specialist, `nvfp4-mixed` |
+  | Qwen3.5 0.8B | [doth4580/Qwen3.5-0.8B-NVFP4-MIXED](https://huggingface.co/doth4580/Qwen3.5-0.8B-NVFP4-MIXED) | dense hybrid, `nvfp4-mixed` |
+  | Qwen3.5 2B | [doth4580/Qwen3.5-2B-NVFP4-MIXED](https://huggingface.co/doth4580/Qwen3.5-2B-NVFP4-MIXED) | dense hybrid, `nvfp4-mixed` |
+  | Qwen3.5 4B | [doth4580/Qwen3.5-4B-NVFP4-MIXED](https://huggingface.co/doth4580/Qwen3.5-4B-NVFP4-MIXED) | dense hybrid, `nvfp4-mixed` |
+  | Qwen3.5 9B | [doth4580/Qwen3.5-9B-NVFP4-FULL](https://huggingface.co/doth4580/Qwen3.5-9B-NVFP4-FULL) | dense hybrid, `nvfp4-full` |
+  | Qwen3.6 27B | [doth4580/Qwen3.6-27B-NVFP4-FULL](https://huggingface.co/doth4580/Qwen3.6-27B-NVFP4-FULL) | dense hybrid, `nvfp4-full` |
+  | Qwen3.6 35B MoE | [doth4580/Qwen3.6-35B-A3B-NVFP4-FULL](https://huggingface.co/doth4580/Qwen3.6-35B-A3B-NVFP4-FULL) | MoE hybrid, `nvfp4-full` |
+  | Qwen3.5 122B MoE | [doth4580/Qwen3.5-122B-A10B-NVFP4-MIXED](https://huggingface.co/doth4580/Qwen3.5-122B-A10B-NVFP4-MIXED) / [GDN4](https://huggingface.co/doth4580/Qwen3.5-122B-A10B-NVFP4-GDN4) | MoE hybrid, `nvfp4-mixed` or `gdn4` |
+  | Tencent Hy3 | [doth4580/Tencent-Hy3-295B-A21B-NVFP4](https://huggingface.co/doth4580/Tencent-Hy3-295B-A21B-NVFP4) | 295B-A21B pure-GQA MoE |
+  | KAT-Coder-V2.5-Dev | [doth4580/Kwaipilot-KAT-Coder-V2.5-Dev-NVFP4-MIXED](https://huggingface.co/doth4580/Kwaipilot-KAT-Coder-V2.5-Dev-NVFP4-MIXED) | 35B-A3B MoE hybrid, code specialist, `nvfp4-mixed` |
 
 ## Unique aspects
 
