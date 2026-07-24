@@ -131,9 +131,19 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
 - **Long context** — chunked prefill; 32K-class envelopes validated end-to-end on TP=2;
   model-context up to 256K on the 27B. The hybrid GDN layers carry a fixed-size recurrent state,
   so KV memory grows only on the periodic full-attention layers.
-- **Model coverage** — Qwen3.5 0.8B/2B/4B/9B, Qwen3.6 27B (dense hybrid), Qwen3.6 35B (MoE),
-  Qwen3.5 122B (MoE hybrid), Tencent Hy3 (295B-A21B MoE). One binary; the model is a directory,
-  not a build.
+- **Supported models** — one binary loads any of these; the model is a directory, not a build.
+
+  | Model | HF artifact | Architecture / recipe |
+  |---|---|---|
+  | Qwen3.5 0.8B | [doth4580/0.8b-nvfp4-mixed](https://huggingface.co/doth4580/0.8b-nvfp4-mixed) | dense hybrid, `nvfp4-mixed` |
+  | Qwen3.5 2B | [doth4580/2b-nvfp4-mixed](https://huggingface.co/doth4580/2b-nvfp4-mixed) | dense hybrid, `nvfp4-mixed` |
+  | Qwen3.5 4B | [doth4580/4b-nvfp4-mixed](https://huggingface.co/doth4580/4b-nvfp4-mixed) | dense hybrid, `nvfp4-mixed` |
+  | Qwen3.5 9B | [doth4580/9b-nvfp4-full](https://huggingface.co/doth4580/9b-nvfp4-full) | dense hybrid, `nvfp4-full` |
+  | Qwen3.6 27B | [doth4580/3.6-27b-nvfp4-full](https://huggingface.co/doth4580/3.6-27b-nvfp4-full) | dense hybrid, `nvfp4-full` |
+  | Qwen3.6 35B MoE | [doth4580/3.6-35b-nvfp4-full](https://huggingface.co/doth4580/3.6-35b-nvfp4-full) | MoE hybrid, `nvfp4-full` |
+  | Qwen3.5 122B MoE | [doth4580/3.5-122b-nvfp4-mixed](https://huggingface.co/doth4580/3.5-122b-nvfp4-mixed) / [gdn4](https://huggingface.co/doth4580/3.5-122b-nvfp4-gdn4) | MoE hybrid, `nvfp4-mixed` or `gdn4` |
+  | Tencent Hy3 | [doth4580/hy3-nvfp4](https://huggingface.co/doth4580/hy3-nvfp4) | 295B-A21B pure-GQA MoE |
+  | KAT-Coder-V2.5-Dev | [doth4580/kat-coder-v2.5-dev-nvfp4-mixed](https://huggingface.co/doth4580/kat-coder-v2.5-dev-nvfp4-mixed) | 35B-A3B MoE hybrid, code specialist, `nvfp4-mixed` |
 
 ## Unique aspects
 

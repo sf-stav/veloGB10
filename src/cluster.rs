@@ -556,3 +556,123 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
     eprintln!("[head] node synced; control stream RETAINED for the serving session");
     Ok((nodes, stream))
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Blob cache management (ops CLI: --list-model-blobs / --remove-model-blob / --clear-model-blobs)
+// ---------------------------------------------------------------------------------------------------
+
+/// Walk every symlink under `cache/models/<model_id>/`, calling `f(model_id, link_path, target)`.
+fn walk_model_links(mut f: impl FnMut(&str, &Path, &Path)) {
+    let mdir = cache_root().join("models");
+    let Ok(models) = std::fs::read_dir(&mdir) else { return };
+    for e in models.flatten() {
+        let mid = e.file_name().to_string_lossy().to_string();
+        let mut stack = vec![e.path()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                let Ok(ft) = ent.file_type() else { continue };
+                if ft.is_dir() { stack.push(p); continue; }
+                if ft.is_symlink() {
+                    if let Ok(t) = std::fs::read_link(&p) { f(&mid, &p, &t); }
+                }
+            }
+        }
+    }
+}
+
+fn fmt_gib(b: u64) -> String { format!("{:.2} GiB", b as f64 / (1u64 << 30) as f64) }
+
+/// `--list-model-blobs`: every blob in the cache — its id (sha256 = the blob's file name), size,
+/// and which assembled model dir(s) reference it (ORPHAN = none). `tmp.*` rows are interrupted
+/// fetch partials, safe to reclaim via --clear-model-blobs.
+pub fn list_model_blobs() -> Result<()> {
+    let dir = cache_root().join("blobs");
+    let mut refs: HashMap<String, Vec<String>> = HashMap::new();
+    walk_model_links(|mid, _p, t| {
+        if let Some(h) = t.file_name() { refs.entry(h.to_string_lossy().to_string()).or_default().push(mid.to_string()); }
+    });
+    for v in refs.values_mut() { v.sort(); v.dedup(); }
+
+    let mut rows: Vec<(String, u64)> = Vec::new();
+    let mut tmp: Vec<(String, u64)> = Vec::new();
+    for e in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+        if name.starts_with("tmp.") { tmp.push((name, size)); } else { rows.push((name, size)); }
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let total: u64 = rows.iter().map(|r| r.1).sum();
+    println!("cache {} — {} blobs, {}", dir.display(), rows.len(), fmt_gib(total));
+    for (h, sz) in &rows {
+        let users = refs.get(h).cloned().unwrap_or_default();
+        let tag = if users.is_empty() { "ORPHAN".to_string() } else { users.join(",") };
+        println!("{h}  {:>12}  {tag}", fmt_gib(*sz));
+    }
+    if !tmp.is_empty() {
+        let t: u64 = tmp.iter().map(|x| x.1).sum();
+        println!("-- {} interrupted-fetch partial(s), {} reclaimable (tmp.*)", tmp.len(), fmt_gib(t));
+    }
+    Ok(())
+}
+
+/// `--remove-model-blob <hash|unique-prefix>`: delete ONE blob + the assembled-dir symlinks that
+/// reference it (so `models/` stays consistent). A model that loses files re-fetches the blob on
+/// its next head sync — removal never corrupts a later run. If every match is a `tmp.*`
+/// interrupted-fetch partial, ALL of them are deleted (they are junk by definition).
+pub fn remove_model_blob(id: &str) -> Result<()> {
+    if id.len() < 4 { bail!("refusing to match an id shorter than 4 characters"); }
+    let dir = cache_root().join("blobs");
+    let mut matches: Vec<String> = Vec::new();
+    for e in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == id || name.starts_with(id) { matches.push(name); }
+    }
+    if matches.is_empty() { bail!("no blob matching '{id}' in {}", dir.display()); }
+    if matches.iter().all(|m| m.starts_with("tmp.")) {
+        let mut freed = 0u64;
+        for m in &matches {
+            freed += std::fs::metadata(dir.join(m)).map(|x| x.len()).unwrap_or(0);
+            let _ = std::fs::remove_file(dir.join(m));
+        }
+        println!("removed {} interrupted-fetch partial(s), {}", matches.len(), fmt_gib(freed));
+        return Ok(());
+    }
+    let hash = match matches.len() {
+        1 => matches.pop().unwrap(),
+        n => bail!("'{id}' matches {n} blobs — give a longer prefix"),
+    };
+    let size = std::fs::metadata(blob_path(&hash)).map(|m| m.len()).unwrap_or(0);
+    std::fs::remove_file(blob_path(&hash)).with_context(|| format!("remove blob {hash}"))?;
+    let mut pruned = 0usize;
+    let mut affected: Vec<String> = Vec::new();
+    walk_model_links(|mid, p, t| {
+        if t.file_name().map(|h| h.to_string_lossy() == hash).unwrap_or(false) {
+            if std::fs::remove_file(p).is_ok() { pruned += 1; affected.push(mid.to_string()); }
+        }
+    });
+    affected.sort(); affected.dedup();
+    println!("removed blob {hash} ({}) — pruned {pruned} link(s) in [{}]",
+             fmt_gib(size), affected.join(","));
+    println!("note: those models now have missing files; a head re-sync re-fetches this blob on next use.");
+    Ok(())
+}
+
+/// `--clear-model-blobs`: delete ALL cached blobs (including interrupted tmp.* partials) and the
+/// assembled model dirs (symlink trees). The next head run re-syncs from scratch.
+pub fn clear_model_blobs() -> Result<()> {
+    let dir = cache_root().join("blobs");
+    let mut total = 0u64;
+    let mut n = 0usize;
+    for e in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?.flatten() {
+        total += e.metadata().map(|m| m.len()).unwrap_or(0);
+        std::fs::remove_file(e.path()).with_context(|| format!("remove {}", e.path().display()))?;
+        n += 1;
+    }
+    let mdir = cache_root().join("models");
+    if mdir.exists() { std::fs::remove_dir_all(&mdir).context("remove assembled model dirs")?; }
+    println!("cleared {n} blob(s), {} — assembled model dirs removed; next head run re-syncs from scratch",
+             fmt_gib(total));
+    Ok(())
+}

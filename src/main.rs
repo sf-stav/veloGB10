@@ -21,6 +21,9 @@ fn print_help() {
     println!("  --bench-accept      Diagnose acceptance: coverage by target confidence, n-gram run-length");
     println!("  --probe-binv        Batch-invariance probe (column 0 bit-identical for every N)");
     println!("  --bench-batch       Batched-decode throughput");
+    println!("  --list-model-blobs  List TP blob cache (ids, sizes, referencing models)");
+    println!("  --remove-model-blob <ID>  Remove one cached blob by hash/unique prefix");
+    println!("  --clear-model-blobs Delete ALL cached blobs (node re-syncs on next use)");
     println!("  (default)           Interactive CLI: load model, generate from a prompt");
     println!("  --help, -h          Show this help");
     println!();
@@ -346,6 +349,29 @@ fn main() {
     //   --requant-gdn --from <mixed-dir> --out <gdn4-dir>
     if args.iter().any(|a| a == "--requant-gdn") {
         run_requant_gdn(&args);
+        return;
+    }
+
+    // TP blob-cache ops (node-side; pure local file ops on GB10_TP_CACHE / ~/.cache/gb10_tp).
+    if args.iter().any(|a| a == "--list-model-blobs") {
+        if let Err(e) = gb10_inference::cluster::list_model_blobs() {
+            eprintln!("error: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--remove-model-blob") {
+        let id = args.get(pos + 1).unwrap_or_else(|| {
+            eprintln!("--remove-model-blob requires <hash|unique-prefix>"); std::process::exit(2);
+        });
+        if let Err(e) = gb10_inference::cluster::remove_model_blob(id) {
+            eprintln!("error: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--clear-model-blobs") {
+        if let Err(e) = gb10_inference::cluster::clear_model_blobs() {
+            eprintln!("error: {e:#}"); std::process::exit(1);
+        }
         return;
     }
 
@@ -1701,7 +1727,11 @@ fn run_quantize(args: &[String]) {
     let mut pending: Pending = std::collections::BTreeMap::new();
     let n_experts: Option<usize> = std::fs::read_to_string(ind.join("config.json")).ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|c| c.get("num_experts").or_else(|| c.get("n_routed_experts")).and_then(|v| v.as_u64()))
+        .and_then(|c| {
+            // Multimodal-wrapped configs (e.g. KAT-Coder) nest the model section under `text_config`.
+            let get = |m: &serde_json::Value| m.get("num_experts").or_else(|| m.get("n_routed_experts")).and_then(|v| v.as_u64());
+            get(&c).or_else(|| c.get("text_config").and_then(get))
+        })
         .map(|v| v as usize);
     let parse_expert = |name: &str| -> Option<(String, String, usize)> {
         let stem = name.strip_suffix(".weight")?;

@@ -6784,6 +6784,58 @@ impl GpuModel {
         (emit_ok, kv_ok)
     }
 
+    // --- GB10_DEBUG_HASH=1 (TEMPORARY instrumentation: TP bench_accept vs bench_mtp divergence hunt).
+    // Host-side only (sync + dtoh + eprintln); no collectives, SPMD-safe. All sites are env-gated so
+    // the deployed binary is behavior-identical with the gate off.
+    fn dbg_fnv_update(mut h: u64, v: &[half::bf16]) -> u64 {
+        for x in v {
+            let b = x.to_bits().to_le_bytes();
+            h = (h ^ b[0] as u64).wrapping_mul(0x100000001b3);
+            h = (h ^ b[1] as u64).wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    /// FNV-1a over the raw bf16 bits of the first `n` elements + the first few values.
+    pub fn dbg_hash_bf16(&self, tag: &str, buf: &B, n: usize) {
+        if std::env::var("GB10_DEBUG_HASH").is_err() { return; }
+        self.sync_stream();
+        let v: Vec<half::bf16> = self.dev.dtoh_sync_copy(buf).unwrap();
+        let n = n.min(v.len());
+        let h = Self::dbg_fnv_update(0xcbf29ce484222325, &v[..n]);
+        let first: Vec<f32> = v[..n.min(4)].iter().map(|x| x.to_f32()).collect();
+        eprintln!("  [dbghash] {tag} n={n} fnv={h:016x} first={first:?}");
+    }
+
+    /// Hash only the WRITTEN region (positions 0..npos) of a main-model KV cache slot:
+    /// layout [head][pos][hd] with pos-stride kv_stride (unwritten positions hold alloc_zeros
+    /// garbage, which legitimately differs between runs and would be pure noise).
+    pub fn dbg_hash_kv(&self, tag: &str, cache: &B, nkv: usize, kv_stride: usize, hd: usize, npos: usize) {
+        if std::env::var("GB10_DEBUG_HASH").is_err() { return; }
+        self.sync_stream();
+        let v: Vec<half::bf16> = self.dev.dtoh_sync_copy(cache).unwrap();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for head in 0..nkv {
+            let base = head * kv_stride * hd;
+            h = Self::dbg_fnv_update(h, &v[base..base + npos * hd]);
+        }
+        eprintln!("  [dbghash] {tag} nkv={nkv} npos={npos} fnv={h:016x}");
+    }
+
+    /// hout0 + slot-0 main KV of the first FullAttention layer, right after prefill.
+    pub fn dbg_probe_prefill(&self, tag: &str, a0: u32, hout0: &B, h: usize, plen: usize,
+                             state: &BatchGpuState, kv_stride: usize) {
+        if std::env::var("GB10_DEBUG_HASH").is_err() { return; }
+        eprintln!("  [dbghash] {tag}.prefill a0={a0} plen={plen} kv_stride={kv_stride}");
+        self.dbg_hash_bf16(&format!("{tag}.hout0"), hout0, h * plen);
+        if let Some(fa_li) = self.cfg.layer_types.iter().position(|t| matches!(t, LayerType::FullAttention)) {
+            let (nkv, hd) = (self.eff_num_kv_heads(), self.cfg.head_dim);
+            self.dbg_hash_kv(&format!("{tag}.maink0.L{fa_li}"), state.k_cache[fa_li].as_ref().unwrap(), nkv, kv_stride, hd, plen);
+            self.dbg_hash_kv(&format!("{tag}.mainv0.L{fa_li}"), state.v_cache[fa_li].as_ref().unwrap(), nkv, kv_stride, hd, plen);
+        }
+    }
+    // --- end GB10_DEBUG_HASH instrumentation
+
     pub fn bench_accept(&self, pool: &mut Pool, state: &mut BatchGpuState, prompt: &[u32],
                         kv_stride: usize, depth: usize, max_new: usize, ngram: usize)
                         -> (Vec<AcceptSample>, Vec<u32>) {
@@ -6805,6 +6857,7 @@ impl GpuModel {
 
         self.zero_slot_state(state, 0, kv_stride);
         let (a0, hout0) = self.prefill_batch(pool, prompt, state, 0, kv_stride, 0);
+        self.dbg_probe_prefill("ACCEPT", a0, &hout0, h, plen, state, kv_stride);   // GB10_DEBUG_HASH
 
         let copy_stream = self.stream.stream;
         let copy_col = |dst_ptr: u64, src_buf: &B, col: usize| unsafe {
@@ -6813,8 +6866,12 @@ impl GpuModel {
         };
 
         self.mtp_prime_prompt(pool, &hout0, &prompt[1..plen], mtp_kc_ptr, mtp_vc_ptr, kv_stride, 0);
+        // GB10_DEBUG_HASH: whole buffers — both were memset+sync'd, so unwritten rows are zeros.
+        self.dbg_hash_bf16("ACCEPT.mtpkc", &mtp_kc, nkv * kv_stride * hd);
+        self.dbg_hash_bf16("ACCEPT.mtpvc", &mtp_vc, nkv * kv_stride * hd);
         let mut mtp_pos = plen - 1;
         copy_col(*h_prev.device_ptr(), &hout0, plen - 1);
+        self.dbg_hash_bf16("ACCEPT.h_prev0", &h_prev, h);   // GB10_DEBUG_HASH
         pool.release_bf16(hout0, h * plen);
 
         let mut out = vec![a0];
@@ -6836,6 +6893,7 @@ impl GpuModel {
             for _ in 0..depth - 1 {
                 let m = self.mtp_draft_step(pool, &cur_hidden, cur_tok, dpos,
                                             mtp_kc_ptr, mtp_vc_ptr, kv_stride);
+                if out.len() == 1 && drafts.is_empty() { self.dbg_hash_bf16("ACCEPT.m0", &m, h); }   // GB10_DEBUG_HASH
                 dpos += 1;
                 copy_col(*cur_hidden.device_ptr(), &m, 0);
                 pool.release_bf16(m, h);
@@ -6986,6 +7044,7 @@ impl GpuModel {
         // Prefill slot 0 (MTP) and slot 1 (sequential ground truth).
         self.zero_slot_state(state, 0, kv_stride);
         let (a0, hout0) = self.prefill_batch(pool, prompt, state, 0, kv_stride, 0);
+        self.dbg_probe_prefill("MTP", a0, &hout0, h, plen, state, kv_stride);   // GB10_DEBUG_HASH
         self.zero_slot_state(state, 1, kv_stride);
         let (a1, _hout1) = self.prefill_batch(pool, prompt, state, 1, kv_stride, 0);
         assert_eq!(a0, a1, "prefill divergence slot0 vs slot1");
@@ -7001,9 +7060,13 @@ impl GpuModel {
         // Prompt-prime MTP over main positions 0..plen-2: step t uses (h_t, prompt[t+1]).
         // Same primitive the server uses -- see the note above.
         self.mtp_prime_prompt(pool, &hout0, &prompt[1..plen], mtp_kc_ptr, mtp_vc_ptr, kv_stride, 0);
+        // GB10_DEBUG_HASH: whole buffers — both were memset+sync'd, so unwritten rows are zeros.
+        self.dbg_hash_bf16("MTP.mtpkc", &mtp_kc, nkv * kv_stride * hd);
+        self.dbg_hash_bf16("MTP.mtpvc", &mtp_vc, nkv * kv_stride * hd);
         let mut mtp_pos = plen - 1;   // next main position for an MTP write
         // h_prev = h at plen-1 (last prompt position) — seeds the first draft.
         copy_col(*h_prev.device_ptr(), &hout0, plen - 1);
+        self.dbg_hash_bf16("MTP.h_prev0", &h_prev, h);   // GB10_DEBUG_HASH
         pool.release_bf16(hout0, h * plen);
 
         let mut mtp_tokens = vec![a0];      // a0 (prefill's first token) is already emitted
@@ -7041,6 +7104,7 @@ impl GpuModel {
             for _ in 0..depth - 1 {
                 let m = self.mtp_draft_step(pool, &cur_hidden, cur_tok, dpos,
                                             mtp_kc_ptr, mtp_vc_ptr, kv_stride);
+                if mtp_tokens.len() == 1 && drafts.is_empty() { self.dbg_hash_bf16("MTP.m0", &m, h); }   // GB10_DEBUG_HASH
                 dpos += 1;
                 copy_col(*cur_hidden.device_ptr(), &m, 0);
                 pool.release_bf16(m, h);
