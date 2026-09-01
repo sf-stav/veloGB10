@@ -72,8 +72,10 @@ __device__ __forceinline__ unsigned char cvt_e2m1x2(float lo, float hi) {
 
 // ue4m3 encode of |x| rounded UP (sign bit 0 — the OMMA ignores it). Mirrors the quantizer.
 __device__ __host__ __forceinline__ unsigned char e4m3_ceil(float x) {
+    // E4M3 has NO infinity and 0x7F is NaN: the largest finite code is 0x7E = 448. Saturate there
+    // (the codes then clip through cvt.satfinite) — 0x7F would poison the whole MMA output.
     if (!(x > 0.f)) return 0x00;
-    if (x >= 448.0f) return 0x7F;
+    if (x >= 448.0f) return 0x7E;
     int e;
     float m = frexpf(x, &e);
     int e4 = e + 6;
@@ -83,7 +85,7 @@ __device__ __host__ __forceinline__ unsigned char e4m3_ceil(float x) {
         int sm = (int)ceilf(x * 512.0f);
         return (unsigned char)(sm > 7 ? 7 : sm);
     }
-    if (e4 > 14) return 0x7F;
+    if (e4 > 15 || (e4 == 15 && mant >= 7)) return 0x7E;
     return (unsigned char)((e4 << 3) | mant);
 }
 

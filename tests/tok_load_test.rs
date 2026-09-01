@@ -22,7 +22,7 @@ fn hy3_chat_template_renders_with_tools() {
     let tok = QwenTokenizer::from_file("/mnt/models/hy3-nvfp4/tokenizer.json").unwrap();
     let msgs = vec![
         ChatMessage { role: "system".into(), content: Some("You are helpful.".into()),
-                      tool_calls: None, tool_call_id: None, name: None, reasoning_content: None },
+                      tool_calls: None, tool_call_id: None, name: None, reasoning_content: None, images: vec![] },
         ChatMessage::user("What is 2+2?"),
     ];
     let plain = tok.apply_chat_template(&msgs, None, None).expect("template without tools");

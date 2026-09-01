@@ -12,7 +12,7 @@
 set -u
 BIN="${GB10_BIN:-$(dirname "$0")/../target/release/gb10_inference}"
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
-VALID="${GB10_VALID_MODEL_DIR:-}
+VALID="${GB10_VALID_MODEL_DIR:-}"
 BASE="/tmp/model_load_fixtures"
 LOGBASE=/tmp/model_load_gate
 mkdir -p "$LOGBASE"

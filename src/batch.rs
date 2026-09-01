@@ -77,7 +77,7 @@ pub struct BatchRequest {
     /// it at into_request). Feeds the `[req] ttft=` log line — the server-side TTFT truth the
     /// measurement protocol asserts.
     pub received_at: std::time::Instant,
-    /// V3 vision: merged image embeddings (concatenated, [sum(num_tokens), 5120] f32) + the spans
+    /// V3 vision: merged image embeddings (concatenated, [sum(num_tokens), hidden] f32) + the spans
     /// (absolute positions in the EXPANDED prompt). None/empty for text-only traffic (unchanged).
     pub image_embeds: Option<Vec<f32>>,
     pub image_spans: Vec<crate::vision_encoder::ImageSpan>,
@@ -210,6 +210,12 @@ pub struct MtpPolicy {
 }
 
 use crate::gpu::MAX_AUTO_DEPTH;
+
+/// KV positions kept beyond the requested output: MTP draft/verify plus re-prime slop,
+/// or one guard row for plain decode.
+pub fn decode_headroom(mtp_active: bool) -> usize {
+    if mtp_active { MAX_AUTO_DEPTH + 8 } else { 1 }
+}
 
 /// B8/G3 — the runtime speculation-source switch (PLAN/08 scheduler delta). `Mtp` is always
 /// available; `Dspark` is the block drafter (falls back to MTP while K-DSP is unbuilt); `DFlash2`
@@ -975,6 +981,12 @@ impl BatchScheduler {
         // A/B switch: GB10_NO_DECODE_GRAPHS=1 forces the non-graph path, so the value of capture can be
         // measured on any config without rebuilding (and gives an escape hatch if capture ever misbehaves).
         let smem_bytes = if std::env::var("GB10_NO_DECODE_GRAPHS").is_ok() { usize::MAX } else { smem_bytes };
+        // qwen4_exp with the PLE table on SSD: the forward has a host round-trip (row reads) —
+        // not capturable. Everything else keeps the graph path.
+        let smem_bytes = if gpu.decode_graphs_supported() { smem_bytes } else {
+            println!("Skipping CUDA graphs: PLE table is SSD-resident (host gather inside the forward).");
+            usize::MAX
+        };
         let mut graphs = std::collections::HashMap::new();
         if smem_bytes <= 48 * 1024 {
             print!("Attempting CUDA graph capture for batch sizes 1..={}... ", max_batch);
@@ -1027,7 +1039,7 @@ impl BatchScheduler {
              mtp_draft_pen_freq) =
             if mtp_has_head {
                 let cfg = gpu.cfg();
-                let h = cfg.hidden_size;
+                let h = gpu.mtp_hidden_width();   // MTP hidden width (hc streams on qwen4_exp)
                 // §4.1: with --tp-shard-mtp the MTP attention is head-sharded and the draft cache
                 // holds only this rank's kv heads (mtp_kv_heads == num_kv_heads when unsharded).
                 let nkv = gpu.mtp_kv_heads();
@@ -1039,10 +1051,12 @@ impl BatchScheduler {
                 let mut vc: Vec<B> = Vec::with_capacity(max_batch);
                 let mut hp: Vec<B> = Vec::with_capacity(max_batch);
                 for _ in 0..max_batch {
-                    let k = dev.alloc_zeros::<half::bf16>(nkv * kv_stride * hd).unwrap();
+                    // qwen4_exp QSA: the head's raw-key cache rides at the end of its K buffer
+                    // (mtp_kc_elems) so the (kc, vc, kv_stride) plumbing stays untouched.
+                    let k = dev.alloc_zeros::<half::bf16>(gpu.mtp_kc_elems(kv_stride)).unwrap();
                     let v = dev.alloc_zeros::<half::bf16>(nkv * kv_stride * hd).unwrap();
                     let p = dev.alloc_zeros::<half::bf16>(h).unwrap();
-                    gpu.memset_compute_stream(*k.device_ptr(), kv_bytes);
+                    gpu.memset_compute_stream(*k.device_ptr(), gpu.mtp_kc_elems(kv_stride) * 2);
                     gpu.memset_compute_stream(*v.device_ptr(), kv_bytes);
                     kc.push(k);
                     vc.push(v);
@@ -1575,7 +1589,7 @@ impl BatchScheduler {
         let mut t_prime = 0.0f64;
 
         let cfg = self.gpu.cfg().clone();
-        let h = cfg.hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
 
         // The KV cache is exactly `kv_stride` positions deep. `write_kv_prefill` had no bound check, so
         // an over-long prompt wrote past the end of it and corrupted the neighbouring allocation. The
@@ -1587,14 +1601,13 @@ impl BatchScheduler {
         // depth + 8 (the τ floor's slop) when MTP is active, using the policy MAX depth so a later
         // depth-upswitch can't cross the line mid-request. Plain decode needs no such headroom (1 slot
         // of slop). All inputs are replicated state, so both TP ranks reject identically.
-        let mtp_depth = if will_use_mtp { crate::gpu::MAX_AUTO_DEPTH } else { 0 };
-        let mtp_headroom = if will_use_mtp { mtp_depth + 8 } else { 1 };
+        let mtp_headroom = decode_headroom(will_use_mtp);
         let reject_msg = if plen >= self.kv_stride {
             Some(format!("prompt is {plen} tokens but the KV cache holds {} — raise --max-seq-len",
                          self.kv_stride))
-        } else if plen + max_new + mtp_headroom > self.kv_stride {
-            Some(format!("plen {plen} + max_new {max_new} + depth {mtp_depth} + 8 exceeds KV stride {} — \
-                          raise --max-seq-len", self.kv_stride))
+        } else if plen + mtp_headroom >= self.kv_stride {
+            Some(format!("prompt {plen} + decode headroom {mtp_headroom} leaves no generation room \
+                          in KV stride {} — raise --max-seq-len", self.kv_stride))
         } else {
             None
         };
@@ -1613,7 +1626,8 @@ impl BatchScheduler {
             let _ = tx.send(TokEvent::Finish { reason: "context_length_exceeded".to_string() });
             return;
         }
-        let max_new = max_new.min(self.kv_stride - plen - mtp_headroom);
+        let room = self.kv_stride - plen - mtp_headroom;
+        let max_new = max_new.min(room);
 
         // Bound the pool. Safe here: `trim` synchronizes before freeing, and this runs before any GPU
         // work for this request. Without it the pool grows forever — see Pool::trim.
@@ -2125,7 +2139,7 @@ impl BatchScheduler {
     /// GDN checkpoint, re-primes MTP over the accepted path, and emits. Lossless: every emitted token is
     /// the target's argmax given its accepted prefix (same as the chain). Returns true if finished.
     fn mtp_tree_step(&mut self, i: usize) -> bool {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // MTP/backbone hidden width (hc streams on qwen4_exp)
         let depth = self.mtp.depth();
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let ckpt = self.mtp_snapshot_slot;   // tree checkpoints base (slots ckpt..ckpt+n-2)
@@ -2269,7 +2283,7 @@ impl BatchScheduler {
     /// This is `mtp_lane_step` generalized to L lanes sharing one main-model forward — the concurrency
     /// throughput win. Greedy, no-penalty lanes only (v1). Returns (lane_index, finished) per lane.
     fn mtp_forest_step(&mut self, lanes: &[usize]) -> Vec<(usize, bool)> {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // MTP/backbone hidden width (hc streams on qwen4_exp)
         let ck = self.gpu.cfg().conv_kernel;
         let mv = crate::gpu::MAX_VERIFY;
         let kv_stride = self.kv_stride;
@@ -2482,7 +2496,7 @@ impl BatchScheduler {
         if self.tree_draft && self.mtp.depth() >= 3 {
             return self.mtp_tree_step(i);
         }
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // MTP/backbone hidden width (hc streams on qwen4_exp)
         let depth = self.mtp.depth();
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
@@ -2715,7 +2729,7 @@ impl BatchScheduler {
     /// Emits the accepted drafts + replacement/bonus token, advancing the lane.
     /// Returns true if the lane finished (EOS or max_new reached).
     fn mtp_lane_step_sample(&mut self, i: usize) -> bool {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // MTP/backbone hidden width (hc streams on qwen4_exp)
         let depth = self.mtp.depth();
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
@@ -2942,7 +2956,7 @@ impl BatchScheduler {
     ///
     /// Emits the accepted drafts + bonus, advancing the lane by nacc+1. Returns true if finished.
     fn df2_lane_step(&mut self, i: usize) -> bool {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // MTP/backbone hidden width (hc streams on qwen4_exp)
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
         let kv_stride = self.kv_stride;
@@ -3145,7 +3159,7 @@ impl BatchScheduler {
     /// al. 2023: accept with prob min(1, p(x)/q(x)) = p(x) since q = 1; else emit the residual).
     /// Distribution-exact by construction; gated by the DFlash2 chi-square probe.
     fn df2_lane_step_sample(&mut self, i: usize) -> bool {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // MTP/backbone hidden width (hc streams on qwen4_exp)
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
         let kv_stride = self.kv_stride;
@@ -3347,7 +3361,7 @@ impl BatchScheduler {
     /// — the L2 chi-square gate's contract. Distribution-exact by construction; gated by
     /// `--bench-df2-sample-realq`.
     fn df2_lane_step_sample_rq(&mut self, i: usize) -> bool {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // MTP/backbone hidden width (hc streams on qwen4_exp)
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
         let kv_stride = self.kv_stride;

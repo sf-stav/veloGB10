@@ -21,6 +21,7 @@ fn main() {
     println!("cargo:rustc-env=CUDA_ARCHITECTURES=121");
     println!("cargo:rustc-link-lib=cuda");
     println!("cargo:rustc-link-lib=cudart");
+    println!("cargo:rustc-link-lib=cusolver");
 
     let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
     println!("cargo:include={}/include", cuda_home);
@@ -60,6 +61,7 @@ fn main() {
         ("mxfp4_bench.cu", "mxfp4_bench.ptx", "sm_121a"),
         ("gpu_mxfp4.cu", "gpu_mxfp4.ptx", "sm_121a"),
         ("gpu_mxfp4_moe.cu", "gpu_mxfp4_moe.ptx", "sm_121a"),
+        ("gpu_w4a4.cu", "gpu_w4a4.ptx", "sm_121a"),
     ];
 
     for (src_name, _, _) in &kernels {

@@ -7,6 +7,9 @@ pub mod vision_encoder;
 pub mod vision_gpu;
 pub mod gpu;
 pub mod quant;
+pub mod ple;
+pub mod memwatch;
+pub mod gptq;
 pub mod mxfp4;
 pub mod batch;
 pub mod kernels;
@@ -36,6 +39,7 @@ pub mod dsv4_dspark;
 pub mod dflash;
 pub mod dspark;
 pub mod dflash2;
+pub mod w4a4;
 
 use serde::Serialize;
 

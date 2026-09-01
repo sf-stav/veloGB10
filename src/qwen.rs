@@ -16,7 +16,7 @@ pub enum LayerType {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Family { Qwen35, HyV3, Dsv4 }
+pub enum Family { Qwen35, HyV3, Dsv4, Qwen4Exp }
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -67,6 +67,30 @@ pub struct Config {
     pub route_norm: bool,
     pub router_scaling: f32,
     pub lm_head_fp32: bool,
+    // qwen4_exp (Qwen3.8-Flash-Next). Multi-stream residual ("hyper-connections"): the residual
+    // stream is `hc_count` copies of the hidden (rw = hc_count*hidden); every sublayer reads a gated
+    // mix of the streams and writes back a per-stream-weighted injection (see GpuHc). No
+    // input/post layernorms and no final norm — the hc norms play that role. `hc_count == 1` for
+    // every other family (and `resid_width() == hidden_size`).
+    pub hc_count: usize,
+    pub hc_lowrank: usize,
+    /// GDN output gate activation: qwen3_5 = silu ("swish"); qwen4_exp = sigmoid.
+    pub gdn_gate_sigmoid: bool,
+    /// PLE n-gram injection layer (0-based trunk layer index), if the model has one. qwen4_exp's
+    /// config lists `ple_layer_ids: [2]` meaning the layer whose (idx+1) == 2, i.e. layer 1.
+    pub ple_layer: Option<usize>,
+    pub ple_ngram_size: usize,          // 3 → contexts of 2 and 3 tokens
+    pub ple_heads_per_ngram: usize,     // 8
+    pub ple_vocab_base: usize,          // 20_000_000: head vocab sizes are the next primes after it
+    pub ple_embed_dim: usize,           // 2560 = ngram_heads * 160
+    pub ple_conv_kernel: usize,         // 4 (dilation = ngram_size)
+    pub ple_vocab_divisor: usize,       // pad the table rows to a multiple of this (128)
+    pub ple_seed: u64,                  // 1234 — layer multiplier hash seed
+    /// QSA sparse-attention indexer on the full-attention layers (None = dense attention).
+    pub indexer_n_heads: usize,
+    pub indexer_head_dim: usize,
+    pub indexer_budget: usize,
+    pub indexer_compress_ratio: usize,
 }
 
 impl Config {
@@ -83,6 +107,7 @@ impl Config {
         let model_type = root["model_type"].as_str().unwrap_or("");
         let family = if model_type == "hy_v3" { Family::HyV3 }
                      else if model_type == "deepseek_v4" { Family::Dsv4 }
+                     else if model_type == "qwen4_exp" || model_type == "qwen4_exp_text" { Family::Qwen4Exp }
                      else { Family::Qwen35 };
         if family == Family::Dsv4 {
             anyhow::bail!(
@@ -180,6 +205,32 @@ impl Config {
         let router_scaling = tc["router_scaling_factor"].as_f64().unwrap_or(1.0) as f32;
         let lm_head_fp32 = tc["enable_lm_head_fp32"].as_bool().unwrap_or(false);
 
+        // qwen4_exp: hyper-connections, PLE, QSA indexer, sigmoid GDN gate.
+        let is_q4 = family == Family::Qwen4Exp;
+        let hc_count = if is_q4 { tc["hc_count"].as_u64().unwrap_or(4) as usize } else { 1 };
+        let hc_lowrank = if is_q4 { tc["hc_lowrank"].as_u64().unwrap_or(320) as usize } else { 0 };
+        let gdn_gate_sigmoid = tc["output_gate_type"].as_str().map_or(false, |s| s == "sigmoid");
+        let ple_ids: Vec<usize> = tc["ple_layer_ids"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect()).unwrap_or_default();
+        anyhow::ensure!(ple_ids.len() <= 1, "qwen4_exp: more than one PLE layer ({ple_ids:?}) is not supported");
+        // HF: `ple_layer_index = config.ple_layer_ids.index(layer_idx + 1)` → the PLE lives on layer id-1.
+        let ple_layer = ple_ids.first().map(|&id| { assert!(id >= 1, "ple_layer_ids entries are 1-based"); id - 1 });
+        let ple_ngram_size = tc["ngram_size"].as_u64().unwrap_or(3) as usize;
+        let ple_heads_per_ngram = tc["heads_per_ngram"].as_u64().unwrap_or(8) as usize;
+        let ple_vocab_base = tc["ngram_vocab_size_base"].as_u64().unwrap_or(20_000_000) as usize;
+        let ple_embed_dim = tc["ple_embed_dim"].as_u64().unwrap_or(hidden_size as u64) as usize;
+        let ple_conv_kernel = tc["ple_conv_kernel_size"].as_u64().unwrap_or(4) as usize;
+        let ple_vocab_divisor = tc["make_ngram_vocab_size_divisible_by"].as_u64().unwrap_or(128) as usize;
+        let ple_seed = tc["seed"].as_u64().unwrap_or(1234);
+        let indexer_n_heads = tc["indexer_n_heads"].as_u64().unwrap_or(0) as usize;
+        let indexer_head_dim = tc["indexer_head_dim"].as_u64().unwrap_or(0) as usize;
+        let indexer_budget = tc["indexer_budget"].as_u64().unwrap_or(0) as usize;
+        let indexer_compress_ratio = tc["indexer_compress_ratio"].as_u64().unwrap_or(1) as usize;
+        if is_q4 && indexer_n_heads > 0 {
+            anyhow::ensure!(tc["indexer_kv_heads"].as_u64().unwrap_or(1) == 1, "qwen4_exp QSA requires indexer_kv_heads == 1");
+            anyhow::ensure!(indexer_budget % indexer_compress_ratio == 0, "indexer_budget must be divisible by indexer_compress_ratio");
+        }
+
         // tie_word_embeddings
         let tie = tc["tie_word_embeddings"].as_bool()
             .or_else(|| root["tie_word_embeddings"].as_bool())
@@ -195,8 +246,21 @@ impl Config {
             is_moe, num_experts, num_experts_per_tok, moe_intermediate_size,
             shared_expert_intermediate_size, mlp_only_layers,
             qk_norm, router_sigmoid, router_expert_bias, route_norm, router_scaling, lm_head_fp32,
+            hc_count, hc_lowrank, gdn_gate_sigmoid, ple_layer, ple_ngram_size, ple_heads_per_ngram,
+            ple_vocab_base, ple_embed_dim, ple_conv_kernel, ple_vocab_divisor, ple_seed,
+            indexer_n_heads, indexer_head_dim, indexer_budget, indexer_compress_ratio,
         })
     }
+
+    /// Width of the residual stream: hc_count * hidden (qwen4_exp), hidden otherwise.
+    pub fn resid_width(&self) -> usize { self.hidden_size * self.hc_count.max(1) }
+    pub fn is_q4(&self) -> bool { self.family == Family::Qwen4Exp }
+    /// PLE n-gram heads = (ngram_size - 1) * heads_per_ngram (16 on Flash-Next), row dim = embed/heads.
+    pub fn ple_heads(&self) -> usize { (self.ple_ngram_size.saturating_sub(1)) * self.ple_heads_per_ngram }
+    pub fn ple_head_dim(&self) -> usize { if self.ple_heads() == 0 { 0 } else { self.ple_embed_dim / self.ple_heads() } }
+    /// Dilated-conv state length: (kernel-1) * dilation, dilation = ngram_size (9 on Flash-Next).
+    pub fn ple_conv_state_len(&self) -> usize { (self.ple_conv_kernel - 1) * self.ple_ngram_size }
+    pub fn has_indexer(&self) -> bool { self.is_q4() && self.indexer_n_heads > 0 }
 
     pub fn key_dim(&self) -> usize { self.lin_k_dim * self.lin_num_k_heads }
     pub fn value_dim(&self) -> usize { self.lin_v_dim * self.lin_num_v_heads }
@@ -229,6 +293,10 @@ impl Config {
             shared_expert_intermediate_size: 0, mlp_only_layers: Vec::new(),
             qk_norm: false, router_sigmoid: false, router_expert_bias: false,
             route_norm: true, router_scaling: 1.0, lm_head_fp32: false,
+            hc_count: 1, hc_lowrank: 0, gdn_gate_sigmoid: false, ple_layer: None, ple_ngram_size: 0,
+            ple_heads_per_ngram: 0, ple_vocab_base: 0, ple_embed_dim: 0, ple_conv_kernel: 0,
+            ple_vocab_divisor: 128, ple_seed: 1234, indexer_n_heads: 0, indexer_head_dim: 0,
+            indexer_budget: 0, indexer_compress_ratio: 1,
         }
     }
 }

@@ -1,5 +1,11 @@
 target/
+.venv/
+.venv-*/
 **/__pycache__/
 *.nsys-rep
 *.sqlite
 .DS_Store
+# tool-eval-bench state and reports (generated locally, not needed to build or run)
+data/
+runs/
+*.log

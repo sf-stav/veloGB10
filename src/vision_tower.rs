@@ -20,6 +20,8 @@ pub const HEAD_DIM: usize = HIDDEN / HEADS; // 72
 pub const INTER: usize = 4304;
 pub const NUM_BLOCKS: usize = 27;
 pub const NUM_POS: usize = 2304;
+/// Merger output width of the historical Qwen3.5-27B tower (= text hidden 5120). Other models,
+/// including qwen4_exp, use the geometry-driven `TowerDims::out_hidden` value.
 pub const OUT_HIDDEN: usize = 5120;
 pub const MERGE_INTER: usize = HIDDEN * MERGE * MERGE; // 4608
 
@@ -327,8 +329,12 @@ impl VisualTower {
             let raw = std::fs::read_to_string(&index)?;
             let j: serde_json::Value = serde_json::from_str(&raw)?;
             if let Some(wm) = j["weight_map"].as_object() {
+                // Only the shards that hold `model.visual.*`. Reading every shard into host memory
+                // to find them is what pushed the box into the kernel's OOM path on a 97 GB
+                // artifact (2026-08-28): the tower is ~1.3 GB and lives in one 4 GB shard.
                 let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-                for (_, v) in wm {
+                for (k, v) in wm {
+                    if !k.starts_with("model.visual.") { continue; }
                     if let Some(s) = v.as_str() {
                         set.insert(s.to_string());
                     }
@@ -506,7 +512,7 @@ mod tests {
         assert_eq!(t.blocks.len(), 27);
         assert_eq!(t.patch_embed_w.len(), 1152 * 3 * 2 * 16 * 16);
         assert_eq!(t.pos_embed_w.len(), 2304 * 1152);
-        assert_eq!(t.merger_fc2_w.len(), 5120 * 4608);
+        assert_eq!(t.merger_fc2_w.len(), t.dims.out_hidden * t.dims.merge_inter());
     }
 
     /// The geometry probe: every Qwen3.5/3.8 VL geometry parses; `to_dims` requires all fields.

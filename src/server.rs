@@ -38,6 +38,9 @@ pub struct AppState {
     /// KV cache depth, in positions. NOTHING used to check a prompt against it: an over-long prompt
     /// ran `write_kv_prefill` straight past the end of the cache and corrupted the next allocation.
     pub max_seq_len: usize,
+    /// Decode positions reserved beyond `max_tokens` for speculative verification/re-prime.
+    /// Mirrors the scheduler reserve so an HTTP-clamped request is always admissible.
+    pub decode_headroom: usize,
     /// Scheduler prefix-cache flag (mirror of TpConfig.prefix_cache). The message-boundary
     /// checkpoint (`ckpt_at`) is only ever USED when the scheduler's prefix cache is on
     /// (batch.rs filters it again); gating its render+tokenize here saves the double
@@ -120,7 +123,13 @@ pub fn model_id_from_dir(model_path: &str) -> String {
 }
 
 fn esc(t: &str) -> String {
-    t.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    // SSE chunks interpolate this inside a JSON string. Hand-escaping only backslashes,
+    // quotes and newlines left literal tabs (common in Go), carriage returns and other
+    // control characters in the payload. Clients discard that invalid JSON, which looks
+    // like the first characters of indented lines were truncated. Use the complete JSON
+    // escaping rules, then remove the surrounding quotes supplied by the serializer.
+    let quoted = serde_json::to_string(t).expect("serializing a Rust string cannot fail");
+    quoted[1..quoted.len() - 1].to_string()
 }
 
 /// (The think close marker is resolved per-request from the model's vocab — see
@@ -197,6 +206,29 @@ fn partial_overlap(s: &str, marker: &str) -> usize {
 }
 
 fn partial_think_overlap(s: &str, marker: &str) -> usize { partial_overlap(s, marker) }
+
+/// Whether generation starts inside an unclosed think block in the prompt that was ACTUALLY
+/// rendered. This must not be inferred from the model family: Qwen normally primes `<think>`, but
+/// `reasoning_effort=no_think` renders the same family with thinking disabled. Conversely hy_v3 can
+/// start either inside or outside its think block depending on the request.
+fn prompt_ends_inside_think(prompt: &str, think_open: &str) -> bool {
+    // Only the generation-prompt suffix is authoritative. Searching the whole rendered conversation
+    // would let a literal `<think>` in the user's text alter the stream state.
+    prompt.trim_end().ends_with(think_open)
+}
+
+/// Map the union accepted by the HTTP/CLI surface onto the vocabulary of the active template.
+/// In particular, OpenAI's `high` must never mean "disable thinking" (the old mapping did exactly
+/// that for Qwen, which also made the streaming-state bug intermittent across clients).
+fn normalize_reasoning_effort(effort: &str, hy_v3: bool) -> &str {
+    match (effort, hy_v3) {
+        ("high" | "medium" | "xhigh" | "max", true) => "high",
+        ("high" | "max", false) => "xhigh",
+        ("xhigh" | "medium" | "low", false) | ("low", true) => effort,
+        ("no_think" | "minimal" | "none" | "off" | "", _) => "no_think",
+        (other, _) => other,
+    }
+}
 
 /// The opening marker of a tool call. While streaming we must never forward this (or a partial prefix
 /// of it) to the client as CONTENT: a harness would render raw XML in the chat and never invoke the
@@ -326,6 +358,11 @@ fn spec_finish_reason(reason: &str) -> &str {
     if reason == "context_length_exceeded" { "length" } else { reason }
 }
 
+fn generation_room(max_seq_len: usize, prompt_len: usize, decode_headroom: usize) -> Option<usize> {
+    let used = prompt_len.checked_add(decode_headroom)?;
+    max_seq_len.checked_sub(used).filter(|&room| room > 0)
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
@@ -346,46 +383,48 @@ async fn chat_completions(
     //   - hy_v3's template accepts `no_think|low|high` (default low), and its Rust dsv4 path treats
     //     None/"" as low.
     //   - Qwen3.5's template accepts `xhigh|medium|low` (default xhigh) and RAISES on anything else.
-    // Forward the client's value verbatim when it is valid for THIS family's template; convert
-    // the OpenAI API convention onto the nearest native level. When NEITHER the request nor
-    // --reasoning-effort specifies one, pass None so the model's own template default wins
-    // (xhigh for Qwen 3.8, low for hy_v3) — never a hardcoded guess.
-    //
-    // Qwen 3.8 native (the ONLY values its template accepts; anything else raises => 500):
-    //   xhigh (default) | medium | low          ["no_think"/"off" => enable_thinking=false]
-    // OpenAI API -> Qwen 3.8 (owner spec 2026-08-30):
-    //   none    -> thinking off      (latency-critical; no reasoning)
-    //   low     -> low               (efficient reasoning)
-    //   medium  -> medium            (balanced; OpenAI's default)
-    //   high    -> xhigh             (hard reasoning)
-    //   xhigh   -> xhigh             (deep research)
-    //   max     -> xhigh             (maximum)
-    // hy_v3 native: no_think | low | high  =>  none->no_think, low->low, medium/high/xhigh/max->high
-    //
-    // REGRESSION FIX (2026-08-30): the 289e1a1 refactor lumped "high" into the no_think arm,
-    // so every OpenAI-convention client sending reasoning_effort=high silently LOST thinking.
-    let (_, think_close_tag, _) = state.tokenizer.think_tags();
-    let hy_family = think_close_tag != "</think>";
+    // Forward the client's value verbatim when it is one of the Qwen values; normalize the OpenAI
+    // convention (minimal|low|medium|high) onto a family-agnostic low/high only when a value is
+    // given. When NEITHER the request nor --reasoning-effort specifies one, pass None so the model's
+    // own template default wins (xhigh for Qwen, low for hy_v3) — never a hardcoded guess.
+    let hy_v3 = !state.tokenizer.think_tags().2;
     let effort: Option<&str> = req.reasoning_effort.as_deref()
         .or(state.reasoning_effort.as_deref())
         .map(|e| {
-            let n = match (e, hy_family) {
-                ("high", true) | ("medium", true) | ("xhigh", true) | ("max", true) => "high",
-                ("high", false) | ("xhigh", false) | ("max", false) => "xhigh",
-                ("low", _) | ("medium", false) => e,
-                ("no_think", _) | ("none", _) | ("minimal", _) | ("off", _) | ("", _) => "no_think",
-                (other, _) => other,
-            };
+            let n = normalize_reasoning_effort(e, hy_v3);
             if n != e {
-                eprintln!("[req] reasoning_effort '{e}' normalized to '{n}' for this model family");
+                eprintln!("[req] reasoning_effort '{e}' normalized to '{n}' for {}",
+                          if hy_v3 { "hy_v3" } else { "Qwen" });
+            }
+            if !matches!(n, "xhigh" | "medium" | "low" | "no_think" | "high") {
+                eprintln!("[req] reasoning_effort '{e}' not a known level (passing through verbatim)");
             }
             n
         });
+    // tool_choice: "none" renders the turn without tools; "required" / a named function FORCE the
+    // call by seeding the assistant turn with the template's tool-call opener (the thinking block
+    // is closed empty first — a forced call cannot start inside <think>). The seed is prepended to
+    // the generated text before parsing so the serializer sees a complete call.
+    let (tools_for_render, forced_prefix): (Option<&[serde_json::Value]>, String) = match &req.tool_choice {
+        Some(serde_json::Value::String(c)) if c == "none" => (None, String::new()),
+        Some(serde_json::Value::String(c)) if c == "required" && req.tools.is_some() => (req.tools.as_deref(), "<tool_call>\n<function=".to_string()),
+        Some(v) if v.get("type").and_then(|t| t.as_str()) == Some("function") && req.tools.is_some() => {
+            let name = v["function"]["name"].as_str().unwrap_or("").to_string();
+            (req.tools.as_deref(), format!("<tool_call>\n<function={name}>\n"))
+        }
+        _ => (req.tools.as_deref(), String::new()),
+    };
     let t_render = std::time::Instant::now();
-    let prompt = match state.tokenizer.apply_chat_template(&req.messages, req.tools.as_deref(), effort) {
+    let mut prompt = match state.tokenizer.apply_chat_template(&req.messages, tools_for_render, effort) {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    if !forced_prefix.is_empty() {
+        if let Some(p) = prompt.strip_suffix("<think>\n") { prompt = format!("{p}<think>\n\n</think>\n\n"); }
+        prompt.push_str(&forced_prefix);
+        eprintln!("[req] tool_choice forces a call: seeded {:?}", forced_prefix);
+    }
+    let forced_prefix_stream = forced_prefix.clone();
     let render_ms = t_render.elapsed().as_secs_f64() * 1000.0;
 
     // Optional diagnostic: dump the exact rendered prompt string so the bytes a model
@@ -471,15 +510,17 @@ async fn chat_completions(
     // out of bounds — silently, corrupting whatever allocation followed, which showed up as two
     // identical prefills disagreeing. Reject what cannot fit, and cap generation at the room left:
     // running short is a `finish_reason: "length"`, which is in the contract. Corruption is not.
-    if prompt_len >= state.max_seq_len {
+    if generation_room(state.max_seq_len, prompt_len, state.decode_headroom).is_none() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
             "message": format!("This model's maximum context length is {} tokens, but your messages \
-                                came to {} tokens. Shorten the input or restart the server with a \
-                                larger --max-seq-len.", state.max_seq_len, prompt_len),
+                                came to {} tokens and decoding reserves {} more positions. Shorten the input or \
+                                restart the server with a larger --max-seq-len.",
+                                state.max_seq_len, prompt_len, state.decode_headroom),
             "type": "invalid_request_error", "code": "context_length_exceeded",
         }}))).into_response();
     }
-    let room = state.max_seq_len - prompt_len;
+    let room = generation_room(state.max_seq_len, prompt_len, state.decode_headroom)
+        .expect("context room checked above");
     let asked = req.max_tokens.unwrap_or(state.default_max_tokens);
     let req_max = asked.min(room);
     // If the KV cache forced generation shorter than asked, SAY SO. A thinking model spends a big fixed
@@ -487,8 +528,8 @@ async fn chat_completions(
     // reasoning" as a conversation grows — which is exactly how this surfaced in the wild. Raise
     // --max-seq-len (graphs cost ~nothing here; KV is ~64 KB/token) to give multi-turn room.
     if req_max < asked {
-        eprintln!("[req] max_tokens clamped {} -> {} (KV cache room: {} of {} used by the {}-token prompt; \
-                   raise --max-seq-len)", asked, req_max, prompt_len, state.max_seq_len, prompt_len);
+        eprintln!("[req] max_tokens clamped {} -> {} (KV cache: {}-token prompt + {} reserved decode positions of {}; \
+                   raise --max-seq-len)", asked, req_max, prompt_len, state.decode_headroom, state.max_seq_len);
     }
     let temperature = req.temperature;
     let top_p = req.top_p.max(0.01);
@@ -548,22 +589,15 @@ async fn chat_completions(
         let t0 = std::time::Instant::now();
         let req_tools = req.tools.clone();
         let include_usage = req.stream_options.as_ref().map(|o| o.include_usage).unwrap_or(true);
-        // Think markers + the initial reasoning/content state. Derive the start mode from the
-        // RENDERED PROMPT TAIL, not a family constant: qwen's template primes an OPEN think block
-        // when thinking (prompt ends with `<think>`), but its no-think branch (enable_thinking=
-        // false — effort none/no_think/off) emits a CLOSED empty block `<think>\n\n</think>\n\n`,
-        // so that stream starts in CONTENT. A family-constant `primed` mislabeled the direct
-        // answer as reasoning_content forever (content stayed empty; the model card's non-thinking
-        // mode is real and respected by the model — verified sync+bf16 2026-08-30). hy_v3 keeps
-        // the effort arm: its low|high template primes `…assistant<think:opensource>` even when
-        // the tail check can't see it.
+        // Resolve markers from the model's vocab, but derive the initial state from the prompt that
+        // was ACTUALLY rendered. Family-based inference is wrong for request-level no-think: Qwen's
+        // family default is a primed `<think>` block, while `reasoning_effort=no_think` renders a
+        // plain assistant prompt. The old inference consequently streamed the whole normal answer as
+        // `reasoning_content` because no `</think>` was ever supposed to arrive. Inspecting the
+        // generation-prompt suffix also handles hy_v3 and forced tool-call prefixes without special
+        // cases, while ignoring literal markers in user messages.
         let (think_open, think_close, _) = tokenizer.think_tags();
-        // trim_end: the primed form is `<think>\n` — the trailing newline must not defeat the
-        // tail check (a plain ends_with(think_open) sent thinking streams to content: exactly
-        // the 35b4b15 follow-up bug). The no-think tail `<think>\n\n</think>\n\n` trims to
-        // `</think>` and stays content.
-        let starts_in_reasoning = prompt.trim_end().ends_with(think_open)
-            || matches!(effort, Some("low") | Some("high"));
+        let starts_in_reasoning = prompt_ends_inside_think(&prompt, think_open);
 
         let stream = async_stream::stream! {
             yield Ok::<Event, axum::Error>(Event::default().data(
@@ -573,7 +607,7 @@ async fn chat_completions(
             // multi-byte char split across tokens (all emoji) into "�" — the crate's ByteLevel
             // decode is String::from_utf8_lossy per call. Reassembles raw bytes across tokens.
             let mut stream_dec = tokenizer.stream_decoder();
-            let mut acc = String::new();
+            let mut acc = forced_prefix_stream.clone();
             let mut n = 0usize;
             let mut stop_hit = false;
             let mut finish = "length".to_string();
@@ -773,7 +807,7 @@ async fn chat_completions(
             }
         }
         let dt = t0.elapsed().as_secs_f32();
-        let mut text = state.tokenizer.decode(&tokens, true).unwrap_or_default();
+        let mut text = format!("{forced_prefix}{}", state.tokenizer.decode(&tokens, true).unwrap_or_default());
         if !req.stop.is_empty() {
             if let Some(p) = req.stop.iter().filter_map(|s| text.find(s)).min() {
                 text.truncate(p); finish = "stop".to_string();
@@ -853,4 +887,88 @@ pub fn create_router(state: AppState) -> Router {
         // so images that other engines accept also arrive here.
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod context_budget_tests {
+    use super::{esc, generation_room, normalize_reasoning_effort, prompt_ends_inside_think};
+
+    #[test]
+    fn mtp_headroom_is_reserved_before_clamping() {
+        assert_eq!(generation_room(4096, 1314, 16), Some(2766));
+        assert_eq!(generation_room(4096, 1324, 16), Some(2756));
+    }
+
+    #[test]
+    fn prompt_that_leaves_only_headroom_has_no_generation_room() {
+        assert_eq!(generation_room(4096, 4080, 16), None);
+        assert_eq!(generation_room(4096, usize::MAX, 16), None);
+    }
+
+    #[test]
+    fn sse_json_escape_preserves_indented_go_code() {
+        let text = concat!(
+            "// New crée un cache.\n",
+            "func New(capacity int) *CacheLRU {\n",
+            "\treturn &CacheLRU{\r\n",
+            "\t\tcapacity: capacity,\n",
+            "\t\titems: make(map[interface{}]*list.Element),\n",
+            "\t}\n",
+            "}\n",
+        );
+        let payload = format!(r#"{{"delta":{{"content":"{}"}}}}"#, esc(text));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("SSE data must contain valid JSON");
+
+        assert_eq!(parsed["delta"]["content"], text);
+        assert!(!payload.contains('\t'), "JSON payload must not contain literal tabs");
+        assert!(!payload.contains('\r'), "JSON payload must not contain literal CRs");
+    }
+
+    #[test]
+    fn streaming_state_follows_the_rendered_prompt_not_the_model_family() {
+        assert!(prompt_ends_inside_think(
+            "<|im_start|>assistant\n<think>\n",
+            "<think>",
+        ));
+
+        // Qwen with reasoning_effort=no_think: same tokenizer family, but the template does not
+        // prime a think block. A normal answer must therefore stream through `content`.
+        assert!(!prompt_ends_inside_think(
+            "<|im_start|>assistant\n",
+            "<think>",
+        ));
+
+        // Forced tool calls explicitly close the template's primed block before their prefix.
+        assert!(!prompt_ends_inside_think(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=",
+            "<think>",
+        ));
+
+        // hy_v3 uses different markers and can be rendered in either state as well.
+        assert!(prompt_ends_inside_think(
+            "assistant<think:opensource>",
+            "<think:opensource>",
+        ));
+        assert!(!prompt_ends_inside_think(
+            "assistant<think:opensource></think:opensource>",
+            "<think:opensource>",
+        ));
+
+        // A literal marker in user content must not prime a no-think generation.
+        assert!(!prompt_ends_inside_think(
+            "<|im_start|>user\nplease print <think><|im_end|>\n<|im_start|>assistant\n",
+            "<think>",
+        ));
+    }
+
+    #[test]
+    fn reasoning_effort_high_stays_a_thinking_level() {
+        assert_eq!(normalize_reasoning_effort("high", false), "xhigh");
+        assert_eq!(normalize_reasoning_effort("high", true), "high");
+        assert_eq!(normalize_reasoning_effort("medium", true), "high");
+        assert_eq!(normalize_reasoning_effort("max", false), "xhigh");
+        assert_eq!(normalize_reasoning_effort("max", true), "high");
+        assert_eq!(normalize_reasoning_effort("minimal", false), "no_think");
+    }
 }

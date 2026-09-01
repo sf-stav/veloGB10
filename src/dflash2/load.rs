@@ -97,6 +97,50 @@ pub fn load(dir: &str, sha256_pin: Option<&str>) -> Result<LoadedArtifact, anyho
     })
 }
 
+/// Load the logical 81-tensor DFlash2 inventory from a mixed MR-GPTQ artifact. Projection
+/// families may be represented by the standard NVFP4 packed triple; they are dequantized here
+/// only to build the oracle/prime mirror. The serving round separately uploads the packed bytes.
+pub fn load_runtime(dir: &str) -> Result<LoadedArtifact, anyhow::Error> {
+    let rd = crate::gptq::ShardReader::open(Path::new(dir))?;
+    let inv = inventory();
+    let mut weights = Dflash2Weights {
+        layers: Vec::with_capacity(crate::dflash2::N_LAYERS),
+        fc: Vec::new(), hidden_norm: Vec::new(), norm: Vec::new(),
+        hidden_projection: Vec::new(), predecessor_codebook: Vec::new(), successor_codebook: Vec::new(),
+    };
+    let mut n_params = 0u64;
+    for (name, shape) in &inv {
+        n_params += shape.iter().map(|&d| d as u64).product::<u64>();
+        let vals = if rd.metas.contains_key(name) {
+            let (got, v) = rd.read_bf16(name)?;
+            anyhow::ensure!(&got == shape, "{name}: shape {got:?} != {shape:?}");
+            v
+        } else {
+            let stem = name.strip_suffix(".weight").ok_or_else(|| anyhow::anyhow!("missing tensor {name}"))?;
+            let pn = format!("{stem}.weight_packed");
+            let sn = format!("{stem}.weight_scale");
+            let gn = format!("{stem}.weight_global_scale");
+            let (pm, qw) = rd.read_bytes(&pn)?;
+            let (sm, sc) = rd.read_bytes(&sn)?;
+            let (_, gb) = rd.read_bytes(&gn)?;
+            anyhow::ensure!(shape.len() == 2 && pm.shape == vec![shape[0], shape[1] / 2]
+                && sm.shape == vec![shape[0], shape[1] / 16], "{stem}: malformed NVFP4 family");
+            anyhow::ensure!(gb.len() == 4, "{gn}: expected one f32");
+            let global_scale = f32::from_le_bytes(gb[..4].try_into().unwrap());
+            crate::quant::dequantize_nvfp4(&crate::quant::Nvfp4Tensor {
+                qweight: qw, scales: sc, global_scale, m: shape[0], k: shape[1],
+            })
+        };
+        assign(&mut weights, name, vals.into_iter().map(|x| x.to_f32()).collect())?;
+    }
+    anyhow::ensure!(n_params == N_PARAMS, "param count {n_params} != {N_PARAMS}");
+    let file_size = rd.metas.values().map(|m| m.off.1 - m.off.0).sum();
+    Ok(LoadedArtifact {
+        weights, n_tensors: N_TENSORS, n_params, sha256: "mixed-runtime".into(),
+        file_size, header_size: file_size.saturating_sub(n_params * 2),
+    })
+}
+
 /// Assign one f32 tensor into the weight struct by name (fixed-order, deterministic).
 fn assign(w: &mut Dflash2Weights, name: &str, v: Vec<f32>) -> Result<(), anyhow::Error> {
     match name {
