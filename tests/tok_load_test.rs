@@ -4,7 +4,9 @@ use gb10_inference::tokenizer::{ChatMessage, QwenTokenizer};
 
 #[test]
 fn load_hy3_tokenizer_via_engine() {
-    let tok = QwenTokenizer::from_file("/mnt/models/hy3-nvfp4/tokenizer.json")
+    let dir = std::env::var("GB10_TEST_MODEL_DIR")
+        .unwrap_or_else(|_| "models/hy3-nvfp4".to_string());
+    let tok = QwenTokenizer::from_file(&format!("{dir}/tokenizer.json"))
         .expect("hy3 tokenizer must load (pair-merge upgrade)");
     let ids = tok.encode("The history of the railway", true).expect("encode");
     assert_eq!(ids[..4], [628, 4043, 279, 252]);   // oracle p1 prefix
@@ -19,9 +21,11 @@ fn load_hy3_tokenizer_via_engine() {
 
 #[test]
 fn hy3_chat_template_renders_with_tools() {
-    let tok = QwenTokenizer::from_file("/mnt/models/hy3-nvfp4/tokenizer.json").unwrap();
+    let dir = std::env::var("GB10_TEST_MODEL_DIR")
+        .unwrap_or_else(|_| "models/hy3-nvfp4".to_string());
+    let tok = QwenTokenizer::from_file(&format!("{dir}/tokenizer.json")).unwrap();
     let msgs = vec![
-        ChatMessage { role: "system".into(), content: Some("You are helpful.".into()),
+        ChatMessage { role: "system".into(), content: Some("You are helpful.".into()), images: vec![],
                       tool_calls: None, tool_call_id: None, name: None, reasoning_content: None },
         ChatMessage::user("What is 2+2?"),
     ];

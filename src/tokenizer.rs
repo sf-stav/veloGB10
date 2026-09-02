@@ -47,6 +47,12 @@ impl QwenTokenizer {
         self.tokenizer.get_vocab(true).get("<|endoftext|>").copied().unwrap_or(151643) as u32
     }
 
+    /// Vocab size INCLUDING added tokens — the exclusive upper bound of a valid token id.
+    /// Used by the /v1/tokenize endpoint to reject id-list prompts that carry garbage ids.
+    pub fn vocab_size(&self) -> usize {
+        self.tokenizer.get_vocab_size(true)
+    }
+
     /// The think-block markers for this model's chat format, and whether a fresh generation starts
     /// INSIDE a think block. Qwen templates prime `<think>\n` (starts in reasoning, closes with
     /// `</think>`). hy_v3's no_think prompt renders `<think:opensource></think:opensource>` INTO the

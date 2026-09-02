@@ -268,6 +268,8 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
 - **OpenAI-compatible server** — streaming, tool calling (schema-aware argument coercion, with a
   single canonical serializer across streaming and non-streaming), seedable sampling, continuous
   batching, prefix caching, and OpenAI `reasoning_effort` levels (`none/low/medium/high/xhigh/max`).
+  Also exposes vLLM-compatible `POST /v1/tokenize` and `POST /v1/detokenize` endpoints for
+  benchmarking.
 - **Vision** — image input on a GPU vision tower across the Qwen3.5/3.8 VL family
   (`--vision-cpu` for the CPU reference path); PNG/JPEG/WebP/GIF. The tower bootstraps
   opportunistically: a non-vision or incompatible model serves text-only, never a startup crash.
@@ -405,9 +407,25 @@ Complete surface of `gb10_inference` (same content as `--help`). Square brackets
 
 | Mode | What it does |
 |---|---|
-| `--server` | OpenAI-compatible HTTP server — the normal way to run (endpoints: `POST /v1/chat/completions`, `GET /v1/models[/:id]`, `GET /health`) |
+| `--server` | OpenAI-compatible HTTP server — the normal way to run (endpoints: `POST /v1/chat/completions`, `POST /v1/tokenize`, `POST /v1/detokenize`, `GET /v1/models[/:id]`, `GET /health`) |
 | *(no mode)* | Interactive CLI: load model, generate from `--prompt` |
 | `--help`, `-h` | Print help |
+
+### Tokenize / detokenize (benchmarking)
+
+Two vLLM-compatible endpoints expose the resident tokenizer for benchmarking and exact prompt
+construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
+
+- **`POST /v1/tokenize`** — `{model, prompt (string | token-id list), add_special_tokens (default
+  true), truncate_prompt_tokens (optional)}` → `{tokens: [ids], count, max_model_len}`. Accepts a
+  `prompt` string or a chat `messages` array; the `messages` mode renders exactly as the chat path
+  does (shared reminder-effort resolution), so its count equals `usage.prompt_tokens` for the same
+  conversation. An empty prompt returns `{tokens: [], count: 0}` (vLLM behavior); an over-length
+  prompt returns `400` with `code: context_length_exceeded` (truncation keeps the last `n` tokens).
+- **`POST /v1/detokenize`** — `{model, tokens, skip_special_tokens (default false)}` → `{model,
+  prompt}`. The decode half of the pair, for exact-N prompt building.
+
+`max_model_len` mirrors the configured context size, so benchmarks can plan prompts that fit.
 
 ### Server flags (`--server`)
 

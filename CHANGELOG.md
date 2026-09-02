@@ -3,6 +3,16 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.5.2 — vLLM-compatible tokenize / detokenize endpoints
+
+- **`POST /v1/tokenize`** — vLLM-compatible tokenization: `{tokens, count, max_model_len}`, a pure
+  tokenizer call (no forward / KV / GPU). Accepts a `prompt` string or a chat `messages` array; the
+  `messages` mode renders exactly as the chat path so its count equals `usage.prompt_tokens`. Empty
+  prompt → `{tokens: [], count: 0}`; over-length → `400 context_length_exceeded`.
+- **`POST /v1/detokenize`** — vLLM-compatible decode half of the pair (`{model, prompt}`) for
+  exact-N prompt building.
+- Added so our engine can be benchmarked more correctly. Minor bug fixes and optimizations.
+
 ## v0.5.1 — Vision robustness, reasoning-effort, graceful-load fixes
 
 - **Vision generalization + boot fix.** The GPU vision tower now bootstraps opportunistically: a

@@ -31,7 +31,7 @@ fn print_help() {
     println!("  SERVER MODE (--server) â OpenAI-compatible, continuous batching");
     println!("âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ");
     println!();
-    println!("  Endpoints:  POST /v1/chat/completions   GET /v1/models[/:id]   GET /health");
+    println!("  Endpoints:  POST /v1/chat/completions   POST /v1/tokenize   POST /v1/detokenize   GET /v1/models[/:id]   GET /health");
     println!();
     println!("  MODEL");
     println!("    --model-dir <DIR>          Model directory (config.json + *.safetensors + tokenizer).");
@@ -12496,6 +12496,8 @@ fn run_server(args: &[String]) {
         println!("OpenAI-compatible server running on http://0.0.0.0:{}", port);
         println!("Serving model: {}  (GET /v1/models)", model_name);
         println!("POST /v1/chat/completions   max_batch={}  default max_tokens={}", max_batch, default_max_tokens);
+        println!("POST /v1/tokenize           vLLM-compatible: {{tokens, count, max_model_len}} — pure tokenizer, no forward (prompt | messages)");
+        println!("POST /v1/detokenize         vLLM-compatible: {{model, prompt}} — decode half of the pair (exact-N prompt building)");
         axum::serve(listener, app).await.unwrap();
     });
 }

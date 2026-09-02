@@ -12,7 +12,12 @@
 set -u
 BIN="${GB10_BIN:-$(dirname "$0")/../target/release/gb10_inference}"
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
-VALID="${GB10_VALID_MODEL_DIR:-}
+VALID="${GB10_VALID_MODEL_DIR:-}"
+if [[ -z "$VALID" ]]; then
+  echo "ERROR: GB10_VALID_MODEL_DIR is required — point it at a VALID model dir for the control case." >&2
+  echo "  GB10_VALID_MODEL_DIR=/path/to/a/valid/model ./tests/model_load_graceful_exit_gate.sh" >&2
+  exit 2
+fi
 BASE="/tmp/model_load_fixtures"
 LOGBASE=/tmp/model_load_gate
 mkdir -p "$LOGBASE"
