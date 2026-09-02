@@ -346,6 +346,12 @@ caching (99% prefill skip on cache hits) and lossless speculation work on this a
 > run across all models × modes × contexts is in progress; these tables will be regenerated
 > from it. Single-stream decode, greedy, NVFP4, unless noted.
 
+> **Benchmark network.** These results were measured on the following network configuration:
+> **4× Asus Ascent GX10** (OEM DGX Spark clones) connected to a **MikroTik CRS812 DDQ
+> (CRS812-8DS-2DQ-2DDQ)** switch: 2 Sparks connect to the **200G ports** with QSFP112 cables; the
+> other 2 Sparks connect to the **400G port** via a **1× 400G → 2× 200G splitter cable**. All
+> inter-box links were measured to be **optimal (maxed out) at 111G**.
+
 ### Qwen3.5 family (tok/s, greedy, MTP auto unless noted)
 
 | Model (recipe) | Single node | TP=2 |
