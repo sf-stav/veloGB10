@@ -241,6 +241,89 @@ pub fn fake_quant_nvfp4(w: &mut [bf16], m: usize, k: usize) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// FP8-E4M3 with NVFP4-style per-16 block scales ("fp8-block") — PLAN/25 §1a-fp8b.
+//
+// The untested corner of the 2x2: nvfp4 = fine scale + coarse payload (lost TP=4 on deep-chain
+// noise), fp8-per-row = fine payload + coarse scale (lost TP=4 on outlier rows). fp8-block is
+// fine x fine: E4M3 payload (~3% per-weight steps) with a per-16 E4M3 scale (16x-local outlier
+// adaptivity) at 8.5 bits/weight. Same reciprocal global-scale convention as NVFP4:
+//
+//   w ≈ e4m3(q) * e4m3(s_block) / global_scale,   global_scale = 448 / amax(W)
+//
+// so stored block scales land in (0, 1] — inside E4M3's normal range for any tensor whose
+// per-block amax is at least ~1/448 of the tensor amax (a near-zero block dequantizes to
+// near-zero weights regardless — the residual error is bounded by the subnormal scale, which
+// is tiny in real units).
+pub struct Fp8BlockTensor {
+    pub qweight: Vec<u8>,   // [M, K] E4M3
+    pub scales: Vec<u8>,    // [M, K/16] E4M3
+    pub global_scale: f32,  // 448/amax — DIVIDE by this on dequant
+    pub m: usize,
+    pub k: usize,
+}
+
+pub fn quantize_fp8_block16(w: &[bf16], m: usize, k: usize) -> Fp8BlockTensor {
+    assert_eq!(w.len(), m * k, "shape mismatch");
+    assert_eq!(k % BLOCK, 0, "K={} is not a multiple of {}", k, BLOCK);
+
+    let amax = w.iter().fold(0.0f32, |acc, x| acc.max(x.to_f32().abs()));
+    let global_scale = if amax > 0.0 { E4M3_MAX / amax } else { 1.0 };
+    let s_tensor = 1.0 / global_scale;
+
+    let nblk = k / BLOCK;
+    let mut qweight = vec![0u8; m * k];
+    let mut scales = vec![0u8; m * nblk];
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).max(1);
+    let rows_per = m.div_ceil(nthreads).max(1);
+    std::thread::scope(|sc| {
+        let qparts = qweight.chunks_mut(rows_per * k);
+        let sparts = scales.chunks_mut(rows_per * nblk);
+        for (t, (qp, sp)) in qparts.zip(sparts).enumerate() {
+            sc.spawn(move || {
+                let r0 = t * rows_per;
+                let nrows = qp.len() / k;
+                for r in 0..nrows {
+                    let row = r0 + r;
+                    for b in 0..nblk {
+                        let blk = &w[row * k + b * BLOCK..][..BLOCK];
+                        let bmax = blk.iter().fold(0.0f32, |a, x| a.max(x.to_f32().abs()));
+                        // s_block = e4m3(amax(block) / 448 / s_tensor) — mirrors the nvfp4 recipe
+                        // with the payload max (448) in E2M1_MAX's role.
+                        let s_raw = if bmax > 0.0 { bmax / E4M3_MAX / s_tensor } else { 0.0 };
+                        let s_code = f32_to_e4m3(s_raw);
+                        sp[r * nblk + b] = s_code;
+
+                        let s = e4m3_to_f32(s_code) * s_tensor;
+                        let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+                        for i in 0..BLOCK {
+                            // local row r within this thread's chunk (mirrors quantize_nvfp4)
+                            qp[r * k + b * BLOCK + i] = f32_to_e4m3(blk[i].to_f32() * inv);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Fp8BlockTensor { qweight, scales, global_scale, m, k }
+}
+
+/// Dequantize to FP32 — the reference semantics the kernel must reproduce:
+/// `e4m3(code) * e4m3(scale) / global_scale`.
+pub fn dequantize_fp8_block16_f32(q: &Fp8BlockTensor) -> Vec<f32> {
+    let nblk = q.k / BLOCK;
+    let mut out = vec![0.0f32; q.m * q.k];
+    for r in 0..q.m {
+        for b in 0..nblk {
+            let s = e4m3_to_f32(q.scales[r * nblk + b]) / q.global_scale;
+            for i in 0..BLOCK {
+                out[r * q.k + b * BLOCK + i] = e4m3_to_f32(q.qweight[r * q.k + b * BLOCK + i]) * s;
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
 // Q2 (2-bit, E26) — the 2-bit codec. Per-16 block along K (the NVFP4 granularity, so the future
 // kernel reuses the tile machinery), Lloyd-Max 2-bit levels for a standard normal (the published
 // optimum for Gaussian sources): {-1.5104, -0.4528, +0.4528, +1.5104} — RTN midpoints ±0.9816, 0.
@@ -1146,16 +1229,26 @@ pub fn fuse_nvfp4(parts: &[(&[u8], &[u8], f32, usize)], k: usize) -> (Vec<u8>, V
 }
 
 /// Concatenate FP8 tensors along M. FP8 scales are already per output row, so they just concatenate.
-pub fn fuse_fp8(parts: &[(&[u8], &[f32], usize)], k: usize) -> (Vec<u8>, Vec<f32>) {
+/// Concatenate FP8 tensors along M. `nb_k` selects the scheme and the per-part scale length:
+/// 0 → legacy per-row (part scales are [part_m]); >0 → Qwen block-128 (part scales are
+/// [(part_m/128)*nb_k]). Band scales concatenate exactly like rows do — segments are 128-row
+/// aligned (asserted here and by the sharder), so fused band boundaries stay block-aligned.
+pub fn fuse_fp8_len(parts: &[(&[u8], &[f32], usize)], k: usize, nb_k: usize) -> (Vec<u8>, Vec<f32>) {
     let (mut qw, mut rs) = (Vec::new(), Vec::new());
     for &(pq, prs, m) in parts {
         assert!(m % MMA_M == 0, "fused segment M={} must be a multiple of {}", m, MMA_M);
         assert_eq!(pq.len(), m * k, "fused segment fp8 size");
-        assert_eq!(prs.len(), m, "fused segment row_scale size");
+        let want = if nb_k > 0 { (m / 128) * nb_k } else { m };
+        assert_eq!(prs.len(), want, "fused segment fp8 scale size (nb_k={nb_k})");
         qw.extend_from_slice(pq);
         rs.extend_from_slice(prs);
     }
     (qw, rs)
+}
+
+/// Legacy per-row entry point (scale length == m).
+pub fn fuse_fp8(parts: &[(&[u8], &[f32], usize)], k: usize) -> (Vec<u8>, Vec<f32>) {
+    fuse_fp8_len(parts, k, 0)
 }
 
 // ================================ DRAFT-VOCAB row subset ================================

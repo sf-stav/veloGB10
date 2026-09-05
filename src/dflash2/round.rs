@@ -38,11 +38,15 @@ use half::bf16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::dflash2::capture::Df2TapSink;
-use crate::dflash2::gpu::{fork_blocking_stream, upload_bf16, upload_norm, GpuGlobal, GpuLayer};
+use crate::dflash2::capture::{copy_row_into, Df2TapSink};
+use crate::dflash2::gpu::{fork_blocking_stream, upload_bf16, upload_fp8, upload_norm, upload_nvfp4, Df2W, GpuGlobal, GpuLayer};
+
+/// Which ring kv projection (the prime-twin helper's selector).
+#[derive(Clone, Copy)]
+enum Kv { K, V }
 use crate::dflash2::band_smem;
 use crate::dflash2::{BLOCK, CONV_GROUP, CONV_GROUPS, CONV_KERNEL, HEAD_DIM, HIDDEN, INTER, N_LAYERS,
-                     NUM_HEADS, NUM_KV_HEADS, RMS_EPS, SELECTOR_RANK, TAP_CONCAT_DIM, VOCAB};
+                     NUM_HEADS, NUM_KV_HEADS, RMS_EPS, SELECTOR_RANK, TAP_CONCAT_DIM, TAP_LAYERS, VOCAB};
 
 /// The ring depth (the sliding window; all 5 layers `sliding_attention`).
 pub const RING: usize = crate::dflash2::SLIDING_WINDOW;      // 2048
@@ -378,8 +382,32 @@ impl Df2Round {
             Some(hex) => Some(hex),
             None => Some(crate::dflash2::REAL_SHA256),
         };
-        let art = crate::dflash2::load::load(dir, pin)?;
-        let w = &art.weights;
+        // PLAN/25 §1a: a baked (NVFP4 weight-only) artifact loads through the quantized sidecar;
+        // the BF16 original keeps its exact loader. Round-shard (P2) slices host f32 pre-upload —
+        // it does not understand packed tiles yet, so the combination refuses loudly (the
+        // standing MTP fallback would mask a real config mistake).
+        let baked = crate::dflash2::load::is_baked(dir);
+        if baked {
+            anyhow::ensure!(ar.is_none(),
+                "df2 baked (nvfp4/fp8) artifact + --df2-round-shard: packed-tile sharding not supported yet —                  drop the flag or serve the BF16 artifact");
+        }
+        let (art_weights, quant): (crate::dflash2::oracle::Dflash2Weights,
+                                   Option<Vec<crate::dflash2::load::QuantTensor>>) = if baked {
+            let (a, q) = crate::dflash2::load::load_quantized(dir)?;
+            // The BF16 artifact's default pin is the source checkpoint's sha — the baked config
+            // carries the same value under df2_quant_source_sha256; honor a requested pin vs it.
+            if let Some(p) = pin {
+                if p != "off" {
+                    anyhow::ensure!(q.source_sha256.eq_ignore_ascii_case(p),
+                        "baked artifact source sha {} != pin {p}", q.source_sha256);
+                }
+            }
+            (a.weights, Some(q.tensors))
+        } else {
+            let a = crate::dflash2::load::load(dir, pin)?;
+            (a.weights, None)
+        };
+        let w = &art_weights;
         let cfg = crate::dflash2::oracle::Dflash2Config::default();
         let max_pos = max_c + BLOCK + 1;
 
@@ -411,7 +439,7 @@ impl Df2Round {
         let bptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_batch.ptx")?);
         let mut bfnames = ["rmsnorm_b", "rmsnorm_perhead_b", "rope_b", "gather_rope_b",
             "write_kv_b", "add_residual_b", "silu_mul_b", "kernel_build_id",
-            "gemm_mma_fp4_b", "embed_gather_fp4_tiled_b", "dequant_fp4_tiled_b",
+            "gemm_mma_fp4_b", "gemm_mma_fp8_b", "embed_gather_fp4_tiled_b", "dequant_fp4_tiled_b",
             "embed_gather_b", "gemm_binv_b"].to_vec();
         // P2: the all-reduce handshake kernels live in gpu_batch.cu (the trunk AR path's module);
         // f32tobf16 lives in gpu_kernels.cu — it joins kfnames below (a name from the wrong
@@ -437,8 +465,12 @@ impl Df2Round {
             bk.insert(n.to_string(), dev.get_func(module, n).with_context(|| format!("kernel {n} not in ptx"))?);
         }
 
+        let up_b = |data: &[f32]| -> CudaSlice<bf16> {
+            let b: Vec<bf16> = data.iter().map(|&x| bf16::from_f32(x)).collect();
+            dev.htod_sync_copy(&b).expect("upload bf16")
+        };
         let mut layers = Vec::with_capacity(N_LAYERS);
-        for l in &w.layers {
+        for (li, l) in w.layers.iter().enumerate() {
             // P2 shard-at-load (host-side slices BEFORE the bf16 upload — the trunk's proven
             // pattern). Row-major [out, in]: head/row bands are contiguous row slices; the
             // K-split (o/down) takes a per-row column band. Full-K everywhere a band is an
@@ -453,52 +485,101 @@ impl Df2Round {
                 let nq_rows = nq_l * HEAD_DIM;    // 1024 @ world=4
                 let nkv_rows = nkv_l * HEAD_DIM;  // 256
                 layers.push(GpuLayer {
-                    q_proj: upload_bf16(&dev, &rows(&l.q_proj, HIDDEN, shard_rank * nq_rows, (shard_rank + 1) * nq_rows)),
-                    k_proj: upload_bf16(&dev, &rows(&l.k_proj, HIDDEN, shard_rank * nkv_rows, (shard_rank + 1) * nkv_rows)),
-                    v_proj: upload_bf16(&dev, &rows(&l.v_proj, HIDDEN, shard_rank * nkv_rows, (shard_rank + 1) * nkv_rows)),
-                    o_proj: upload_bf16(&dev, &cols(&l.o_proj, HIDDEN, NUM_HEADS * HEAD_DIM,
-                                                    shard_rank * nq_rows, (shard_rank + 1) * nq_rows)),
-                    gate_proj: upload_bf16(&dev, &rows(&l.gate_proj, HIDDEN, shard_rank * ni_l, (shard_rank + 1) * ni_l)),
-                    up_proj: upload_bf16(&dev, &rows(&l.up_proj, HIDDEN, shard_rank * ni_l, (shard_rank + 1) * ni_l)),
-                    down_proj: upload_bf16(&dev, &cols(&l.down_proj, HIDDEN, INTER,
-                                                       shard_rank * ni_l, (shard_rank + 1) * ni_l)),
+                    q_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.q_proj, HIDDEN, shard_rank * nq_rows, (shard_rank + 1) * nq_rows))),
+                    k_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.k_proj, HIDDEN, shard_rank * nkv_rows, (shard_rank + 1) * nkv_rows))),
+                    k_proj_bf16: None,
+                    v_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.v_proj, HIDDEN, shard_rank * nkv_rows, (shard_rank + 1) * nkv_rows))),
+                    v_proj_bf16: None,
+                    o_proj: Df2W::Bf16(upload_bf16(&dev, &cols(&l.o_proj, HIDDEN, NUM_HEADS * HEAD_DIM,
+                                                    shard_rank * nq_rows, (shard_rank + 1) * nq_rows))),
+                    gate_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.gate_proj, HIDDEN, shard_rank * ni_l, (shard_rank + 1) * ni_l))),
+                    up_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.up_proj, HIDDEN, shard_rank * ni_l, (shard_rank + 1) * ni_l))),
+                    down_proj: Df2W::Bf16(upload_bf16(&dev, &cols(&l.down_proj, HIDDEN, INTER,
+                                                       shard_rank * ni_l, (shard_rank + 1) * ni_l))),
                     q_norm: upload_norm(&dev, &l.q_norm),
                     k_norm: upload_norm(&dev, &l.k_norm),
                     input_ln: upload_norm(&dev, &l.input_ln),
                     post_ln: upload_norm(&dev, &l.post_ln),
-                    attn_kp: upload_bf16(&dev, &l.attention_conv.kernel_projection),
+                    attn_kp: Df2W::Bf16(upload_bf16(&dev, &l.attention_conv.kernel_projection)),
                     attn_base: upload_bf16(&dev, &l.attention_conv.base_kernel),
-                    mlp_kp: upload_bf16(&dev, &l.mlp_conv.kernel_projection),
+                    mlp_kp: Df2W::Bf16(upload_bf16(&dev, &l.mlp_conv.kernel_projection)),
+                    mlp_base: upload_bf16(&dev, &l.mlp_conv.base_kernel),
+                });
+            } else if let Some(q) = &quant {
+                // PLAN/25 §1a: the 9 block linears come off the packed sidecar (MMA-repacked at
+                // upload); k/v keep BF16 twins for prime_window; norms/bases come off the kept
+                // bf16 side (the f32 struct's linear fields are EMPTY here — never touch them).
+                let _ = l;
+                let up4 = |name: String| -> Df2W {
+                    let p = q.iter().find(|t| t.name() == name)
+                        .unwrap_or_else(|| panic!("baked artifact missing packed tensor {name}"));
+                    match p {
+                        crate::dflash2::load::QuantTensor::Nvfp4(p) => Df2W::Nvfp4(upload_nvfp4(&dev, p)),
+                        crate::dflash2::load::QuantTensor::Fp8(p) => Df2W::Fp8(upload_fp8(&dev, p)),
+                    }
+                };
+                let ln = |sfx: &str| format!("layers.{li}.{sfx}");
+                layers.push(GpuLayer {
+                    q_proj: up4(ln("self_attn.q_proj.weight")),
+                    k_proj: up4(ln("self_attn.k_proj.weight")),
+                    k_proj_bf16: Some(up_b(&l.k_proj)),
+                    v_proj: up4(ln("self_attn.v_proj.weight")),
+                    v_proj_bf16: Some(up_b(&l.v_proj)),
+                    o_proj: up4(ln("self_attn.o_proj.weight")),
+                    gate_proj: up4(ln("mlp.gate_proj.weight")),
+                    up_proj: up4(ln("mlp.up_proj.weight")),
+                    down_proj: up4(ln("mlp.down_proj.weight")),
+                    q_norm: upload_norm(&dev, &l.q_norm),
+                    k_norm: upload_norm(&dev, &l.k_norm),
+                    input_ln: upload_norm(&dev, &l.input_ln),
+                    post_ln: upload_norm(&dev, &l.post_ln),
+                    attn_kp: up4(ln("attention_conv.kernel_projection.weight")),
+                    attn_base: upload_bf16(&dev, &l.attention_conv.base_kernel),
+                    mlp_kp: up4(ln("mlp_conv.kernel_projection.weight")),
                     mlp_base: upload_bf16(&dev, &l.mlp_conv.base_kernel),
                 });
             } else {
                 layers.push(GpuLayer {
-                    q_proj: upload_bf16(&dev, &l.q_proj),
-                    k_proj: upload_bf16(&dev, &l.k_proj),
-                    v_proj: upload_bf16(&dev, &l.v_proj),
-                    o_proj: upload_bf16(&dev, &l.o_proj),
-                    gate_proj: upload_bf16(&dev, &l.gate_proj),
-                    up_proj: upload_bf16(&dev, &l.up_proj),
-                    down_proj: upload_bf16(&dev, &l.down_proj),
+                    q_proj: Df2W::Bf16(upload_bf16(&dev, &l.q_proj)),
+                    k_proj: Df2W::Bf16(upload_bf16(&dev, &l.k_proj)),
+                    k_proj_bf16: None,
+                    v_proj: Df2W::Bf16(upload_bf16(&dev, &l.v_proj)),
+                    v_proj_bf16: None,
+                    o_proj: Df2W::Bf16(upload_bf16(&dev, &l.o_proj)),
+                    gate_proj: Df2W::Bf16(upload_bf16(&dev, &l.gate_proj)),
+                    up_proj: Df2W::Bf16(upload_bf16(&dev, &l.up_proj)),
+                    down_proj: Df2W::Bf16(upload_bf16(&dev, &l.down_proj)),
                     q_norm: upload_norm(&dev, &l.q_norm),
                     k_norm: upload_norm(&dev, &l.k_norm),
                     input_ln: upload_norm(&dev, &l.input_ln),
                     post_ln: upload_norm(&dev, &l.post_ln),
-                    attn_kp: upload_bf16(&dev, &l.attention_conv.kernel_projection),
+                    attn_kp: Df2W::Bf16(upload_bf16(&dev, &l.attention_conv.kernel_projection)),
                     attn_base: upload_bf16(&dev, &l.attention_conv.base_kernel),
-                    mlp_kp: upload_bf16(&dev, &l.mlp_conv.kernel_projection),
+                    mlp_kp: Df2W::Bf16(upload_bf16(&dev, &l.mlp_conv.kernel_projection)),
                     mlp_base: upload_bf16(&dev, &l.mlp_conv.base_kernel),
                 });
             }
         }
-        let glob = GpuGlobal {
-            fc: upload_bf16(&dev, &w.fc),
-            hidden_norm: upload_norm(&dev, &w.hidden_norm),
-            norm: upload_norm(&dev, &w.norm),
-        };
-        let up_b = |data: &[f32]| -> CudaSlice<bf16> {
-            let b: Vec<bf16> = data.iter().map(|&x| bf16::from_f32(x)).collect();
-            dev.htod_sync_copy(&b).expect("upload bf16")
+        let glob = match &quant {
+            Some(q) => {
+                let p = q.iter().find(|t| t.name() == "fc.weight").expect("baked: fc.weight packed");
+                let fc_w = match p {
+                    crate::dflash2::load::QuantTensor::Nvfp4(p) => Df2W::Nvfp4(upload_nvfp4(&dev, p)),
+                    crate::dflash2::load::QuantTensor::Fp8(p) => Df2W::Fp8(upload_fp8(&dev, p)),
+                };
+                GpuGlobal {
+                    fc: fc_w,
+                    fc_bf16: Some(up_b(&w.fc)),
+                    hidden_norm: upload_norm(&dev, &w.hidden_norm),
+                    norm: upload_norm(&dev, &w.norm),
+                }
+            }
+            None => GpuGlobal {
+                fc: Df2W::Bf16(upload_bf16(&dev, &w.fc)),
+                fc_bf16: None,
+                hidden_norm: upload_norm(&dev, &w.hidden_norm),
+                norm: upload_norm(&dev, &w.norm),
+            },
         };
         let hp_w = up_b(&w.hidden_projection);
         let pred_cb = up_b(&w.predecessor_codebook);
@@ -832,6 +913,57 @@ impl Df2Round {
             (d(out), d(w), x_ptr, outn as i32, inn as i32));
     }
 
+    /// PLAN/25 §1a: dispatch one block-pass linear on its storage. Nvfp4 runs the TRUNK's
+    /// persistent `gemm_mma_fp4_b`, Fp8 its sibling `gemm_mma_fp8_b` (both M=outn rows,
+    /// K=inn, N=BLOCK token columns — the N≤16-clamped X reads cover the round's fixed
+    /// width; X/out layouts match `gemm_dsp` exactly). The drafter's own numbers gate on
+    /// the acceptance quartet, not on binv (a trunk-verify property).
+    fn gemm_lin(&self, out: &CudaSlice<bf16>, w: &Df2W, x_ptr: u64, outn: usize, inn: usize) {
+        match w {
+            Df2W::Bf16(w) => self.gemm_dsp(out, w, x_ptr, outn, inn),
+            Df2W::Nvfp4(q) => {
+                debug_assert_eq!(outn, q.m);
+                debug_assert_eq!(inn, q.k);
+                let persistent = (crate::gpu::GB10_SMS * 6).min(q.m / 16) as u32;
+                klaunch!(self, "gemm_mma_fp4_b", (persistent, 1, 1), (256, 1, 1), 0,
+                    (d(out), d(&q.wt), d(&q.st), d(&q.gs), x_ptr,
+                     q.m as i32, q.k as i32, BLOCK as i32, 0u64, 0i32));
+            }
+            Df2W::Fp8(q) => {
+                debug_assert_eq!(outn, q.m);
+                debug_assert_eq!(inn, q.k);
+                // One CTA per 16-row tile (the kernel's own grid choice — the trunk serving
+                // path runs it exactly like this); NO PDL arg (unlike gemm_mma_fp4_b).
+                klaunch!(self, "gemm_mma_fp8_b", (q.m as u32 / 16, 1, 1), (256, 1, 1), 0,
+                    (d(out), d(&q.wt), d(&q.rs), x_ptr,
+                     q.m as i32, q.k as i32, BLOCK as i32, 0u64));
+            }
+        }
+    }
+
+
+    /// The weight `prime_window` runs fc against: the BF16 arm's own tensor, or the baked
+    /// artifact's dedicated twin (`gemm_mma_fp4_b` is N≤16; prime is not).
+    fn fc_prime(&self) -> &CudaSlice<bf16> {
+        match &self.glob.fc {
+            Df2W::Bf16(s) => s,
+            Df2W::Nvfp4(_) | Df2W::Fp8(_) =>
+                self.glob.fc_bf16.as_ref().expect("fc bf16 twin (baked artifact)"),
+        }
+    }
+    /// Same for the prime path's per-layer k/v.
+    fn kv_prime(&self, li: usize, which: Kv) -> &CudaSlice<bf16> {
+        let l = &self.layers[li];
+        let (w, twin) = match which {
+            Kv::K => (&l.k_proj, &l.k_proj_bf16),
+            Kv::V => (&l.v_proj, &l.v_proj_bf16),
+        };
+        match w {
+            Df2W::Bf16(s) => s,
+            Df2W::Nvfp4(_) | Df2W::Fp8(_) => twin.as_ref().expect("k/v bf16 twin (baked artifact)"),
+        }
+    }
+
     /// Large-M GEMM (S3F's ctx-side kernel): out [outn, m] = w [outn, k] x x [k, m] col-major bf16.
     fn gemm_tiled(&self, out: &CudaSlice<bf16>, w: &CudaSlice<bf16>, x_ptr: u64, outn: usize, k: usize, m: usize) {
         let mx = ((m + 127) / 128) as u32;
@@ -916,7 +1048,7 @@ impl Df2Round {
     /// all-reduce (kv projections are rank-local) — capture-safe by construction.
     fn inject_kernels(&self, m: usize) {
         // fc + hidden_norm at M=m (gemm_dsp; cols ≥ m are garbage-but-unread)
-        self.gemm_dsp(&self.th_raw, &self.glob.fc, d(&self.staging), HIDDEN, TAP_CONCAT_DIM);
+        self.gemm_lin(&self.th_raw, &self.glob.fc, d(&self.staging), HIDDEN, TAP_CONCAT_DIM);
         self.rmsnorm(&self.th, &self.th_raw, &self.glob.hidden_norm, HIDDEN, m);
 
         // per-layer k/v: k = rope(k_norm(k_proj(th))) @ ring rows; v raw
@@ -926,10 +1058,10 @@ impl Df2Round {
         self.gather_rope(&self.cos_c, &self.sin_c, d(&self.pos_c), m);
         for li in 0..N_LAYERS {
             let l = &self.layers[li];
-            self.gemm_dsp(&self.kc, &l.k_proj, d(&self.th), nkv * HEAD_DIM, HIDDEN);
+            self.gemm_lin(&self.kc, &l.k_proj, d(&self.th), nkv * HEAD_DIM, HIDDEN);
             self.rmsnorm_perhead(&self.kc, &l.k_norm, nkv, m);
             self.rope(&self.kc, &self.cos_c, &self.sin_c, nkv, m);
-            self.gemm_dsp(&self.vc, &l.v_proj, d(&self.th), nkv * HEAD_DIM, HIDDEN);
+            self.gemm_lin(&self.vc, &l.v_proj, d(&self.th), nkv * HEAD_DIM, HIDDEN);
             klaunch!(self, "write_kv_b", grid(m * nkv * HEAD_DIM), (256, 1, 1), 0,
                 (d(&self.k_ring[li]), d(&self.v_ring[li]), d(&self.kc), d(&self.vc),
                  d(&self.wrow_c), RING_STRIDE as i32, nkv as i32, HEAD_DIM as i32,
@@ -988,7 +1120,7 @@ impl Df2Round {
         // fc + hidden_norm at M=n (one weight read for the whole window).
         let th_raw = self.dev.alloc_zeros::<bf16>(HIDDEN * n).context("prime th_raw")?;
         let th = self.dev.alloc_zeros::<bf16>(HIDDEN * n).context("prime th")?;
-        self.gemm_tiled(&th_raw, &self.glob.fc, d(taps), HIDDEN, TAP_CONCAT_DIM, n);
+        self.gemm_tiled(&th_raw, self.fc_prime(), d(taps), HIDDEN, TAP_CONCAT_DIM, n);
         self.rmsnorm(&th, &th_raw, &self.glob.hidden_norm, HIDDEN, n);
 
         // per-layer k/v at M=n, written at ring rows (pos_start+j) % RING.
@@ -998,10 +1130,10 @@ impl Df2Round {
         let vc = self.dev.alloc_zeros::<bf16>(nkv * HEAD_DIM * n).context("prime v")?;
         for li in 0..N_LAYERS {
             let l = &self.layers[li];
-            self.gemm_tiled(&kc, &l.k_proj, d(&th), nkv * HEAD_DIM, HIDDEN, n);
+            self.gemm_tiled(&kc, self.kv_prime(li, Kv::K), d(&th), nkv * HEAD_DIM, HIDDEN, n);
             self.rmsnorm_perhead(&kc, &l.k_norm, nkv, n);
             self.rope(&kc, &cos_c, &sin_c, nkv, n);
-            self.gemm_tiled(&vc, &l.v_proj, d(&th), nkv * HEAD_DIM, HIDDEN, n);
+            self.gemm_tiled(&vc, self.kv_prime(li, Kv::V), d(&th), nkv * HEAD_DIM, HIDDEN, n);
             klaunch!(self, "write_kv_b", grid(n * nkv * HEAD_DIM), (256, 1, 1), 0,
                 (d(&self.k_ring[li]), d(&self.v_ring[li]), d(&kc), d(&vc),
                  d(&wrow_dev), RING_STRIDE as i32, nkv as i32, HEAD_DIM as i32,
@@ -1247,6 +1379,37 @@ impl Df2Round {
         Ok(Df2SampleOut { tokens, q_rows, cand_tok, cand_q })
     }
 
+    /// PLAN/25 Phase 1 (tree-verify spike): read back the per-level candidate table the
+    /// selector walk ALREADY wrote — `walk_out_tok[7..7+112]` / `walk_out_q[7..7+112]`, the
+    /// top-16 (token, q) pairs for each of the 7 MASK levels. Zero extra GPU work: the buffers
+    /// are populated by the same round replay (graph or eager) that produced the chain; this is
+    /// one ~760 B dtoh readback. Valid only between a round run and the next one.
+    pub fn tree_tables(&self) -> Result<(Vec<u32>, Vec<f32>)> {
+        let cand_tok: Vec<u32> = self.dev.dtoh_sync_copy(&self.walk_out_tok)?.to_vec();
+        let cand_q: Vec<f32> = self.dev.dtoh_sync_copy(&self.walk_out_q)?.to_vec();
+        Ok((cand_tok[7..7 + 7 * 16].to_vec(), cand_q[7..7 + 7 * 16].to_vec()))
+    }
+
+    /// PLAN/25 Phase 1: gather the accepted tree path's tap columns out of the WIDE tree sink
+    /// into this round's 8-column staging, in ring order at cols [0..path.len()) —
+    /// `inject_dev(path.len())` then works unchanged (path.len() <= BLOCK: the accepted path
+    /// spans at most one branch's depth). Stream-ordered 2D copies, no sync.
+    pub fn sync_staging_from_wide(&mut self, wide: &Df2TapSink, path: &[usize]) -> Result<()> {
+        let k = path.len();
+        assert!(k >= 1 && k <= BLOCK, "sync_staging_from_wide path len {k}");
+        let dst = *self.staging.device_ptr() as u64;
+        let src = *wide.staging.device_ptr() as u64;
+        // Staging layout is [token][TAP_CONCAT_DIM] row-major (token t's features = row t); the
+        // gather is a whole-row copy per accepted token — one driver call each.
+        for j in 0..k {
+            copy_row_into(&self.dev, self.stream.stream,
+                          dst + (j * TAP_CONCAT_DIM * 2) as u64,
+                          src + (path[j] * TAP_CONCAT_DIM * 2) as u64,
+                          TAP_CONCAT_DIM);
+        }
+        Ok(())
+    }
+
     /// S5F — capture the draft-round kernel sequence as a CUDA graph (the MTP verify-graph
     /// pattern): the captured region is kernel-only (embed -> layers -> norm -> head -> top16 ->
     /// hp -> walk); per-replay inputs (anchor, nprev) are device ints written before each replay.
@@ -1302,6 +1465,14 @@ impl Df2Round {
     /// graph launch, then the 7-token readback. Bit-identical to the eager path (same kernels,
     /// same order — the graph determinism is asserted by the probe). Falls back to the eager
     /// path when no graph is captured.
+    /// PLAN/25 Phase 1: the top-16 candidate table ([7][16] u32, head-logit rank order) — the
+    /// tree lane's B-branch source. Written by the top16 stage on EVERY round path (the graph
+    /// replay included), so the tree lane can run the CAPTURED graph and pay one 448 B dtoh
+    /// instead of the eager full round's ~640 KB `h_final` readback.
+    pub fn candidate_table(&self) -> Result<Vec<u32>> {
+        Ok(self.dev.dtoh_sync_copy(&self.out_ids)?.to_vec())
+    }
+
     pub fn draft_round_graph(&mut self, anchor: u32) -> Result<Vec<u32>> {
         let Some(g) = self.round_graph.as_ref() else {
             return self.draft_round_dev(anchor);
@@ -1340,15 +1511,15 @@ impl Df2Round {
         let sharded = self.ar.is_some();
         // attention sublayer
         self.rmsnorm(&blk.normed, &blk.h, &l.input_ln, HIDDEN, BLOCK);
-        self.gemm_dsp(&blk.dyn_attn, &l.attn_kp, d(&blk.normed), 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
+        self.gemm_lin(&blk.dyn_attn, &l.attn_kp, d(&blk.normed), 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
         self.conv2(&blk.x_conv, &blk.normed, &blk.dyn_attn, d(&l.attn_base), BLOCK, 0);
-        self.gemm_dsp(&blk.q, &l.q_proj, d(&blk.x_conv), nq * HEAD_DIM, HIDDEN);
+        self.gemm_lin(&blk.q, &l.q_proj, d(&blk.x_conv), nq * HEAD_DIM, HIDDEN);
         self.rmsnorm_perhead(&blk.q, &l.q_norm, nq, BLOCK);
         self.rope(&blk.q, &blk.cos8, &blk.sin8, nq, BLOCK);
-        self.gemm_dsp(&blk.k, &l.k_proj, d(&blk.x_conv), nkv * HEAD_DIM, HIDDEN);
+        self.gemm_lin(&blk.k, &l.k_proj, d(&blk.x_conv), nkv * HEAD_DIM, HIDDEN);
         self.rmsnorm_perhead(&blk.k, &l.k_norm, nkv, BLOCK);
         self.rope(&blk.k, &blk.cos8, &blk.sin8, nkv, BLOCK);
-        self.gemm_dsp(&blk.v, &l.v_proj, d(&blk.x_conv), nkv * HEAD_DIM, HIDDEN);
+        self.gemm_lin(&blk.v, &l.v_proj, d(&blk.x_conv), nkv * HEAD_DIM, HIDDEN);
         // block rows → ring rows [RING, RING+8) (+ the linear control copy at [nprev, nprev+8))
         klaunch!(self, "write_kv_b", grid(BLOCK * nkv * HEAD_DIM), (256, 1, 1), 0,
             (d(&self.k_ring[li]), d(&self.v_ring[li]), d(&blk.k), d(&blk.v),
@@ -1380,7 +1551,7 @@ impl Df2Round {
                 (d(&self.ctl_attn), d(&blk.q), d(&self.k_ring[li]), d(&self.v_ring[li]),
                  d(&self.pos_blk), lin_stride, nh_packed, window_b, fbits(scale)));
         }
-        self.gemm_dsp(&blk.attn_out, &l.o_proj, d(&blk.attn), HIDDEN, nq * HEAD_DIM);
+        self.gemm_lin(&blk.attn_out, &l.o_proj, d(&blk.attn), HIDDEN, nq * HEAD_DIM);
         if sharded {
             // AR site 1: land the rank's o_proj partial (K-split over q heads) — conv2's
             // channel-local finish and the residual then run on the full sum.
@@ -1391,13 +1562,13 @@ impl Df2Round {
             (d(&blk.h), d(&blk.h), d(&blk.fin), (HIDDEN * BLOCK) as i32));
         // mlp sublayer
         self.rmsnorm(&blk.normed2, &blk.h, &l.post_ln, HIDDEN, BLOCK);
-        self.gemm_dsp(&blk.dyn_mlp, &l.mlp_kp, d(&blk.normed2), 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
+        self.gemm_lin(&blk.dyn_mlp, &l.mlp_kp, d(&blk.normed2), 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
         self.conv2(&blk.x_conv2, &blk.normed2, &blk.dyn_mlp, d(&l.mlp_base), BLOCK, 0);
-        self.gemm_dsp(&blk.gate, &l.gate_proj, d(&blk.x_conv2), ni, HIDDEN);
-        self.gemm_dsp(&blk.up, &l.up_proj, d(&blk.x_conv2), ni, HIDDEN);
+        self.gemm_lin(&blk.gate, &l.gate_proj, d(&blk.x_conv2), ni, HIDDEN);
+        self.gemm_lin(&blk.up, &l.up_proj, d(&blk.x_conv2), ni, HIDDEN);
         klaunch!(self, "silu_mul_b", grid(ni * BLOCK), (256, 1, 1), 0,
             (d(&blk.gate), d(&blk.gate), d(&blk.up), (ni * BLOCK) as i32));
-        self.gemm_dsp(&blk.mlp_out, &l.down_proj, d(&blk.gate), HIDDEN, ni);
+        self.gemm_lin(&blk.mlp_out, &l.down_proj, d(&blk.gate), HIDDEN, ni);
         if sharded {
             // AR site 2: land the rank's down_proj partial (K-split over inter rows).
             self.tp_ar_bf16(d(&blk.mlp_out), HIDDEN * BLOCK);

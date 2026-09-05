@@ -51,7 +51,13 @@ impl Df2TapSink {
     /// AGENTS §2.2; a partial round's never-written columns must read as 0, and the first
     /// draft round may run with C < 8 committed positions).
     pub fn new(dev: &Arc<CudaDevice>) -> Self {
-        let n = TAP_CONCAT_DIM * BLOCK;
+        Self::new_cols(dev, BLOCK)
+    }
+    /// PLAN/25 Phase 1: a WIDE staging for the tree-verify capture (`cols` up to MAX_VERIFY —
+    /// a tree verifies more columns than the chain's 8; the accepted path is gathered out of
+    /// this buffer into the round's 8-column staging by `sync_staging_from_wide`).
+    pub fn new_cols(dev: &Arc<CudaDevice>, cols: usize) -> Self {
+        let n = TAP_CONCAT_DIM * cols;
         let zero = dev.htod_sync_copy(&vec![half::bf16::default(); n]).expect("df2 tap staging alloc");
         Df2TapSink { staging: zero }
     }
@@ -102,6 +108,29 @@ pub fn capture_cols_into(dev: &Arc<CudaDevice>, stream: cudarc::driver::sys::CUs
     unsafe {
         let r = sys::cuMemcpy2DAsync_v2(&cp, stream);
         assert!(r == sys::CUresult::CUDA_SUCCESS, "df2 tap capture D2D failed: {r:?}");
+    }
+}
+
+/// PLAN/25 Phase 1: one full staging ROW (all `TAP_LAYERS·HIDDEN` features of one token) —
+/// the tree gather's per-token copy. One driver call per token instead of one per (token,
+/// layer): 5× fewer `cuMemcpy2D` issues for the same bytes; both pitches are the row stride.
+pub fn copy_row_into(dev: &Arc<CudaDevice>, stream: cudarc::driver::sys::CUstream,
+                     dst_ptr: u64, src_ptr: u64, row_elems: usize) {
+    use cudarc::driver::sys;
+    let cp = sys::CUDA_MEMCPY2D {
+        srcXInBytes: 0, srcY: 0,
+        srcMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+        srcHost: std::ptr::null(), srcDevice: src_ptr,
+        srcArray: std::ptr::null_mut(), srcPitch: row_elems * 2,
+        dstXInBytes: 0, dstY: 0,
+        dstMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+        dstHost: std::ptr::null_mut(), dstDevice: dst_ptr,
+        dstArray: std::ptr::null_mut(), dstPitch: row_elems * 2,
+        WidthInBytes: row_elems * 2, Height: 1,
+    };
+    unsafe {
+        let r = sys::cuMemcpy2DAsync_v2(&cp, stream);
+        assert!(r == sys::CUresult::CUDA_SUCCESS, "df2 row copy D2D failed: {r:?}");
     }
 }
 

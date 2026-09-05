@@ -16,6 +16,7 @@ pub mod kv_cache;
 pub mod engine;
 pub mod tokenizer;
 pub mod server;
+pub mod otel;
 pub mod net;
 pub mod pp;
 pub mod cluster;

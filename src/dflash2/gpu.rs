@@ -56,28 +56,100 @@ pub(crate) fn fork_blocking_stream(dev: &Arc<CudaDevice>) -> cudarc::driver::Cud
     s
 }
 
-/// One draft-backbone layer's device weights (all bf16 row-major; norms f32 as w−1).
+/// One NVFP4 weight tensor on device, MMA-repacked (`quant::repack_nvfp4_mma`) and ready for
+/// `gemm_mma_fp4_b` (the trunk's persistent fp4 GEMM; the drafter's shapes all satisfy its
+/// M%16/K%32 constraints). PLAN/25 §1a: the per-step block pass streams these instead of bf16 —
+/// 3.59 GB → 1.01 GB of weight bytes per round.
+pub(crate) struct Nvfp4Dev {
+    pub(crate) wt: CudaSlice<u8>,
+    pub(crate) st: CudaSlice<u8>,
+    pub(crate) gs: CudaSlice<f32>,
+    pub(crate) m: usize,
+    pub(crate) k: usize,
+}
+
+/// A drafter linear weight: BF16 (the original artifact, and everything the probe path runs),
+/// NVFP4 (`--df2-bake-nvfp4`) or FP8-E4M3 (`--df2-bake-fp8`). Dispatched in `round.rs::gemm_lin`.
+pub(crate) enum Df2W {
+    Bf16(CudaSlice<bf16>),
+    Nvfp4(Nvfp4Dev),
+    Fp8(Fp8Dev),
+}
+
+impl Df2W {
+    /// The BF16 slice (the probe/oracle path only ever builds this arm).
+    pub(crate) fn bf16(&self) -> &CudaSlice<bf16> {
+        match self { Df2W::Bf16(s) => s, Df2W::Nvfp4(_) | Df2W::Fp8(_) => unreachable!("probe path is bf16-only") }
+    }
+}
+
+/// Device state for `upload_fp8` — the twin of [`Nvfp4Dev`] for the trunk's
+/// `gemm_mma_fp8_b` (8-bit weights + a per-ROW f32 scale multiplier).
+pub(crate) struct Fp8Dev {
+    pub(crate) wt: CudaSlice<u8>,
+    pub(crate) rs: CudaSlice<f32>,
+    pub(crate) m: usize,
+    pub(crate) k: usize,
+}
+
+/// Upload a packed NVFP4 tensor: MMA-repack on host (the trunk's own flow — quantize at bake,
+/// repack at load), then the three device buffers `gemm_mma_fp4_b` consumes.
+pub(crate) fn upload_nvfp4(dev: &Arc<CudaDevice>, p: &crate::dflash2::load::PackedNvfp4) -> Nvfp4Dev {
+    let (wt, st) = crate::quant::repack_nvfp4_mma(&p.qweight, &p.scales, p.m, p.k);
+    // The file's weight_global_scale is the trunk --quantize emit convention: a DIVISOR
+    // (6*448/amax). The fp4 kernels MULTIPLY by gs and index it PER 16-ROW TILE (gs[mt]) —
+    // upload the reciprocal REPLICATED to m/16 entries, byte-for-byte the trunk loader's own
+    // convention (gpu.rs: `let gsv = vec![1.0f32 / gs; rn / 16]`).
+    Nvfp4Dev {
+        wt: dev.htod_sync_copy(&wt).expect("upload fp4 weights"),
+        st: dev.htod_sync_copy(&st).expect("upload fp4 scales"),
+        gs: dev.htod_sync_copy(&vec![1.0f32 / p.global_scale; p.m / 16]).expect("upload fp4 gs"),
+        m: p.m,
+        k: p.k,
+    }
+}
+
+/// Upload a packed FP8 tensor: MMA-repack on host (`quant::repack_fp8_mma`, the trunk's own
+/// DSV4-attention flow), then the two device buffers `gemm_mma_fp8_b` consumes. The row scales
+/// MULTIPLY (no divisor, no per-tile replication — the epilogue indexes `rs[m]` directly).
+pub(crate) fn upload_fp8(dev: &Arc<CudaDevice>, p: &crate::dflash2::load::PackedFp8) -> Fp8Dev {
+    let wt = crate::quant::repack_fp8_mma(&p.qweight, p.m, p.k);
+    Fp8Dev {
+        wt: dev.htod_sync_copy(&wt).expect("upload fp8 weights"),
+        rs: dev.htod_sync_copy(&p.row_scale).expect("upload fp8 row scales"),
+        m: p.m,
+        k: p.k,
+    }
+}
+
+/// One draft-backbone layer's device weights (row-major; norms f32 as w−1). The 9 linears are
+/// `Df2W` (BF16 on the original artifact, NVFP4 on a baked one); `k_proj_bf16`/`v_proj_bf16`
+/// carry the BF16 twins `prime_window` needs in nvfp4 mode (`gemm_mma_fp4_b` is N≤16, prime is
+/// not; fc's twin lives on `GpuGlobal`).
 pub(crate) struct GpuLayer {
-    pub(crate) q_proj: CudaSlice<bf16>,     // [4096, 5120]
-    pub(crate) k_proj: CudaSlice<bf16>,     // [1024, 5120]
-    pub(crate) v_proj: CudaSlice<bf16>,     // [1024, 5120]
-    pub(crate) o_proj: CudaSlice<bf16>,     // [5120, 4096]
-    pub(crate) gate_proj: CudaSlice<bf16>,  // [17408, 5120]
-    pub(crate) up_proj: CudaSlice<bf16>,    // [17408, 5120]
-    pub(crate) down_proj: CudaSlice<bf16>,  // [5120, 17408]
+    pub(crate) q_proj: Df2W,     // [4096, 5120]
+    pub(crate) k_proj: Df2W,     // [1024, 5120]
+    pub(crate) k_proj_bf16: Option<CudaSlice<bf16>>,
+    pub(crate) v_proj: Df2W,     // [1024, 5120]
+    pub(crate) v_proj_bf16: Option<CudaSlice<bf16>>,
+    pub(crate) o_proj: Df2W,     // [5120, 4096]
+    pub(crate) gate_proj: Df2W,  // [17408, 5120]
+    pub(crate) up_proj: Df2W,    // [17408, 5120]
+    pub(crate) down_proj: Df2W,  // [5120, 17408]
     pub(crate) q_norm: CudaSlice<f32>,      // [128] (w−1)
     pub(crate) k_norm: CudaSlice<f32>,      // [128] (w−1)
     pub(crate) input_ln: CudaSlice<f32>,    // [5120] (w−1)
     pub(crate) post_ln: CudaSlice<f32>,     // [5120] (w−1)
-    pub(crate) attn_kp: CudaSlice<bf16>,    // [1280, 5120]
+    pub(crate) attn_kp: Df2W,    // [1280, 5120]
     pub(crate) attn_base: CudaSlice<bf16>,  // [4, 5120] ([2,kernel,hidden] flattened)
-    pub(crate) mlp_kp: CudaSlice<bf16>,     // [1280, 5120]
+    pub(crate) mlp_kp: Df2W,     // [1280, 5120]
     pub(crate) mlp_base: CudaSlice<bf16>,   // [4, 5120]
 }
 
-/// The global (non-layer) device weights.
+/// The global (non-layer) device weights. `fc_bf16` = the prime twin (see `GpuLayer`).
 pub(crate) struct GpuGlobal {
-    pub(crate) fc: CudaSlice<bf16>,          // [5120, 25600]
+    pub(crate) fc: Df2W,                     // [5120, 25600]
+    pub(crate) fc_bf16: Option<CudaSlice<bf16>>,
     pub(crate) hidden_norm: CudaSlice<f32>,  // [5120] (w−1)
     pub(crate) norm: CudaSlice<f32>,         // [5120] (w−1)
 }
@@ -189,25 +261,28 @@ impl Df2Gpu {
         let mut layers = Vec::with_capacity(N_LAYERS);
         for l in &w.layers {
             layers.push(GpuLayer {
-                q_proj: upload_bf16(&dev, &l.q_proj),
-                k_proj: upload_bf16(&dev, &l.k_proj),
-                v_proj: upload_bf16(&dev, &l.v_proj),
-                o_proj: upload_bf16(&dev, &l.o_proj),
-                gate_proj: upload_bf16(&dev, &l.gate_proj),
-                up_proj: upload_bf16(&dev, &l.up_proj),
-                down_proj: upload_bf16(&dev, &l.down_proj),
+                q_proj: Df2W::Bf16(upload_bf16(&dev, &l.q_proj)),
+                k_proj: Df2W::Bf16(upload_bf16(&dev, &l.k_proj)),
+                k_proj_bf16: None,
+                v_proj: Df2W::Bf16(upload_bf16(&dev, &l.v_proj)),
+                v_proj_bf16: None,
+                o_proj: Df2W::Bf16(upload_bf16(&dev, &l.o_proj)),
+                gate_proj: Df2W::Bf16(upload_bf16(&dev, &l.gate_proj)),
+                up_proj: Df2W::Bf16(upload_bf16(&dev, &l.up_proj)),
+                down_proj: Df2W::Bf16(upload_bf16(&dev, &l.down_proj)),
                 q_norm: upload_norm(&dev, &l.q_norm),
                 k_norm: upload_norm(&dev, &l.k_norm),
                 input_ln: upload_norm(&dev, &l.input_ln),
                 post_ln: upload_norm(&dev, &l.post_ln),
-                attn_kp: upload_bf16(&dev, &l.attention_conv.kernel_projection),
+                attn_kp: Df2W::Bf16(upload_bf16(&dev, &l.attention_conv.kernel_projection)),
                 attn_base: upload_bf16(&dev, &l.attention_conv.base_kernel),
-                mlp_kp: upload_bf16(&dev, &l.mlp_conv.kernel_projection),
+                mlp_kp: Df2W::Bf16(upload_bf16(&dev, &l.mlp_conv.kernel_projection)),
                 mlp_base: upload_bf16(&dev, &l.mlp_conv.base_kernel),
             });
         }
         let glob = GpuGlobal {
-            fc: upload_bf16(&dev, &w.fc),
+            fc: Df2W::Bf16(upload_bf16(&dev, &w.fc)),
+            fc_bf16: None,
             hidden_norm: upload_norm(&dev, &w.hidden_norm),
             norm: upload_norm(&dev, &w.norm),
         };
@@ -259,7 +334,7 @@ impl Df2Gpu {
 
     /// Re-upload layer 0's q_proj (the sign-flip negative control).
     pub fn set_layer0_q_proj(&mut self, data: &[f32]) {
-        self.layers[0].q_proj = upload_bf16(&self.dev, data);
+        self.layers[0].q_proj = Df2W::Bf16(upload_bf16(&self.dev, data));
     }
 
     fn gemm_dsp(&self, out: &CudaSlice<bf16>, w: &CudaSlice<bf16>, x: &CudaSlice<bf16>, outn: usize, inn: usize) {
@@ -313,10 +388,10 @@ impl Df2Gpu {
                       cos_c: &CudaSlice<f32>, sin_c: &CudaSlice<f32>,
                       pos_ctx: &CudaSlice<i32>, slot_ids: &CudaSlice<i32>) {
         let l = &self.layers[li];
-        self.gemm_tiled(k_out, &l.k_proj, th, NUM_KV_HEADS * HEAD_DIM, HIDDEN, c);
+        self.gemm_tiled(k_out, l.k_proj.bf16(), th, NUM_KV_HEADS * HEAD_DIM, HIDDEN, c);
         self.rmsnorm_perhead(k_out, &l.k_norm, NUM_KV_HEADS, c);
         self.rope(k_out, cos_c, sin_c, NUM_KV_HEADS, c);
-        self.gemm_tiled(v_out, &l.v_proj, th, NUM_KV_HEADS * HEAD_DIM, HIDDEN, c);
+        self.gemm_tiled(v_out, l.v_proj.bf16(), th, NUM_KV_HEADS * HEAD_DIM, HIDDEN, c);
         klaunch!(self, "write_kv_b", grid(c * NUM_KV_HEADS * HEAD_DIM), (256, 1, 1), 0,
             (d(&self.k_cache[li]), d(&self.v_cache[li]), d(k_out), d(v_out),
              d(pos_ctx), self.caches_n as i32, NUM_KV_HEADS as i32, HEAD_DIM as i32, c as i32,
@@ -356,7 +431,7 @@ impl Df2Gpu {
         self.gather_rope(&cos_c, &sin_c, d(&pos_ctx_dev), c);
 
         // ---- tap projection: th = hidden_norm(fc(taps)) over c rows ----
-        self.gemm_tiled(&th_raw, &self.glob.fc, &taps_dev, HIDDEN, tap_dim, c);
+        self.gemm_tiled(&th_raw, self.glob.fc.bf16(), &taps_dev, HIDDEN, tap_dim, c);
         self.rmsnorm(&th, &th_raw, &self.glob.hidden_norm, HIDDEN, c);
 
         // ---- draft KV write for all 5 layers (ctx rows 0..C-1) ----
@@ -411,15 +486,15 @@ impl Df2Gpu {
         let base1_off = (CONV_KERNEL * HIDDEN * 2) as u64; // byte offset of side 1 in base_kernel
         // attention sublayer
         self.rmsnorm(&blk.normed, &blk.h, &l.input_ln, HIDDEN, BLOCK);
-        self.gemm_dsp(&blk.dyn_attn, &l.attn_kp, &blk.normed, 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
+        self.gemm_dsp(&blk.dyn_attn, l.attn_kp.bf16(), &blk.normed, 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
         self.conv2(&blk.x_conv, &blk.normed, &blk.dyn_attn, d(&l.attn_base), BLOCK, 0);
-        self.gemm_dsp(&blk.q, &l.q_proj, &blk.x_conv, NUM_HEADS * HEAD_DIM, HIDDEN);
+        self.gemm_dsp(&blk.q, l.q_proj.bf16(), &blk.x_conv, NUM_HEADS * HEAD_DIM, HIDDEN);
         self.rmsnorm_perhead(&blk.q, &l.q_norm, NUM_HEADS, BLOCK);
         self.rope(&blk.q, &blk.cos8, &blk.sin8, NUM_HEADS, BLOCK);
-        self.gemm_dsp(&blk.k, &l.k_proj, &blk.x_conv, NUM_KV_HEADS * HEAD_DIM, HIDDEN);
+        self.gemm_dsp(&blk.k, l.k_proj.bf16(), &blk.x_conv, NUM_KV_HEADS * HEAD_DIM, HIDDEN);
         self.rmsnorm_perhead(&blk.k, &l.k_norm, NUM_KV_HEADS, BLOCK);
         self.rope(&blk.k, &blk.cos8, &blk.sin8, NUM_KV_HEADS, BLOCK);
-        self.gemm_dsp(&blk.v, &l.v_proj, &blk.x_conv, NUM_KV_HEADS * HEAD_DIM, HIDDEN);
+        self.gemm_dsp(&blk.v, l.v_proj.bf16(), &blk.x_conv, NUM_KV_HEADS * HEAD_DIM, HIDDEN);
         klaunch!(self, "write_kv_b", grid(BLOCK * NUM_KV_HEADS * HEAD_DIM), (256, 1, 1), 0,
             (d(&self.k_cache[li]), d(&self.v_cache[li]), d(&blk.k), d(&blk.v),
              d(&self.pos_block), self.caches_n as i32, NUM_KV_HEADS as i32, HEAD_DIM as i32, BLOCK as i32,
@@ -432,19 +507,19 @@ impl Df2Gpu {
         klaunch!(self, "gqa_attn_band_b", ((BLOCK * NUM_HEADS) as u32, 1, 1), (HEAD_DIM as u32, 1, 1), smem as u32,
             (d(&blk.attn), d(&blk.q), d(&self.k_cache[li]), d(&self.v_cache[li]),
              d(&self.pos_block), ntot_stride, nh_packed, window_b, fbits(scale)));
-        self.gemm_dsp(&blk.attn_out, &l.o_proj, &blk.attn, HIDDEN, NUM_HEADS * HEAD_DIM);
+        self.gemm_dsp(&blk.attn_out, l.o_proj.bf16(), &blk.attn, HIDDEN, NUM_HEADS * HEAD_DIM);
         self.conv2(&blk.fin, &blk.attn_out, &blk.dyn_attn, d(&l.attn_base) + base1_off, BLOCK, 1);
         klaunch!(self, "add_residual_b", grid(HIDDEN * BLOCK), (256, 1, 1), 0,
             (d(&blk.h), d(&blk.h), d(&blk.fin), (HIDDEN * BLOCK) as i32));
         // mlp sublayer
         self.rmsnorm(&blk.normed2, &blk.h, &l.post_ln, HIDDEN, BLOCK);
-        self.gemm_dsp(&blk.dyn_mlp, &l.mlp_kp, &blk.normed2, 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
+        self.gemm_dsp(&blk.dyn_mlp, l.mlp_kp.bf16(), &blk.normed2, 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
         self.conv2(&blk.x_conv2, &blk.normed2, &blk.dyn_mlp, d(&l.mlp_base), BLOCK, 0);
-        self.gemm_dsp(&blk.gate, &l.gate_proj, &blk.x_conv2, INTER, HIDDEN);
-        self.gemm_dsp(&blk.up, &l.up_proj, &blk.x_conv2, INTER, HIDDEN);
+        self.gemm_dsp(&blk.gate, l.gate_proj.bf16(), &blk.x_conv2, INTER, HIDDEN);
+        self.gemm_dsp(&blk.up, l.up_proj.bf16(), &blk.x_conv2, INTER, HIDDEN);
         klaunch!(self, "silu_mul_b", grid(INTER * BLOCK), (256, 1, 1), 0,
             (d(&blk.gate), d(&blk.gate), d(&blk.up), (INTER * BLOCK) as i32));
-        self.gemm_dsp(&blk.mlp_out, &l.down_proj, &blk.gate, HIDDEN, INTER);
+        self.gemm_dsp(&blk.mlp_out, l.down_proj.bf16(), &blk.gate, HIDDEN, INTER);
         self.conv2(&blk.fin2, &blk.mlp_out, &blk.dyn_mlp, d(&l.mlp_base) + base1_off, BLOCK, 1);
         klaunch!(self, "add_residual_b", grid(HIDDEN * BLOCK), (256, 1, 1), 0,
             (d(&blk.h), d(&blk.h), d(&blk.fin2), (HIDDEN * BLOCK) as i32));

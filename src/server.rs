@@ -1,6 +1,6 @@
 use axum::{
     extract::{DefaultBodyLimit, Json, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response, Sse},
     response::sse::Event,
     routing::{get, post},
@@ -51,6 +51,11 @@ pub struct AppState {
     pub vision_gpu: Option<std::sync::Arc<std::sync::Mutex<crate::vision_gpu::GpuVisualTower>>>,
     /// Force the CPU vision tower (--vision-cpu), as a diagnostic/escape hatch.
     pub vision_cpu: bool,
+    /// OTel generation-telemetry emitter (--otel-endpoint). `None` = OFF (the default): every
+    /// telemetry hook site in the SSE path compiles to one `if let Some` branch — zero cost.
+    /// Some = the lock-free-ring sink; the SSE chunk hooks below forward the SAME chunk bytes
+    /// (single source of truth) and the timer-polled sender exports them (crate::otel).
+    pub otel: Option<std::sync::Arc<crate::otel::OtelSink>>,
 }
 
 #[derive(Serialize)]
@@ -267,6 +272,11 @@ struct ChatCompletionRequest {
     /// so a client asking for include_usage got nothing and no [DONE] sentinel either.
     #[serde(default)]
     stream_options: Option<StreamOptions>,
+    /// Non-standard OpenAI `metadata` object, accepted and passed through. Only one key is
+    /// consumed: `session_id` (or `conversation_id`) — the OTel generation-telemetry SESSION
+    /// key (see crate::otel::SessionRegistry). Absent/other keys are ignored.
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -298,8 +308,12 @@ struct ChatCompletionResponse {
     model: String,
     choices: Vec<ChatChoice>,
     usage: Usage,
-    /// Extension (llama.cpp naming). Strict clients ignore unknown top-level fields.
+    /// llama.cpp-compatible timing block, emitted as a top-level extension field (strict
+    /// clients ignore unknown top-level fields).
     timings: Timings,
+    /// OTel generation-telemetry SESSION key (extension; None when telemetry is off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -376,6 +390,7 @@ fn resolve_reasoning_effort(tokenizer: &QwenTokenizer, req_effort: Option<&str>,
 
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     // Log the request parameters the client sent (useful for debugging OpenWebUI behavior)
@@ -553,6 +568,27 @@ async fn chat_completions(
     };
     let _ = state.scheduler.send(request);
 
+    // SESSION identity for the OTel generation-telemetry (crate::otel::SessionRegistry). One
+    // resolution per REQUEST, only when the emitter is on (off = no session work at all):
+    // explicit client key first (X-Session-Id header, then metadata.session_id / .conversation_id),
+    // else the engine infers the continuous conversation from the messages-prefix rule — turn
+    // N+1's messages array contains turn N's as an exact prefix, so a follow-up lands in the
+    // SAME session id and the client sees one continuous session, not one per response.
+    let otel_session: Option<String> = state.otel.as_ref().map(|s| {
+        let explicit = headers.get("x-session-id").and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| req.metadata.as_ref().and_then(|m| m.get("session_id"))
+                .and_then(|v| v.as_str()).map(str::to_string))
+            .or_else(|| req.metadata.as_ref().and_then(|m| m.get("conversation_id"))
+                .and_then(|v| v.as_str()).map(str::to_string));
+        // Canonical per-message JSON, in order — the fingerprint material (serialized once).
+        let per_msg: Vec<String> = req.messages.iter()
+            .map(|m| serde_json::to_string(m).unwrap_or_default()).collect();
+        let sess = s.resolve_session(explicit, &per_msg);
+        eprintln!("[req] session {sess} (turn of {} message(s))", req.messages.len());
+        sess
+    });
+
     let content_chunk = |cid: &str, created: i64, model: &str, text: &str| {
         format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}",
             cid, created, model, esc(text))
@@ -599,10 +635,24 @@ async fn chat_completions(
         let starts_in_reasoning = prompt.trim_end().ends_with(think_open)
             || matches!(effort, Some("low") | Some("high"));
 
+        // OTel generation telemetry (--otel-endpoint). Handle built ONCE per request; the hooks
+        // below forward the SAME chunk strings the SSE path yields (single source of truth —
+        // the telemetry path never re-derives or re-encodes a delta). `None` (endpoint absent)
+        // = the default = every hook below compiles away. The hooks are pure observers: they
+        // cannot alter the SSE bytes (see crate::otel — lock-free ring, drop-on-full, the
+        // sender runs on its own timer off the compute stream). request.id = the SESSION key
+        // (stable across the conversation's turns); generation.id = this POST's execution id.
+        let otel_req = match (&state.otel, &otel_session) {
+            (Some(s), Some(sess)) =>
+                Some(s.open_request(sess, &format!("gen-{}", Uuid::new_v4()))),
+            _ => None,
+        };
+
         let stream = async_stream::stream! {
-            yield Ok::<Event, axum::Error>(Event::default().data(
-                format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}",
-                    completion_id, created, model_name)));
+            let role_chunk = format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}",
+                completion_id, created, model_name);
+            if let Some(r) = &otel_req { r.start(&role_chunk); }   // event=stream_start, token.index 0
+            yield Ok::<Event, axum::Error>(Event::default().data(role_chunk));
             // Byte-level stream decoder: the per-token decode path above would mangle every
             // multi-byte char split across tokens (all emoji) into "�" — the crate's ByteLevel
             // decode is String::from_utf8_lossy per call. Reassembles raw bytes across tokens.
@@ -634,7 +684,9 @@ async fn chat_completions(
                                         // a second think block must not match the first one's close.
                                         if let Some(idx) = acc[reason_emitted..].find(think_close).map(|i| reason_emitted + i) {
                                             if idx > reason_emitted {
-                                                yield Ok(Event::default().data(reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..idx])));
+                                                let c = reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..idx]);
+                                                if let Some(r) = &otel_req { r.delta(&c); }
+                                                yield Ok(Event::default().data(c));
                                             }
                                             let cs = idx + think_close.len();
                                             let mut lead = cs;
@@ -651,7 +703,9 @@ async fn chat_completions(
                                                     .max(partial_overlap(region, think_open)),
                                             };
                                             if safe_end > lead {
-                                                yield Ok(Event::default().data(content_chunk(&completion_id, created, &model_name, &acc[lead..safe_end])));
+                                                let c = content_chunk(&completion_id, created, &model_name, &acc[lead..safe_end]);
+                                                if let Some(r) = &otel_req { r.delta(&c); }
+                                                yield Ok(Event::default().data(c));
                                             }
                                             content_emitted = safe_end;
                                         } else {
@@ -677,7 +731,9 @@ async fn chat_completions(
                                                 None => safe - partial_overlap(region, TOOL_OPEN),
                                             };
                                             if safe_end > reason_emitted {
-                                                yield Ok(Event::default().data(reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..safe_end])));
+                                                let c = reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..safe_end]);
+                                                if let Some(r) = &otel_req { r.delta(&c); }
+                                                yield Ok(Event::default().data(c));
                                                 reason_emitted = safe_end;
                                             }
                                         }
@@ -692,7 +748,9 @@ async fn chat_completions(
                                         if let Some(tp) = region.find(think_open) {
                                             let upto = cs + tp;
                                             if upto > content_emitted {
-                                                yield Ok(Event::default().data(content_chunk(&completion_id, created, &model_name, &acc[content_emitted..upto])));
+                                                let c = content_chunk(&completion_id, created, &model_name, &acc[content_emitted..upto]);
+                                                if let Some(r) = &otel_req { r.delta(&c); }
+                                                yield Ok(Event::default().data(c));
                                             }
                                             content_start = None;
                                             reason_emitted = upto + think_open.len();
@@ -707,7 +765,9 @@ async fn chat_completions(
                                                 .max(partial_overlap(region, think_open)),
                                         };
                                         if safe_end > content_emitted {
-                                            yield Ok(Event::default().data(content_chunk(&completion_id, created, &model_name, &acc[content_emitted..safe_end])));
+                                            let c = content_chunk(&completion_id, created, &model_name, &acc[content_emitted..safe_end]);
+                                            if let Some(r) = &otel_req { r.delta(&c); }
+                                            yield Ok(Event::default().data(c));
                                             content_emitted = safe_end;
                                         }
                                         }
@@ -749,7 +809,9 @@ async fn chat_completions(
                 for t in &tool_calls {
                     eprintln!("[req] tool_call  {} {}({})", t.id, t.function.name, t.function.arguments);
                 }
-                yield Ok(Event::default().data(tool_calls_chunk(&completion_id, created, &model_name, &tool_calls)));
+                let tc = tool_calls_chunk(&completion_id, created, &model_name, &tool_calls);
+                if let Some(r) = &otel_req { r.delta(&tc); }
+                yield Ok(Event::default().data(tc));
                 finish = fin;
             // Watermark is whichever cursor is live: in reasoning mode content_emitted stays 0
             // and the held-back span lives after reason_emitted (tool call before any
@@ -757,22 +819,27 @@ async fn chat_completions(
             } else if let Some(held) = crate::tools::held_back_remainder(&acc, reason_emitted.max(content_emitted)) {
                 // A tool-call marker was held back but nothing parsed: surface the buffered text
                 // as content, exactly what the non-streaming mode returns for the same output.
-                yield Ok(Event::default().data(content_chunk(&completion_id, created, &model_name, held)));
+                let c = content_chunk(&completion_id, created, &model_name, held);
+                if let Some(r) = &otel_req { r.delta(&c); }
+                yield Ok(Event::default().data(c));
                 content_emitted = acc.len();
             }
             let final_chunk = format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"}}]}}",
                 completion_id, created, model_name, spec_finish_reason(&finish));
+            if let Some(r) = &otel_req { r.end(&final_chunk); }   // event=stream_end (carries finish_reason)
             yield Ok(Event::default().data(final_chunk));
             if include_usage {
                 // Spec stream-usage chunk: empty choices, top-level usage. `timings` rides along
-                // as the extension field (strict clients ignore it).
-                let usage_chunk = serde_json::json!({
+                // as the extension field (strict clients ignore it), and `session_id` echoes the
+                // OTel session key so the client can label the stream without computing anything.
+                let mut usage_chunk = serde_json::json!({
                     "id": completion_id, "object": "chat.completion.chunk",
                     "created": created, "model": model_name, "choices": [],
                     "usage": {"prompt_tokens": prompt_len, "completion_tokens": n,
                               "total_tokens": prompt_len + n},
                     "timings": make_timings(t0, first_tok, prompt_len, n),
                 });
+                if let Some(s) = &otel_session { usage_chunk["session_id"] = serde_json::json!(s); }
                 yield Ok(Event::default().data(usage_chunk.to_string()));
             }
             // The OpenAI SSE terminator. Without it a strict client sits on an open stream
@@ -867,6 +934,7 @@ async fn chat_completions(
                 total_tokens: prompt_len + tokens.len(),
             },
             timings: make_timings(t0, first_tok, prompt_len, tokens.len()),
+            session_id: otel_session,
         };
         Json(response).into_response()
     }

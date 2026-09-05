@@ -270,15 +270,22 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
   batching, prefix caching, and OpenAI `reasoning_effort` levels (`none/low/medium/high/xhigh/max`).
   Also exposes vLLM-compatible `POST /v1/tokenize` and `POST /v1/detokenize` endpoints for
   benchmarking.
+- **Built-in OpenTelemetry** — `--otel-endpoint <URL>` streams OTLP/HTTP-JSON generation telemetry
+  (the actual SSE chunk bytes, with `model.id` / `topology` / `request.id` / `token.index` / `event`
+  attributes), off by default. `request.id` is the conversation key so a reply's turns join one
+  continuous session; `generation.id` stays per-POST. Companion flags: `--otel-batch-size`,
+  `--otel-batch-interval-ms`, `--otel-include-tokens`, `--otel-model-id`, `--otel-topology`.
 - **Vision** — image input on a GPU vision tower across the Qwen3.5/3.8 VL family
   (`--vision-cpu` for the CPU reference path); PNG/JPEG/WebP/GIF. The tower bootstraps
   opportunistically: a non-vision or incompatible model serves text-only, never a startup crash.
 - **MTP speculative decoding** — native multi-token prediction heads with an auto-depth policy
   that measures its own cost/acceptance trade-off live and re-picks depth (or disables itself)
-  per workload. No configuration required.
+  per workload. No configuration required. An additional opt-in `--spec-source dflash2-tree` mode
+  adds tree verification alongside MTP/DFlash2.
 - **Two-node / four-node TP serving** — see below.
 - **NVFP4 / FP8 mixed-precision quantization** — offline quantizer producing HF-compatible
-  compressed-tensors artifacts; NVFP4 tensor-core GEMMs for the serving path.
+  compressed-tensors artifacts; NVFP4 tensor-core GEMMs for the serving path, plus direct load of
+  fine-grained block-128 FP8 (`weight_scale_inv`).
 - **Long context** — chunked prefill; 32K-class envelopes validated end-to-end on TP=2;
   model-context up to 256K on the 27B. The hybrid GDN layers carry a fixed-size recurrent state,
   so KV memory grows only on the periodic full-attention layers.
@@ -450,11 +457,18 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--output-prompts [n]` | off | Log each chat request human-readable (params, messages, rendered prompt); optional render cap `n` |
 | `--mtp <auto\|on\|off>` | auto | MTP speculative decoding. `auto` measures whether it pays and self-tunes depth from live acceptance; greedy verify is bitwise-lossless, temp>0 distribution-exact. `on`/`off` force it (benchmarking) |
 | `--mtp-depth <N>` | auto | Pin draft depth instead of auto-picking (benchmarking) |
+| `--spec-source <mode>` | auto | Speculative source: `mtp` / `dflash2` / `dflash2-rq` / `dflash2-auto` / `dflash2-tree` (tree verification, opt-in) / `none` |
 | `--ngram-draft <N>` | 0 | EXPERIMENTAL prompt-lookup drafting, n-gram order N (0 = off) |
 | `--prefix-cache <on\|off>` | off | Reuse a conversation's cached prefix (~3× faster follow-up turns). Not bit-exact across reuse; greedy MTP stays lossless |
 | `--default-repetition-penalty <F>` | 1.0 | Repetition penalty (1.0 = off) |
 | `--default-presence-penalty <F>` | 1.5 (2.0 on 2B) | Presence penalty |
 | `--default-frequency-penalty <F>` | 0.0 | Frequency penalty |
+| `--otel-endpoint <URL>` | off | Enable the OpenTelemetry emitter: OTLP receiver base URL (POSTs `/v1/logs`). Off = zero session work |
+| `--otel-batch-size <N>` | 512 | Max LogRecords per POST `/v1/logs` |
+| `--otel-batch-interval-ms <MS>` | — | Sender drain period (timer-polled, never per-token) |
+| `--otel-include-tokens <on\|off>` | off | Include token text in the telemetry |
+| `--otel-model-id <ID>` | auto | Override the `model.id` attribute (auto: `/v1/models` id) |
+| `--otel-topology <T>` | auto | Override the `topology` attribute (auto: `single`/`tp2`/`tp4`) |
 
 `temperature` / `top_p` / `top_k` / `seed` are **per-request** only (defaults 0.7 / 0.8 / 20) —
 every request may override in its JSON body. There are no MTP env vars; speculation is auto-tuned

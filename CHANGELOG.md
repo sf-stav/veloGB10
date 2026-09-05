@@ -3,6 +3,20 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.5.4 — Built-in OpenTelemetry, FP8 support, DFlash2 tree mode
+
+- **Built-in OpenTelemetry.** `--otel-endpoint <URL>` streams OTLP/HTTP-JSON generation telemetry
+  (the actual SSE chunk bytes, with `model.id` / `topology` / `request.id` / `token.index` / `event`
+  attributes), off by default, near-zero decode interference. `request.id` is now the conversation
+  key so a reply's turns join one continuous session; `generation.id` stays per-POST. Companion
+  flags: `--otel-batch-size`, `--otel-batch-interval-ms`, `--otel-include-tokens`,
+  `--otel-model-id`, `--otel-topology`.
+- **FP8 support expanded.** Direct load of Qwen fine-grained block-128 FP8 (`weight_scale_inv`);
+  DFlash2 FP8 drafter bake (`--df2-bake-fp8`) plus weight-only NVFP4 (`--df2-bake-nvfp4`);
+  `--df2-quant-fidelity` gate tool. Fixed FP8 kernel bugs across `gpu_batch.cu`.
+- **DFlash2 tree verification.** New opt-in `--spec-source dflash2-tree` mode (additive; MTP and
+  DFlash2 unchanged). Minor bug fixes and optimizations.
+
 ## v0.5.2 — vLLM-compatible tokenize / detokenize endpoints
 
 - **`POST /v1/tokenize`** — vLLM-compatible tokenization: `{tokens, count, max_model_len}`, a pure

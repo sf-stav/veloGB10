@@ -82,6 +82,23 @@ pub struct Df2StepRec {
     pub tap_ck: Vec<u64>,
     /// True when this step's raw h_final was written to hfinal.bin (steps < RAW_STEPS).
     pub hfinal_written: bool,
+
+    // ---- PLAN/25 Phase 0 (coverage curves) — dump-only additions, all empty when the
+    // ---- coverage capture is off.
+    /// Greedy lane: per verify column j the TARGET's top-4 token ids + raw logits
+    /// (row-major [8][4]), the full-vocab softmax p of the argmax, and the top1−top2
+    /// logit gap (the near-tie gauge). Empty on the sample lanes (their distribution-side
+    /// table is `top20`).
+    pub tgt_ids: Vec<u32>,
+    pub tgt_logit: Vec<f32>,
+    pub tgt_p1: Vec<f32>,
+    pub tgt_margin: Vec<f32>,
+    /// The LOGGING-ONLY MTP chain run on the same step grid (the union instrument): per
+    /// draft position j (1..7) the MTP head's top-8 candidate ids + raw logits, row-major
+    /// [7][8], conditioned on the SAME committed prefix the DF2 round drafted from. The
+    /// chain writes nothing but this record — the DF2 selection path is untouched.
+    pub mtp_ids: Vec<u32>,
+    pub mtp_logit: Vec<f32>,
 }
 
 /// The per-step MTP record (the p-computation control).
@@ -97,6 +114,25 @@ pub struct MtpStepRec {
     pub bonus: u32,
     pub nacc: usize,
     pub emitted: usize,
+
+    // ---- PLAN/25 Phase 0 (coverage curves) — dump-only additions, all empty when the
+    // ---- coverage capture is off (the S5F3 parity runs leave them at their defaults).
+    /// Per verify column j (position pos+1+j): the TARGET's top-4 token ids (row-major
+    /// [n][4]) with raw logits, the full-vocab softmax p of the argmax, and the
+    /// top1−top2 LOGIT gap (the near-tie gauge). Greedy lane only (the sample lane's
+    /// distribution-side table is `tgt_top20`).
+    pub tgt_ids: Vec<u32>,
+    pub tgt_logit: Vec<f32>,
+    pub tgt_p1: Vec<f32>,
+    pub tgt_margin: Vec<f32>,
+    /// Per draft position j: the DRAFTER head's top-8 candidate ids + raw logits
+    /// (row-major [depth-1][8]). top-1 == the draft (argmax path unchanged — the head is
+    /// re-run read-only for this readback, never used to draft).
+    pub draft_topk_ids: Vec<u32>,
+    pub draft_topk_logit: Vec<f32>,
+    /// Sample lane: the verify's packed (p<<32|tok) top-20 per column (verify_forward_sample's
+    /// `t20_out`), empty on the greedy lane.
+    pub tgt_top20: Vec<u64>,
 }
 
 /// FNV-1a 64 over raw u16s (bf16 bit patterns).
@@ -107,6 +143,27 @@ fn fnv64(words: &[u16]) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// PLAN/25 Phase 0 — the target-side coverage readback (host, dump-only): top-`k` token ids
+/// + raw logits from one verify column, the full-vocab softmax p of the argmax, and the
+/// top1−top2 logit gap (the near-tie gauge). Same arithmetic as `bench_accept`'s inline
+/// per-column scan (the Phase-0 methodology's reference). Overflow-safe on ±inf logits.
+pub fn tgt_topk_host(col: &[f32], k: usize) -> (Vec<u32>, Vec<f32>, f32, f32) {
+    let n = k.min(col.len()).max(1);
+    let mut idx: Vec<usize> = (0..col.len()).collect();
+    // Partial-select the top-n (O(len)), then order just those. The `.then(a.cmp(&b))`
+    // tie-break keeps the LOWEST index among bit-equal logits — the same element the verify's
+    // argmax kernel keeps — so ids[0] IS the device argmax, not a coin flip among equals.
+    idx.select_nth_unstable_by(n - 1, |&a, &b| col[b].total_cmp(&col[a]));
+    idx.truncate(n);
+    idx.sort_by(|&a, &b| col[b].total_cmp(&col[a]).then(a.cmp(&b)));
+    let ids: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
+    let vals: Vec<f32> = idx.iter().map(|&i| col[i]).collect();
+    let b1 = vals[0];
+    let denom: f32 = col.iter().map(|&x| (x - b1).exp()).sum();
+    let margin = vals[0] - vals.get(1).unwrap_or(&vals[0]);
+    (ids, vals, 1.0 / denom, margin)
 }
 
 /// The dump writer. Owned by the `BatchScheduler` (one per process); jobs write sequentially.
@@ -287,6 +344,12 @@ impl StepDump {
                   self.job_tag, self.taps_from, self.taps_from + self.taps_n, self.n_steps);
         self.job_tag.clear();
     }
+
+    /// Whether a job's records are currently open. Serving-mode markers consult this so a new
+    /// admission never splits an open job, and the bench harness's explicit markers stay
+    /// authoritative (job_end itself no-ops on a closed job, so a lane finish in bench mode
+    /// cannot double-close).
+    pub fn job_open(&self) -> bool { !self.job_tag.is_empty() }
 
     pub fn finish(&mut self) {
         self.job_end();

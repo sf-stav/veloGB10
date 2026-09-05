@@ -223,7 +223,12 @@ use crate::gpu::MAX_AUTO_DEPTH;
 /// the serving loop via `df2_effective_src`; MTP stays permanently selectable (`--spec-source
 /// mtp`, the standing directive) and is the fallback whenever the round is absent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SpecSource { Mtp, Dspark, DFlash2, DFlash2Rq, DFlash2Auto, Plain }
+pub enum SpecSource { Mtp, Dspark, DFlash2, DFlash2Rq, DFlash2Auto, DFlash2Tree, Plain }
+
+/// PLAN/25 Phase 1 (tree-verify spike): the DF2 TREE lane — the selector round's candidate
+/// table walked into a two-branch tree (the walk chain + the best per-level alternates),
+/// verified with per-node KV paths and per-node target argmax (`verify_forward_topo`).
+/// Greedy-only in v0; lossless by construction (emitted tokens are target argmax tokens).
 
 /// S8F — the per-request routing domain for the DF2 lane split. `Code` routes the GREEDY selector
 /// (S5F4's code cell: greedy τ 6.72 > rq 5.98); `General` (math/chat/prose) routes the real-q
@@ -272,7 +277,8 @@ pub fn df2_effective_src(src: SpecSource, domain: Domain, prose_greedy: bool, re
 
 /// S8F — is this source a DFlash2 source (any of the three DF2 variants)?
 pub fn is_df2_src(src: SpecSource) -> bool {
-    matches!(src, SpecSource::DFlash2 | SpecSource::DFlash2Rq | SpecSource::DFlash2Auto)
+    matches!(src, SpecSource::DFlash2 | SpecSource::DFlash2Rq | SpecSource::DFlash2Auto
+                 | SpecSource::DFlash2Tree)
 }
 
 /// CLI surface for `--spec-source {mtp,dflash2,dflash2-rq,none}` (S5F; S6F owns the per-domain
@@ -285,6 +291,7 @@ impl SpecSource {
             "dflash2" | "df2" => Some(SpecSource::DFlash2),
             "dflash2-rq" | "df2rq" => Some(SpecSource::DFlash2Rq),
             "dflash2-auto" | "df2-auto" | "df2auto" => Some(SpecSource::DFlash2Auto),
+            "dflash2-tree" | "df2-tree" => Some(SpecSource::DFlash2Tree),
             "none" | "plain" | "off" => Some(SpecSource::Plain),
             _ => None,
         }
@@ -296,6 +303,7 @@ impl SpecSource {
             SpecSource::DFlash2 => "dflash2",
             SpecSource::DFlash2Rq => "dflash2-rq",
             SpecSource::DFlash2Auto => "dflash2-auto",
+            SpecSource::DFlash2Tree => "dflash2-tree",
             SpecSource::Plain => "none",
         }
     }
@@ -849,6 +857,9 @@ pub struct BatchScheduler {
     df2: Option<crate::dflash2::round::Df2Round>,
     /// The trunk's tap-capture sink writer twin (the round reads the staging via attach_sink).
     df2_sink: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
+    /// PLAN/25 Phase 1: the WIDE tree-verify sink (armed on the trunk when the source is
+    /// `dflash2-tree`; the topo verify's n > BLOCK taps land here).
+    df2_sink_tree: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
     /// The prefill window's wide tap buffer (the prompt-prime capture target).
     df2_prime: Option<std::sync::Arc<crate::dflash2::capture::Df2PrimeSink>>,
     /// One-time "DFlash2 requested but unavailable → serving via MTP" log (the fallback proof).
@@ -862,6 +873,13 @@ pub struct BatchScheduler {
     prose_lane_greedy: bool,
     /// S5F3 draft-parity step dump (dump-only; None = the standing path, zero overhead).
     step_dump: Option<crate::dflash2::stepdump::StepDump>,
+    /// PLAN/25 Phase 0: run the coverage-trace OP SEQUENCE (eager keep-logits verify, logging
+    /// MTP chain, per-level top-k GEMMs) even where `step_dump` is None. SPMD-critical under TP:
+    /// the node mirror must execute the identical op/collective sequence as the head, so the
+    /// trace flag rides TpConfig to every rank while only the head's `step_dump` writes records.
+    cov_trace: bool,
+    /// PLAN/25 Phase 0: serving-side dump-job counter (reqNNNN tags).
+    cov_req_n: usize,
     // ---- Live MTP acceptance telemetry (stderr, every N MTP lane-steps) ----
     mtp_stat_steps: u64,     // number of mtp_lane_step invocations
     mtp_stat_drafts: u64,    // total draft tokens proposed (depth-1 per step)
@@ -873,6 +891,9 @@ pub struct BatchScheduler {
     df2_stat_drafts: u64,
     df2_stat_accepted: u64,
     df2_stat_emitted: u64,
+    df2_tree_stat_steps: u64,   // df2_tree_step invocations
+    df2_tree_stat_rescues: u64, // accepted path crossed into the B branch (the tree's whole point)
+    df2_tree_stat_nodes: u64,   // verified tree nodes (cost side: the chain would be depth+1)
     // ---- S5F: per-step speculation recorder (the on-engine τ matrix harness) ----
     /// When `spec_steps_on`, every speculation step (MTP or DFlash2 lane) pushes a record.
     spec_steps: Vec<SpecStepRec>,
@@ -911,7 +932,7 @@ impl BatchScheduler {
 
     /// S5F: `new` + the DFlash2 round (loaded by the caller; `None` = absent/failed artifact → the
     /// source falls back to MTP per the standing directive) and its tap-sink twins.
-    pub fn with_df2(gpu: GpuModel, max_batch: usize, kv_stride: usize, eos: Vec<u32>,
+    pub fn with_df2(mut gpu: GpuModel, max_batch: usize, kv_stride: usize, eos: Vec<u32>,
                     rx: mpsc::UnboundedReceiver<BatchRequest>,
                     mtp: MtpPolicy, prefix_cache: bool, ngram_draft: usize, tree_draft: bool,
                     mtp_lanes: bool,
@@ -937,7 +958,12 @@ impl BatchScheduler {
         // A single slot is only correct at depth 2. With depth >= 3 it silently rolled the recurrent
         // state back past accepted drafts, which is why greedy MTP was not lossless above depth 2.
         let mtp_snapshot_slot = max_batch;
-        let n_ckpt = if mtp_has_head { if tree_draft || mtp_lanes { crate::gpu::MAX_VERIFY } else { mtp_depth.saturating_sub(1).max(1) } } else { 0 };
+        // PLAN/25 Phase 1: the DFlash2 TREE lane can engage lazily on any scheduler that carries
+        // the DF2 round (e.g. the lossless probe switches sources per job), and its verify writes
+        // per-column GDN checkpoints for up to MAX_VERIFY columns — size the band for that
+        // capability whenever the round is present, not just when the source is the tree.
+        let src_is_tree = matches!(mtp.spec_source(), SpecSource::DFlash2Tree);
+        let n_ckpt = if mtp_has_head { if df2.is_some() || tree_draft || mtp_lanes || src_is_tree { crate::gpu::MAX_VERIFY } else { mtp_depth.saturating_sub(1).max(1) } } else { 0 };
         // One PROMPT checkpoint slot per lane, after the MTP snapshot slots. These hold the GDN state
         // as it stood at the END OF PREFILL — see `prompt_ckpt_slot`. They are pure state: no KV, and
         // none at all when prefix caching is off (51 MB/slot on 9B, 154 MB on 27B).
@@ -1088,6 +1114,14 @@ impl BatchScheduler {
         // The graph replays with per-step (anchor, nprev) written to device ints; the R13
         // volatile kernels are stable under capture (the probe asserts determinism). Env
         // GB10_NO_DF2_GRAPH=1 keeps the eager path (the captured-vs-eager measurement).
+        // PLAN/25 Phase 1: `dflash2-tree` arms the WIDE (MAX_VERIFY-col) tap sink on the trunk —
+        // the topo verify's n > BLOCK per-column taps land there; the accepted path is gathered
+        // into the round's 8-col staging at commit. No-op for every other source.
+        let df2_sink_tree = if matches!(mtp.spec_source(), SpecSource::DFlash2Tree) {
+            let ws = std::sync::Arc::new(crate::dflash2::capture::Df2TapSink::new_cols(gpu.dev(), crate::gpu::MAX_VERIFY));
+            gpu.set_df2_capture_tree(ws.clone());
+            Some(ws)
+        } else { None };
         let mut s = Self {
             gpu, pool, state, bufs, graphs, kv_stride, eos, max_batch, rx,
             lanes: (0..max_batch).map(|_| None).collect(),
@@ -1125,15 +1159,21 @@ impl BatchScheduler {
             pen_had: false,
             df2,
             df2_sink,
+            df2_sink_tree,
             df2_prime,
             df2_fallback_logged: false,
             prose_lane_greedy: false,
+            cov_trace: step_dump.is_some(),
+            cov_req_n: 0,
             step_dump,
             mtp_stat_steps: 0,
             mtp_stat_drafts: 0,
             mtp_stat_accepted: 0,
             mtp_stat_emitted: 0,
             mtp_stat_verify_fwds: 0,
+            df2_tree_stat_steps: 0,
+            df2_tree_stat_rescues: 0,
+            df2_tree_stat_nodes: 0,
             df2_stat_steps: 0,
             df2_stat_drafts: 0,
             df2_stat_accepted: 0,
@@ -1470,6 +1510,10 @@ impl BatchScheduler {
     /// chat pays prefill of its whole history on every turn — per-turn TTFT grows linearly and a session
     /// costs O(T²) in total prefill. We pick the free slot whose cached sequence is the longest prefix of
     /// this prompt and prefill only the suffix.
+    /// PLAN/25 Phase 0: flip the coverage-trace op sequence on a rank whose `step_dump` is None
+    /// (the TP node mirror — the flag arrives via TpConfig; on the head it is implied by the dump).
+    pub fn set_cov_trace(&mut self, on: bool) { self.cov_trace = on; }
+
     fn admit(&mut self, req: BatchRequest) {
         // R9: register the live gpu+state once so net::agree's mismatch path can dump GDN state.
         if std::env::var("GB10_TP_DIAG").is_ok() { r9_register_state(&self.gpu, &self.state); }
@@ -1812,6 +1856,16 @@ impl BatchScheduler {
             h.finish()
         });
 
+        // PLAN/25 Phase 0: serving-side job marker. Only opens when no job is open (the bench
+        // harness emits its own markers; a job left open by a mid-admit reject self-heals at the
+        // next lane finish). Records interleave if lanes overlap — max-batch 1 is the clean case.
+        if let Some(d) = self.step_dump.as_mut() {
+            if !d.job_open() {
+                self.cov_req_n += 1;
+                let tag = format!("req{:04}", self.cov_req_n);
+                d.job_start(&tag, &prompt, self.gpu.dev());
+            }
+        }
         self.lanes[slot] = Some(Lane {
             phys, pos: plen, last_tok: first_tok, max_new,
             generated: 1, greedy, domain, temperature, top_p, top_k,
@@ -1897,6 +1951,8 @@ impl BatchScheduler {
                 let src = df2_effective_src(src, lane.domain, self.prose_lane_greedy, lane.greedy);
                 let done = match src {
                     SpecSource::DFlash2Rq => self.df2_lane_step_sample_rq(0),
+                    // PLAN/25 Phase 1: the tree lane (greedy v0; sampled falls back to the rq walk).
+                    SpecSource::DFlash2Tree if lane.greedy => self.df2_tree_step(0),
                     _ if lane.greedy => self.df2_lane_step(0),
                     _ => self.df2_lane_step_sample(0),
                 };
@@ -2012,6 +2068,10 @@ impl BatchScheduler {
                 self.free_slots.push(lane.phys);
                 let reason = if lane.generated >= lane.max_new { "length" } else { "stop" };
                 let _ = lane.tx.send(TokEvent::Finish { reason: reason.to_string() });
+                // PLAN/25 Phase 0: close the serving dump job (no-op when none is open; in bench
+                // mode run_spec_bench's own job_end then no-ops the same way — taps are written
+                // exactly once, here, under the bench tag).
+                if let Some(d) = self.step_dump.as_mut() { d.job_end(); }
             } else {
                 self.lanes[write] = self.lanes[i].take();
                 write += 1;
@@ -2523,6 +2583,11 @@ impl BatchScheduler {
 
         // ---- Draft chain (depth-1 drafts). cur_hidden starts at h_prev; chains via MTP outputs. ----
         let step_t0 = std::time::Instant::now();
+        // PLAN/25 Phase 0: coverage capture (dump-only) — the drafter's top-8 per position is
+        // read back AFTER the argmax (the draft itself still comes from `argmax_hidden`; the
+        // readback never picks a draft). Zero effect when the step dump is off.
+        let cov_on = self.cov_trace;
+        let mut cov_draft_topk: Vec<Vec<(u32, f32)>> = Vec::new();
         self.gpu.copy_hidden_col(cur_ptr, &self.mtp_h_prev[phys], 0);
         let mut drafts: Vec<u32> = Vec::with_capacity(depth - 1);
         let mut cur_tok = committed_tok as i32;
@@ -2534,6 +2599,10 @@ impl BatchScheduler {
             self.gpu.copy_hidden_col(cur_ptr, &m, 0);
             self.pool.release_bf16(m, h);
             cur_tok = self.gpu.argmax_hidden(&mut self.pool, self.mtp_cur_hidden.as_ref().unwrap()) as i32;
+            if cov_on {
+                cov_draft_topk.push(
+                    self.gpu.topk_hidden_kv(&mut self.pool, self.mtp_cur_hidden.as_ref().unwrap(), 8));
+            }
             // PROMPT-LOOKUP OVERRIDE (see mtp_lane_step's twin logic in gpu.rs::bench_accept). If the
             // last `ngram` tokens recur earlier in this lane's context, propose the token that followed
             // the most recent earlier occurrence — a free, exact copy that the 1-layer head cannot do.
@@ -2564,8 +2633,48 @@ impl BatchScheduler {
         // Ping-pong GDN: the verify snapshots S1 (post committed-token state) into the snapshot slot
         // via the kernel checkpoint, so a rejected draft restores S1 with a dtod copy — no reverify.
         let verify_t0 = std::time::Instant::now();
-        let (preds, vout) = self.gpu.verify_forward(
-            &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos, Some(snapshot), penalty);
+        // PLAN/25 Phase 0 (cov_on): keep the verify logits and derive preds + the per-column
+        // target top-4/p1/top1−top2 margin host-side (the bench_accept readback). The eager core
+        // is the exact sequence the E13 graph captures, so the values — and therefore preds —
+        // are identical to the non-dump path. Dump-only.
+        // Penalty-aware stand-down: a penalized request's preds must come from the penalized
+        // verify, so the coverage capture quietly skips that step (empty tgt fields in its
+        // record). `has_penalty` is a per-request property, identical on both ranks — SPMD-safe.
+        let (preds, vout, cov_tgt) = if cov_on {
+            let (logits, vout) = self.gpu.verify_forward_keep_logits(
+                &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
+                Some(snapshot));
+            let n = verify_input.len();
+            let vocab = self.gpu.cfg().vocab_size;
+            let lg_f32: Vec<f32> = match logits {
+                crate::gpu::VerifyLogits::B16(lg) => {
+                    let v: Vec<half::bf16> = self.gpu.dev().dtoh_sync_copy(&lg).unwrap();
+                    self.pool.release_bf16(lg, vocab * n);
+                    v.iter().map(|x| x.to_f32()).collect()
+                }
+                crate::gpu::VerifyLogits::F32(lg) => {
+                    let v: Vec<f32> = self.gpu.dev().dtoh_sync_copy(&lg).unwrap();
+                    self.pool.release(lg, vocab * n);
+                    v
+                }
+            };
+            let mut preds = Vec::with_capacity(n);
+            let (mut tids, mut tlog) = (Vec::with_capacity(n * 4), Vec::with_capacity(n * 4));
+            let (mut tp1, mut tmar) = (Vec::with_capacity(n), Vec::with_capacity(n));
+            for c in 0..n {
+                let (ids, vals, p1, margin) = crate::dflash2::stepdump::tgt_topk_host(
+                    &lg_f32[c * vocab..(c + 1) * vocab], 4);
+                preds.push(ids[0]);
+                tids.extend_from_slice(&ids); tlog.extend_from_slice(&vals);
+                tp1.push(p1); tmar.push(margin);
+            }
+            (preds, vout, Some((tids, tlog, tp1, tmar)))
+        } else {
+            let (preds, vout) = self.gpu.verify_forward(
+                &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
+                Some(snapshot), penalty);
+            (preds, vout, None)
+        };
         let verify_ms = verify_t0.elapsed().as_secs_f32() * 1e3;
 
         // ---- Accept longest prefix (greedy: drafts[i] accepted iff preds[i]==drafts[i]). ----
@@ -2681,11 +2790,24 @@ impl BatchScheduler {
         });
         // ---- S5F3 MTP control dump (dump-only; the p-computation control). ----
         if let Some(d) = self.step_dump.as_mut() {
+            let (mut tids, mut tlog) = (Vec::new(), Vec::new());
+            let (mut tp1, mut tmar) = (Vec::new(), Vec::new());
+            if let Some((a, b, c, e)) = cov_tgt.as_ref() {
+                tids = a.clone(); tlog = b.clone(); tp1 = c.clone(); tmar = e.clone();
+            }
+            let mut dk_ids = Vec::with_capacity(cov_draft_topk.len() * 8);
+            let mut dk_logit = Vec::with_capacity(cov_draft_topk.len() * 8);
+            for tk in &cov_draft_topk {
+                for (t, v) in tk { dk_ids.push(*t); dk_logit.push(*v); }
+            }
             let rec = crate::dflash2::stepdump::MtpStepRec {
                 step: self.mtp_stat_steps, pos: main_pos, committed: committed_tok, depth,
                 drafts: drafts.clone(), p_draft: Vec::new(),
                 resid: preds[..depth.saturating_sub(1).min(preds.len())].to_vec(),
                 bonus, nacc, emitted: emit_count,
+                tgt_ids: tids, tgt_logit: tlog, tgt_p1: tp1, tgt_margin: tmar,
+                draft_topk_ids: dk_ids, draft_topk_logit: dk_logit,
+                tgt_top20: Vec::new(),
             };
             d.record_mtp(&rec);
         }
@@ -2757,6 +2879,10 @@ impl BatchScheduler {
         let mut qprobs: Vec<f32> = Vec::with_capacity(depth - 1);
         let mut cur_tok = committed_tok as i32;
         let mut dpos = mtp_pos;
+        // PLAN/25 Phase 0: coverage capture (dump-only) — drafter top-8 readback per position,
+        // after the argmax (the readback never picks the draft).
+        let cov_on = self.cov_trace;
+        let mut cov_draft_topk: Vec<Vec<(u32, f32)>> = Vec::new();
         for _ in 0..depth - 1 {
             let m = self.gpu.mtp_draft_step(
                 &mut self.pool, self.mtp_cur_hidden.as_ref().unwrap(), cur_tok, dpos,
@@ -2765,6 +2891,10 @@ impl BatchScheduler {
             self.pool.release_bf16(m, h);
             let tok = self.gpu.argmax_hidden(&mut self.pool, self.mtp_cur_hidden.as_ref().unwrap());
             cur_tok = tok as i32;
+            if cov_on {
+                cov_draft_topk.push(
+                    self.gpu.topk_hidden_kv(&mut self.pool, self.mtp_cur_hidden.as_ref().unwrap(), 8));
+            }
             drafts.push(tok);
             qprobs.push(1.0); // greedy draft = point mass
             dpos += 1;
@@ -2783,10 +2913,14 @@ impl BatchScheduler {
 
         // ---- Verify with stochastic output. ----
         let verify_t0 = std::time::Instant::now();
+        // PLAN/25 Phase 0: the dump-only top-20 table rides out on `cov_t20` when the step
+        // dump is armed (verify_forward_sample's existing t20_out hook).
+        let mut cov_t20: Vec<u64> = Vec::new();
         let (vsample, vout) = self.gpu.verify_forward_sample(
             &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
             Some(snapshot), verify_penalty,
-            &drafts, &qprobs, temperature, top_k, top_p, &verify_seeds, None);
+            &drafts, &qprobs, temperature, top_k, top_p, &verify_seeds,
+            if cov_on { Some(&mut cov_t20) } else { None });
         let verify_ms = verify_t0.elapsed().as_secs_f32() * 1e3;
 
         // ---- Speculative rejection sampling accept loop (Leviathan et al. 2023). ----
@@ -2903,11 +3037,20 @@ impl BatchScheduler {
         // ---- S5F3 MTP control dump (dump-only; p_of_draft + residual + bonus — the
         // ---- p-computation cross-check against the DFlash2 lane's verify). ----
         if let Some(d) = self.step_dump.as_mut() {
+            let mut dk_ids = Vec::with_capacity(cov_draft_topk.len() * 8);
+            let mut dk_logit = Vec::with_capacity(cov_draft_topk.len() * 8);
+            for tk in &cov_draft_topk {
+                for (t, v) in tk { dk_ids.push(*t); dk_logit.push(*v); }
+            }
             let rec = crate::dflash2::stepdump::MtpStepRec {
                 step: self.mtp_stat_steps, pos: main_pos, committed: committed_tok, depth,
                 drafts: drafts.clone(), p_draft: vsample.p_of_draft.clone(),
                 resid: vsample.resid_tok.clone(), bonus: vsample.bonus_tok,
                 nacc, emitted: emit_count,
+                tgt_ids: Vec::new(), tgt_logit: Vec::new(), tgt_p1: Vec::new(),
+                tgt_margin: Vec::new(),
+                draft_topk_ids: dk_ids, draft_topk_logit: dk_logit,
+                tgt_top20: cov_t20.clone(),
             };
             d.record_mtp(&rec);
         }
@@ -2941,6 +3084,219 @@ impl BatchScheduler {
     /// slots — the probe asserts the pointer ranges).
     ///
     /// Emits the accepted drafts + bonus, advancing the lane by nacc+1. Returns true if finished.
+    /// PLAN/25 Phase 1 — the DF2 TREE lane (opt-in `--spec-source dflash2-tree`, greedy v0).
+    /// The selector round already computes a top-16 candidate table for each of the 7 levels in
+    /// its single block forward; the chain is one walk through it. This lane walks a SECOND
+    /// chain (best per-level candidate that the walk did not pick) and verifies BOTH as a
+    /// 15-node tree: per-node KV paths (`verify_forward_topo`), per-node target argmax,
+    /// longest root-path accept (lossless — every emitted token is a target argmax token).
+    /// Commit: GDN checkpoint of the accepted leaf (per-column ckpts written by the topo
+    /// verify), the ring staging compacted to the accepted path (`compact_staging`), then the
+    /// standing `inject_dev`. The chain lane (`df2_lane_step`) is untouched when this mode is off.
+    fn df2_tree_step(&mut self, i: usize) -> bool {
+        const LEVELS: usize = 7;
+        let h = self.gpu.cfg().hidden_size;
+        let phys = self.lanes[i].as_ref().unwrap().phys;
+        let ckpt = self.mtp_snapshot_slot;   // per-column GDN checkpoint base (MAX_VERIFY slots)
+        // Lazy arm: schedulers not built through `with_df2` (the lossless probe) still get the
+        // WIDE tap sink on the first tree step — it must be on the trunk BEFORE the verify's
+        // capture D2Ds run. One Option test per step.
+        if self.df2_sink_tree.is_none() {
+            let ws = std::sync::Arc::new(
+                crate::dflash2::capture::Df2TapSink::new_cols(self.gpu.dev(), crate::gpu::MAX_VERIFY));
+            self.gpu.set_df2_capture_tree(ws.clone());
+            self.df2_sink_tree = Some(ws);
+        }
+        let kv_stride = self.kv_stride;
+
+        let committed_tok = self.lanes[i].as_ref().unwrap().last_tok;
+        let main_pos = self.lanes[i].as_ref().unwrap().pos;
+        let generated = self.lanes[i].as_ref().unwrap().generated;
+        let max_new = self.lanes[i].as_ref().unwrap().max_new;
+        let eos = self.eos.clone();
+        let (rep_pen, presence_pen, freq_pen, has_penalty) = {
+            let l = self.lanes[i].as_ref().unwrap();
+            (l.rep_penalty, l.presence_penalty, l.frequency_penalty, l.has_penalty())
+        };
+        let history: Vec<u32> = self.lanes[i].as_ref().unwrap().history.clone();
+
+        // ---- Draft: the S4F round exactly as the chain runs it (graph when captured). ----
+        let step_t0 = std::time::Instant::now();
+        let dump_on = self.cov_trace;   // op-sequence gate: must match across TP ranks
+        let (drafts, full_out): (Vec<u32>, Option<crate::dflash2::round::Df2RoundOut>) = {
+            let df2 = self.df2.as_mut().unwrap();
+            assert_eq!(df2.nprev(), main_pos,
+                "df2 ring nprev {} != lane pos {} (ring stale or unprimed)", df2.nprev(), main_pos);
+            if dump_on {
+                // Coverage-trace mode keeps the eager FULL round (its op sequence is what the
+                // TP node mirrors and the dump parity harness expects).
+                let o = df2.draft_round_full(committed_tok).expect("df2 draft_round_full");
+                let toks = o.tokens.clone();
+                (toks, Some(o))
+            } else {
+                // Serving path: the CAPTURED graph (the chain lane's round) + one 448 B dtoh for
+                // the top-16 candidate table the B branch ranks from — the full round's ~640 KB
+                // h_final readback stays out of the serving step.
+                let mk_out = |cand: Vec<u32>| crate::dflash2::round::Df2RoundOut {
+                    tokens: Vec::new(), candidates: cand, unary: Vec::new(), scores: Vec::new(),
+                    h_final: Vec::new(), layer_hiddens: Vec::new(), logits: None, hp: None,
+                    stage_ms: None,
+                };
+                if df2.round_graph.is_some() {
+                    let toks = df2.draft_round_graph(committed_tok).expect("df2 draft_round_graph");
+                    let cand = df2.candidate_table().expect("df2 candidate_table");
+                    (toks, Some(mk_out(cand)))
+                } else {
+                    let toks = df2.draft_round_dev(committed_tok).expect("df2 draft_round");
+                    let cand = df2.candidate_table().expect("df2 candidate_table");
+                    (toks, Some(mk_out(cand)))
+                }
+            }
+        };
+        let round_ms = step_t0.elapsed().as_secs_f32() * 1e3;
+
+        // ---- Build the tree: chain A + branch B (best per-level alternate by selector q). ----
+        // candidate table layout: [level][16] (token, q); the walk's own chain pick per level is
+        // `drafts[j]`. Branch B takes, per level, the highest-q candidate that is neither the
+        // chain pick at that level nor any B pick so far (dedupe keeps the tree duplicate-free).
+        // The candidate table rides out with the FULL round (head-logit rank order per level —
+        // the same table the Phase-0 c_k curves measured). Branch B takes, per level, the
+        // highest-ranked candidate that is neither the walk's pick at that level nor any B pick
+        // so far (dedupe keeps the tree duplicate-free).
+        let cand_tok: Vec<u32> = full_out.as_ref()
+            .map(|o| o.candidates.clone())
+            .expect("df2-tree: the full round must carry the candidate table");
+        let mut b_toks: Vec<u32> = Vec::with_capacity(LEVELS);
+        for j in 0..LEVELS {
+            let row_t = &cand_tok[j * 16..(j + 1) * 16];
+            let mut best: Option<u32> = None;
+            for c in 0..16 {
+                let t = row_t[c];
+                if t == drafts[j] || b_toks.contains(&t) { continue; }
+                best = Some(t);
+                break;
+            }
+            match best { Some(t) => b_toks.push(t), None => break }
+        }
+        let nb = b_toks.len();
+        let n = 1 + drafts.len() + nb;             // root + A + B
+        let mut tokens: Vec<u32> = Vec::with_capacity(n);
+        tokens.push(committed_tok);
+        tokens.extend_from_slice(&drafts);
+        tokens.extend_from_slice(&b_toks);
+        let mut parent: Vec<i32> = vec![-1i32; n];
+        for c in 1..=drafts.len() { parent[c] = c as i32 - 1; }
+        if nb > 0 { parent[1 + drafts.len()] = 0; } // B rooted at the committed token
+        for k in 1..nb { parent[1 + drafts.len() + k] = (drafts.len() + k) as i32; }
+
+        // ---- Verify the tree (per-node KV paths + per-node argmax). ----
+        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let verify_t0 = std::time::Instant::now();
+        let topo = self.gpu.topo_from_parent(&parent, main_pos);
+        let (preds, vout) = self.gpu.verify_forward_topo(
+            &mut self.pool, &tokens, &mut self.state, phys, kv_stride, main_pos, Some(ckpt),
+            penalty, Some(&topo));
+        let verify_ms = verify_t0.elapsed().as_secs_f32() * 1e3;
+
+        // ---- Accept walk: follow the target argmax down the tree (mtp_tree_step rule). ----
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for c in 1..n { children[parent[c] as usize].push(c); }
+        let mut path = vec![0usize];
+        let mut emitted: Vec<u32> = Vec::new();
+        let mut cur = 0usize;
+        loop {
+            let want = preds[cur];
+            emitted.push(want);
+            match children[cur].iter().copied().find(|&c| tokens[c] == want) {
+                Some(c) => { path.push(c); cur = c; }
+                None => break,
+            }
+        }
+        let nacc = path.len() - 1;
+        let leaf = *path.last().unwrap();
+
+        // ---- Telemetry: did the B branch actually earn its verify width? (greedy v0 has no
+        // other visibility -- the serving A/B showed tree = chain tok/s; this one line says
+        // whether that is "rescue rate ~ 0, chain never derails" or "tree never engaged".) ----
+        self.df2_tree_stat_steps += 1;
+        self.df2_tree_stat_nodes += n as u64;
+        if leaf >= 1 + drafts.len() { self.df2_tree_stat_rescues += 1; }
+        if self.df2_tree_stat_steps % 50 == 0 {
+            let resc = self.df2_tree_stat_rescues as f64
+                / self.df2_tree_stat_steps.max(1) as f64 * 100.0;
+            let width = self.df2_tree_stat_nodes as f64 / self.df2_tree_stat_steps.max(1) as f64;
+            eprintln!("[df2-tree] steps={} b_rescue={:.1}% avg_nodes={:.1} (chain equivalent {})",
+                      self.df2_tree_stat_steps, resc, width, LEVELS + 1);
+        }
+
+        // ---- Commit: compact the accepted path's KV into sequential slots [main_pos..). The topo
+        // ---- verify writes per-COLUMN slots (main_pos+c); a path that crossed into the B branch
+        // ---- leaves accepted tokens at scattered slots, and the next verify reads this span
+        // ---- DIRECTLY (dd<0 → slot r) — without the compaction its prefix context is corrupted.
+        // ---- Identity short-circuit inside: a pure A-chain accept (the common case) is a no-op.
+        {
+            let src_pos: Vec<i32> = path.iter().map(|&p| p as i32).collect();
+            self.gpu.compact_kv(&mut self.pool, &mut self.state, phys, main_pos, &src_pos, kv_stride);
+        }
+        // ---- Adopt the leaf's GDN checkpoint (the topo verify wrote per-column ckpts).
+        if leaf != n - 1 { self.gpu.copy_gdn_slot(&self.state, ckpt + leaf, phys); }
+
+        // ---- Ring: gather the accepted path's taps (wide tree sink -> ring order), then the
+        // ---- standing inject. nacc+1 <= BLOCK always (one branch's depth).
+        {
+            let wide = self.df2_sink_tree.as_ref()
+                .expect("dflash2-tree: wide tap sink not armed");
+            let df2 = self.df2.as_mut().unwrap();
+            df2.sync_staging_from_wide(wide, &path).expect("df2 sync_staging_from_wide");
+            df2.inject_dev(nacc + 1, None).expect("df2 inject_dev");
+        }
+        self.pool.release_bf16(vout, h * n);
+
+        // ---- Emit accepted + bonus (the standing EOS/max_new discipline). ----
+        let mut new_toks: Vec<u32> = Vec::with_capacity(nacc + 1);
+        let mut hit_eos = false;
+        for k in 0..nacc {
+            if generated + new_toks.len() >= max_new { break; }
+            new_toks.push(emitted[k]);
+            if eos.contains(&emitted[k]) { hit_eos = true; break; }
+        }
+        if !hit_eos && generated + new_toks.len() < max_new {
+            new_toks.push(emitted[nacc]);
+            if eos.contains(&emitted[nacc]) { hit_eos = true; }
+        }
+        let emit_count = new_toks.len();
+        let finished = hit_eos || generated + emit_count >= max_new;
+
+        {
+            let cache = &mut self.slot_cache[phys];
+            cache.push(committed_tok);
+            cache.extend_from_slice(&emitted[..nacc]);
+        }
+        {
+            let lane = self.lanes[i].as_mut().unwrap();
+            for &t in &new_toks {
+                let _ = lane.tx.send(TokEvent::Tok(t));
+                lane.history.push(t);
+                if lane.history.len() > 256 { lane.history.drain(0..128); }
+            }
+            lane.generated += emit_count;
+            if !finished {
+                lane.last_tok = emitted[nacc];
+                lane.pos = main_pos + nacc + 1;
+                lane.mtp_pos = main_pos + nacc;
+            } else {
+                lane.df2_stale = true;
+            }
+        }
+        self.mtp.record_step(drafts.len() as u64, nacc as u64, emit_count as u64);
+        self.rec_step(SpecStepRec {
+            greedy: true, pos: main_pos as u32, drafts: drafts.len() as u32, nacc: nacc as u32,
+            emitted: emit_count as u32, round_ms, verify_ms,
+            step_ms: step_t0.elapsed().as_secs_f32() * 1e3,
+        });
+        finished
+    }
+
     fn df2_lane_step(&mut self, i: usize) -> bool {
         let h = self.gpu.cfg().hidden_size;
         let phys = self.lanes[i].as_ref().unwrap().phys;
@@ -2961,7 +3317,7 @@ impl BatchScheduler {
 
         // ---- Draft: the S4F round (refresh block positions, then the lean draft). ----
         let step_t0 = std::time::Instant::now();
-        let dump_on = self.step_dump.is_some();
+        let dump_on = self.cov_trace;   // op-sequence gate: must match across TP ranks
         let (drafts, full_out): (Vec<u32>, Option<crate::dflash2::round::Df2RoundOut>) = {
             let df2 = self.df2.as_mut().unwrap();
             assert_eq!(df2.nprev(), main_pos,
@@ -2990,9 +3346,47 @@ impl BatchScheduler {
         verify_input.extend(drafts.iter().copied());
         let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
         let verify_t0 = std::time::Instant::now();
-        let (preds, vout) = self.gpu.verify_forward(
-            &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
-            Some(snapshot), penalty);
+        // PLAN/25 Phase 0 (cov_on): keep the verify logits and derive preds + the per-column
+        // target top-4/p1/top1−top2 margin host-side (the bench_accept readback; the eager core
+        // is exactly what the E13 graph captures, so preds are identical to the non-dump path).
+        // Dump-only. cov_on already folds in !has_penalty (penalized steps keep the plain
+        // penalized verify and carry empty tgt fields; has_penalty is rank-identical — SPMD-safe).
+        let cov_on = self.cov_trace && !has_penalty;
+        let (preds, vout, cov_tgt) = if cov_on {
+            let (logits, vout) = self.gpu.verify_forward_keep_logits(
+                &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
+                Some(snapshot));
+            let n = verify_input.len();
+            let vocab = self.gpu.cfg().vocab_size;
+            let lg_f32: Vec<f32> = match logits {
+                crate::gpu::VerifyLogits::B16(lg) => {
+                    let v: Vec<half::bf16> = self.gpu.dev().dtoh_sync_copy(&lg).unwrap();
+                    self.pool.release_bf16(lg, vocab * n);
+                    v.iter().map(|x| x.to_f32()).collect()
+                }
+                crate::gpu::VerifyLogits::F32(lg) => {
+                    let v: Vec<f32> = self.gpu.dev().dtoh_sync_copy(&lg).unwrap();
+                    self.pool.release(lg, vocab * n);
+                    v
+                }
+            };
+            let mut preds = Vec::with_capacity(n);
+            let (mut tids, mut tlog) = (Vec::with_capacity(n * 4), Vec::with_capacity(n * 4));
+            let (mut tp1, mut tmar) = (Vec::with_capacity(n), Vec::with_capacity(n));
+            for c in 0..n {
+                let (ids, vals, p1, margin) = crate::dflash2::stepdump::tgt_topk_host(
+                    &lg_f32[c * vocab..(c + 1) * vocab], 4);
+                preds.push(ids[0]);
+                tids.extend_from_slice(&ids); tlog.extend_from_slice(&vals);
+                tp1.push(p1); tmar.push(margin);
+            }
+            (preds, vout, Some((tids, tlog, tp1, tmar)))
+        } else {
+            let (preds, vout) = self.gpu.verify_forward(
+                &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
+                Some(snapshot), penalty);
+            (preds, vout, None)
+        };
         let verify_ms = verify_t0.elapsed().as_secs_f32() * 1e3;
 
         // ---- Accept longest prefix (greedy: drafts[i] accepted iff preds[i]==drafts[i]). ----
@@ -3003,6 +3397,53 @@ impl BatchScheduler {
         // ---- GDN rollback on partial reject (restore the state as of the last accepted column). --
         if nacc + 1 != 8 {
             self.gpu.copy_gdn_slot(&self.state, snapshot + nacc, phys);
+        }
+
+        // ---- PLAN/25 Phase 0: the LOGGING-ONLY MTP chain (coverage capture, dump-only). ----
+        // Runs the MTP head over the SAME committed prefix this step's DF2 round drafted from,
+        // recording its top-8 per position — the union instrument: both drafters' candidate sets
+        // on ONE step grid, joined by (tag, pos) offline with zero grid-alignment bias. The
+        // chain writes nothing but the record fields: the DF2 drafts above are untouched, and the
+        // head's speculative KV entries beyond the re-primed span have exactly the mtp lane's own
+        // semantics (always rewritten before they are ever attended).
+        let mut cov_mtp_sets: Option<(Vec<u32>, Vec<f32>)> = None;
+        if cov_on {
+            let kc = *self.mtp_kc[phys].device_ptr();
+            let vc = *self.mtp_vc[phys].device_ptr();
+            let cur_ptr = *self.mtp_cur_hidden.as_ref().unwrap().device_ptr();
+            self.gpu.copy_hidden_col(cur_ptr, &self.mtp_h_prev[phys], 0);
+            let mut cur_tok = committed_tok as i32;
+            let mut dpos = main_pos - 1;
+            let mut mids = Vec::with_capacity(7 * 8);
+            let mut mlog = Vec::with_capacity(7 * 8);
+            for _ in 0..7 {
+                let m = self.gpu.mtp_draft_step(
+                    &mut self.pool, self.mtp_cur_hidden.as_ref().unwrap(), cur_tok, dpos,
+                    kc, vc, kv_stride);
+                self.gpu.copy_hidden_col(cur_ptr, &m, 0);
+                self.pool.release_bf16(m, h);
+                cur_tok = self.gpu.argmax_hidden(&mut self.pool, self.mtp_cur_hidden.as_ref().unwrap()) as i32;
+                for (t, v) in self.gpu.topk_hidden_kv(&mut self.pool, self.mtp_cur_hidden.as_ref().unwrap(), 8) {
+                    mids.push(t); mlog.push(v);
+                }
+                dpos += 1;
+            }
+            cov_mtp_sets = Some((mids, mlog));
+            // Re-prime the head over the REAL accepted span (mirror of mtp_lane_step's re-prime:
+            // col 0 from the cursor hidden, then the verify's real hiddens), so the next step's
+            // chain conditions on the committed prefix exactly as an MTP lane would.
+            let n_rp = nacc + 1;
+            let rp_hidden = self.pool.get_bf16(h * n_rp);
+            let rp_ptr = *rp_hidden.device_ptr();
+            let mut rp_toks: Vec<u32> = Vec::with_capacity(n_rp);
+            self.gpu.copy_hidden_col(rp_ptr, &self.mtp_h_prev[phys], 0);
+            rp_toks.push(committed_tok);
+            self.gpu.copy_hidden_cols(rp_ptr + (h * 2) as u64, &vout, 0, nacc);
+            for k in 1..=nacc { rp_toks.push(drafts[k - 1]); }
+            self.gpu.mtp_reprime(&mut self.pool, &rp_hidden, &rp_toks, main_pos - 1, kc, vc, kv_stride);
+            self.pool.release_bf16(rp_hidden, h * n_rp);
+            // Cursor hidden ← hidden at the last accepted column (the next step's h_prev twin).
+            self.gpu.copy_hidden_col(*self.mtp_h_prev[phys].device_ptr(), &vout, nacc);
         }
 
         // ---- Inject the accepted span's taps into the ring (cols [0, nacc+1) of the sink
@@ -3092,6 +3533,14 @@ impl BatchScheduler {
                 top20: Vec::new(), tap_ck: ck,
                 hfinal_written: full_out.is_some() && self.df2_stat_steps
                     < crate::dflash2::stepdump::RAW_STEPS as u64,
+                // PLAN/25 Phase 0: the target-side coverage readback + the logging-only MTP
+                // chain's top-8 per position (the union instrument).
+                tgt_ids: cov_tgt.as_ref().map(|(a, ..)| a.clone()).unwrap_or_default(),
+                tgt_logit: cov_tgt.as_ref().map(|(_, b, ..)| b.clone()).unwrap_or_default(),
+                tgt_p1: cov_tgt.as_ref().map(|(.., c, _)| c.clone()).unwrap_or_default(),
+                tgt_margin: cov_tgt.as_ref().map(|(.., e)| e.clone()).unwrap_or_default(),
+                mtp_ids: cov_mtp_sets.as_ref().map(|(a, _)| a.clone()).unwrap_or_default(),
+                mtp_logit: cov_mtp_sets.as_ref().map(|(_, b)| b.clone()).unwrap_or_default(),
             };
             let hf = full_out.as_ref().map(|o| o.h_final.as_slice());
             d.record_df2(&rec, hf);
@@ -3169,7 +3618,7 @@ impl BatchScheduler {
 
         // ---- Draft: the S4F round (same as the greedy lane). ----
         let step_t0 = std::time::Instant::now();
-        let dump_on = self.step_dump.is_some();
+        let dump_on = self.cov_trace;   // op-sequence gate: must match across TP ranks
         let (drafts, full_out): (Vec<u32>, Option<crate::dflash2::round::Df2RoundOut>) = {
             let df2 = self.df2.as_mut().unwrap();
             assert_eq!(df2.nprev(), main_pos,
@@ -3202,7 +3651,7 @@ impl BatchScheduler {
             &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
             Some(snapshot), penalty,
             &drafts, &qprobs, temperature, top_k, top_p, &verify_seeds,
-            if dump_on { Some(&mut t20) } else { None });
+            if self.cov_trace { Some(&mut t20) } else { None });
         let verify_ms = verify_t0.elapsed().as_secs_f32() * 1e3;
 
         // ---- Speculative rejection sampling accept loop (q = 1 ⇒ ratio = p(x)). ----
@@ -3301,6 +3750,11 @@ impl BatchScheduler {
                 top20: std::mem::take(&mut t20), tap_ck: ck,
                 hfinal_written: full_out.is_some() && self.df2_stat_steps
                     < crate::dflash2::stepdump::RAW_STEPS as u64,
+                // PLAN/25 Phase 0 fields: the greedy-lane coverage readback and the logging-only
+                // MTP chain don't run on the sampled lanes (the sample lane's distribution-side
+                // table is `top20`; the temp-0.7 union uses the per-source marginals).
+                tgt_ids: Vec::new(), tgt_logit: Vec::new(), tgt_p1: Vec::new(),
+                tgt_margin: Vec::new(), mtp_ids: Vec::new(), mtp_logit: Vec::new(),
             };
             let hf = full_out.as_ref().map(|o| o.h_final.as_slice());
             d.record_df2(&rec, hf);
@@ -3369,7 +3823,7 @@ impl BatchScheduler {
 
         // ---- Draft: the SAMPLED selector path (eager round; per-position selector seeds). ----
         let step_t0 = std::time::Instant::now();
-        let dump_on = self.step_dump.is_some();
+        let dump_on = self.cov_trace;   // op-sequence gate: must match across TP ranks
         let sel_seeds: Vec<u32> = (0..7).map(|j| rng_u32(step_key, RNG_DOM_DF2_SEL, j)).collect();
         let (drafts, q_rows, cand_tok, cand_q) = {
             let df2 = self.df2.as_mut().unwrap();
@@ -3404,7 +3858,7 @@ impl BatchScheduler {
             &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
             Some(snapshot), penalty,
             &drafts, &cand_tok, &cand_q, temperature, top_k, top_p, &verify_seeds,
-            if dump_on { Some(&mut t20) } else { None });
+            if self.cov_trace { Some(&mut t20) } else { None });
         let verify_ms = verify_t0.elapsed().as_secs_f32() * 1e3;
 
         // ---- Real-q rejection sampling: accept iff u*q < p (min(1, p/q) ratio). ----
@@ -3488,6 +3942,9 @@ impl BatchScheduler {
                 nacc, emitted: emit_count, q_rows,
                 candidates: cand_tok, cand_q, unary: Vec::new(), scores: Vec::new(),
                 top20: std::mem::take(&mut t20), tap_ck: ck, hfinal_written: false,
+                // PLAN/25 Phase 0 fields (see the greedy-lane record): not captured on rq lanes.
+                tgt_ids: Vec::new(), tgt_logit: Vec::new(), tgt_p1: Vec::new(),
+                tgt_margin: Vec::new(), mtp_ids: Vec::new(), mtp_logit: Vec::new(),
             };
             d.record_df2(&rec, None);
             // S5F3 ring rows (first RING_STEPS steps).

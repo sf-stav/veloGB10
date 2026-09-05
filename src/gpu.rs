@@ -36,6 +36,9 @@ pub struct XChainCapture {
 }
 
 static XCHAIN: std::sync::OnceLock<parking_lot::Mutex<Vec<XChainCapture>>> = std::sync::OnceLock::new();
+/// Set by --probe-mxfp4-xchain: disable the 8-entry retention trim so a full pass's captures
+/// survive to `xchain_capture_take`. Serving never sets it (R9 memory bound stays active there).
+static XCHAIN_UNBOUNDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // R9: while a CUDA-graph capture is open (decode/verify graph instantiation), ANY dtoh on the
 // capturing stream invalidates it (CUDA_ERROR_STREAM_CAPTURE_*), even one that early-returns —
@@ -66,7 +69,9 @@ fn xchain_new(batch: usize) {
     // entry (enough to localize the divergent layer); the agree aborts long before more is needed.
     // R9: cap at 8 entries (prefill + the first several decode forwards) so the mismatch dump
     // localizes the divergent step without unbounded host memory. Keep the prefill entry always.
-    if g.len() >= 8 {
+    // The --probe-mxfp4-xchain instrument needs EVERY decode step of its pass (it asserts
+    // caps == max_new) — the probe flips XCHAIN_UNBOUNDED and takes the memory hit itself.
+    if g.len() >= 8 && !XCHAIN_UNBOUNDED.load(std::sync::atomic::Ordering::Relaxed) {
         let mut retained: Vec<XChainCapture> = Vec::new();
         if let Some(i) = g.iter().position(|c| c.batch > 1) { retained.push(g.remove(i)); }
         for c in g.drain(..).take(7) { retained.push(c); }
@@ -892,6 +897,10 @@ pub struct GpuModel {
     /// `dflash2::TAP_LAYERS` = [5,19,33,47,61] into this drafter-owned staging at draft time
     /// only. `None` = the dead path — zero launches, zero host work (the R1 timing-free proof).
     df2_capture: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
+    /// PLAN/25 Phase 1: WIDE (MAX_VERIFY-col) tap sink for the tree-verify path — the topo
+    /// verify captures n > BLOCK columns here; the accepted path is gathered into the round's
+    /// 8-col staging by `sync_staging_from_wide`. None unless serving `dflash2-tree`.
+    df2_capture_tree: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
     /// S5F DFlash2 PROMPT-PRIME sink (DEFAULT-OFF; set via `set_df2_prime_sink`): the PREFILL
     /// path copies the same tap residuals into this wider `[25600, cols]` buffer per window, so
     /// the round's `prime_window` can seed the ctx ring with the PROMPT's taps (the 8-column
@@ -1066,6 +1075,10 @@ unsafe impl Send for GpuModel {}
 pub enum W {
     Bf16(B),
     Fp8 { data: cudarc::driver::CudaSlice<u8>, row_scale: S, m: usize, k: usize },
+    /// Qwen fine-grained FP8 (quant_method "fp8", weight_block_size [128,128]): E4M3 codes
+    /// MMA-repacked like `Fp8`, but scales are per-128x128-block `weight_scale_inv` upcast to
+    /// f32, stored flat [(m/128) * nb_k], nb_k = k/128. Decode runs `gemm_mma_fp8_blk_b`.
+    Fp8Blk { data: cudarc::driver::CudaSlice<u8>, blk_scale: S, nb_k: usize, m: usize, k: usize },
     /// `gs` is ONE reciprocal tensor-scale per 16-row MMA tile, not a scalar. A fused weight stacks
     /// several source tensors along M and each brought its own NVFP4 global scale; every segment
     /// boundary is 16-aligned, so a tile lies wholly inside one segment and the kernel reads its
@@ -1087,6 +1100,7 @@ impl W {
         match self {
             W::Bf16(_) => 0,
             W::Fp8 { data, .. } => *data.device_ptr() as u64,
+            W::Fp8Blk { data, .. } => *data.device_ptr() as u64,
             W::Nvfp4 { qweight, .. } | W::Nvfp4Raw { qweight, .. } => *qweight.device_ptr() as u64,
         }
     }
@@ -1103,6 +1117,7 @@ impl W {
         match self {
             W::Bf16(_) => 0, // unknown here; only used for reporting on quantized paths
             W::Fp8 { m, k, .. } => m * k + m * 4,
+            W::Fp8Blk { m, k, nb_k, .. } => m * k + (m / 128) * nb_k * 4,
             W::Nvfp4 { m, k, .. } => m * k / 2 + m * k / 16 + m / 4,
             W::Nvfp4Raw { m, k, .. } => m * k / 2 + m * k / 16,
         }
@@ -1111,11 +1126,11 @@ impl W {
 
 /// M (output rows) of a packed weight — 0 for bf16, whose shape the slice length can't recover.
 fn w_m(w: &W) -> usize {
-    match w { W::Nvfp4 { m, .. } | W::Fp8 { m, .. } | W::Nvfp4Raw { m, .. } => *m, W::Bf16(_) => 0 }
+    match w { W::Nvfp4 { m, .. } | W::Fp8 { m, .. } | W::Fp8Blk { m, .. } | W::Nvfp4Raw { m, .. } => *m, W::Bf16(_) => 0 }
 }
 /// K (reduction dim) of a packed weight — the dim a ROW-parallel shard shrinks.
 fn w_k(w: &W) -> usize {
-    match w { W::Nvfp4 { k, .. } | W::Fp8 { k, .. } | W::Nvfp4Raw { k, .. } => *k, W::Bf16(_) => 0 }
+    match w { W::Nvfp4 { k, .. } | W::Fp8 { k, .. } | W::Fp8Blk { k, .. } | W::Nvfp4Raw { k, .. } => *k, W::Bf16(_) => 0 }
 }
 
 pub struct GpuMtpLayer {
@@ -1781,6 +1796,24 @@ fn qwen_load_shard_op(names: &[String], cfg: &Config, quantized: bool, world: us
             (0, kdim, true), (kdim, kdim, true), (2 * kdim, vdim, true),
             (cdim, vdim, true), (cdim + vdim, lin_nv, false), (cdim + vdim + lin_nv, lin_nv, false)]);
     }
+    // Mixed-dtype GDN site (foreign checkpoints: in_proj_qkv/z FP8, in_proj_b/a bf16 — the
+    // [lin_nv, k] b/a rows don't tile into 128-blocks): the 4-name FUSED rule above can never
+    // assemble it, so the site runs the legacy SPLIT arm and each part arrives here as a 1-name
+    // group. Under TP the split arm computes LOCAL dims, so the quantized parts must shard by
+    // head band exactly like the fused site — a replicated full weight would make EVERY rank
+    // read the FIRST head band and the out_proj all-reduce would sum the same half twice.
+    // b/a stay replicated-full: the arm GEMMs them at the full head count and the kernel reads
+    // the rank's band via a bf16 pointer offset (no bf16 shard pipeline needed).
+    if n.ends_with("linear_attn.in_proj_qkv.weight") && quantized {
+        if gdn_shard_factor_for(cfg, world, true) <= 1 { return LoadShardOp::None; }
+        let (kdim, vdim) = (cfg.key_dim(), cfg.value_dim());
+        return LoadShardOp::ColSegs(vec![
+            (0, kdim, true), (kdim, kdim, true), (2 * kdim, vdim, true)]);
+    }
+    if n.ends_with("linear_attn.in_proj_z.weight") && quantized {
+        if gdn_shard_factor_for(cfg, world, true) <= 1 { return LoadShardOp::None; }
+        return LoadShardOp::Col;
+    }
     if names.len() != 1 { return LoadShardOp::None; }
     if n == "lm_head.weight" {
         return if quantized && vocab_shard_factor_for(cfg, world, true) > 1 { LoadShardOp::Col } else { LoadShardOp::None };
@@ -1882,6 +1915,59 @@ fn shard_raw_fp8(qw: &[u8], rs: &[f32], m: usize, k: usize,
     }
 }
 
+/// RAW-side shard twin for Qwen block-128 FP8: slices the fused RAW [M,K] codes AND the flat
+/// [(M/128)*nb_k] scale matrix, preserving the w = code·scale_inv[row-band, k-block] pairing.
+/// Col/ColSegs split M → scale BANDS split (asserts 128-row alignment: a 16-row tile must never
+/// straddle a band, which holds for every Qwen tensor — segment offsets are head multiples of
+/// 256 and rank splits are 128-multiples). Row splits K → scale k-blocks split. Byte-identical
+/// contract to shard_raw_fp8: the caller repacks to MMA order afterwards.
+fn shard_raw_fp8_blk(qw: &[u8], sc: &[f32], m: usize, k: usize, nb_k: usize,
+                     op: &LoadShardOp, rank: usize, world: usize)
+                     -> (Vec<u8>, Vec<f32>, usize, usize, usize) {
+    let bands = m / 128;
+    let seg_pick = |rows: &[(usize, usize)]| -> (Vec<u8>, Vec<f32>, usize) {
+        let mut q = Vec::new(); let mut s = Vec::new(); let mut mo = 0usize;
+        for &(r0, take) in rows {
+            assert!(r0 % 128 == 0 && take % 128 == 0,
+                    "fp8-blk shard segment (off {r0}, take {take}) not 128-aligned — tiles would straddle scale bands");
+            q.extend_from_slice(&qw[r0 * k..(r0 + take) * k]);
+            s.extend_from_slice(&sc[(r0 / 128) * nb_k..((r0 + take) / 128) * nb_k]);
+            mo += take;
+        }
+        (q, s, mo)
+    };
+    match op {
+        LoadShardOp::None => (qw.to_vec(), sc.to_vec(), m, k, nb_k),
+        LoadShardOp::Col => {
+            let take = m / world;
+            let (q, s, mo) = seg_pick(&[(rank * take, take)]);
+            (q, s, mo, k, nb_k)
+        }
+        LoadShardOp::ColSegs(segs) => {
+            let mut rows = Vec::new();
+            for &(off, cnt, split) in segs {
+                let take = if split { cnt / world } else { cnt };
+                let r0 = off + if split { rank * take } else { 0 };
+                rows.push((r0, take));
+            }
+            let (q, s, mo) = seg_pick(&rows);
+            (q, s, mo, k, nb_k)
+        }
+        LoadShardOp::Row => {
+            assert!(nb_k % world == 0, "fp8-blk row shard: nb_k={nb_k} won't split across world {world}");
+            let k0 = rank * (k / world);
+            let k_local = k / world;
+            let nb_local = nb_k / world;
+            let kb0 = rank * nb_local;
+            let mut q = Vec::with_capacity(m * k_local);
+            for r in 0..m { q.extend_from_slice(&qw[r * k + k0..r * k + k0 + k_local]); }
+            let mut s = Vec::with_capacity(bands * nb_local);
+            for b in 0..bands { s.extend_from_slice(&sc[b * nb_k + kb0..b * nb_k + kb0 + nb_local]); }
+            (q, s, m, k_local, nb_local)
+        }
+    }
+}
+
 /// Host-side twin of `shard_nvfp4_col_segs`: slice 16-row tile bands out of the MMA-repacked
 /// (wt, st, gsv) triple. Returns the sharded triple + local M.
 pub(crate) fn host_shard_nvfp4_col_segs(wt: &[u8], st: &[u8], gsv: &[f32], k: usize,
@@ -1945,6 +2031,10 @@ impl GpuModel {
     /// S4F: disarm the DFlash2 tap capture (the probe's capture-off control).
     pub fn set_df2_capture_off(&mut self) {
         self.df2_capture = None;
+    }
+    /// PLAN/25 Phase 1: arm the WIDE tree sink (the topo verify's n > BLOCK columns).
+    pub fn set_df2_capture_tree(&mut self, sink: std::sync::Arc<crate::dflash2::capture::Df2TapSink>) {
+        self.df2_capture_tree = Some(sink);
     }
 
     /// S4F: is the DFlash2 tap capture armed? (the probe's negative controls toggle it).
@@ -2129,7 +2219,7 @@ impl GpuModel {
         let (kv_quant, kv_tq, kv_tq_b3, kv_k8v4) = Self::kv_modes_from_env();
         let tq_tables = Self::build_tq_tables(&dev)?;
         dev.synchronize()?;
-        Ok(Self { dev, blas, stream, cfg, embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head: None, draft_ids: Vec::new(), lm_head_sharded: false, tp_sharded_at_load: false, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4: None, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None, dflash_tap: None, df2_capture: None, df2_prime: None, dflash_lm_head: None, df2_full_head: None })
+        Ok(Self { dev, blas, stream, cfg, embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head: None, draft_ids: Vec::new(), lm_head_sharded: false, tp_sharded_at_load: false, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4: None, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None, dflash_tap: None, df2_capture: None, df2_capture_tree: None, df2_prime: None, dflash_lm_head: None, df2_full_head: None })
     }
 
     /// Stream-load from safetensors directly as bf16 — no f32 intermediate.
@@ -2400,7 +2490,11 @@ impl GpuModel {
         // input projections must be concatenated along M *before* the mma permutation, and they are
         // not guaranteed to arrive in the same shard.
         type Q4H = (Vec<u8>, Vec<u8>, f32, usize, usize);   // qweight, scales, 1/global_scale, m, k
-        type Q8H = (Vec<u8>, Vec<f32>, usize, usize);       // qweight, row_scale, m, k
+        type Q8H = (Vec<u8>, Vec<f32>, usize, usize, usize);   // qweight RAW, scales, m, k, nb_k
+        // nb_k == 0 → legacy per-row scheme, scales [M] f32 (w = code·scale_row).
+        // nb_k == k/128 → Qwen block-128 scheme, scales flat [(m/128)*nb_k] f32
+        // (w = code·scale_inv[(row/128)*nb_k + (col/128)]). RAW bytes either way — the worker
+        // shards RAW and repacks to MMA order last (the pipeline's existing contract).
         let mut host_q4: std::collections::HashMap<String, Q4H> = std::collections::HashMap::new();
         let mut host_q8: std::collections::HashMap<String, Q8H> = std::collections::HashMap::new();
         // ---- STREAMING LOAD pre-pass (122B OOM fix, 2026-08-07) ----
@@ -2498,7 +2592,10 @@ impl GpuModel {
         // Reserved LM-head/embed parts for the FR-Spec draft head: the head's own assembly job
         // consumes them from host_q4/host_q8, so the draft build (post-loop) reads these copies.
         let mut draft_parts_q4: Option<Q4H> = None;
-        let mut draft_parts_q8: Option<Q8H> = None;
+        // Draft-head FP8 parts — row-scheme ONLY (nb_k==0): the DFlash2 borrowed-head subsetter
+        // (subset_rows_fp8) has no block-scale variant, and every checkpoint that needs it
+        // (Qwen official FP8) keeps lm_head bf16 anyway, so the blk path never populates this.
+        let mut draft_parts_q8: Option<(Vec<u8>, Vec<f32>, usize, usize)> = None;
         // The economy/dual-layout decision (used by the workers AND the fit guard): computed
         // here from the header pre-pass totals — the maps drain during the load, so a mid-load
         // sum would be wrong.
@@ -2682,12 +2779,24 @@ impl GpuModel {
         {
             let attn_in = |gwn: &mut dyn FnMut(&[String]) -> W, lp: &str, fuse: bool| -> AttnIn {
                 let n = |s: &str| format!("{}.self_attn.{}.weight", lp, s);
-                if fuse { AttnIn::Fused(gwn(&[n("q_proj"), n("k_proj"), n("v_proj")])) }
+                // Fuse only when EVERY part is quantized: foreign checkpoints (Qwen official
+                // FP8) may leave small linears bf16, and a mixed group can't assemble into one
+                // packed weight. The split arm dispatches per-part through gemm_act, so parts
+                // may be any variant; under TP a split site is replicated (legacy full-width
+                // contract — the ColSegs rule keys on the fused 3-name group).
+                let parts = [n("q_proj"), n("k_proj"), n("v_proj")];
+                let fuse = fuse && parts.iter().all(|nm| matches!(variants.get(nm), Some(1 | 2)));
+                if fuse { AttnIn::Fused(gwn(&parts)) }
                 else { AttnIn::Split { q: gwn(&[n("q_proj")]), k: gwn(&[n("k_proj")]), v: gwn(&[n("v_proj")]) } }
             };
             let gdn_in = |gwn: &mut dyn FnMut(&[String]) -> W, lp: &str| -> GdnIn {
                 let n = |s: &str| format!("{}.linear_attn.{}.weight", lp, s);
-                if quantized { GdnIn::Fused(gwn(&[n("in_proj_qkv"), n("in_proj_z"), n("in_proj_b"), n("in_proj_a")])) }
+                // Same dtype-aware rule: Qwen official FP8 quantizes in_proj_qkv/z but leaves
+                // in_proj_b/a bf16 ([48,5120] rows don't tile into 128-blocks), so the 4-name
+                // fused group can never assemble there — run the legacy split path.
+                let parts = [n("in_proj_qkv"), n("in_proj_z"), n("in_proj_b"), n("in_proj_a")];
+                let fuse = quantized && parts.iter().all(|nm| matches!(variants.get(nm), Some(1 | 2)));
+                if fuse { GdnIn::Fused(gwn(&parts)) }
                 else { GdnIn::Split { qkv: gwn(&[n("in_proj_qkv")]), z: gwn(&[n("in_proj_z")]),
                                       b: gwn(&[n("in_proj_b")]), a: gwn(&[n("in_proj_a")]) } }
             };
@@ -3098,7 +3207,7 @@ impl GpuModel {
             /// (computed in the worker next to repack_nvfp4_mma; the default path never sees it).
             Q4 { wt: Vec<u8>, st: Vec<u8>, gsv: Vec<f32>, m: usize, k: usize,
                  omma: Option<(Vec<u8>, Vec<u8>)> },
-            Q8 { wt: Vec<u8>, rs: Vec<f32>, m: usize, k: usize },
+            Q8 { wt: Vec<u8>, rs: Vec<f32>, m: usize, k: usize, nb_k: usize },
         }
         // RAII gate charge: the worker holds it for the job's lifetime, so a PANICKING worker
         // releases its charge on unwind instead of leaking it and hanging every other worker at
@@ -3304,24 +3413,35 @@ impl GpuModel {
                                     W::Nvfp4 { qweight, scales, gs, m, k }
                                 }
                             }
-                            AssembledInner::Q8 { wt, rs, m, k } => {
+                            AssembledInner::Q8 { wt, rs, m, k, nb_k } => {
                                 if sync_uploads {
-                                    W::Fp8 {
-                                        data:      dev_ref.htod_sync_copy(&wt).unwrap(),
-                                        row_scale: dev_ref.htod_sync_copy(&rs).unwrap(), m, k }
+                                    if nb_k > 0 {
+                                        W::Fp8Blk {
+                                            data:      dev_ref.htod_sync_copy(&wt).unwrap(),
+                                            blk_scale: dev_ref.htod_sync_copy(&rs).unwrap(),
+                                            nb_k, m, k }
+                                    } else {
+                                        W::Fp8 {
+                                            data:      dev_ref.htod_sync_copy(&wt).unwrap(),
+                                            row_scale: dev_ref.htod_sync_copy(&rs).unwrap(), m, k }
+                                    }
                                 } else {
                                     let data = unsafe { dev_ref.alloc::<u8>(wt.len()).unwrap() };
-                                    let row_scale = unsafe { dev_ref.alloc::<f32>(rs.len()).unwrap() };
+                                    let scales = unsafe { dev_ref.alloc::<f32>(rs.len()).unwrap() };
                                     unsafe {
                                         cudarc::driver::result::memcpy_htod_async(
                                             *data.device_ptr(), &wt, std::ptr::null_mut()).unwrap();
                                         cudarc::driver::result::memcpy_htod_async(
-                                            *row_scale.device_ptr(), &rs, std::ptr::null_mut()).unwrap();
+                                            *scales.device_ptr(), &rs, std::ptr::null_mut()).unwrap();
                                     }
                                     queued_bytes += wt.len() + rs.len() * 4;
                                     queued_copies += 2;
-                                    keep.push(AssembledInner::Q8 { wt, rs, m, k });
-                                    W::Fp8 { data, row_scale, m, k }
+                                    keep.push(AssembledInner::Q8 { wt, rs, m, k, nb_k });
+                                    if nb_k > 0 {
+                                        W::Fp8Blk { data, blk_scale: scales, nb_k, m, k }
+                                    } else {
+                                        W::Fp8 { data, row_scale: scales, m, k }
+                                    }
                                 }
                             }
                         };
@@ -3445,21 +3565,27 @@ impl GpuModel {
                                             .collect()
                                     };
                                     let k = parts[0].3;
+                                    let nb_k = parts[0].4;
                                     let m: usize = parts.iter().map(|p| p.2).sum();
                                     let refs: Vec<(&[u8], &[f32], usize)> =
                                         parts.iter().map(|p| (&p.0[..], &p.1[..], p.2)).collect();
                                     let t = std::time::Instant::now();
-                                    let (qw, rs) = crate::quant::fuse_fp8(&refs, k);
+                                    let (qw, rs) = crate::quant::fuse_fp8_len(&refs, k, nb_k);
                                     tf += t.elapsed();
                                     // Shard-at-load: slice the fused RAW fp8 to rank r's shard.
-                                    let (qw, rs, m, k) = if let Some(op) = &shard_op {
-                                        shard_raw_fp8(&qw, &rs, m, k, op, sal_c.unwrap(), world_w)
-                                    } else { (qw, rs, m, k) };
+                                    let (qw, rs, m, k, nb_k) = if let Some(op) = &shard_op {
+                                        if nb_k > 0 {
+                                            shard_raw_fp8_blk(&qw, &rs, m, k, nb_k, op, sal_c.unwrap(), world_w)
+                                        } else {
+                                            let (a, b, c, d) = shard_raw_fp8(&qw, &rs, m, k, op, sal_c.unwrap(), world_w);
+                                            (a, b, c, d, 0usize)
+                                        }
+                                    } else { (qw, rs, m, k, nb_k) };
                                     let t = std::time::Instant::now();
                                     let wt = crate::quant::repack_fp8_mma(&qw, m, k);
                                     tr += t.elapsed();
                                     AssembledW { names: names.clone(), est: *est,
-                                                 w: AssembledInner::Q8 { wt, rs, m, k } }
+                                                 w: AssembledInner::Q8 { wt, rs, m, k, nb_k } }
                                 }
                             };
                             // Backpressure lives here too: the channel is 2 deep.
@@ -3604,20 +3730,44 @@ impl GpuModel {
             for wname in &fp8 {
                 let stem = wname.trim_end_matches(".weight");
                 let wv = st.tensor(wname)?;
-                let sv = st.tensor(&format!("{}.weight_scale", stem))?;
                 let (m, k) = (wv.shape()[0], wv.shape()[1]);
-                let row_scale: Vec<f32> = bytemuck::cast_slice::<u8, f32>(sv.data()).to_vec();
+                // Scale sibling: legacy per-row f32 `weight_scale` [M], or Qwen fine-grained
+                // `weight_scale_inv` BF16 [M/128, K/128] — w = code·scale_inv per 128x128 block
+                // (direction verified numerically against the BF16 source: rel-L2 2.65e-2).
+                let (scales, nb_k) = if let Some(sv) = st.tensor(&format!("{}.weight_scale", stem)).ok() {
+                    (bytemuck::cast_slice::<u8, f32>(sv.data()).to_vec(), 0usize)
+                } else {
+                    let sv = st.tensor(&format!("{}.weight_scale_inv", stem))?;
+                    assert_eq!(sv.dtype(), Dtype::BF16, "weight_scale_inv must be BF16: {}", wname);
+                    assert!(m % 128 == 0 && k % 128 == 0,
+                            "block-128 fp8 needs M,K % 128 == 0: {} ({}x{})", wname, m, k);
+                    assert_eq!(sv.shape(), &[m / 128, k / 128],
+                               "weight_scale_inv shape mismatch: {}", wname);
+                    (bytemuck::cast_slice::<u8, half::bf16>(sv.data()).iter()
+                        .map(|x| x.to_f32()).collect::<Vec<f32>>(), k / 128)
+                };
                 if dequant_at_load {
-                    let q = crate::quant::Fp8Tensor {
-                        qweight: wv.data().to_vec(), row_scale, m, k };
-                    let bv = crate::quant::dequantize_fp8(&q);
+                    let bv: Vec<half::bf16> = if nb_k > 0 {
+                        // Exact block dequant: reuse the row codec with unit row scales, then
+                        // apply scale_inv per 128x128 block (one multiply, no requantization).
+                        let q = crate::quant::Fp8Tensor {
+                            qweight: wv.data().to_vec(), row_scale: vec![1.0f32; m], m, k };
+                        crate::quant::dequantize_fp8(&q).iter().enumerate().map(|(i, v)| {
+                            let (row, col) = (i / k, i % k);
+                            half::bf16::from_f32(v.to_f32() * scales[(row / 128) * nb_k + (col / 128)])
+                        }).collect()
+                    } else {
+                        let q = crate::quant::Fp8Tensor {
+                            qweight: wv.data().to_vec(), row_scale: scales.clone(), m, k };
+                        crate::quant::dequantize_fp8(&q)
+                    };
                     let t = std::time::Instant::now();
                     gpu_bf16.insert(wname.clone(), dev.htod_sync_copy(&bv).unwrap());
                     t_up_shard += t.elapsed();
                 } else {
-                    host_q8.lock().unwrap().insert(wname.clone(), (wv.data().to_vec(), row_scale.clone(), m, k));
-                    if wname == &head_name && draft_parts_q8.is_none() {
-                        draft_parts_q8 = Some((wv.data().to_vec(), row_scale, m, k));
+                    host_q8.lock().unwrap().insert(wname.clone(), (wv.data().to_vec(), scales.clone(), m, k, nb_k));
+                    if wname == &head_name && nb_k == 0 && draft_parts_q8.is_none() {
+                        draft_parts_q8 = Some((wv.data().to_vec(), scales, m, k));
                     }
                 }
 
@@ -3825,7 +3975,13 @@ impl GpuModel {
                 let dflash_active = rank == 0
                     && (std::env::var("GB10_TP_DFLASH").is_ok()
                         || crate::tp::tp_config().map(|c| c.dflash).unwrap_or(false));
-                let dflash_full = if dflash_active {
+                // S9F twin for the BF16-head class: the round borrows the FULL head on EVERY
+                // rank (GB10_DF2_TP — set by the head, shipped to the node via TpConfig).
+                // Without this the borrow sees the E7 rank-local half and the round's
+                // full-VOCAB head GEMM reads past the allocation — TP=2 DF2 acceptance 0.0%
+                // with correct committed text (verify rejects every draft), 2026-09-04.
+                let df2_tp = std::env::var("GB10_DF2_TP").is_ok();
+                let dflash_full = if dflash_active || df2_tp {
                     let mut full = dev.alloc_zeros::<half::bf16>(v * h)?;
                     unsafe {
                         let r = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
@@ -3840,6 +3996,9 @@ impl GpuModel {
                               v as f64 * h as f64 * 2.0 / 1e6);
                     Some(full)
                 } else { None };
+                if df2_tp {
+                    df2_full_head_lc = dflash_full.clone().map(W::Bf16);
+                }
                 let mut shard = dev.alloc_zeros::<half::bf16>(hv * h)?;
                 unsafe {
                     let r = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
@@ -3903,7 +4062,7 @@ impl GpuModel {
         let (kv_quant, kv_tq, kv_tq_b3, kv_k8v4) = Self::kv_modes_from_env();
         let tq_tables = Self::build_tq_tables(&dev)?;
         mem_probe("post-mxfp4-build");
-        Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head, draft_ids, lm_head_sharded: lm_head_sharded_lc, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), tp_sharded_at_load: sal.is_some(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4, tp_rank: 0, tp_world: world, tp_ctx_dptr: 0, head_visits: None, dflash_tap: dflash_tap_out, df2_capture: df2_capture_out, df2_prime: None, dflash_lm_head: dflash_full_lm_head, df2_full_head: df2_full_head_lc }, cfg))
+        Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head, draft_ids, lm_head_sharded: lm_head_sharded_lc, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), tp_sharded_at_load: sal.is_some(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4, tp_rank: 0, tp_world: world, tp_ctx_dptr: 0, head_visits: None, dflash_tap: dflash_tap_out, df2_capture: df2_capture_out, df2_capture_tree: None, df2_prime: None, dflash_lm_head: dflash_full_lm_head, df2_full_head: df2_full_head_lc }, cfg))
     }
 
     fn init_ptx(dev: &Arc<CudaDevice>) -> anyhow::Result<()> {
@@ -3964,7 +4123,7 @@ impl GpuModel {
             "conv1d_prefill","conv1d_prefill_state","delta_step_prefill","gdn_chunk_prefill_b","gdn_prep_b","attn_softmax_tile","attn_finalize","attn_tile_init","attn_prefill_fa_b","attn_prefill_fa_sc_b","write_kv_prefill","gqa_attn_prefill",
             "rep_penalty_b","rep_penalty_f32_b","gqa_attn_splitk","gqa_attn_reduce","sample_b","sample_f32_b","concat_b",
             "gemm_binv_b","gemm_binv_f32_b","sample_prob_b","spec_verify_b","spec_verify_f32_b","spec_verify_realq_b","df2_topk20_dump_b","nll_b","argmax_f32_b","verify_chain_params_b",
-            "gemm_mma_fp4_b","gemm_mma_fp8_b","gemm_mma_fp4_splitk_b","gemm_mma_splitk_reduce_b","gemm_dsv4_fp8_bsb","dequant_fp4_tiled_b","dequant_fp8_tiled_b",
+            "gemm_mma_fp4_b","gemm_mma_fp8_b","gemm_mma_fp8_blk_b","gemm_mma_fp4_splitk_b","gemm_mma_splitk_reduce_b","gemm_dsv4_fp8_bsb","dequant_fp4_tiled_b","dequant_fp8_tiled_b","dequant_fp8_blk_tiled_b",
             "embed_gather_fp4_tiled_b","embed_gather_fp8_tiled_b","bw_read_b",
             "split_gdn_b","split_qkv_b",
             "moe_router_topk_b","moe_router_topk_sigmoid_b","moe_router_topk_sigmoid_f32_b","moe_experts_b","moe_experts_fp4_b","moe_shared_combine_b",
@@ -4790,6 +4949,10 @@ impl GpuModel {
                 blaunch!(self, "dequant_fp8_tiled_b", (grid,1,1), (256,1,1), 0,
                     (ptr, *data.device_ptr() as u64, d(row_scale), outn as i32, inn as i32));
             }
+            W::Fp8Blk { data, blk_scale, nb_k, .. } => {
+                blaunch!(self, "dequant_fp8_blk_tiled_b", (grid,1,1), (256,1,1), 0,
+                    (ptr, *data.device_ptr() as u64, d(blk_scale), *nb_k as i32, outn as i32, inn as i32));
+            }
             W::Nvfp4Raw { .. } => unreachable!("Nvfp4Raw is MoE-experts-only"),
             W::Bf16(_) => unreachable!(),
         }
@@ -5016,7 +5179,14 @@ impl GpuModel {
     /// weights are read once per many tokens, bandwidth stops being the constraint, and it is cheaper
     /// to dequantize once into scratch and let cuBLAS's tensor cores do the work.
     fn gemm_act(&self, w: &W, x: &B, out: &mut B, inn: usize, outn: usize, batch: usize) {
-        const BINV_BATCH: usize = 2;
+        // BF16 batch-invariance boundary: gemm_binv_b at EVERY verify width. The old cutoff
+        // (batch <= 2) silently fell to cuBLAS at widths 3..MAX_VERIFY — cuBLAS picks a different
+        // kernel per (M,N,K), so col-0 of a wide verify diverged from decode (probe-binv: bf16
+        // lm_head first divergent N = 3, xor 0x8070). Latent until now because every resident
+        // artifact quantizes its head; Qwen official FP8 keeps lm_head + in_proj_b/a bf16, so
+        // MTP verify ran non-invariant logits. Above MAX_VERIFY (prefill) invariance is not
+        // contractual and cuBLAS wins — that boundary is unchanged.
+        const BINV_BATCH: usize = MAX_VERIFY;
 
         match w {
             W::Nvfp4 { qweight, scales, gs, .. } if batch <= MAX_VERIFY => {
@@ -5041,7 +5211,15 @@ impl GpuModel {
                      d(x), outn as i32, inn as i32, batch as i32, 0u64));
                 return;
             }
-            W::Nvfp4 { .. } | W::Fp8 { .. } => {
+            W::Fp8Blk { data, blk_scale, .. } if batch <= MAX_VERIFY => {
+                // Qwen block-128 FP8: fixed-order per-128-K spans folded ×scale_inv inside the
+                // kernel — same N-independent column arithmetic contract as gemm_mma_fp8_b.
+                blaunch!(self, "gemm_mma_fp8_blk_b", ((outn / 16) as u32,1,1), (256,1,1), 0,
+                    (d(out), *data.device_ptr() as u64, d(blk_scale),
+                     d(x), outn as i32, inn as i32, batch as i32, 0u64));
+                return;
+            }
+            W::Nvfp4 { .. } | W::Fp8 { .. } | W::Fp8Blk { .. } => {
                 self.gemm_quant_prefill(w, x, out, inn, outn, batch);
                 return;
             }
@@ -6846,6 +7024,7 @@ impl GpuModel {
             let (recipe, m, k, bytes) = match w {
                 W::Bf16(b) => ("bf16", 0, 0, b.len() * 2),
                 W::Fp8 { m, k, .. } => ("fp8", *m, *k, w.bytes()),
+                W::Fp8Blk { m, k, .. } => ("fp8blk", *m, *k, w.bytes()),
                 W::Nvfp4 { m, k, .. } => ("nvfp4", *m, *k, w.bytes()),
                 W::Nvfp4Raw { m, k, .. } => ("nvfp4raw", *m, *k, w.bytes()),
             };
@@ -8734,14 +8913,34 @@ impl GpuModel {
             }
             GdnIn::Split { qkv: pq, z: pz, b: pb, a: pa } => {
                 // E9: the FIRST (qkv) GEMM carries the programmatic launch; z/b/a follow it plainly.
+                // Geometry contract (asserted once): under TP the quantized parts arrive SHARDED
+                // (qkv/z = rank-local head bands) while b/a stay replicated-full — every rank must
+                // read rows [0..local) of qkv/z or the all-reduce sums one head band twice (the
+                // TP=2 mojibake of 2026-09-04: both ranks silently GEMM'd the first half of
+                // replicated full-width weights).
+                static SPLIT_GEO: std::sync::Once = std::sync::Once::new();
+                SPLIT_GEO.call_once(|| {
+                    let rows = |w: &W| -> usize { match w {
+                        W::Bf16(v) => v.len() / h.max(1),
+                        W::Fp8 { m, .. } | W::Fp8Blk { m, .. } | W::Nvfp4 { m, .. }
+                        | W::Nvfp4Raw { m, .. } => *m, } };
+                    let (rq, rz, rb, ra) = (rows(pq), rows(pz), rows(pb), rows(pa));
+                    assert_eq!(rq, conv_dim, "split-GDN geometry: in_proj_qkv rows {rq} != local conv_dim {conv_dim} (world {})", self.tp_world);
+                    assert_eq!(rz, value_dim, "split-GDN geometry: in_proj_z rows {rz} != local value_dim {value_dim} (world {})", self.tp_world);
+                    assert_eq!(rb, nh_src, "split-GDN geometry: in_proj_b rows {rb} != full head count {nh_src}");
+                    assert_eq!(ra, nh_src, "split-GDN geometry: in_proj_a rows {ra} != full head count {nh_src}");
+                });
                 let mut qkvb = pool.get_bf16(conv_dim*batch);
                 let mut zb = pool.get_bf16(value_dim*batch);
-                let mut bb = pool.get_bf16(nh*batch);
-                let mut ab = pool.get_bf16(nh*batch);
+                // b/a are replicated-full (bf16 rows have no shard pipeline): GEMM them at the
+                // FULL head count; the kernel reads the rank's band via pointer offset below.
+                // At world==1 nh_src == nh, so this is byte-identical to the old local call.
+                let mut bb = pool.get_bf16(nh_src*batch);
+                let mut ab = pool.get_bf16(nh_src*batch);
                 self.gemm_act_pdl(pq, hidden, &mut qkvb, h, conv_dim, batch);
                 self.gemm_act(pz, hidden, &mut zb, h, value_dim, batch);
-                self.gemm_act(pb, hidden, &mut bb, h, nh, batch);
-                self.gemm_act(pa, hidden, &mut ab, h, nh, batch);
+                self.gemm_act(pb, hidden, &mut bb, h, nh_src, batch);
+                self.gemm_act(pa, hidden, &mut ab, h, nh_src, batch);
                 qkv = Some(qkvb); z = Some(zb); b = Some(bb); a = Some(ab);
             }
         }
@@ -8756,7 +8955,10 @@ impl GpuModel {
         let (b_ptr, a_ptr): (u64, u64) = match &fused_qkv {
             Some(f) => (d(f) + ((conv_dim + value_dim + h0) as u64) * 2,
                         d(f) + ((conv_dim + value_dim + nh_src + h0) as u64) * 2),
-            None => (d(b.as_ref().expect("b")), d(a.as_ref().expect("a"))),
+            // Split path: b/a are replicated-full — offset to THIS rank's head band (one row
+            // per head, bf16). world==1 → rank 0 → offset 0, byte-identical to before.
+            None => (d(b.as_ref().expect("b")) + (self.tp_rank as usize * nh * 2) as u64,
+                     d(a.as_ref().expect("a")) + (self.tp_rank as usize * nh * 2) as u64),
         };
         blaunch!(self, "conv1d_b", grid(batch*conv_dim), (256,1,1), 0, (qkv_ptr, conv_ptr, d(&la.conv1d), conv_dim as i32, ck as i32, batch as i32, slot_ids_ptr, qkv_stride as i32));
         // NEGATIVE CONTROL (GB10_TP_HEAD_PROOF_FAULT=1): deliberately launch the state kernel at the
@@ -8937,6 +9139,9 @@ impl GpuModel {
                     xchain_capture(|c| c.layer_outputs.push(Vec::new()));
                 }
             }
+            // GB10_LAYER_CSUM (diagnostic): prefill-loop twin only — the decode loop's pooled
+            // residual rotates between layers and the dtoh here would race its release.
+            let _ = li;
             // E29-B3 DFlash tap: the post-FFN-add residual (post-TP-reduce, full-rank) at the
             // tapped layers → rank-0 staging scratch. Device-side 2D D2D on the compute stream,
             // no dtoh; the draft loop copies the columns it needs into the ctx feature buffer.
@@ -9580,6 +9785,8 @@ impl GpuModel {
                     (out_ptr, *data.device_ptr() as u64, d(row_scale),
                      toks_ptr, h as i32, batch as i32));
             }
+            W::Fp8Blk { .. } => unreachable!(
+                "embed as block-128 FP8 is not a supported artifact layout (Qwen keeps embed bf16)"),
             W::Nvfp4Raw { .. } => unreachable!("Nvfp4Raw is MoE-experts-only"),
         }
     }
@@ -9983,6 +10190,11 @@ impl GpuModel {
                     let mut z = pool.get_bf16(value_dim * n);
                     let mut b = pool.get_bf16(lin_nh * n);
                     let mut a = pool.get_bf16(lin_nh * n);
+                    // b/a row geometry for gdn_prep_b: the FUSED arm splits to LOCAL-width rows;
+                    // the SPLIT arm GEMMs the replicated-full b/a at the FULL head count and
+                    // hands the kernel the rank's band via pointer offset + full row stride.
+                    let mut ba_stride_pf = lin_nh;
+                    let mut ba_off_pf: u64 = 0;
                     match &la.in_proj {
                         GdnIn::Fused(w) => {
                             let mtot = self.eff_gdn_fused_m();
@@ -9995,10 +10207,21 @@ impl GpuModel {
                             pool.release_bf16(fused, mtot * n);
                         }
                         GdnIn::Split { qkv: pq, z: pz, b: pb, a: pa } => {
+                            // Under TP the quantized qkv/z parts arrive SHARDED (rank-local head
+                            // bands — the split arm computes local dims); b/a stay replicated-full
+                            // (bf16 rows have no shard pipeline), so GEMM them at the FULL head
+                            // count and let gdn_prep_b read this rank's band. world==1: identical
+                            // to the old local call.
+                            let nh_src = self.cfg.lin_num_v_heads;
                             self.gemm_act(pq, &normed, &mut qkv, h, conv_dim, n);
                             self.gemm_act(pz, &normed, &mut z, h, value_dim, n);
-                            self.gemm_act(pb, &normed, &mut b, h, lin_nh, n);
-                            self.gemm_act(pa, &normed, &mut a, h, lin_nh, n);
+                            let mut bb = pool.get_bf16(nh_src * n);
+                            let mut ab = pool.get_bf16(nh_src * n);
+                            self.gemm_act(pb, &normed, &mut bb, h, nh_src, n);
+                            self.gemm_act(pa, &normed, &mut ab, h, nh_src, n);
+                            b = bb; a = ab;
+                            ba_stride_pf = nh_src;
+                            ba_off_pf = (self.tp_rank as usize * lin_nh * 2) as u64;
                         }
                     }
                     // conv1d is a causal depthwise STENCIL, not a recurrence: out[t] reads in[t-3..t].
@@ -10017,7 +10240,7 @@ impl GpuModel {
                     let core = pool.get_bf16(lin_nh * vd * n);
                     let (nchunk, smem) = gdn_launch(kd, vd);
                     // F0: packed qkv/z/b/a strides — (qkv_stride<<15)|ba_stride = (conv_dim<<15)|lin_nh.
-                    let stride_pack = ((conv_dim as u32) << 15) | (lin_nh as u32);
+                    let stride_pack = ((conv_dim as u32) << 15) | (ba_stride_pf as u32);
                     // P4 B3: chunked WY/UT scan for prefill (GB10_GDN_CHUNK). Prefill-only —
                     // decode/verify keep delta_step_prefill (bit-exact contract). VC=16 columns
                     // per block keeps dynamic smem (~33KB) under the 48KB default: plain launch.
@@ -10037,7 +10260,7 @@ impl GpuModel {
                         let Vs = pool.get(n * lin_nh * vd);
                         let Ps = pool.get(n * lin_nh * 2);
                         blaunch!(self, "gdn_prep_b", (n as u32, lin_nh as u32, 1), (kd as u32,1,1), (2*kd*4) as u32,
-                            (d(&qkv), d(&b), d(&a), stride_pack as i32, (kd as i32) | ((vd as i32) << 16),
+                            (d(&qkv), d(&b) + ba_off_pf, d(&a) + ba_off_pf, stride_pack as i32, (kd as i32) | ((vd as i32) << 16),
                              d(&la.a_log), d(&la.dt_bias),
                              (n as i32 & 0xFFFFFF) | ((self.eff_lin_k_heads() as i32 & 0xFF) << 24),
                              d(&Qs), d(&Ks), d(&Vs), d(&Ps)));
@@ -10098,7 +10321,7 @@ impl GpuModel {
                         if gdn_time { self.sync_stream(); }   // F: drain the queue BEFORE the stopwatch
                         let t_p = std::time::Instant::now();
                         blaunch!(self, "gdn_prep_b", (n as u32, lin_nh as u32, 1), (kd as u32,1,1), (2*kd*4) as u32,
-                            (d(&qkv), d(&b), d(&a), stride_pack as i32, (kd as i32) | ((vd as i32) << 16),
+                            (d(&qkv), d(&b) + ba_off_pf, d(&a) + ba_off_pf, stride_pack as i32, (kd as i32) | ((vd as i32) << 16),
                              d(&la.a_log), d(&la.dt_bias),
                              (n as i32 & 0xFFFFFF) | ((self.eff_lin_k_heads() as i32 & 0xFF) << 24),
                              d(&Qs), d(&Ks), d(&Vs), d(&Ps)));
@@ -10429,6 +10652,24 @@ impl GpuModel {
             }
             blaunch!(self, "fused_res_rmsnorm_b", (n as u32,1,1), (1024,1,1), (4096) as u32,
                 (d(&normed), d(&residual), d(&mixer), d(&layer.post_ln), h as i32, n as i32, fbits(cfg.rms_eps)));
+            // GB10_LAYER_CSUM: post-MIXER residual (pre-FFN) — splits GDN/attn corruption from MLP.
+            if std::env::var("GB10_LAYER_CSUM").is_ok() {
+                let base = *residual.device_ptr() as cudarc::driver::sys::CUdeviceptr;
+                let mut acc = String::new();
+                for r in [0usize, n / 2, n - 1] {
+                    let mut tmp = vec![0u8; h * 2];
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtoh_sync(&mut tmp, base + (r * h * 2) as u64)
+                    }.expect("csum dtoh");
+                    let (mut s, mut mx) = (0.0f64, 0.0f32);
+                    for ch in tmp.chunks_exact(2) {
+                        let f = half::bf16::from_bits(u16::from_le_bytes([ch[0], ch[1]])).to_f32();
+                        s += f as f64; if f.abs() > mx { mx = f.abs(); }
+                    }
+                    acc.push_str(&format!(" MX{s}:{s:.4}/{mx:.4}"));
+                }
+                eprintln!("[csum] L{li} n{n}{acc}");
+            }
             let ReduceOut::Full(mlp_out) = self.ffn_batch(pool, &normed, &layer.mlp, n, self.ffn_shard_factor() > 1, false) else {
                 unreachable!("AR landing 2: prefill never fuses the FFN epilogue")
             };
@@ -10457,6 +10698,26 @@ impl GpuModel {
                     }
                 }
                 xchain_capture(|c| c.layer_outputs.push(fp));
+            }
+            // GB10_LAYER_CSUM (diagnostic): 3-row checksum of the post-FFN residual per layer —
+            // TP bring-up bisect: same prompt at TP=1 vs TP=N, first divergent layer names the
+            // corrupt stage. Rows (not the whole buffer) keep the per-layer cost trivial.
+            if std::env::var("GB10_LAYER_CSUM").is_ok() {
+                let base = *residual.device_ptr() as cudarc::driver::sys::CUdeviceptr;
+                let mut acc = String::new();
+                for r in [0usize, n / 2, n - 1] {
+                    let mut tmp = vec![0u8; h * 2];
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtoh_sync(&mut tmp, base + (r * h * 2) as u64)
+                    }.expect("csum dtoh");
+                    let (mut s, mut mx) = (0.0f64, 0.0f32);
+                    for ch in tmp.chunks_exact(2) {
+                        let f = half::bf16::from_bits(u16::from_le_bytes([ch[0], ch[1]])).to_f32();
+                        s += f as f64; if f.abs() > mx { mx = f.abs(); }
+                    }
+                    acc.push_str(&format!(" r{s}:{s:.4}/{mx:.4}"));
+                }
+                eprintln!("[csum] L{li} n{n}{acc}");
             }
             // S5F DFlash2 prompt-prime capture: the post-FFN-add residual IS hidden_states[l+1] —
             // the same tap source the decode/verify path captures. The prefill runs at window
@@ -10618,6 +10879,20 @@ impl GpuModel {
                           pos_start: usize, ckpt_slot: Option<usize>,
                           penalty: Option<VerifyPenalty>) -> (Vec<u32>, B) {
         self.verify_forward_topo(pool, tokens, state, slot, kv_stride, pos_start, ckpt_slot, penalty, None)
+    }
+
+    /// PLAN/25 Phase 0 (coverage capture, dump-only): `verify_forward` that hands back the raw
+    /// verify LOGITS for the host-side top-k/margin readback (the `bench_accept` methodology,
+    /// moved into the scheduler's dump path). Same kernels in the same order as
+    /// `verify_forward`'s eager path — the E13 graph is a capture of exactly this sequence, so
+    /// the values are bit-identical; only the argmax kernel's readback is replaced by the
+    /// caller's host scan over the returned logits (preds are the caller's to derive). The
+    /// caller owns the returned logits and must release them (`pool.release[_bf16](lg, vocab*n)`).
+    /// No penalty (the coverage jobs run penalty-free, like the spec bench).
+    pub fn verify_forward_keep_logits(&self, pool: &mut Pool, tokens: &[u32],
+                          state: &mut BatchGpuState, slot: usize, kv_stride: usize,
+                          pos_start: usize, ckpt_slot: Option<usize>) -> (VerifyLogits, B) {
+        self.verify_forward_core(pool, tokens, state, slot, kv_stride, pos_start, ckpt_slot, false)
     }
 
     /// `verify_forward` with an optional planted tree topology (fork-then-chain in serving).
@@ -11041,14 +11316,16 @@ impl GpuModel {
                             }
                         }
                         GdnIn::Split { qkv: pq, z: pz, b: pb, a: pa } => {
+                            // TP: qkv/z sharded (local dims); b/a replicated-full — GEMM at the
+                            // FULL head count, rank band selected by pointer offset below.
                             let mut qkvb = pool.get_bf16(conv_dim * n);
                             let mut zb = pool.get_bf16(value_dim * n);
-                            let mut bb = pool.get_bf16(lin_nh * n);
-                            let mut ab = pool.get_bf16(lin_nh * n);
+                            let mut bb = pool.get_bf16(nh_src * n);
+                            let mut ab = pool.get_bf16(nh_src * n);
                             self.gemm_act(pq, &normed, &mut qkvb, h, conv_dim, n);
                             self.gemm_act(pz, &normed, &mut zb, h, value_dim, n);
-                            self.gemm_act(pb, &normed, &mut bb, h, lin_nh, n);
-                            self.gemm_act(pa, &normed, &mut ab, h, lin_nh, n);
+                            self.gemm_act(pb, &normed, &mut bb, h, nh_src, n);
+                            self.gemm_act(pa, &normed, &mut ab, h, nh_src, n);
                             qkv = Some(qkvb); z = Some(zb); b = Some(bb); a = Some(ab);
                         }
                     }
@@ -11076,12 +11353,14 @@ impl GpuModel {
                     let core = pool.get_bf16(lin_nh * vd * n);
                     let (nchunk, smem) = gdn_launch(kd, vd);
                     // b/a pointers: packed buffers, or the fused views pre-offset past [qkv|z] + h0.
+                    // Split path: replicated-full b/a — offset to THIS rank's head band (bf16 rows).
                     let (b_ptr, a_ptr): (u64, u64) = match &fused_qkv {
                         Some(f) => (d(f) + ((conv_dim + value_dim + h0) as u64) * 2,
                                     d(f) + ((conv_dim + value_dim + nh_src + h0) as u64) * 2),
-                        None => (d(b.as_ref().expect("b")), d(a.as_ref().expect("a"))),
+                        None => (d(b.as_ref().expect("b")) + (self.tp_rank as usize * lin_nh * 2) as u64,
+                                 d(a.as_ref().expect("a")) + (self.tp_rank as usize * lin_nh * 2) as u64),
                     };
-                    let ba_stride = if fused_qkv.is_some() { mtot } else { lin_nh };
+                    let ba_stride = if fused_qkv.is_some() { mtot } else { nh_src };
                     let stride_pack = ((conv_dim as u32) << 15) | (ba_stride as u32);
                     blaunch!(self, "delta_step_prefill", ((lin_nh*nchunk) as u32,1,1), (kd as u32,1,1), smem,
                         (d(&core), d(&convo), s_ptr, b_ptr, a_ptr, stride_pack as i32, (kd as i32) | ((vd as i32) << 16),
@@ -11266,6 +11545,14 @@ impl GpuModel {
             // F5: the FFN epilogue's flavor-Q kernel is BIT-EXACT to add_residual_b + rmsnorm_b
             // (sum_sq from the ROUNDED residual); the mixer epilogue stays flavor S.
             self.ffn_epilogue(pool, d(&normed), res_ptr, mlp_out, fuse, next_w, h, n, false);
+            // GB10_LAYER_CSUM (diagnostic, prefill loop): see the block_forward twin.
+            if std::env::var("GB10_LAYER_CSUM").is_ok() {
+                let rv = residual.as_ref().expect("prefill residual");
+                let v: Vec<half::bf16> = self.dev.dtoh_sync_copy(rv).unwrap();
+                let (mut s, mut mx) = (0.0f64, 0.0f32);
+                for x in v.iter().take(h * n) { let f = half::bf16::to_f32(*x); s += f as f64; if f.abs() > mx { mx = f.abs(); } }
+                eprintln!("[csum] L{li} pf{n} sum {:.6e} maxabs {mx:.6e}", s);
+            }
             // E29-B3 DFlash tap: post-FFN-add residual at the tapped layers → rank-0 staging
             // scratch (the verify is where the draft loop's accepted-span features come from).
             // Capturable: the D2D becomes a memcpy node inside the chain-verify CUDA graph.
@@ -11278,6 +11565,16 @@ impl GpuModel {
             }
             // S4F DFlash2 tap (verify path — the round loop's committed positions): same D2D,
             // same stream; capturable identically. DEFAULT OFF = dead branch.
+            // PLAN/25 Phase 1: n > BLOCK is the TREE verify (up to MAX_VERIFY nodes) — its
+            // per-column taps land in the WIDE sink; the accepted path is gathered out of it.
+            if n > crate::dflash2::BLOCK && n <= MAX_VERIFY {
+                if let Some(sink) = &self.df2_capture_tree {
+                    if let Some(k) = crate::dflash2::TAP_LAYERS.iter().position(|&l| l == li) {
+                        crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
+                            res_ptr, h, n, k);
+                    }
+                }
+            }
             if n <= crate::dflash2::BLOCK {
                 if let Some(sink) = &self.df2_capture {
                     if let Some(k) = crate::dflash2::TAP_LAYERS.iter().position(|&l| l == li) {
@@ -11708,6 +12005,64 @@ impl GpuModel {
         // preds[i] must equal seq_tokens[i+1] (token predicted at pos plen+i is the one at plen+i+1).
         let matches: Vec<bool> = (0..depth).map(|i| preds[i] == seq_tokens[i + 1]).collect();
         (seq_tokens, preds, matches)
+    }
+
+    /// PLAN/25 Phase 0 — the verify-WIDTH cost curve (bench-only, `--bench-verify
+    /// --time-widths`): per-requested-width median of ONE `verify_forward(W columns)` vs the
+    /// per-token median of sequential `forward_decode`, measured ALTERNATING within each rep
+    /// (same-window alternation, the E1b lesson — never compare across windows). Every leg
+    /// starts from a fresh identical prefill state (slot 0 for decode, slot 1 for verify), so
+    /// legs are independent and the verify legs are real chain verifies (lossless path, graphs
+    /// as shipped). Returns (width, decode_ms_per_tok_median, verify_ms_median).
+    pub fn time_verify_widths(&self, pool: &mut Pool, state: &mut BatchGpuState, prompt: &[u32],
+                              kv_stride: usize, widths: &[usize], reps: usize)
+                              -> anyhow::Result<Vec<(usize, f64, f64)>> {
+        let h = self.cfg.hidden_size;
+        let maxw = *widths.iter().max().expect("time_verify_widths: no widths");
+        let mut bufs = self.new_decode_buffers(2);
+        let plen = prompt.len();
+        let mut dec_ms: Vec<f64> = Vec::new();
+        let mut ver_ms: Vec<Vec<f64>> = vec![Vec::new(); widths.len()];
+        for _ in 0..reps {
+            // ---- decode leg (slot 0): maxw sequential greedy steps, per-step wall. ----
+            self.zero_slot_state(state, 0, kv_stride);
+            let (s0, h0) = self.prefill_batch(pool, prompt, state, 0, kv_stride, 0);
+            pool.release_bf16(h0, h * plen);
+            let mut seq = vec![s0];
+            let mut pos = plen;
+            for _ in 0..maxw {
+                let tok = *seq.last().unwrap() as i32;
+                self.dev.htod_sync_copy_into(&[tok, 0], &mut bufs.tokens_dev).unwrap();
+                self.dev.htod_sync_copy_into(&[pos as i32, 0], &mut bufs.pos_dev).unwrap();
+                self.dev.synchronize().unwrap();
+                let t0 = std::time::Instant::now();
+                let nx = self.forward_decode(pool, &mut bufs, state, kv_stride, pos + 1, 1);
+                self.dev.synchronize().unwrap();
+                dec_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                seq.push(nx[0]);
+                pos += 1;
+            }
+            // ---- verify legs (slot 1): one verify_forward(W) per width, fresh state each. ----
+            for (wi, &w) in widths.iter().enumerate() {
+                self.zero_slot_state(state, 1, kv_stride);
+                let (_s1, h1) = self.prefill_batch(pool, prompt, state, 1, kv_stride, 0);
+                pool.release_bf16(h1, h * plen);
+                let inputs: Vec<u32> = seq[..w].to_vec();
+                self.dev.synchronize().unwrap();
+                let t0 = std::time::Instant::now();
+                let (_p, vout) = self.verify_forward(pool, &inputs, state, 1, kv_stride, plen, None, None);
+                self.dev.synchronize().unwrap();
+                ver_ms[wi].push(t0.elapsed().as_secs_f64() * 1e3);
+                pool.release_bf16(vout, h * w);
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        Ok(widths.iter().enumerate()
+            .map(|(wi, &w)| (w, med(&mut dec_ms), med(&mut ver_ms[wi])))
+            .collect())
     }
 
     /// State-divergence probe: prefills both slots identically, advances slot 0 by ONE
@@ -12471,6 +12826,34 @@ impl GpuModel {
         }).collect()
     }
 
+    /// PLAN/25 Phase 0 — `topk_hidden` returning the raw logits alongside the ids (the
+    /// coverage curves need the drafter's score shape, not just the ranking). Same rules as
+    /// `topk_hidden`: diagnostic only, NOT on any serving path; the draft itself is still
+    /// chosen by `argmax_hidden` (this function never picks the draft).
+    pub fn topk_hidden_kv(&self, pool: &mut Pool, hidden: &B, k: usize) -> Vec<(u32, f32)> {
+        let (logits, vocab) = match &self.draft_head {
+            Some(dh) => {
+                let vocab = self.draft_ids.len();
+                let mut lg = pool.get_bf16(vocab);
+                self.gemm_act(dh, hidden, &mut lg, self.cfg.hidden_size, vocab, 1);
+                (lg, vocab)
+            }
+            None => (self.logits_batch(pool, hidden, 1), self.cfg.vocab_size),
+        };
+        self.sync_stream();
+        let lg: Vec<half::bf16> = self.dev.dtoh_sync_copy(&logits).unwrap();
+        pool.release_bf16(logits, vocab);
+        let mut idx: Vec<usize> = (0..vocab).collect();
+        let k = k.min(vocab);
+        idx.select_nth_unstable_by(k - 1, |&a, &b| lg[b].to_f32().total_cmp(&lg[a].to_f32()));
+        idx.truncate(k);
+        idx.sort_by(|&a, &b| lg[b].to_f32().total_cmp(&lg[a].to_f32()));
+        idx.into_iter().map(|row| (match &self.draft_head {
+            Some(_) => self.draft_ids[row.min(self.draft_ids.len() - 1)],
+            None => row as u32,
+        }, lg[row].to_f32())).collect()
+    }
+
     /// One MTP draft step: given the previous hidden (main or prior MTP output) and a token, run the
     /// MTP layer forward at the given absolute position, returning the next MTP hidden. The caller
     /// argmaxes lm_head(next_hidden) to get the predicted token. batch=1.
@@ -12985,6 +13368,24 @@ impl GpuModel {
             };
             blaunch!(self, "fused_res_rmsnorm_b", (n as u32,1,1), (1024,1,1), (4096) as u32,
                 (d(&normed), d(&residual), d(&mixer), d(&layer.post_ln), h as i32, n as i32, fbits(cfg.rms_eps)));
+            // GB10_LAYER_CSUM: post-MIXER residual (pre-FFN) — splits GDN/attn corruption from MLP.
+            if std::env::var("GB10_LAYER_CSUM").is_ok() {
+                let base = *residual.device_ptr() as cudarc::driver::sys::CUdeviceptr;
+                let mut acc = String::new();
+                for r in [0usize, n / 2, n - 1] {
+                    let mut tmp = vec![0u8; h * 2];
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtoh_sync(&mut tmp, base + (r * h * 2) as u64)
+                    }.expect("csum dtoh");
+                    let (mut s, mut mx) = (0.0f64, 0.0f32);
+                    for ch in tmp.chunks_exact(2) {
+                        let f = half::bf16::from_bits(u16::from_le_bytes([ch[0], ch[1]])).to_f32();
+                        s += f as f64; if f.abs() > mx { mx = f.abs(); }
+                    }
+                    acc.push_str(&format!(" MX{s}:{s:.4}/{mx:.4}"));
+                }
+                eprintln!("[csum] L{li} n{n}{acc}");
+            }
             let ReduceOut::Full(mlp_out) = self.ffn_batch(pool, &normed, &layer.mlp, n, self.ffn_shard_factor() > 1, false) else {
                 unreachable!("AR landing 2: the capture probe never fuses")
             };
@@ -16662,6 +17063,7 @@ impl GpuModel {
             Some(s) => s,
             None => { println!("probe-mxfp4-xchain: --mxfp4=on required (the native chain needs the OMMA state)"); std::process::exit(1); }
         };
+        XCHAIN_UNBOUNDED.store(true, std::sync::atomic::Ordering::Relaxed);
         if std::env::var("GB10_MXFP4_ECONOMY").is_ok() {
             println!("probe-mxfp4-xchain: GB10_MXFP4_ECONOMY is set — the bf16 chain's standard layout is NOT resident; refusing (27B/0.8B are non-economy)");
             std::process::exit(1);
@@ -18813,5 +19215,113 @@ mod xchain2_tests {
         assert!(xchain2_read(tmp2.to_str().unwrap()).is_err());
         std::fs::remove_file(&tmp).ok();
         std::fs::remove_file(&tmp2).ok();
+    }
+}
+
+#[cfg(test)]
+mod shard_raw_fp8_blk_tests {
+    use super::*;
+
+    /// Synthetic block-128 FP8 tensor: m=256 (2 bands), k=256 (nb_k=2). Byte i of the raw is
+    /// (i % 251) as u8; scale [b, kb] = 1.0 + b*10 + kb. Roundtrip: shard to `world` ranks,
+    /// reassemble in rank order, and require byte-exact equality of BOTH the codes and the
+    /// flat scale matrix (the sharder must preserve the code<->scale pairing exactly).
+    fn synth() -> (Vec<u8>, Vec<f32>, usize, usize, usize) {
+        let (m, k) = (512usize, 256usize);
+        let nb_k = k / 128;
+        let qw: Vec<u8> = (0..m * k).map(|i| (i % 251) as u8).collect();
+        let sc: Vec<f32> = (0..(m / 128) * nb_k).map(|i| 1.0 + (i / nb_k) as f32 * 10.0 + (i % nb_k) as f32).collect();
+        (qw, sc, m, k, nb_k)
+    }
+
+    fn dequant_ref(qw: &[u8], sc: &[f32], m: usize, k: usize, nb_k: usize) -> Vec<f32> {
+        qw.iter().enumerate().map(|(i, &c)| {
+            let (r, c2) = (i / k, i % k);
+            (c as f32) * sc[(r / 128) * nb_k + (c2 / 128)]
+        }).collect()
+    }
+
+    #[test]
+    fn col_shard_roundtrip() {
+        let (qw, sc, m, k, nb_k) = synth();
+        let mut gq = Vec::new(); let mut gs = Vec::new();
+        for rank in 0..2usize {
+            let (q, s, mo, kk, nb) =
+                shard_raw_fp8_blk(&qw, &sc, m, k, nb_k, &LoadShardOp::Col, rank, 2);
+            assert_eq!(mo, m / 2); assert_eq!(kk, k); assert_eq!(nb, nb_k);
+            assert_eq!(q.len(), mo * kk); assert_eq!(s.len(), (mo / 128) * nb);
+            gq.extend(q); gs.extend(s);
+        }
+        assert_eq!(gq, qw, "Col: reassembled codes differ");
+        assert_eq!(gs, sc, "Col: reassembled scales differ");
+    }
+
+    #[test]
+    fn col_segs_shard_roundtrip() {
+        let (qw, sc, m, k, nb_k) = synth();
+        // two segments [0,256) and [256,512), both split across world=2 (take=128, band-aligned
+        // — the real fused-qkv geometry: every segment is a whole number of 128-row bands).
+        // Per-rank layout is the FUSED rank-local order [local seg0 | local seg1], so the test
+        // asserts each rank's piece against its expected slice, not against the original order.
+        let segs = vec![(0usize, 256usize, true), (256usize, 256usize, true)];
+        for rank in 0..2usize {
+            let (q, s, mo, kk, nb) =
+                shard_raw_fp8_blk(&qw, &sc, m, k, nb_k, &LoadShardOp::ColSegs(segs.clone()), rank, 2);
+            assert_eq!(mo, m / 2); assert_eq!(kk, k); assert_eq!(nb, nb_k);
+            let (off0, take0, off1, take1) = (0usize, 128usize, 256usize, 128usize);
+            // rank r holds seg i's r-th half: [off_i + r*take_i .. +take_i]
+            let (s0, s1) = (off0 + rank * take0, off1 + rank * take1);
+            let mut expect_q = Vec::new();
+            expect_q.extend_from_slice(&qw[s0 * k..(s0 + take0) * k]);
+            expect_q.extend_from_slice(&qw[s1 * k..(s1 + take1) * k]);
+            assert_eq!(q.len(), expect_q.len());
+            let bad = q.iter().zip(&expect_q).position(|(a, b)| a != b);
+            assert!(bad.is_none(), "ColSegs rank {rank}: first code diff at byte {:?} (got {} want {})",
+                    bad, q[bad.unwrap()], expect_q[bad.unwrap()]);
+            // scale bands follow the ROWS: band (s/128) for each rank-local segment slice
+            let mut expect_s = Vec::new();
+            expect_s.extend_from_slice(&sc[(s0 / 128) * nb_k..((s0 + take0) / 128) * nb_k]);
+            expect_s.extend_from_slice(&sc[(s1 / 128) * nb_k..((s1 + take1) / 128) * nb_k]);
+            assert_eq!(s, expect_s, "ColSegs rank {rank}: scales differ");
+        }
+    }
+
+    #[test]
+    fn row_shard_roundtrip_and_dequant() {
+        let (qw, sc, m, k, nb_k) = synth();
+        let mut gq: Vec<Option<u8>> = vec![None; m * k];
+        let mut gs: Vec<Option<f32>> = vec![None; (m / 128) * nb_k];
+        for rank in 0..2usize {
+            let (q, s, mo, kk, nb) =
+                shard_raw_fp8_blk(&qw, &sc, m, k, nb_k, &LoadShardOp::Row, rank, 2);
+            assert_eq!(mo, m); assert_eq!(kk, k / 2); assert_eq!(nb, nb_k / 2);
+            assert_eq!(s.len(), (m / 128) * nb);
+            // scatter this rank's pieces back to global positions
+            let k0 = rank * kk; let kb0 = rank * nb;
+            for r in 0..mo {
+                for c in 0..kk { gq[r * k + k0 + c] = Some(q[r * kk + c]); }
+            }
+            for b in 0..(m / 128) {
+                for kb in 0..nb { gs[b * nb_k + kb0 + kb] = Some(s[b * nb + kb]); }
+            }
+        }
+        let rq: Vec<u8> = gq.into_iter().map(|x| x.unwrap()).collect();
+        let rs: Vec<f32> = gs.into_iter().map(|x| x.unwrap()).collect();
+        assert_eq!(rq, qw, "Row: reassembled codes differ");
+        assert_eq!(rs, sc, "Row: reassembled scales differ");
+        // and the pairing: dequant of the reassembly equals the reference dequant
+        let dq = dequant_ref(&rq, &rs, m, k, nb_k);
+        let dr = dequant_ref(&qw, &sc, m, k, nb_k);
+        assert_eq!(dq, dr, "Row: reassembled dequant differs");
+    }
+
+    #[test]
+    fn misaligned_segment_panics() {
+        let (qw, sc, m, k, nb_k) = synth();
+        let segs = vec![(0usize, 96usize, true)]; // 96 rows: NOT a 128 multiple
+        let r = std::panic::catch_unwind(|| {
+            let _ = shard_raw_fp8_blk(&qw, &sc, m, k, nb_k, &LoadShardOp::ColSegs(segs), 0, 2);
+        });
+        assert!(r.is_err(), "misaligned ColSegs split must panic loudly");
     }
 }

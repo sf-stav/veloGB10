@@ -30,7 +30,8 @@ const DEFAULT_RDMA_DEV: &str = "rocep1s0f1";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TpConfig {
-    pub config_version: u32,          // = 13 (v13: + df2_round_shard, the P2 round-sharding flag;
+    pub config_version: u32,          // = 14 (v14: + df2_step_dump, the Phase-0 coverage-trace SPMD flag;
+                                       //     v13: + df2_round_shard, the P2 round-sharding flag;
                                        //     v12: + spec_source/df2_draft_dir, the TP-DF2 leg
                                        //     — S9F; v11: + decode_ctx, the DecodeCtx probe branch riding
                                        //     the config — P0-2; v10: + shard_mtp, the MTP-block
@@ -200,6 +201,11 @@ pub struct TpConfig {
     /// Phase D quad truth flips it.
     #[serde(default)]
     pub df2_round_shard: bool,
+    /// head's --df2-step-dump (PLAN/25 Phase 0 coverage trace). SPMD: the node mirror must run
+    /// the identical trace op sequence (eager keep-logits verify, logging MTP chain) — it sets
+    /// `cov_trace` from this flag and leaves `step_dump` None (only the head writes records).
+    #[serde(default)]
+    pub df2_step_dump: bool,
     /// P3(a) close: route GREEDY (temp-0) General requests to GREEDY drafts — DEFAULT ON since
     /// the 2026-08-23 quad temp-0 sweep (prose tau +10.5% step-weighted, code control
     /// bit-identical). SAMPLED (temp>0) General keeps the real-q walk (greedy drafts regress
@@ -217,7 +223,7 @@ impl TpConfig {
     /// their v1-compatible defaults — a bench config is indistinguishable from before.
     pub fn from_env() -> Self {
         TpConfig {
-            config_version: 12,
+            config_version: 14,
             // TP rank count. The --tp CLI flag is the single authority for a TP run (bare --tp = 2,
             // --tp N = N); `from_env` only snapshots the bench `--head` path, which is always TP=2.
             // GB10_TP_WORLD is deliberately NOT read here — one source of truth, zero ambiguity.
@@ -299,6 +305,7 @@ impl TpConfig {
             df2_draft_dir: String::new(),
             df2_sha_pin: None,
             df2_round_shard: false,
+            df2_step_dump: false,
             df2_prose_lane_greedy: false,
         }
     }

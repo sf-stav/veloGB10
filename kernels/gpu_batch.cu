@@ -6728,6 +6728,69 @@ extern "C" __global__ __launch_bounds__(256) void gemm_mma_fp8_b(
     mma_epilogue(sh, acc, C, RowScale, nullptr, mt, M, N, Cf);
 }
 
+// ================== QWEN FINE-GRAINED FP8 (block-128) DECODE GEMV ==================
+//
+// C[n,m] = Σ over K/128 blocks kbb of ( Σ over that 128-K span of code·x ) · scale_inv[m/128, kbb]
+//
+// Qwen3.8-27B-FP8 layout (quant_method "fp8", weight_block_size [128,128]): weights are RAW
+// row-major E4M3 (MMA-repacked at ingest by the loader — same tile order as gemm_mma_fp8_b),
+// scales are BF16 weight_scale_inv [M/128, K/128] upcast to f32 on upload. Dequant direction
+// verified numerically vs the BF16 source: w = code · scale_inv (rel-L2 2.65e-2, the E4M3 class).
+//
+// Every 16-row output tile lies wholly inside one 128-row scale band (16 | 128), so the band index
+// is a per-block constant `mt>>3`. The k-loop accumulates each 128-K span into a private
+// sub-accumulator and folds it × s into the main accumulator at span boundaries — a FIXED
+// accumulation order independent of N, so batch-invariance (col 0 == a decode) is preserved the
+// same way gemm_mma_fp4_b's is. Requires K % 128 == 0 (asserted at load: every Qwen tensor is).
+extern "C" __global__ __launch_bounds__(256, 6) void gemm_mma_fp8_blk_b(
+    __nv_bfloat16* C, const uint8_t* __restrict__ Wt, const float* __restrict__ BlkScale,
+    const __nv_bfloat16* __restrict__ X, int M, int K, int N, float* Cf)
+{
+    const int mt = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3, nblk = K >> 4, nkbb = K >> 7;
+
+    const int band = mt >> 3;                       // 128-row scale band of this output tile
+    const long long xr0 = (long long)(g     < N ? g     : N - 1) * K;
+    const long long xr1 = (long long)(g + 8 < N ? g + 8 : N - 1) * K;
+
+    float acc[2][4]  = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+    float accb[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+    const uint2* Wt64 = reinterpret_cast<const uint2*>(Wt);
+
+    int kbb = 0; float s = BlkScale[band * nkbb];   // span 0's scale
+    for (int kb = warp; kb < nblk; kb += MMA_NW) {
+        if ((kb >> 3) != kbb) {                     // crossed a 128-K boundary: fold, reset, re-read
+            #pragma unroll
+            for (int i = 0; i < 8; i++) acc[i >> 2][i & 3] += accb[i >> 2][i & 3] * s;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) accb[i >> 2][i & 3] = 0.f;
+            kbb = kb >> 3;
+            s = BlkScale[band * nkbb + kbb];
+        }
+        const long long tile = (long long)mt * nblk + kb;
+        const uint2 w8 = Wt64[tile * 32 + lane];            // ONE 8-byte load = the whole A-fragment
+
+        uint32_t ra[4];
+        ra[0] = fp8_pair_bf16(w8.x,       w8.x >>  8);      // row g,   cols 2t, 2t+1
+        ra[1] = fp8_pair_bf16(w8.x >> 16, w8.x >> 24);      // row g+8, cols 2t, 2t+1
+        ra[2] = fp8_pair_bf16(w8.y,       w8.y >>  8);      // row g,   cols 2t+8, 2t+9
+        ra[3] = fp8_pair_bf16(w8.y >> 16, w8.y >> 24);      // row g+8, cols 2t+8, 2t+9
+
+        const uint32_t* Xl = reinterpret_cast<const uint32_t*>(X + xr0 + (kb << 4));
+        const uint32_t* Xh = reinterpret_cast<const uint32_t*>(X + xr1 + (kb << 4));
+        uint32_t rb0[2] = { Xl[t], Xl[t + 4] };
+        uint32_t rb1[2] = { Xh[t], Xh[t + 4] };
+
+        mma_m16n8k16(accb[0], ra, rb0);
+        mma_m16n8k16(accb[1], ra, rb1);
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) acc[i >> 2][i & 3] += accb[i >> 2][i & 3] * s;   // final span
+
+    __shared__ float sh[MMA_SMEM];
+    mma_epilogue_prescaled(sh, acc, C, mt, M, N, Cf);
+}
+
 // ================== DSV4 FP8 BLOCK-SCALE EPILOGUE GEMM (§12.A.2, §C.3) ==================
 //
 // C[n,m] (bf16, or f32 into Cf for the TP path) =
@@ -7840,6 +7903,15 @@ extern "C" __global__ void dequant_fp8_tiled_b(__nv_bfloat16* out, const uint8_t
     if (i >= (long long)M * K) return;
     int row = (int)(i / K);
     out[i] = f2b(fp8_tiled_at(Wt, K >> 4, row, (int)(i % K)) * RowScale[row]);
+}
+// Qwen fine-grained FP8 prefill dequant: same tiled layout, scale is per-128x128 block
+// `BlkScale[(row/128)*nb_k + (col/128)]` (exact — one multiply, no requantization).
+extern "C" __global__ void dequant_fp8_blk_tiled_b(__nv_bfloat16* out, const uint8_t* Wt,
+                                                   const float* BlkScale, int nb_k, int M, int K) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)M * K) return;
+    int row = (int)(i / K), col = (int)(i % K);
+    out[i] = f2b(fp8_tiled_at(Wt, K >> 4, row, col) * BlkScale[(row >> 7) * nb_k + (col >> 7)]);
 }
 extern "C" __global__ void embed_gather_fp4_tiled_b(__nv_bfloat16* out, const uint8_t* Wt,
                                                     const uint8_t* Sct, const float* gs,
