@@ -162,7 +162,9 @@ types;
 
 Full, step-by-step setup instructions for single-node, TP=2, and TP=4 deployments (node layout,
 required files, launch commands, and expected output) are in
-**[QWEN_27B_SETUP.md](QWEN_27B_SETUP.md)**. The Tencent Hy3 model's two-node TP=2 bring-up is in
+**[QWEN_27B_SETUP.md](QWEN_27B_SETUP.md)**. Ready-to-paste launch lines for every recipe we run —
+Qwen3.8 27B in NVFP4 and FP8, and Qwen3.6 35B A3B, each in single-node / TP=2 / TP=4 form — are in
+**[BEST_WAYS_TO_RUN.md](BEST_WAYS_TO_RUN.md)**. The Tencent Hy3 model's two-node TP=2 bring-up is in
 **[HY3_SETUP.md](HY3_SETUP.md)**. Managing the engine's TP model cache is documented in
 **[MANAGING_CACHE.md](MANAGING_CACHE.md)**. If you want to see how the stack holds up under a long
 run, there's an **8-hour endurance report** — throughput, latency, determinism, and thermals over a
@@ -208,13 +210,34 @@ Don't want to build? Use the prebuilt package on the [**Releases** page](https:/
 
 ## Running
 
-> **Qwen3.8 27B with DFlash 2 requires the draft-model arguments.** Add
-> `--spec-source dflash2-auto --draft-dir <path/to/Qwen3.8-27B-DFlash2>` to the launch command, and
-> point `--model-dir` at the DFlash2-capable quantized model. The Qwen3.8 27B NVFP4 model is not a
-> standalone drafter runner — it needs the DFlash2 drafter for speculative decoding. See
-> [QWEN_27B_SETUP.md](QWEN_27B_SETUP.md) for the full Qwen3.8 27B command lines.
+The launch lines we actually run are collected in [**BEST_WAYS_TO_RUN.md**](BEST_WAYS_TO_RUN.md) —
+Qwen3.8 27B in NVFP4 and FP8, and Qwen3.6 35B A3B, each in single-node / TP=2 / TP=4 form. Start
+there for a known-good command; the rest of this section is the generic picture.
 
-**Single node, single user (maximum speed):**
+> **Qwen3.8 27B requires the draft-model arguments.** Point `--model-dir` at the quantized model and
+> add `--spec-source dflash2 --draft-dir <path/to/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED>`, with
+> `--df2-block 16` for a 16-token draft round. The Qwen3.8 27B NVFP4 checkpoint is not a standalone
+> drafter runner: the drafter is what makes speculative decoding possible. Without one the model
+> still serves, just with plain decode. Full walkthrough: [QWEN_27B_SETUP.md](QWEN_27B_SETUP.md);
+> the draft artifact is
+> [doth4580/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED](https://huggingface.co/doth4580/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED).
+
+**Qwen3.8 27B NVFP4, single node — the recommended starting point:**
+
+```bash
+./gb10_inference --server --model-dir ~/models/3.8-27b-nvfp4-full-all --kv-cache k8v8 \
+  --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --prefix-cache on \
+  --default-presence-penalty 0.0 --mtp=auto --fp8-prefill on --reasoning-effort low \
+  --df2-block 16 --df2-round-shard on \
+  --spec-source dflash2 --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
+```
+
+**Qwen3.8 27B NVFP4, TP=2** — start the peer with `./gb10_inference --node --port 29500`, then add
+`--tp 2 --nodes <peer-ip>:29500` to the line above. **TP=4** — run three peers and add
+`--tp 4 --nodes <peer-ip1>:29500,<peer-ip2>:29500,<peer-ip3>:29500`. Both variants are written out
+in full in [BEST_WAYS_TO_RUN.md](BEST_WAYS_TO_RUN.md).
+
+**Minimum flags for any other model, single node, single user:**
 
 ```bash
 ./gb10_inference --server --model-dir=/path/to/model --port=9000 \
@@ -228,12 +251,16 @@ Don't want to build? Use the prebuilt package on the [**Releases** page](https:/
   --max-seq-len=32768 --max-batch=4 --mtp-lanes=on --prefix-cache=on
 ```
 
+Note that `--kv-cache k8v8` cannot be combined with `--max-batch` greater than 1: the int8 K/V rows
+are read only by the single-lane attention kernel, and the engine rejects that combination before
+loading the model. Use `--kv-cache bf16` (or `k8v4`) when you want concurrency.
+
 **Two nodes, TP=2** (start the peer first — it needs no model copy and no configuration; the head
 ships weights, settings, and calibration at sync):
 
 ```bash
 ./gb10_inference --node --port 29500                                    # on the second GB10
-./gb10_inference --server --model-dir=/path/to/model --tp \
+./gb10_inference --server --model-dir=/path/to/model --tp 2 \
   --nodes <peer-ip>:29500 --port=9000 --max-seq-len=32768 --prefix-cache=on   # on the head
 ```
 
