@@ -116,6 +116,74 @@ Full setup (pack layout, node command, launch lines, expected output):
 
 ---
 
+## How unique is this project?
+
+A few words on the uniqueness of this project. Everything below is something no other implementer of
+a vLLM / SGLang / ExLlamaV3 recipe has, to my knowledge.
+
+**Kernel work** (our own Rust + CUDA engine, written for GB10 sm_121)
+
+- Batch-invariant EXL3 trellis GEMMs, so a verify pass gives exactly the same result as a normal
+  decode step.
+- Grouped MoE expert kernels that never rebuild full weights, for both decode and prefill.
+- Faster prefill MoE expert kernel and a reworked expert schedule.
+- Fused prefill hc-mixer chain.
+- Faster GDN chunked scan in prefill.
+- Router fold spread across more of the GPU.
+- Parallel sparse-attention (QSA) selection at long context.
+- Short-context attention split across more of the GPU.
+- Shared-expert work overlapped with the MoE step.
+- Several small kernels folded into their neighbours (a Hadamard step, the expert routing).
+
+**Speculation (MTP)**
+
+- Draft depth up to 7 (I have seen up to 5).
+- Dynamic draft stop with depth-keyed bins and a cost guard.
+- Output guarantees:
+  - greedy with speculation is bitwise identical to no speculation;
+  - sampled speculation is distribution-exact (ratio rule), verified by chi-square tests.
+- Dynamic draft stop for sampled lanes too.
+- Real-q draft screen (DHEAD) for sampled draft passes.
+
+**Prefill and multi-turn**
+
+- Prefix cache with intermediate prefill checkpoints; a resume is bit-identical to a cold prefill.
+- Message-boundary (tail) checkpoints, so follow-up turns resume near the end.
+- 2,048-token wide prefill chunks.
+
+**TP=2** (with a specific goal for speed improvements, not just capacity)
+
+- The model split across two Sparks:
+  - attention, GDN and the KV cache split by head;
+  - experts divided between the boxes;
+  - dense layers split by rows.
+- Our own GPU-direct RDMA transport over ConnectX-7, using both links for prefill.
+- Barrier steps folded into kernel epilogues, with GPU-side receive.
+- Split draft screen for the MTP head.
+- Output head split by vocabulary, for greedy and sampled rows, with output bitwise identical to the
+  unsplit head.
+- Sequence-parallel prefill: each box handles half the rows.
+- Prefill network and compute overlapped.
+- Draft-stop cost tuned for TP=2.
+- A per-step agreement check and a watchdog to keep both boxes in lockstep.
+- A boot handshake that tolerates one box loading slowly.
+- A node that fails at boot makes the head exit instead of hanging.
+
+**Tuning**
+
+- Build-time tune registry and autotuner for kernel choices (it measured little gain on this model).
+- Per-shape split-K choices for the TP-split dense layers (opt-in).
+
+**Serving and operations**
+
+- The fast engine served over an OpenAI-compatible HTTP API. Other recipes' API path is vLLM/SGLang,
+  which are much slower.
+- Streaming, cancel mid-decode and mid-prefill, penalties with the reference engine's windowing,
+  loop detection.
+- Every option is a command-line flag, plus `--print-config`.
+
+---
+
 ## Qwen 3.8 27B NVFP4 with DFlash 2
 
 **veloGB10 fully supports the Qwen3.8 27B NVFP4 model, with native DFlash 2 speculative
