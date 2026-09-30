@@ -64,23 +64,39 @@ full 262,144-token context.**
 | Speculation | built-in MTP, automatic depth — greedy output is **bitwise identical** to non-speculative decoding |
 | Modality | text only on this path |
 
-### Performance (TP=2, two GB10)
+### Performance
 
-Measured 2026-09-30 on two GB10 (DGX Spark) over ConnectX-7, one request at a time, on the same
-engine code as this release (not the release binary). Decode includes MTP speculation.
+Measured 2026-09-30 with **VeloBenchmark 0.1.0** against the served model, one request at a time,
+reasoning effort low. Decode includes MTP speculation.
 
-| Workload (greedy) | Decode |
-|---|---:|
-| C code | **~192 tok/s** |
-| Python | ~160 tok/s |
-| Prose | ~110 tok/s |
-| Thinking-on (sampled) | ~95 tok/s |
+**Pure-code decode** — ANSI C sorting, ~3.2K output tokens:
 
-| Prefill | 2K | 32K | 128K | 256K |
+| | Single (TP=1) | **TP=2** |
+|---|---:|---:|
+| Decode median | 137 tok/s | **186 tok/s** |
+| Decode min / max | 83.1 / 144 | 122 / 199 |
+| Decode p50 / p90 / p99 | 137 / 142 / 144 | 186 / 193 / 195 |
+| Time per output token (TPOT) | 7.5 ms | **5.4 ms** |
+| Draft acceptance / depth | 84% / 5.7 | 85% / 6.0 |
+| Stability (sustain / peak) | 99% | 99% |
+
+**Prefill** — one measurement per input size:
+
+| Input tokens | TP=1 tok/s | TP=1 TTFT | **TP=2 tok/s** | **TP=2 TTFT** |
 |---|---:|---:|---:|---:|
-| tokens/s | **2,485** | 2,376 | 2,279 | 2,138 |
+| ~550 | 1,323 | 0.42 s | 2,001 | 0.28 s |
+| ~2.1K | 1,470 | 1.42 s | 2,319 | 0.90 s |
+| ~6.2K | 1,517 | 4.08 s | 2,441 | 2.53 s |
+| ~10.3K | 1,541 | 6.67 s | **2,452** | 4.19 s |
+| ~18.5K | 1,541 | 12.0 s | 2,451 | 7.54 s |
+| ~34.9K | 1,525 | 22.9 s | 2,432 | 14.3 s |
 
-Against TP=1, on the same runs: decode **×1.38–1.42**, prefill **×1.56–1.69**.
+On these runs TP=2 buys **×1.36** on decode and **×1.5–1.6** on prefill over a single GB10.
+
+> The decode figures are the VeloBenchmark code session (one ~3.2K-token ANSI C generation, 85%
+> draft acceptance); the prefill figures are its context sweep, one measurement per input size. The
+> 0.14 s / 0.21 s first-token times above are from the pure-code session, on a 79-token prompt — not
+> comparable with the sweep.
 
 Full setup (pack layout, node command, launch lines, expected output):
 **[QWEN_38_FLASH_NEXT_SETUP.md](QWEN_38_FLASH_NEXT_SETUP.md)**.
