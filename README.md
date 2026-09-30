@@ -52,6 +52,10 @@ compiling anything.
 mixture-of-experts model with ~6B active parameters, running on one GB10 (TP=1) or two (TP=2) at the
 full 262,144-token context.**
 
+> **HUGE thanks to [@vcruz305](https://github.com/vcruz305)** for his EXL3 implementation — and for
+> introducing us to EXL3 in the first place. Full attribution in
+> [EXL3 packs](#exl3-packs-qwen38-flash-next) below.
+
 ### The model
 
 | | |
@@ -398,6 +402,18 @@ detection; and TP=2 speed features that are on by default with an `off` value ea
 - If the TP=2 link fails mid-serve the server stops; there is no auto-restart.
 - The first request of each kind after boot is slower (CUDA graph capture), and a cold first boot is
   slower while ~85 GB is read from disk.
+
+### Attribution
+
+**HUGE thanks to [@vcruz305](https://github.com/vcruz305) for his EXL3 implementation (and for
+introducing us to EXL3!) in his project
+[vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe).**
+
+That work is where this path came from. The trellis weight format itself, the vLLM EXL3 plugin and
+the ExLlamaV3 kernels with fractional-K (3.5 bpw) support that the pack needs are his — and the
+recipe that showed this model could be served on DGX Spark hardware at all was his before it was
+ours. If you want to serve this model, read his repository too; it approaches the same problem from
+the vLLM side, and the comparison is instructive.
 
 ---
 
