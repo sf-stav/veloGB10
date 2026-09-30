@@ -9,7 +9,7 @@ compatible OEM machines built around the NVIDIA GB10 chipset.**
 
 veloGB10 (`gb10_inference`) is a from-scratch Rust + CUDA inference engine for a hand-selected
 set of large language models — currently the Qwen3.5/3.6/3.8 family (including **Qwen3.8-Flash-Next,
-served from EXL3 packs**) and Tencent Hy3 — with support for hybrid GatedDeltaNet + GQA
+served from EXL3 or NVFP4 packs**) and Tencent Hy3 — with support for hybrid GatedDeltaNet + GQA
 architectures, sparse attention, dense models, and MoE models. Two weight formats are served
 natively: the **NVFP4/FP8** families and **EXL3 (ExLlamaV3 trellis)** packs. More model
 families are added deliberately rather than generically; each one is ported, measured, and gated
