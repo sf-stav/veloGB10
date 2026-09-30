@@ -88,7 +88,7 @@ Full setup (pack layout, node command, launch lines, expected output):
 ### Also in v0.7.0
 
 - **TP=2 ships as a served mode** — sequence-parallel prefill, a vocab-parallel LM head and prefill
-  communication overlap — for the NVFP4/FP8 families as well as the EXL3 path.
+  communication overlap — for NVFP4 as well as the EXL3 path.
 - **Breaking: the engine no longer reads environment variables.** Every option is a command-line
   flag; leaving a `GB10_*` variable set refuses startup and names the replacement flag. Migration
   table: **[docs/ENV_TO_FLAGS.md](docs/ENV_TO_FLAGS.md)**. Release notes:
