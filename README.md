@@ -45,21 +45,54 @@ inference binary, the required PTX kernels, SHA-256 checksums, and build provena
 run an NVIDIA DGX Spark or a compatible OEM GB10 machine, you can use a release binary without
 compiling anything.
 
-## Update — v0.7.0: EXL3 packs, Qwen3.8-Flash-Next, TP=2 serving
+## Update — Qwen3.8-Flash-Next support (veloGB10 v0.7.0)
 
-**veloGB10 now serves EXL3 (ExLlamaV3 trellis) packs directly**, and the first model on that path
-is **[Qwen3.8-Flash-Next](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw)** — a
-125B MoE with ~6B active parameters, Qwen Sparse Attention, a 51B n-gram embedding table, an MTP
-draft head and a 262,144-token context. It runs on one GB10 (TP=1) or two (TP=2); setup guide:
+**veloGB10 now serves EXL3 (ExLlamaV3 trellis) packs directly, and the model on that path is
+[Qwen3.8-Flash-Next](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw) — a 125B
+mixture-of-experts model with ~6B active parameters, running on one GB10 (TP=1) or two (TP=2) at the
+full 262,144-token context.**
+
+### The model
+
+| | |
+|---|---|
+| Weights | [doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw) — EXL3 3.05 bpw, ~85 GB (32.6 GB of that is the n-gram table) |
+| Architecture | 125B total / ~6B active, 48 layers — Gated DeltaNet + Qwen Sparse Attention hybrid, **no full-attention layers** |
+| Experts | 512 routed per layer, top-10 per token, plus a shared expert |
+| Extra parameters | 51B hashed n-gram embedding table (kept in host RAM), MTP draft head |
+| Context | 262,144 tokens (no YaRN, so no 1M) |
+| Speculation | built-in MTP, automatic depth — greedy output is **bitwise identical** to non-speculative decoding |
+| Modality | text only on this path |
+
+### Performance (TP=2, two GB10)
+
+Measured 2026-09-30 on two GB10 (DGX Spark) over ConnectX-7, one request at a time, on the same
+engine code as this release (not the release binary). Decode includes MTP speculation.
+
+| Workload (greedy) | Decode |
+|---|---:|
+| C code | **~192 tok/s** |
+| Python | ~160 tok/s |
+| Prose | ~110 tok/s |
+| Thinking-on (sampled) | ~95 tok/s |
+
+| Prefill | 2K | 32K | 128K | 256K |
+|---|---:|---:|---:|---:|
+| tokens/s | **2,485** | 2,376 | 2,279 | 2,138 |
+
+Against TP=1, on the same runs: decode **×1.38–1.42**, prefill **×1.56–1.69**.
+
+Full setup (pack layout, node command, launch lines, expected output):
 **[QWEN_38_FLASH_NEXT_SETUP.md](QWEN_38_FLASH_NEXT_SETUP.md)**.
 
-TP=2 also ships as a served mode — sequence-parallel prefill, a vocab-parallel LM head and prefill
-communication overlap — for the NVFP4/FP8 families as well as the EXL3 path.
+### Also in v0.7.0
 
-**Breaking:** the engine no longer reads environment variables. Every option is a command-line
-flag; leaving a `GB10_*` variable set refuses startup and names the replacement flag. Migration
-table: **[docs/ENV_TO_FLAGS.md](docs/ENV_TO_FLAGS.md)**. Release notes:
-**[CHANGELOG.md](CHANGELOG.md)**.
+- **TP=2 ships as a served mode** — sequence-parallel prefill, a vocab-parallel LM head and prefill
+  communication overlap — for the NVFP4/FP8 families as well as the EXL3 path.
+- **Breaking: the engine no longer reads environment variables.** Every option is a command-line
+  flag; leaving a `GB10_*` variable set refuses startup and names the replacement flag. Migration
+  table: **[docs/ENV_TO_FLAGS.md](docs/ENV_TO_FLAGS.md)**. Release notes:
+  **[CHANGELOG.md](CHANGELOG.md)**.
 
 ---
 
