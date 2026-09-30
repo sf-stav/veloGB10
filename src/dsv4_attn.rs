@@ -144,11 +144,11 @@ fn ceil256(n: usize) -> u32 {
 }
 
 /// Item 2.5 / §6-a resolution: the tolerance-class fast paths (wo_a fp8 einsum, compressor
-/// pair) are the DEFAULT; `--exact-gemm` (CLI → GB10_EXACT_GEMM transport, shipped to the
+/// pair) are the DEFAULT; `--exact-gemm` (CLI → --exact-gemm transport, shipped to the
 /// node via TpConfig) selects the locked bit-exact kernels. Env-first, then the shipped
 /// config, then the fast-path default — the node resolves the same value as the head.
 pub fn exact_gemm_enabled() -> bool {
-    std::env::var("GB10_EXACT_GEMM").is_ok()
+    crate::opts::var(crate::opt!("exact-gemm")).is_ok()
         || crate::tp::tp_config().map(|c| c.exact_gemm).unwrap_or(false)
 }
 
@@ -1361,7 +1361,7 @@ impl Dsv4AttnRuntime {
         } else {
             (self.fp8_bsb_rows(&layer.wq_a, &xc, &xsa, s)?, self.fp8_bsb_rows(&layer.wkv, &xc, &xsa, s)?)
         };
-        let pair_seq = crate::dsv4_gpu::env_flag_once("GB10_PAIR_SEQ");
+        let pair_seq = crate::dsv4_gpu::env_flag_once(crate::opt!("pair-seq"));
         let s_i = s as i32;
         let (sp_i, nh_i, rd_i) = (start_pos as i32, nh as i32, rd as i32);
         let rows_q = s * nh;
@@ -1434,10 +1434,10 @@ impl Dsv4AttnRuntime {
 
         // R2.0 instrument: record which attention path each (layer, start_pos, s) takes —
         // the audit's missing "is the batched chunk-prefill path engaged for chunks 2+?" probe.
-        // Gated by GB10_PREFILL_TRACE so it is free in production. The sequential per-token loop
+        // Gated by --prefill-trace so it is free in production. The sequential per-token loop
         // (start_pos>0) is the structural suspect #1 (§3b #1): chunks 2+ ride it, not the batched
         // prefill path, which would explain the ~27–45 prefill rate sagging with depth.
-        let _pf_trace = crate::env_knob("GB10_PREFILL_TRACE", "DSV4_PREFILL_TRACE").is_some();
+        let _pf_trace = crate::opts::var(crate::opt!("prefill-trace")).ok().is_some();
         let (idxs, t): (I, usize) = if start_pos == 0 {
             // ===================== PREFILL (start_pos == 0): batched — UNCHANGED (lane 3A/3C + trunk gate) =====================
             // §B.2 ring write BEFORE attention (current token attends to itself), rotated for S>win.
@@ -1660,8 +1660,8 @@ impl Dsv4AttnRuntime {
 
             (idxs, t_total)
         } else if start_pos > 0 && s <= win
-            && !crate::dsv4_gpu::env_flag_once("GB10_VERIFY_SEQ")
-            && !crate::dsv4_gpu::env_flag_once("GB10_GRAPH")
+            && !crate::dsv4_gpu::env_flag_once(crate::opt!("verify-seq"))
+            && !crate::dsv4_gpu::env_flag_once(crate::opt!("graph"))
         {
             // ===================== SESSION-10 FUSED GATHER (verify/decode, ONE launch/layer) =====================
             // Queue #5: `dsv4_fused_gather_b` replaces, for the verify (s=6) and decode (s=1)
@@ -1672,8 +1672,8 @@ impl Dsv4AttnRuntime {
             // key order, tile boundaries, online-softmax and P·V chains — the masked entries
             // keep their tile positions as p=0 / fma(0,0) no-ops). Compressor + indexer stay
             // batched (identical to the assembly arms; the indexer remask uses the batched
-            // id space win+s — uniform with comp_off below). GB10_VERIFY_SEQ (the documented
-            // A/B arm) and GB10_GRAPH (the graph policies capture the assembly kernels) keep
+            // id space win+s — uniform with comp_off below). --verify-seq (the documented
+            // A/B arm) and --graph (the graph policies capture the assembly kernels) keep
             // the old paths. The returned idx buffer is a placeholder (topk_idx is consumed
             // only by the debug replay tool, which runs the assembly path).
             let mut nb_max = 0usize;
@@ -1729,7 +1729,7 @@ impl Dsv4AttnRuntime {
             let idxs = I::alloc_zeros(&self.dev, self.stream.stream, s * t_total)?;
             (idxs, t_total)
         } else if start_pos > 0 && s > 1 && start_pos >= win
-            && !crate::dsv4_gpu::env_flag_once("GB10_VERIFY_SEQ")
+            && !crate::dsv4_gpu::env_flag_once(crate::opt!("verify-seq"))
         {
             // ===================== R4 BATCHED VERIFY (s>1, start_pos >= win) =====================
             // The R2.1 batched-continuation machinery generalized to arbitrary alignment by a
@@ -1895,7 +1895,7 @@ impl Dsv4AttnRuntime {
                     let t_total = win + k;
                     // CUDA-graph mode: alloc for the CAP (k ≤ index_topk) so replay never
                     // outgrows the baked buffer; the layout args below stay at the live t.
-                    let cap = if crate::dsv4_gpu::env_flag_once("GB10_GRAPH") {
+                    let cap = if crate::dsv4_gpu::env_flag_once(crate::opt!("graph")) {
                         s * (win + indexer.index_topk)
                     } else {
                         s * t_total
@@ -1914,7 +1914,7 @@ impl Dsv4AttnRuntime {
                     let t_comp_max = (start_pos + s) / ratio;
                     let t_total = win + t_comp_max;
                     // CUDA-graph mode: alloc for the compressor cache CAPACITY (see CSA note).
-                    let cap = if crate::dsv4_gpu::env_flag_once("GB10_GRAPH") {
+                    let cap = if crate::dsv4_gpu::env_flag_once(crate::opt!("graph")) {
                         s * (win + st.attn_compressor.as_ref().expect("HCA").cache_rows)
                     } else {
                         s * t_total
@@ -2250,7 +2250,7 @@ impl Dsv4AttnRuntime {
         Ok((attn_out, q_pre_host, q_rsc_host, kv_host, o_host, oflat_host))
     }
 
-    /// CUDA-graph (GB10_DSPARK_GRAPH) variant of [`dspark_attn_forward`](Self::dspark_attn_forward):
+    /// CUDA-graph (--dspark-graph) variant of [`dspark_attn_forward`](Self::dspark_attn_forward):
     /// the SAME kernel sequence and argument values, but capture-legal — every transient is
     /// a `Dsv4Buf` (GSlice bump slices of the workspace slab under capture) and the three
     /// position vectors (main_kv sp, draft q positions, draft kv positions) arrive as

@@ -262,7 +262,7 @@ pub fn generate(dir: &str, seed: u64) -> Result<GenSummary, anyhow::Error> {
 
 /// Convenience: the default generation target (outside the repo; never in git).
 pub fn default_dir() -> String {
-    std::env::var("DSPARK_SYNTH_DIR").unwrap_or_else(|_| crate::dspark::DEFAULT_SYNTH_DIR.to_string())
+    crate::opts::var(crate::opt!("dspark-synth-dir")).unwrap_or_else(|_| crate::dspark::DEFAULT_SYNTH_DIR.to_string())
 }
 
 /// The default seed (documented constant).

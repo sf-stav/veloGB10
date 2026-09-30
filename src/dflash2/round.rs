@@ -306,7 +306,7 @@ pub struct Df2Round {
     /// records the identical sequence for that m. Every buffer the sequence touches is a
     /// persistent `Df2Round` field (fixed addresses — the same discipline as `round_graph`), and
     /// the region contains NO all-reduce (kv projections are rank-local by construction), so
-    /// capture/replay is SPMD-trivial. `GB10_NO_DF2_INJECT_GRAPH=1` keeps the eager path.
+    /// capture/replay is SPMD-trivial. `--no-df2-inject-graph=1` keeps the eager path.
     pub inject_graphs: std::collections::HashMap<usize, crate::gpu::CudaGraph>,
     /// The per-replay device ints the graph reads (kept alive for the graph's lifetime).
     ntot_buf: Option<CudaSlice<i32>>,
@@ -1187,7 +1187,7 @@ impl Df2Round {
             return Ok(());
         }
         self.inject_kernels(m);
-        if std::env::var("GB10_NO_DF2_INJECT_GRAPH").is_err() {
+        if crate::opts::var(crate::opt!("no-df2-inject-graph")).is_err() {
             let _ = self.capture_inject_graph(m);
         }
         if let Some(t) = timer.as_deref_mut() { t.mark(self.stream.stream); }
@@ -1639,9 +1639,9 @@ impl Df2Round {
         let Some(g) = self.round_graph.as_ref() else {
             return self.draft_round_dev(anchor);
         };
-        // F8 (diagnostic, GB10_ROUND_TRACE): split the replay wall — input H2D syncs, the eager
+        // F8 (diagnostic, --round-trace): split the replay wall — input H2D syncs, the eager
         // rope gather, the pre/post syncs, the graph launch, the token readback.
-        let tr = std::env::var("GB10_ROUND_TRACE").is_ok();
+        let tr = crate::opts::var(crate::opt!("round-trace")).is_ok();
         let mut t = std::time::Instant::now();
         let ntot = self.nprev + block();
         // device inputs for this replay — ONE host sync, then stream-ordered D2D fanning.

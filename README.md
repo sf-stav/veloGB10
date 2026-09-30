@@ -8,8 +8,10 @@
 compatible OEM machines built around the NVIDIA GB10 chipset.**
 
 veloGB10 (`gb10_inference`) is a from-scratch Rust + CUDA inference engine for a hand-selected
-set of large language models — currently including the Qwen3.5/3.6/3.8 family and Tencent Hy3 — with
-support for hybrid GatedDeltaNet + GQA architectures, dense models, and MoE models. More model
+set of large language models — currently the Qwen3.5/3.6/3.8 family (including **Qwen3.8-Flash-Next,
+served from EXL3 packs**) and Tencent Hy3 — with support for hybrid GatedDeltaNet + GQA
+architectures, sparse attention, dense models, and MoE models. Two weight formats are served
+natively: the **NVFP4/FP8** families and **EXL3 (ExLlamaV3 trellis)** packs. More model
 families are added deliberately rather than generically; each one is ported, measured, and gated
 on real GB10 hardware before it ships.
 
@@ -43,9 +45,27 @@ inference binary, the required PTX kernels, SHA-256 checksums, and build provena
 run an NVIDIA DGX Spark or a compatible OEM GB10 machine, you can use a release binary without
 compiling anything.
 
-## Update — Qwen 3.8 27B NVFP4 with DFlash 2
+## Update — v0.7.0: EXL3 packs, Qwen3.8-Flash-Next, TP=2 serving
 
-**veloGB10 now fully supports the Qwen3.8 27B NVFP4 model, with native DFlash 2 speculative
+**veloGB10 now serves EXL3 (ExLlamaV3 trellis) packs directly**, and the first model on that path
+is **[Qwen3.8-Flash-Next](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw)** — a
+125B MoE with ~6B active parameters, Qwen Sparse Attention, a 51B n-gram embedding table, an MTP
+draft head and a 262,144-token context. It runs on one GB10 (TP=1) or two (TP=2); setup guide:
+**[QWEN_38_FLASH_NEXT_SETUP.md](QWEN_38_FLASH_NEXT_SETUP.md)**.
+
+TP=2 also ships as a served mode — sequence-parallel prefill, a vocab-parallel LM head and prefill
+communication overlap — for the NVFP4/FP8 families as well as the EXL3 path.
+
+**Breaking:** the engine no longer reads environment variables. Every option is a command-line
+flag; leaving a `GB10_*` variable set refuses startup and names the replacement flag. Migration
+table: **[docs/ENV_TO_FLAGS.md](docs/ENV_TO_FLAGS.md)**. Release notes:
+**[CHANGELOG.md](CHANGELOG.md)**.
+
+---
+
+## Qwen 3.8 27B NVFP4 with DFlash 2
+
+**veloGB10 fully supports the Qwen3.8 27B NVFP4 model, with native DFlash 2 speculative
 decoding, at the model's full 256K context.**
 
 The supported configuration combines our NVFP4-quantized
@@ -277,6 +297,58 @@ head into a content-addressed cache at `~/.cache/gb10_tp/` on the node machine:
 Only missing blobs are transferred, so the second start of the same model syncs nothing. The cache
 is safe to delete (it just re-fetches over the network) — but keep an eye on disk headroom: a 122B
 recipe is ~76 GB.
+
+---
+
+## EXL3 packs (Qwen3.8-Flash-Next)
+
+`--model-dir` also accepts an **EXL3 (ExLlamaV3 trellis)** pack. The model on this path is
+**Qwen3.8-Flash-Next** — a 125B MoE with ~6B active parameters, a Gated DeltaNet + Qwen Sparse
+Attention hybrid, 512 experts (top-10), a 51B n-gram embedding table, an MTP draft head and a
+262,144-token context. Weights: **[doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw)**
+(EXL3 3.05 bpw, ~85 GB including the 32.6 GB n-gram table).
+
+**One GB10 (TP=1):**
+
+```bash
+./gb10_inference --server --model-dir <pack-dir> --port 9000 \
+  --max-seq-len 262144 --max-batch 1
+```
+
+**Two GB10 (TP=2)** — start the node first on the peer (it needs no other flags; the head sends
+everything), then the head:
+
+```bash
+./gb10_inference --node --port 29500                                    # on the peer
+./gb10_inference --server --model-dir <pack-dir> --tp 2 \
+  --nodes <peer-ip>:29500 --port 9000 --max-seq-len 262144 --max-batch 1   # on the head
+```
+
+Run both from the build directory (the binary loads `src/ptx/*.ptx` relative to the working
+directory). The pack must sit at the **same path on both machines** — there is no cross-check of the
+two copies.
+
+**Supported on this path:** the OpenAI-compatible API with streaming; built-in **MTP speculative
+decoding** (auto depth — greedy output is bitwise identical to non-speculative decoding, sampled
+output is distribution-exact); prefix cache with prefill checkpoints for multi-turn; **q8 KV cache
+by default** (`--kv-cache f32|f16|fp8|q8`, about 3.4 GB at 262K); penalties and streaming loop
+detection; and TP=2 speed features that are on by default with an `off` value each
+(`--tp-seq-parallel`, `--tp-vp-sampled`, `--tp-prefill-overlap`).
+
+**Limits on this path:**
+
+- **262,144 tokens maximum.** YaRN is not implemented, so there is no 1M context.
+- **Text only — no vision.** Image requests are rejected. (Vision is available on the NVFP4 /
+  Qwen3.8 27B path.)
+- **TP=1 and TP=2 only.** Any other world size exits with `--tp 2 only`.
+- `--max-batch 1` is what was tested at TP=2. A second lane works and is hash-exact per lane, but
+  lanes take turns, so there is no aggregate throughput gain yet.
+- Seeded sampled requests are not byte-reproducible across runs.
+- A prefix-cache resume can word an answer differently from a cold prompt by design; pass
+  `--prefix-tail-ckpt 0` for bit-identical resumes.
+- If the TP=2 link fails mid-serve the server stops; there is no auto-restart.
+- The first request of each kind after boot is slower (CUDA graph capture), and a cold first boot is
+  slower while ~85 GB is read from disk.
 
 ---
 
@@ -527,28 +599,33 @@ per request.
 | `--tp` | off | Enable TP=2 on `--server` (sync + RDMA bring-up first) |
 | `--nodes <ip[:port],...>` | — | Explicit node address(es); skips UDP discovery |
 | `--discover-wait <S>` | 3 | Discovery broadcast window (instead of `--nodes`) |
-| `--rdma-dev <d1[,d2]>` | platform defaults | RoCE devices (also `GB10_RDMA_DEV`) |
+| `--rdma-dev <d1[,d2]>` | platform defaults | RoCE devices |
 | `--head --model-dir <DIR>` | — | One-shot bench/generate head (use `--server --tp` for serving) |
 
-TP environment variables (read on the head, shipped to the node at sync; a node never needs them):
+**The engine reads no environment variables.** Every option is a command-line flag: leaving a
+`GB10_*` / `RUST_INFER_*` variable set refuses startup and names the replacement flag (for example
+`GB10_TP_GRAPH` → `--tp-graph`). `--print-config` prints every option's resolved value for a given
+command line. What this table used to list, as flags:
 
-| Env var | Meaning |
-|---|---|
-| `GB10_TP_SHARD_MIXERS=1` | Shard attention/GDN mixers **and** MoE experts (~half weight bytes per rank — the win). Default: FFN-only |
-| `GB10_TP_GRAPH=1` | CUDA-graph the TP decode (bench path) |
-| `GB10_TP_FP32_PARTIALS=1` | FP32 all-reduce partials (~2× barrier payload; kills the bf16-partial acceptance dip on small models) |
-| `GB10_TP_MTP=1`, `GB10_TP_MTP_DEPTH=N` | Bench rig: run `--bench-mtp` under TP |
-| `GB10_TP_CACHE=<dir>` | Node's model blob cache (`~/.cache/gb10_tp`) |
-| `GB10_TP_TAIL_DRILL=1`, `GB10_TP_AGREE_DRILL=N` | Fault-injection drills for the transport/agree guard |
+| Flag | Default | Meaning |
+|---|---|---|
+| `--no-shard-mixers` | off | Turn *off* sharded attention/GDN mixers **and** MoE experts (~half weight bytes per rank — the win). Sharding is on by default under TP |
+| `--tp-graph` | off | CUDA-graph the TP decode (bench path) |
+| `--tp-fp32-partials` | off | FP32 all-reduce partials (~2× barrier payload; kills the bf16-partial acceptance dip on small models) |
+| `--mtp on`, `--mtp-depth N` | auto | Bench rig: run `--bench-mtp` under TP |
+| `--tp-cache <dir>` | `~/.cache` | Node's model blob cache (`~/.cache/gb10_tp`) |
+| `--tp-tail-drill`, `--tp-agree-drill N` | off / unset | Fault-injection drills for the transport/agree guard |
 
-Other single-node env vars: `GB10_RDMA_DEV` (device override), `RUST_INFER_ZERO_KV=1` (restore
-cold-admit KV zeroing), `RUST_INFER_PREFILL_SCALAR=1` (scalar prefill path),
-`GB10_NO_DECODE_GRAPHS=1` (disable decode graphs), `RUST_INFER_CPU_SAMPLE=1` (CPU sampling),
-`GB10_TP_TRACE=1` (per-barrier timing histograms at exit). Prefill levers: `GB10_FA_PREFILL`
-(tensor-core flash-attention prefill) and `GB10_GDN_CHUNK2` (tensor-core chunked GDN scan) are
-**on by default** on the FP8 path (`=0` restores the legacy path); `GB10_MXFP4_PREFILL=1` (v2 W4A4
-prefill GEMM) is an opt-in lever for the NVFP4 path, off by default (its prefill numerics are the
-owner's call). These change the prefill path and are gated where the gates hold.
+Other flags that replaced env vars: `--rdma-dev` (device override), `--zero-kv` (restore cold-admit
+KV zeroing), `--prefill-scalar` (scalar prefill path), `--no-decode-graphs` (disable decode graphs),
+`--cpu-sample` (CPU sampling), `--tp-trace` (per-barrier timing histograms at exit). Prefill levers:
+`--fa-prefill` (tensor-core flash-attention prefill) and `--gdn-chunk2` (tensor-core chunked GDN scan)
+are **on by default** on the FP8 path; `--mxfp4-prefill` (v2 W4A4 prefill GEMM) is an opt-in lever
+for the NVFP4 path, off by default (its prefill numerics are the owner's call). These change the
+prefill path and are gated where the gates hold.
+
+The complete table of every removed variable and its replacement flag is
+**[docs/ENV_TO_FLAGS.md](docs/ENV_TO_FLAGS.md)**.
 
 ### Probes (diagnostics)
 

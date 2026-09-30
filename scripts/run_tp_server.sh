@@ -28,14 +28,14 @@ SHARD=${SHARD:-on}
 
 [ ! -f "$MODEL_DIR/config.json" ] && { echo "ERROR: no model at $MODEL_DIR"; exit 1; }
 
-ENV_ARGS=()
-[ "$SHARD" = "on" ] && ENV_ARGS+=(GB10_TP_SHARD_MIXERS=1)
+SHARD_ARGS=()
+[ "$SHARD" = "off" ] && SHARD_ARGS+=(--no-shard-mixers)   # mixer sharding is the default under --tp
 MTP_ARGS=()
 [ -n "${MTP:-}" ] && MTP_ARGS=(--mtp="$MTP")
 
 echo "=== GB10 TP=2 HEAD — $MODEL_DIR  port $PORT  node $NODE  seq $SEQ  batch $BATCH  prefix-cache $PREFIX  shard $SHARD ==="
 echo "    (first start: model sync to the node + RDMA bring-up + SPMD calibration, a few minutes)"
-exec env "${ENV_ARGS[@]}" "$BIN" --server \
+exec "$BIN" --server "${SHARD_ARGS[@]}" \
   --model-dir "$MODEL_DIR" --tp --nodes "$NODE" --port "$PORT" \
   --max-seq-len "$SEQ" --max-batch "$BATCH" --max-tokens 4096 \
   --default-presence-penalty 1.5 --prefix-cache "$PREFIX" "${MTP_ARGS[@]}"

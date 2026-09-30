@@ -15,7 +15,7 @@
 //!   encode the layer context (e.g. gather slot6 == win+(T+1)/4 ⇒ CSA pair, == win+(T+1)/128
 //!   ⇒ HCA pair, == win ⇒ SWA static). Every inference is VERIFIED against the capture-time
 //!   formula; any mismatch → hard error → the caller falls back to eager (loud, never wrong).
-//! - Depth-growth allocations are max-sized at capture (the GB10_GRAPH arm of the SEQ
+//! - Depth-growth allocations are max-sized at capture (the --graph arm of the SEQ
 //!   attention arm allocs idxs for win+index_topk / win+max_blocks) so NO re-capture is
 //!   ever needed; t/n/k are pure param updates.
 //! - cudarc allocations are stream-ordered (malloc_async) ⇒ capture-legal; the device
@@ -35,7 +35,7 @@
 //! legacy stream depend on a capturing blocking stream"). The fix is the GSlice refactor:
 //! a repo-local CudaSlice equivalent whose alloc/free/memset run on rt.stream (capture-
 //! legal), swapped into the ~150 alloc_zeros sites of the decode forward — the multi-day
-//! workspace item from the original audit. GB10_GRAPH stays OFF by default; the env-gated
+//! workspace item from the original audit. --graph stays OFF by default; the env-gated
 //! arms are inert scaffolding until that lands.
 
 use anyhow::{anyhow, Result};
@@ -470,7 +470,7 @@ impl DecodeGraphs {
                 }
             }
             updates.push(NodeUpdate { node, params, slots, grid: pol.grid, win });
-            if std::env::var("GB10_GRAPH_DEBUG").is_ok() && updates.len() <= 2 {
+            if crate::opts::var(crate::opt!("graph-debug")).is_ok() && updates.len() <= 2 {
                 eprintln!(
                     "[graph-dbg] node {} func={:?} kp={:?} extra={:?} grid=({},{},{}) smem={}",
                     updates.len(), params.func, params.kernelParams, params.extra,
@@ -519,8 +519,8 @@ impl Graph {
     /// DSpark drafter graph can drive the same machinery with its own input refresh (draft
     /// ids / main_hidden / position buffers) and multi-row logits readout.
     pub fn apply_updates_and_launch(&self, stream: &CudaStream, sp: usize) -> Result<()> {
-        let dbg = std::env::var("GB10_GRAPH_DEBUG").is_ok();
-        let skip_updates = std::env::var("GB10_GRAPH_NOUPDATES").is_ok();
+        let dbg = crate::opts::var(crate::opt!("graph-debug")).is_ok();
+        let skip_updates = crate::opts::var(crate::opt!("graph-noupdates")).is_ok();
         for (ui, u) in self.updates.iter().enumerate() {
             if skip_updates {
                 break;
@@ -553,7 +553,7 @@ impl Graph {
             eprintln!("[graph-dbg] launch exec={:?} stream={:?} sp={sp}", self.exec, stream.stream);
         }
         let t_upd = std::time::Instant::now();
-        if std::env::var("GB10_GRAPH_UPLOAD").is_ok() {
+        if crate::opts::var(crate::opt!("graph-upload")).is_ok() {
             // variant: explicit upload before launch (isolates lazy-upload failures)
             let r = unsafe { sys::cuGraphUpload(self.exec, stream.stream) };
             if r != sys::CUresult::CUDA_SUCCESS {

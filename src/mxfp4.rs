@@ -72,7 +72,7 @@ pub struct Mxfp4State {
     /// costs one read lock per GEMM (~ns, semantics unchanged).
     pub allow_bf16: RwLock<HashSet<u64>>,
     /// Mixer projections cleared for the W4A4 v2 PREFILL GEMM despite being on the bf16
-    /// chain for decode/verify (GB10_PF_MIXER4 at load: 'safe' = out_proj/o_proj/qkv_proj,
+    /// chain for decode/verify (--pf-mixer4 at load: 'safe' = out_proj/o_proj/qkv_proj,
     /// 'all' = + in_proj; unset = none). Gate-arbitrated 2026-08-26: 'all' MISMATCHes the
     /// losslessness fuzz at ctx 7418 (same seed GREEN without it) — R4's ruling holds.
     pub mixer4: RwLock<HashSet<u64>>,
@@ -99,7 +99,7 @@ pub struct Mxfp4State {
     pub moe_bp: CudaSlice<u32>,
     pub moe_sfb: CudaSlice<u32>,
     /// Fused activation-quant GEMMs (EXPERT_FUSED_QUANT_RESPONSE.md — F1/F2/F3). Each replaces
-    /// the quant (+silu) + GEMM pair at its launch sites when GB10_MXFP4_FUSED is not "0";
+    /// the quant (+silu) + GEMM pair at its launch sites when --mxfp4-fused is not "0";
     /// byte-identical C and Bp/SFB fragments by construction (§3, §7). The unfused handles
     /// above stay live for the A/B escape. Suffixes: _b1/_b8/_b16 = NR (dense), _b0/_b1 =
     /// XSILU off/on (slot/grouped MoE).
@@ -111,7 +111,7 @@ pub struct Mxfp4State {
     pub moe_grouped_fused0: CudaFunction,  // mxfp4_gemm_moe_grouped_fused_b0 (gu: X = x_perm)
     pub moe_grouped_fused1: CudaFunction,  // mxfp4_gemm_moe_grouped_fused_b1 (dn: silu in stage)
     /// P4 B2 W4A4 prefill path (kernels/gpu_mxfp4.cu, 2026-08-18): quant (K-B) + OMMA GEMM
-    /// (K-A, the perf6 lineage). Used by gemm_quant_prefill when GB10_MXFP4_PREFILL is set
+    /// (K-A, the perf6 lineage). Used by gemm_quant_prefill when --mxfp4-prefill is set
     /// and batch >= MXFP4_PREFILL_MIN_BATCH. Scratch: pf_bq/pf_sb sized for PREFILL_CHUNK
     /// rows at MXFP4_MAX_K.
     pub pf_quant: CudaFunction,      // mxfp4_quant_prefill_b

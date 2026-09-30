@@ -24,12 +24,12 @@
 //! runs unmodified — while the *values* carry exactly the error the real 4-bit kernel would produce.
 //! So we can measure the damage per tensor group, in the real engine, before writing a single kernel.
 //!
-//! Driven by `RUST_INFER_FAKE_QUANT` (an experiment knob, not a serving setting):
+//! Driven by `--fake-quant` (an experiment knob, not a serving setting):
 //! ```text
-//!   RUST_INFER_FAKE_QUANT=all                 # quantize everything we intend to quantize
-//!   RUST_INFER_FAKE_QUANT=all,-gdn            # ...but keep the GDN projections in bf16
-//!   RUST_INFER_FAKE_QUANT=all,-lmhead,-embed  # ...keep the LM head and embedding in bf16
-//!   RUST_INFER_FAKE_QUANT=mlp,attn            # what the HF checkpoints actually do
+//!   --fake-quant=all                 # quantize everything we intend to quantize
+//!   --fake-quant=all,-gdn            # ...but keep the GDN projections in bf16
+//!   --fake-quant=all,-lmhead,-embed  # ...keep the LM head and embedding in bf16
+//!   --fake-quant=mlp,attn            # what the HF checkpoints actually do
 //! ```
 
 use half::bf16;
@@ -229,6 +229,65 @@ pub fn dequantize_nvfp4(q: &Nvfp4Tensor) -> Vec<bf16> {
                 let code = if idx % 2 == 0 { byte & 0x0F } else { byte >> 4 };
                 out[idx] = bf16::from_f32(e2m1_to_f32(code) * s);
             }
+        }
+    }
+    out
+}
+
+// ============================ PLE n-gram table row records (qwen4_exp) ============================
+//
+// Qwen3.8-Flash-Next's PLE n-gram embedding is a 320M-row x 160 table (51 GB in FP8, 102 GB bf16)
+// read by ROW — 16 rows per token — never as a GEMM operand. So it gets its own on-disk codec:
+// one fixed-size record per row, NVFP4 inside:
+//
+//   [ 80 B  E2M1 nibbles (160 values, low nibble = even index) |
+//     10 B  E4M3 block scales (one per 16 values along the row) |
+//      6 B  zero pad ]                                  = 96 B per row (32-B aligned)
+//
+// plus ONE reciprocal-convention global scale per source shard (`w ≈ e2m1 * e4m3 / gs`, exactly the
+// `Nvfp4Tensor` convention). Fixed-size records are the point: a row is ONE contiguous
+// `pread(row * 96)` from NVMe when the table is offloaded to SSD, and one coalesced 96-B load when it
+// is resident on the GPU. 30.7 GB for the whole table (vs 51 GB FP8 / 102 GB bf16).
+pub const PLE_REC_BYTES: usize = 96;
+pub const PLE_DIM: usize = 160;
+pub const PLE_QW_BYTES: usize = PLE_DIM / 2;          // 80
+pub const PLE_SC_BYTES: usize = PLE_DIM / BLOCK;      // 10
+
+/// Quantize a [rows, PLE_DIM] bf16 table shard into 96-B row records. Returns (records, global_scale).
+pub fn quantize_ple_rows(w: &[bf16], rows: usize) -> (Vec<u8>, f32) {
+    assert_eq!(w.len(), rows * PLE_DIM, "PLE shard shape");
+    let q = quantize_nvfp4(w, rows, PLE_DIM);
+    let mut rec = vec![0u8; rows * PLE_REC_BYTES];
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).max(1);
+    let rows_per = rows.div_ceil(nthreads).max(1);
+    std::thread::scope(|sc| {
+        for (t, chunk) in rec.chunks_mut(rows_per * PLE_REC_BYTES).enumerate() {
+            let q = &q;
+            sc.spawn(move || {
+                let r0 = t * rows_per;
+                for (i, r) in chunk.chunks_mut(PLE_REC_BYTES).enumerate() {
+                    let row = r0 + i;
+                    r[..PLE_QW_BYTES].copy_from_slice(&q.qweight[row * PLE_QW_BYTES..][..PLE_QW_BYTES]);
+                    r[PLE_QW_BYTES..PLE_QW_BYTES + PLE_SC_BYTES]
+                        .copy_from_slice(&q.scales[row * PLE_SC_BYTES..][..PLE_SC_BYTES]);
+                }
+            });
+        }
+    });
+    (rec, q.global_scale)
+}
+
+/// Host reference decode of one 96-B record (the device kernel must match this bit-for-bit).
+pub fn dequant_ple_row(rec: &[u8], global_scale: f32) -> [f32; PLE_DIM] {
+    let s_tensor = 1.0 / global_scale;
+    let mut out = [0f32; PLE_DIM];
+    for b in 0..PLE_SC_BYTES {
+        let s = e4m3_to_f32(rec[PLE_QW_BYTES + b]) * s_tensor;
+        for i in 0..BLOCK {
+            let idx = b * BLOCK + i;
+            let byte = rec[idx / 2];
+            let code = if idx % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            out[idx] = e2m1_to_f32(code) * s;
         }
     }
     out
@@ -784,7 +843,7 @@ pub fn roundtrip_error(orig: &[bf16], deq: &[bf16]) -> (f32, f32) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Tensor grouping + the RUST_INFER_FAKE_QUANT spec
+// Tensor grouping + the --fake-quant spec
 // ---------------------------------------------------------------------------------------------
 
 /// Which family a tensor belongs to, for the "can this survive 4 bits?" experiment.
@@ -793,7 +852,7 @@ pub fn roundtrip_error(orig: &[bf16], deq: &[bf16]) -> (f32, f32) {
 /// **router** layers. It does not apply to this dense family — there is no router — but when the MoE
 /// lands, add a `Router` group here and put the claim through the same test rather than inheriting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Group { Mlp, Attn, Gdn, LmHead, Embed, Mtp, Router, Expert, Other }
+pub enum Group { Mlp, Attn, Gdn, LmHead, Embed, Mtp, Router, Expert, Hc, Ple, PleTable, Other }
 
 pub fn group_of(name: &str) -> Group {
     // Routing gates FIRST (before the mtp/embed/mlp catch-alls) so `-router` holds BOTH the main AND the
@@ -805,6 +864,14 @@ pub fn group_of(name: &str) -> Group {
     if name.contains(".eh_proj") { return Group::Mtp; }   // hy_v3: layer-80 MTP embed→hidden projection
     if name.contains("lm_head") { return Group::LmHead; }
     if name.contains("embed_tokens") { return Group::Embed; }
+    // qwen4_exp (Qwen3.8-Flash-Next). The PLE n-gram table is NOT a GEMM weight (an embedding
+    // gathered by row) — its own group so the quantizer can route it to the row-record codec. The
+    // PLE projections (key_proj [hc*h, ple_dim], value_proj [h, ple_dim]) and the hyper-connection
+    // mixers (input_mix_weight_down [lowrank, hc*h] / _up [hc*h, lowrank]) are ordinary GEMMs.
+    // Checked BEFORE `.mlp.`: `mlp_hyper_connection` must land in Hc, not Mlp.
+    if name.contains(".ngram_embedding.") { return Group::PleTable; }
+    if name.contains(".ple.") { return Group::Ple; }
+    if name.contains("hyper_connection") { return Group::Hc; }
     // MoE — test BEFORE the generic `.mlp.`: the stacked routed experts are their own group (the
     // sparse-quant risk lands here).
     if name.contains(".mlp.experts.") { return Group::Expert; }
@@ -822,10 +889,11 @@ pub fn group_name(g: Group) -> &'static str {
         Group::Mlp => "mlp", Group::Attn => "attn", Group::Gdn => "gdn",
         Group::LmHead => "lmhead", Group::Embed => "embed", Group::Mtp => "mtp",
         Group::Router => "router", Group::Expert => "expert", Group::Other => "other",
+        Group::Hc => "hc", Group::Ple => "ple", Group::PleTable => "pletable",
     }
 }
 
-/// Parse `RUST_INFER_FAKE_QUANT` into a per-group format map.
+/// Parse `--fake-quant` into a per-group format map.
 ///
 /// Tokens are `group[:fmt]`, or `-group` to drop one. `fmt` is `nvfp4` (default) or `fp8`.
 /// ```text
@@ -835,7 +903,7 @@ pub fn group_name(g: Group) -> &'static str {
 ///   mlp,attn            what the HF checkpoints actually do
 /// ```
 pub fn fake_quant_spec() -> Option<Vec<(Group, Fmt)>> {
-    let spec = std::env::var("RUST_INFER_FAKE_QUANT").ok()?;
+    let spec = crate::opts::var(crate::opt!("fake-quant")).ok()?;
     parse_recipe(&spec)
 }
 
@@ -846,7 +914,7 @@ pub fn fake_quant_spec() -> Option<Vec<(Group, Fmt)>> {
 /// `all`; L1b: `layers:0-61:bf16` on top of `all` — the bf16 override = no fake-quant on the
 /// clean prefix). `fmt:bf16` in a layer rule means "keep this layer at the raw bf16 weights".
 pub fn fake_quant_layer_rules() -> Vec<LayerRule> {
-    match std::env::var("RUST_INFER_FAKE_QUANT") {
+    match crate::opts::var(crate::opt!("fake-quant")) {
         Ok(spec) => parse_layer_rules(&spec),
         Err(_) => Vec::new(),
     }
@@ -871,7 +939,7 @@ pub fn parse_layer_rules(spec: &str) -> Vec<LayerRule> {
             "fp8" => Fmt::Fp8,
             "nvfp4" => Fmt::Nvfp4,
             "bf16" => Fmt::Bf16,
-            _ => { eprintln!("RUST_INFER_FAKE_QUANT: unknown layer format {:?}", fmt); std::process::exit(1); }
+            _ => { eprintln!("--fake-quant: unknown layer format {:?}", fmt); std::process::exit(1); }
         };
         // The selector is `lo-hi` (range) or a list separated by `,` or `+` (the `+` form
         // keeps the whole token comma-free so the recipe spec tokenizes cleanly).
@@ -880,13 +948,13 @@ pub fn parse_layer_rules(spec: &str) -> Vec<LayerRule> {
             if let Some((lo, hi)) = part.split_once('-') {
                 let (lo, hi): (usize, usize) = match (lo.parse(), hi.parse()) {
                     (Ok(a), Ok(b)) if a <= b => (a, b),
-                    _ => { eprintln!("RUST_INFER_FAKE_QUANT: bad layer range {:?}", part); std::process::exit(1); }
+                    _ => { eprintln!("--fake-quant: bad layer range {:?}", part); std::process::exit(1); }
                 };
                 rules.push(LayerRule { lo, hi, fmt });
             } else if let Ok(li) = part.parse::<usize>() {
                 rules.push(LayerRule { lo: li, hi: li, fmt });
             } else {
-                eprintln!("RUST_INFER_FAKE_QUANT: bad layer selector {:?}", part);
+                eprintln!("--fake-quant: bad layer selector {:?}", part);
                 std::process::exit(1);
             }
         }
@@ -921,7 +989,7 @@ pub fn parse_recipe(spec: &str) -> Option<Vec<(Group, Fmt)>> {
     let spec = spec.trim().to_string();
     if spec.is_empty() || spec == "off" || spec == "none" { return None; }
     let all = [Group::Mlp, Group::Attn, Group::Gdn, Group::LmHead, Group::Embed, Group::Mtp,
-               Group::Router, Group::Expert];
+               Group::Router, Group::Expert, Group::Hc, Group::Ple, Group::PleTable];
     let mut map: Vec<(Group, Fmt)> = Vec::new();
     for tok in spec.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         if tok.strip_prefix('-').unwrap_or(tok).starts_with("layers:") { continue; } // per-layer overrides
@@ -930,7 +998,7 @@ pub fn parse_recipe(spec: &str) -> Option<Vec<(Group, Fmt)>> {
             Some((n, "fp8")) => (n, Fmt::Fp8),
             Some((n, "nvfp4")) => (n, Fmt::Nvfp4),
             Some((n, "bf16")) => (n, Fmt::Bf16),
-            Some((_, f)) => { eprintln!("RUST_INFER_FAKE_QUANT: unknown format {:?}", f); std::process::exit(1); }
+            Some((_, f)) => { eprintln!("--fake-quant: unknown format {:?}", f); std::process::exit(1); }
             None => (tok, Fmt::Nvfp4),
         };
         let groups: Vec<Group> = match name {
@@ -943,7 +1011,10 @@ pub fn parse_recipe(spec: &str) -> Option<Vec<(Group, Fmt)>> {
             "mtp" => vec![Group::Mtp],
             "router" => vec![Group::Router],
             "expert" => vec![Group::Expert],
-            other => { eprintln!("RUST_INFER_FAKE_QUANT: unknown group {:?}", other); std::process::exit(1); }
+            "hc" => vec![Group::Hc],
+            "ple" => vec![Group::Ple],
+            "pletable" => vec![Group::PleTable],
+            other => { eprintln!("--fake-quant: unknown group {:?}", other); std::process::exit(1); }
         };
         for g in groups {
             map.retain(|&(x, _)| x != g);
@@ -1082,7 +1153,7 @@ fn repack_fp8_tile(qw: &[u8], k: usize, mt: usize, kb: usize, wt_tile: &mut [u8]
 /// matching the kernel's `Sb[(mt>>3)*nkb + kb]`). Per 128-row × 128-K block: amax (floored
 /// at 1e-4) → s = 2^ceil(log2(amax/448)) (UE8M0, always up — the §C.1 convention) →
 /// codes = e4m3(x/s). One-time load-path quantizer (the DSpark fp8 draft heads behind
-/// GB10_DSPARK_FP8_LOGITS) — NOT the serving GEMM's weights (those ship quantized).
+/// --dspark-fp8-logits) — NOT the serving GEMM's weights (those ship quantized).
 /// Returns (repacked codes, sb bytes).
 pub fn quantize_fp8_bsb(w: &[bf16], m: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     assert_eq!(w.len(), m * k, "shape mismatch");
@@ -1326,7 +1397,7 @@ pub fn draft_vocab_rows(top: usize, vocab: usize) -> Vec<u32> {
     rows
 }
 
-/// FR-Spec subset from an explicit id file (RUST_INFER_DRAFT_VOCAB_FILE) — the corpus-ranked
+/// FR-Spec subset from an explicit id file (--draft-vocab-file) — the corpus-ranked
 /// variant of `draft_vocab_rows` (the offline artifact step produces this from real frequencies).
 /// Format: whitespace/newline-separated decimal token ids. The special-token tail is appended
 /// (same rule as `draft_vocab_rows`, so a corpus list that omits specials stays chat-safe), then

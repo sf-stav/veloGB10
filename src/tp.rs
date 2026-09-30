@@ -33,7 +33,13 @@ fn df2_block_default() -> usize { crate::dflash2::BLOCK }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TpConfig {
-    pub config_version: u32,          // = 17 (v17: + pf_sched_inline, the P11 --prefill-sched escape;
+    pub config_version: u32,          // = 24 (v24: + exl3_pack_files, PACK-FIX's per-file pack manifest;
+                                      //      v23: exl3_env -> opts, the CLI-1 option registry;
+                                      //      v22: + exl3_seq_parallel, TP-SP1's --tp-seq-parallel;
+                                      //      v21: + exl3_vp_sampled, TP-H2's --tp-vp-sampled;
+                                      //      v20: exl3_pf_overlap gains the `fold` code bit 30, TP-I3 (c1);
+                                      //      v19: + exl3_pf_overlap, TP-I2's --tp-prefill-overlap; v18: the EXL3 TP fields;
+                                      //      v17: + pf_sched_inline, the P11 --prefill-sched escape;
                                       //      v16: + df2_carry, the DFlash2 prefix-cache carry;
                                       //      v15: + df2_block, the DFlash2 runtime draft block;
                                       //      v14: + df2_step_dump, the Phase-0 coverage-trace SPMD flag;
@@ -48,29 +54,29 @@ pub struct TpConfig {
                                       //     int8-K / q4-V cache mode; reduce_fuse rode v6,
                                       //     gpu_recv rode v5)
     pub world: u32,                   // TP rank count — the --tp CLI flag is the only authority (bare = 2)
-    pub shard_mixers: bool,           // GB10_TP_SHARD_MIXERS
-    /// head's --tp-shard-mtp (GB10_TP_SHARD_MTP env alias, harness/diagnostics). Shards the MTP
+    pub shard_mixers: bool,           // [tp-shard-mixers]
+    /// head's --tp-shard-mtp (--tp-shard-mtp env alias, harness/diagnostics). Shards the MTP
     /// draft block (fc m-slice + attn heads + FFN/experts) at attach — the draft path then carries
     /// reduce sites. SPMD-critical: a one-sided shard is a weight-layout + barrier-sequence
     /// mismatch, so it rides the config to every node. DEFAULT ON (user decision 2026-08-15:
-    /// +8.8% under MTP load at TP=4, LOSSLESS-gated); GB10_TP_SHARD_MTP=0 opts out.
+    /// +8.8% under MTP load at TP=4, LOSSLESS-gated); --tp-shard-mtp=0 opts out.
     pub shard_mtp: bool,
-    pub graph: bool,                  // GB10_TP_GRAPH
-    pub fp32_partials: bool,          // GB10_TP_FP32_PARTIALS
-    pub trace: bool,                  // GB10_TP_TRACE
-    pub mtp: bool,                    // GB10_TP_MTP
-    pub mtp_depth: Option<usize>,     // GB10_TP_MTP_DEPTH
-    pub batch_probe: Option<usize>,   // GB10_TP_BATCH_PROBE
-    pub step_probe: Option<usize>,    // GB10_TP_STEP_PROBE
-    /// head's GB10_TP_DECODE_CTX (one-shot DecodeCtx probe branch). Presence-based with the
+    pub graph: bool,                  // --tp-graph
+    pub fp32_partials: bool,          // --tp-fp32-partials
+    pub trace: bool,                  // --tp-trace
+    pub mtp: bool,                    // [tp-mtp]
+    pub mtp_depth: Option<usize>,     // [tp-mtp-depth]
+    pub batch_probe: Option<usize>,   // --tp-batch-probe
+    pub step_probe: Option<usize>,    // --tp-step-probe
+    /// head's --tp-decode-ctx (one-shot DecodeCtx probe branch). Presence-based with the
     /// dispatch's own parse-or-2048 default: the shipped value must equal what the head itself
     /// resolved, garbage values included, or head and node take different TpBranch programs —
     /// the 2026-08-15 "rank 1 selector 0x00, head 0x60" split-brain.
-    pub decode_ctx: Option<usize>,    // GB10_TP_DECODE_CTX
-    pub prefill_payload: Option<usize>, // GB10_TP_PREFILL_PAYLOAD (all-reduce chunk cap, bytes)
-    pub accept: Option<usize>,        // GB10_TP_ACCEPT (bench_accept depth; node runs it too — SPMD)
-    pub capture: Option<String>,      // GB10_TP_CAPTURE (debug dump path; node runs it too — SPMD)
-    // ---- v2: serving mode (TP item A). `from_env` fills these with defaults (bench mode is
+    pub decode_ctx: Option<usize>,    // --tp-decode-ctx
+    pub prefill_payload: Option<usize>, // --tp-prefill-payload (all-reduce chunk cap, bytes)
+    pub accept: Option<usize>,        // --tp-accept (bench_accept depth; node runs it too — SPMD)
+    pub capture: Option<String>,      // --tp-capture (debug dump path; node runs it too — SPMD)
+    // ---- v2: serving mode (TP item A). `from_opts` fills these with defaults (bench mode is
     // unaffected); the head's `--server --tp` branch fills them from the server args. The node
     // needs them to build a BatchScheduler identical to the head's with ZERO env of its own.
     pub mode_serve: bool,             // false = one-shot bench session; true = resident OpenAI server
@@ -90,25 +96,25 @@ pub struct TpConfig {
     pub pf_sched_inline: bool,        // head's --prefill-sched inline
     pub mtp_force: Option<bool>,      // head's --mtp=on|off (None = auto)
     pub mtp_depth_pin: Option<usize>, // head's --mtp-depth
-    pub fp8_prefill: bool,          // head's GB10_FP8_PREFILL (native e4m3 prefill GEMM
+    pub fp8_prefill: bool,          // head's --fp8-prefill (native e4m3 prefill GEMM
                                     // lane; node installs the env so both ranks dispatch
                                     // identically — a head-only lane would split-brain TP2)
-    pub no_decode_graphs: bool,       // head's GB10_NO_DECODE_GRAPHS (env-read; node installs as env)
-    pub cpu_sample: bool,             // head's RUST_INFER_CPU_SAMPLE (env-read; node installs as env)
-    pub no_verify_graph: bool,        // head's GB10_NO_VERIFY_GRAPH (env-read; node installs as env)
-    pub kv_quant: bool,               // head's GB10_KV_QUANT (4-bit KV cache; node installs as env)
-    pub kv_tq: bool,                  // head's GB10_KV_TQ=1 (3.5-bit TurboQuant KV, E4; node installs as env)
-    pub kv_tq_b3: bool,               // head's GB10_KV_TQ=3 (TurboQuant b=3 K variant; node installs as env)
-    /// head's GB10_KV_K8V4=1 (int8-K + q4-V k8v4 cache; node installs as env). Mutually exclusive
+    pub no_decode_graphs: bool,       // head's --no-decode-graphs (env-read; node installs as env)
+    pub cpu_sample: bool,             // head's --cpu-sample (env-read; node installs as env)
+    pub no_verify_graph: bool,        // head's --no-verify-graph (env-read; node installs as env)
+    pub kv_quant: bool,               // head's [kv-quant] (4-bit KV cache; node installs as env)
+    pub kv_tq: bool,                  // head's [kv-tq]=1 (3.5-bit TurboQuant KV, E4; node installs as env)
+    pub kv_tq_b3: bool,               // head's [kv-tq]=3 (TurboQuant b=3 K variant; node installs as env)
+    /// head's [kv-k8v4]=1 (int8-K + q4-V k8v4 cache; node installs as env). Mutually exclusive
     /// with kv_quant/kv_tq — the cache layout must match on both ranks (SPMD).
-    pub kv_k8v4: bool,                // head's GB10_KV_K8V4 (k8v4 KV cache; node installs as env)
+    pub kv_k8v4: bool,                // head's [kv-k8v4] (k8v4 KV cache; node installs as env)
     /// int8 K+V per-16-block cache (20 B/16 both channels) — the direct-read substrate for the
-    /// p8b verify kernel. VALUE-based like kv_k8v4: only GB10_KV_K8V8=1 enables it.
-    pub kv_k8v8: bool,                // head's GB10_KV_K8V8 (k8v8 KV cache; node installs as env)
-    pub fuse_residual: Option<bool>,  // head's GB10_FUSE_RESIDUAL (None = default ON; node installs as env)
+    /// p8b verify kernel. VALUE-based like kv_k8v4: only [kv-k8v8]=1 enables it.
+    pub kv_k8v8: bool,                // head's [kv-k8v8] (k8v8 KV cache; node installs as env)
+    pub fuse_residual: Option<bool>,  // head's --fuse-residual (None = default ON; node installs as env)
     pub device_loop: bool,            // head's --device-loop (device-resident token loop; node installs as env)
-    pub gpu_recv: Option<bool>,       // v2 GPU-direct all-reduce receive (GB10_TP_GPU_RECV; node installs as env)
-    /// AR landing 2: fused reduce+residual+norm epilogue (GB10_TP_REDUCE_FUSE; node installs as
+    pub gpu_recv: Option<bool>,       // v2 GPU-direct all-reduce receive (--tp-gpu-recv; node installs as env)
+    /// AR landing 2: fused reduce+residual+norm epilogue (--tp-reduce-fuse; node installs as
     /// env). SPMD-relevant: the fused kernel replaces the K2 + norm two-launch chain at the
     /// mixer/FFN epilogue sites, so both ranks must fuse the same launches or the barrier chains
     /// diverge.
@@ -138,7 +144,7 @@ pub struct TpConfig {
     /// builds the SAME OMMA repacks and dispatch as the head (SPMD-relevant: rank-local weights
     /// are sharded copies, and a chain divergence would desync the verify all-reduces).
     pub mxfp4: bool,
-    /// head's GB10_MXFP4_MTP_NATIVE escape hatch (the MTP head allowlist — acceptance-gated).
+    /// head's --mxfp4-mtp-native escape hatch (the MTP head allowlist — acceptance-gated).
     /// SPMD-relevant: both ranks must make the same allowlist decision or the MTP draft chain
     /// diverges across ranks. Ships with the config; the node installs it as env before load.
     pub mxfp4_mtp_native: bool,
@@ -156,45 +162,45 @@ pub struct TpConfig {
     pub dspark_fp8_head: bool,
     /// E5: trunk YaRN rope factor (1.0 = legacy; see GpuModel::build_rope_tables).
     pub rope_yarn_factor: f32,
-    /// E29-B3 DFlash drafter: GB10_TP_DFLASH=1 routes the one-shot Generate through the
+    /// E29-B3 DFlash drafter: --tp-dflash=1 routes the one-shot Generate through the
     /// draft-8-verify-accept loop. SPMD-relevant: the drafter runs on rank 0 ONLY (the node
     /// never loads it); the 7 draft tokens are shipped to the node over the link before the
     /// verify, and BOTH ranks verify + accept identically. Ships so the zero-config node takes
     /// the same Generate branch (a one-sided env would silently desync the verify all-reduces).
     pub dflash: bool,
     /// head's `--df2-capture` (S4F DFlash2 trunk tap capture; node installs as env
-    /// GB10_DF2_CAPTURE). DEFAULT OFF — with it off the capture is a strict no-op (zero
+    /// [df2-capture]). DEFAULT OFF — with it off the capture is a strict no-op (zero
     /// launches, zero host work; the R1 timing-free proof). Ships on the config so a future
     /// TP deployment captures on BOTH ranks or neither (a one-sided capture is dead weight
     /// but config-shipped beats env drift).
     pub df2_capture: bool,
-    /// E12 fold escape: head's GB10_MOE_NO_FOLD (fold the shared expert into the grouped MoE
+    /// E12 fold escape: head's --moe-no-fold (fold the shared expert into the grouped MoE
     /// launches as ONE extra slot; =1 restores the separate-launch shared MLP). SPMD-relevant:
     /// the fold changes the launch sequence on both ranks; a one-sided escape would desync the
     /// all-reduce epochs. Node installs it as env before load (the loader reads the env).
     pub moe_fold: bool,
-    /// E8 shard escape: head's GB10_E8_NO_SHARD (=1 keeps the shared expert replicated instead of
+    /// E8 shard escape: head's --e8-no-shard (=1 keeps the shared expert replicated instead of
     /// the paired ColSegs gate+up + row-parallel down). SPMD-relevant: the shard changes the
     /// WEIGHT LAYOUT at load — a one-sided escape is a weight-layout mismatch, not just a
     /// numerics change. Node installs it as env before load.
     pub e8_shard: bool,
-    /// E9 PDL escape: head's GB10_E9_NO_FOLD (presence-based — any value disables the
+    /// E9 PDL escape: head's --e9-no-fold (presence-based — any value disables the
     /// programmatic dependent-launch overlap; =1 restores the plain barrier path). SPMD-relevant:
     /// both ranks must make the same launch-attribute decision or the barrier chain diverges.
     /// Node installs it as env before load.
     pub e9_fold: bool,
     /// P3-1 one-shot all-peers push (world==4 only, DEFAULT OFF). SPMD-critical: it selects the
     /// ring LAYOUT at transport init (sender-indexed recv rings) — the node installs the env from
-    /// this field before link bring-up. Head env: GB10_TP_ONESHOT=1 (any value but "0").
+    /// this field before link bring-up. Head env: --tp-oneshot=1 (any value but "0").
     pub oneshot: bool,
     /// P4: full rank→RoCE-IP topology, indexed by rank (`topology[rank]` = that rank's RoCE IP;
     /// `topology[self_rank]` is this process's own and unused by the N-way transport). Populated
-    /// by the head after discovery and shipped to every node via `Msg::Config`; `from_env` leaves
+    /// by the head after discovery and shipped to every node via `Msg::Config`; `from_opts` leaves
     /// it empty (empty = no discovered topology — only valid for world==2 or non-cluster paths).
     pub topology: Vec<String>,
     /// P4: this node's rank, shipped by the head (the head sets it per-node). The node is
     /// zero-config: it reads its rank + world + topology from the shipped config rather than
-    /// deriving anything locally. Head processes ignore it (rank 0); `from_env` defaults to 1 for
+    /// deriving anything locally. Head processes ignore it (rank 0); `from_opts` defaults to 1 for
     /// the world==2 single-node bench fallback.
     pub node_rank: i32,
     /// S9F (the TP-DF2 leg): the head's resolved `--spec-source` CLI name ("" = pre-v12 configs).
@@ -250,50 +256,99 @@ pub struct TpConfig {
     /// to every node at sync (no env side channel).
     #[serde(default)]
     pub df2_prose_lane_greedy: bool,
-    /// Phase-7 F9 gate: GB10_TP_BINV_TP / the head's --probe-binv-tp — run the TP
+    /// Phase-7 F9 gate: --tp-binv-tp / the head's --probe-binv-tp — run the TP
     /// batch-invariance probe (verify-width sweep N=1..MAX_VERIFY through the real
     /// sharded verify path) instead of generation. SPMD-critical: a one-sided flag would
     /// run the probe on one rank and generation on the other, i.e. mismatched all-reduce
     /// epochs; it rides TpConfig plus the branch selector like every other probe.
     #[serde(default)]
     pub binv_tp: bool,
-    /// Phase-7: GB10_TP_STATE_TP — run the GDN decode-vs-verify state probe on the sharded
+    /// Phase-7: --tp-state-tp — run the GDN decode-vs-verify state probe on the sharded
     /// path (the `--probe-state` gate is world=1 only). SPMD: both ranks run the identical
     /// forwards and compare their own state slices.
     #[serde(default)]
     pub state_tp: bool,
+    // ---- v18 (TP-A, EXL3 TP bring-up — PLAN/TP2_DESIGN_EXL3_2026-09-28.md §5). All
+    // #[serde(default)] so an older peer's config stays parseable (and reads as "not EXL3").
+    /// The session runs the EXL3 engine (FwdModel) — the node routes to the EXL3 TP path.
+    #[serde(default)]
+    pub exl3: bool,
+    /// The head's EXL3 pack dir. Zero-config: the node loads ITS OWN local copy at the same path
+    /// (D-T0-6: every compute box holds the pack; shipping ~80 GB per boot is pointless) and must
+    /// prove it identical to the head's via `exl3_manifest` before it loads a byte.
+    #[serde(default)]
+    pub exl3_pack_dir: String,
+    /// sha256 over the pack's (relative path, sha256, size) list (cluster::pack_manifest) — PACK-FIX:
+    /// over the files the engine READS only (index-referenced safetensors + sidecars + the loader /
+    /// tokenizer / serve small files), never README/LICENSE/other files.
+    #[serde(default)]
+    pub exl3_manifest: String,
+    /// v24 (PACK-FIX): the head's per-file manifest list behind `exl3_manifest` — a refusing node
+    /// names each differing file (head hash vs node hash) in the failure it reports to the head.
+    #[serde(default)]
+    pub exl3_pack_files: Vec<(String, String, u64)>,
+    /// The static expert deal ("interleave" | "contig") — fixes each rank's expert GROUPING, so
+    /// it is numerics-affecting (SPMD).
+    #[serde(default)]
+    pub exl3_ep_deal: String,
+    /// v23 (CLI-1): the head's resolved option registry — every set, non-node-local option as
+    /// (flag, value) (`opts::snapshot`, filled at ship time in cluster::head_sync_one). The node
+    /// installs exactly this set (`opts::install_head`, every mode, before anything reads an option)
+    /// and clears any non-local option of its own the head did not set — "one knob, set on the head,
+    /// rides TpConfig" (AGENTS §7). Replaces v18..v22's env snapshot `exl3_env`.
+    #[serde(default)]
+    pub opts: Vec<(String, String)>,
+    /// The EXL3 TP program: "xtp" (the rung-3 cross-TP probe). Unknown = refuse.
+    #[serde(default)]
+    pub exl3_mode: String,
+    // ---- v19 (TP-I2): CLI-flag knobs of the EXL3 TP engine (owner rule 2026-09-29: new options are
+    // CLI flags riding TpConfig, never env vars).
+    /// The head's resolved `--tp-prefill-overlap` code (rows per hook | dual << 31 | fold << 30 (v20); 0 = off). The node
+    /// installs exactly this value (xtp::set_pf_overlap); None (a pre-v19 head) = off.
+    #[serde(default)]
+    pub exl3_pf_overlap: Option<u32>,
+    /// v21 (TP-H2): the head's resolved `--tp-vp-sampled` code (1 = the vocab-parallel lm_head for sampled /
+    /// penalized / ratio-rule rows, 0 = the replicated head for them). The node installs exactly this
+    /// value (xtp::set_vp_sampled); None (a pre-v21 head) = off.
+    #[serde(default)]
+    pub exl3_vp_sampled: Option<u32>,
+    /// v22 (TP-SP1): the head's resolved `--tp-seq-parallel` code (1 = sequence-parallel prefill, 0 = the
+    /// replicated prefill). The node installs exactly this value (xtp::set_seq_parallel); None (a pre-v22
+    /// head) = off.
+    #[serde(default)]
+    pub exl3_seq_parallel: Option<u32>,
 }
 
 impl TpConfig {
     /// Snapshot the GB10_TP_* env vars (flags = presence; probes/depth = parse). Serving fields get
     /// their v1-compatible defaults — a bench config is indistinguishable from before.
-    pub fn from_env() -> Self {
-        eprintln!("[from_env] GB10_KV_K8V8={:?}", std::env::var("GB10_KV_K8V8").ok());
+    pub fn from_opts() -> Self {
+        eprintln!("[from_opts] [kv-k8v8]={:?}", crate::opts::var(crate::opt!("kv-k8v8")).ok());
         TpConfig {
-            config_version: 17,
+            config_version: 24,
             // TP rank count. The --tp CLI flag is the single authority for a TP run (bare --tp = 2,
-            // --tp N = N); `from_env` only snapshots the bench `--head` path, which is always TP=2.
+            // --tp N = N); `from_opts` only snapshots the bench `--head` path, which is always TP=2.
             // GB10_TP_WORLD is deliberately NOT read here — one source of truth, zero ambiguity.
             world: 2,
-            shard_mixers: std::env::var("GB10_TP_SHARD_MIXERS").is_ok(),
+            shard_mixers: crate::opts::var(crate::opt!("tp-shard-mixers")).is_ok(),
             // Value-based, DEFAULT ON (user decision 2026-08-15: +8.8% measured under MTP load at
             // TP=4, LOSSLESS-gated; CLI flag --tp-shard-mtp still forces it). =0 is the opt-out.
-            shard_mtp: std::env::var("GB10_TP_SHARD_MTP").ok().map_or(true, |v| v != "0"),
-            graph: std::env::var("GB10_TP_GRAPH").is_ok(),
-            fp32_partials: std::env::var("GB10_TP_FP32_PARTIALS").is_ok(),
-            trace: std::env::var("GB10_TP_TRACE").is_ok(),
-            mtp: std::env::var("GB10_TP_MTP").is_ok(),
-            mtp_depth: std::env::var("GB10_TP_MTP_DEPTH").ok().and_then(|v| v.parse().ok()),
-            batch_probe: std::env::var("GB10_TP_BATCH_PROBE").ok().and_then(|v| v.parse().ok()),
-            step_probe: std::env::var("GB10_TP_STEP_PROBE").ok().and_then(|v| v.parse().ok()),
+            shard_mtp: crate::opts::var(crate::opt!("tp-shard-mtp")).ok().map_or(true, |v| v != "0"),
+            graph: crate::opts::var(crate::opt!("tp-graph")).is_ok(),
+            fp32_partials: crate::opts::var(crate::opt!("tp-fp32-partials")).is_ok(),
+            trace: crate::opts::var(crate::opt!("tp-trace")).is_ok(),
+            mtp: crate::opts::var(crate::opt!("tp-mtp")).is_ok(),
+            mtp_depth: crate::opts::var(crate::opt!("tp-mtp-depth")).ok().and_then(|v| v.parse().ok()),
+            batch_probe: crate::opts::var(crate::opt!("tp-batch-probe")).ok().and_then(|v| v.parse().ok()),
+            step_probe: crate::opts::var(crate::opt!("tp-step-probe")).ok().and_then(|v| v.parse().ok()),
             // Same resolution as the dispatch (parse-or-2048): what ships is what the head ran.
-            decode_ctx: std::env::var("GB10_TP_DECODE_CTX").ok().map(|v| v.parse().unwrap_or(2048)),
-            prefill_payload: std::env::var("GB10_TP_PREFILL_PAYLOAD").ok().and_then(|v| v.parse().ok()),
+            decode_ctx: crate::opts::var(crate::opt!("tp-decode-ctx")).ok().map(|v| v.parse().unwrap_or(2048)),
+            prefill_payload: crate::opts::var(crate::opt!("tp-prefill-payload")).ok().and_then(|v| v.parse().ok()),
             // Presence-based like the branch ladder itself: set (even unparsable) means the branch,
             // defaulting depth to 2 — a garbage value must ship the SAME resolution the head makes,
             // or head and node would take different branches.
-            accept: std::env::var("GB10_TP_ACCEPT").ok().map(|v| v.parse().unwrap_or(2)),
-            capture: std::env::var("GB10_TP_CAPTURE").ok(),
+            accept: crate::opts::var(crate::opt!("tp-accept")).ok().map(|v| v.parse().unwrap_or(2)),
+            capture: crate::opts::var(crate::opt!("tp-capture")).ok(),
             mode_serve: false,
             max_seq_len: 0,
             max_batch: 0,
@@ -307,49 +362,49 @@ impl TpConfig {
             no_decode_graphs: false,
             fp8_prefill: false,
             cpu_sample: false,
-            no_verify_graph: std::env::var("GB10_NO_VERIFY_GRAPH").is_ok(),
-            kv_quant: std::env::var("GB10_KV_QUANT").is_ok(),
-            // VALUE-based (not presence): only GB10_KV_TQ=1 (b=2 K) or =3 (b=3 K) enables TQ;
+            no_verify_graph: crate::opts::var(crate::opt!("no-verify-graph")).is_ok(),
+            kv_quant: crate::opts::var(crate::opt!("kv-quant")).is_ok(),
+            // VALUE-based (not presence): only [kv-tq]=1 (b=2 K) or =3 (b=3 K) enables TQ;
             // =0 restores the default path byte-for-byte (the E4 escape-hatch acceptance — see
-            // gpu::kv_modes_from_env).
-            kv_tq: matches!(std::env::var("GB10_KV_TQ").ok().as_deref(), Some("1") | Some("3")),
-            kv_tq_b3: std::env::var("GB10_KV_TQ").ok().as_deref() == Some("3"),
-            // VALUE-based like kv_tq: only GB10_KV_K8V4=1 enables the k8v4 mode.
-            kv_k8v4: std::env::var("GB10_KV_K8V4").ok().as_deref() == Some("1"),
-            kv_k8v8: std::env::var("GB10_KV_K8V8").ok().as_deref() == Some("1"),
-            fuse_residual: std::env::var("GB10_FUSE_RESIDUAL").ok().map(|v| v != "0"),
-            device_loop: std::env::var("GB10_DEVICE_LOOP").map_or(false, |v| matches!(v.as_str(), "1" | "on" | "true")),
-            gpu_recv: std::env::var("GB10_TP_GPU_RECV").ok().map(|v| v != "0"),
-            reduce_fuse: std::env::var("GB10_TP_REDUCE_FUSE").ok().map(|v| v != "0"),
+            // gpu::kv_modes_from_opts).
+            kv_tq: matches!(crate::opts::var(crate::opt!("kv-tq")).ok().as_deref(), Some("1") | Some("3")),
+            kv_tq_b3: crate::opts::var(crate::opt!("kv-tq")).ok().as_deref() == Some("3"),
+            // VALUE-based like kv_tq: only [kv-k8v4]=1 enables the k8v4 mode.
+            kv_k8v4: crate::opts::var(crate::opt!("kv-k8v4")).ok().as_deref() == Some("1"),
+            kv_k8v8: crate::opts::var(crate::opt!("kv-k8v8")).ok().as_deref() == Some("1"),
+            fuse_residual: crate::opts::var(crate::opt!("fuse-residual")).ok().map(|v| v != "0"),
+            device_loop: crate::opts::var(crate::opt!("device-loop")).map_or(false, |v| matches!(v.as_str(), "1" | "on" | "true")),
+            gpu_recv: crate::opts::var(crate::opt!("tp-gpu-recv")).ok().map(|v| v != "0"),
+            reduce_fuse: crate::opts::var(crate::opt!("tp-reduce-fuse")).ok().map(|v| v != "0"),
             eos: Vec::new(),
             calib_prompt: Vec::new(),
             dspark: false,
             dspark_depth: None,
-            exact_gemm: std::env::var("GB10_EXACT_GEMM").is_ok(),
-            splitk_gemm: !std::env::var("GB10_GEMM_SPLITK").is_ok_and(|v| v == "0"),  // default ON (E15); 0 = off
-            mxfp4: std::env::var("GB10_MXFP4").is_ok(),
-            mxfp4_mtp_native: std::env::var("GB10_MXFP4_MTP_NATIVE").is_ok(),
+            exact_gemm: crate::opts::var(crate::opt!("exact-gemm")).is_ok(),
+            splitk_gemm: !crate::opts::var(crate::opt!("splitk-gemm")).is_ok_and(|v| v == "0"),  // default ON (E15); 0 = off
+            mxfp4: crate::opts::var(crate::opt!("mxfp4")).is_ok(),
+            mxfp4_mtp_native: crate::opts::var(crate::opt!("mxfp4-mtp-native")).is_ok(),
             server_dspark: false,
-            dspark_fp8_head: std::env::var("GB10_DSPARK_FP8_LOGITS").is_ok(),
+            dspark_fp8_head: crate::opts::var(crate::opt!("dspark-fp8-logits")).is_ok(),
             rope_yarn_factor: 1.0,
-            dflash: std::env::var("GB10_TP_DFLASH").is_ok(),
-            df2_capture: std::env::var("GB10_DF2_CAPTURE").is_ok(),
-            // E12/E8/E9 escapes: VALUE-based like GB10_KV_TQ — only the explicit disable
+            dflash: crate::opts::var(crate::opt!("tp-dflash")).is_ok(),
+            df2_capture: crate::opts::var(crate::opt!("df2-capture")).is_ok(),
+            // E12/E8/E9 escapes: VALUE-based like [kv-tq] — only the explicit disable
             // (MOE_NO_FOLD=1 / E8_NO_SHARD=1) flips the flag; E9 is presence-based (any
-            // GB10_E9_NO_FOLD disables — the backup gpu.rs resolution rule). The fold is
-            // DEFAULT OFF (2026-08-11: fold-on + MTP degenerates hy3); GB10_MOE_FOLD=1 opts in.
-            moe_fold: std::env::var("GB10_MOE_FOLD").map_or(false, |v| v == "1")
-                && std::env::var("GB10_MOE_NO_FOLD").map_or(true, |v| v != "1"),
-            e8_shard: std::env::var("GB10_E8_NO_SHARD").map_or(true, |v| v != "1"),
-            e9_fold: !std::env::var("GB10_E9_NO_FOLD").is_ok(),
+            // --e9-no-fold disables — the backup gpu.rs resolution rule). The fold is
+            // DEFAULT OFF (2026-08-11: fold-on + MTP degenerates hy3); --moe-fold=1 opts in.
+            moe_fold: crate::opts::var(crate::opt!("moe-fold")).map_or(false, |v| v == "1")
+                && crate::opts::var(crate::opt!("moe-no-fold")).map_or(true, |v| v != "1"),
+            e8_shard: crate::opts::var(crate::opt!("e8-no-shard")).map_or(true, |v| v != "1"),
+            e9_fold: !crate::opts::var(crate::opt!("e9-no-fold")).is_ok(),
             // P3-1 one-shot push (world==4): value-based, DEFAULT OFF (transport risk class —
             // gated by the P3-2 barrier bench + cell battery before any default change).
-            oneshot: std::env::var("GB10_TP_ONESHOT").map_or(false, |v| v != "0"),
-            // P4: no discovered topology in a from_env snapshot (the head overwrites these before
+            oneshot: crate::opts::var(crate::opt!("tp-oneshot")).map_or(false, |v| v != "0"),
+            // P4: no discovered topology in a from_opts snapshot (the head overwrites these before
             // shipping; the node reads them from the shipped config). world==2 never needs topology.
             topology: Vec::new(),
             node_rank: 1,
-            // S9F (TP-DF2 leg): the from_env snapshot predates the serving args — the head fills
+            // S9F (TP-DF2 leg): the from_opts snapshot predates the serving args — the head fills
             // these from its own --spec-source / --draft-dir before shipping; empty = "not set"
             // (the node falls back to the Mtp source, the pre-S9F behavior).
             spec_source: String::new(),
@@ -360,8 +415,18 @@ impl TpConfig {
             df2_carry: false,
             df2_step_dump: false,
             df2_prose_lane_greedy: false,
-            binv_tp: std::env::var("GB10_TP_BINV_TP").is_ok(),
-            state_tp: std::env::var("GB10_TP_STATE_TP").is_ok(),
+            binv_tp: crate::opts::var(crate::opt!("tp-binv-tp")).is_ok(),
+            state_tp: crate::opts::var(crate::opt!("tp-state-tp")).is_ok(),
+            exl3: false,
+            exl3_pack_dir: String::new(),
+            exl3_manifest: String::new(),
+            exl3_pack_files: Vec::new(),
+            exl3_ep_deal: String::new(),
+            opts: Vec::new(),
+            exl3_pf_overlap: None,
+            exl3_vp_sampled: None,
+            exl3_seq_parallel: None,
+            exl3_mode: String::new(),
         }
     }
 }
@@ -374,8 +439,8 @@ pub fn set_tp_config(c: TpConfig) {
     // transport reads the env at init). set_tp_config is the single choke point both node paths
     // (bench one-shot + serving) pass through when the head's config arrives — install here so
     // the layout can never mismatch. The head installs its own env before its own bring-up.
-    if c.oneshot && std::env::var("GB10_TP_ONESHOT").is_err() {
-        std::env::set_var("GB10_TP_ONESHOT", "1");
+    if c.oneshot && crate::opts::var(crate::opt!("tp-oneshot")).is_err() {
+        crate::opts::set(crate::opt!("tp-oneshot"), "1");
     }
     eprintln!("[tp] config installed: world={} shard_mixers={} shard_mtp={} graph={} fp32_partials={} trace={} mtp={} \
                mtp_depth={:?} batch_probe={:?} step_probe={:?} mode_serve={} accept={:?} capture={:?} \
@@ -438,7 +503,7 @@ fn resolve_topology(world: i32) -> Result<Vec<IpAddr>> {
 }
 
 fn rdma_dev() -> String {
-    std::env::var("GB10_RDMA_DEV").ok()
+    crate::opts::var(crate::opt!("rdma-dev")).ok()
         .and_then(|s| s.split(',').next().map(|x| x.trim().to_string()))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_RDMA_DEV.to_string())
@@ -681,6 +746,8 @@ pub enum TpBranch {
     BinvTp,
     StateTp,
     Generate,
+    /// TP-A: the EXL3 cross-TP probe program (rung 3).
+    Exl3Xtp,
 }
 
 impl TpBranch {
@@ -697,6 +764,7 @@ impl TpBranch {
             TpBranch::DecodeCtx(c) => 0x60 ^ (*c as u8),
             TpBranch::BinvTp => 0x70,
             TpBranch::StateTp => 0x71,
+            TpBranch::Exl3Xtp => 0x80,
         }
     }
 }

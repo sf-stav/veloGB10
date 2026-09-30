@@ -19,7 +19,7 @@
 //!
 //! Run: `cargo test --test toolcall_compliance`.
 
-use gb10_inference::tokenizer::{ChatMessage, QwenTokenizer};
+use gb10_inference::tokenizer::{ChatMessage, QwenTokenizer, ThinkingMode};
 
 /// The tool-error payloads, byte-for-byte as they appear on the wire (from the live eval traces).
 const ERR_RATE_LIMIT: &str = r#"{"error": "Service temporarily unavailable. Rate limit exceeded.", "error_code": "ERR_TOOL_UNAVAILABLE", "timestamp": "2026-03-20T12:00:00Z", "trace_id": "trace_198b3243", "request_id": "req_err_198b3243"}"#;
@@ -71,7 +71,7 @@ fn tool_error_round_trips_verbatim_into_next_turn() {
         assert_eq!(tool.content.as_deref(), Some(err), "[{label}] content verbatim");
 
         // Render fidelity: the error text lands VERBATIM inside the model's <tool_response> block.
-        let rendered = tok.apply_chat_template(&msgs, None, None).expect("render");
+        let rendered = tok.apply_chat_template(&msgs, None, None, None, ThinkingMode::Auto).expect("render");
         let inner = format!("<tool_response>\n{err}\n</tool_response>");
         assert!(
             rendered.contains(&inner),
@@ -123,7 +123,7 @@ fn parallel_calls_render_each_result_verbatim_in_order() {
         {"role":"tool","tool_call_id":"call_10","name":"web_search","content":"{\"results\":[{\"snippet\":\"S&P 500 closed up 0.8%\"}]}"}
     ]);
     let msgs: Vec<ChatMessage> = serde_json::from_value(json).expect("parse parallel conversation");
-    let rendered = tok.apply_chat_template(&msgs, None, None).expect("render");
+    let rendered = tok.apply_chat_template(&msgs, None, None, None, ThinkingMode::Auto).expect("render");
     assert!(
         rendered.contains("{\"ticker\":\"AAPL\",\"price\":178.5,\"change_percent\":-1.27}"),
         "first tool result verbatim:\n{rendered}"

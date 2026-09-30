@@ -62,6 +62,9 @@ pub struct BatchRequest {
     pub rep_penalty: f32,
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
+    /// WP08: min-p truncation (0 = off). Honoured by the EXL3 serve path (xq_sample_rows); the
+    /// NVFP4 constructors pass 0.0 (that sampler has no min-p).
+    pub min_p: f32,
     pub min_new: usize,
     pub ignore_eos: bool,
     pub tx: mpsc::UnboundedSender<TokEvent>,
@@ -295,6 +298,13 @@ pub struct MtpPolicy {
 
 use crate::gpu::MAX_AUTO_DEPTH;
 
+/// KV positions kept beyond the requested output: MTP draft/verify plus re-prime slop,
+/// or one guard row for plain decode. (PR #4 — the admission contract, shared with the
+/// server's context budget; see `admit` for dev's clamp-before-reject refinement.)
+pub fn decode_headroom(mtp_active: bool) -> usize {
+    if mtp_active { MAX_AUTO_DEPTH + 8 } else { 1 }
+}
+
 /// B8/G3 — the runtime speculation-source switch (PLAN/08 scheduler delta). `Mtp` is always
 /// available; `Dspark` is the block drafter (falls back to MTP while K-DSP is unbuilt); `DFlash2`
 /// is the S4F integrated round (S5F wiring; falls back to MTP when the artifact is absent/failed
@@ -439,6 +449,22 @@ pub struct SpecStepRec {
     pub round_ms: f32,
     pub verify_ms: f32,
     pub step_ms: f32,
+}
+
+/// B31 diagnostics: opt-in dispatch trace. Diagnostics-only env knob (AGENTS §7): when
+/// --mtp-dispatch-trace is set, the admit → lane-install → decode-dispatch chain prints its
+/// speculation decision per step. Never set by default; never changes any decision.
+fn mtp_dispatch_trace() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static V: AtomicU8 = AtomicU8::new(0);
+    match V.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let v = if crate::opts::var(crate::opt!("mtp-dispatch-trace")).is_ok() { 2 } else { 1 };
+    V.store(v, Ordering::Relaxed);
+    v == 2
 }
 
 /// Context buckets for the per-domain ship rule (PLAN/08 §validation: 4k/16k/32k/64k/128k).
@@ -630,7 +656,13 @@ impl MtpPolicy {
     fn tick(&mut self, ctx: usize) {
         self.decode_steps += 1;
         self.last_ctx = ctx;
-        if self.force.is_some() || !self.head_present { return; }
+        if self.force.is_some() || !self.head_present {
+            if mtp_dispatch_trace() && self.decode_steps <= 3 {
+                eprintln!("[b31-trace] tick: no-eval (force={:?} head={} depth={} ctx={})",
+                          self.force, self.head_present, self.depth, ctx);
+            }
+            return;
+        }
 
         if !self.active {
             if self.decode_steps >= self.retry_at {
@@ -791,7 +823,7 @@ fn df2_carry_ok(enabled: bool, is_df2_src: bool, reuse: usize, plen: usize,
         && reuse > 0
         && ring_slot == Some(phys)
         && ring_len >= reuse
-        // `len_only` is a DIAGNOSTICS-ONLY instrument (GB10_DF2_CARRY_LEN_ONLY=1): it drops the
+        // `len_only` is a DIAGNOSTICS-ONLY instrument (--df2-carry-len-only=1): it drops the
         // frontier term, reproducing DSpark's length-only shape so SPEC §7 gate 7 can force a
         // known-bad carry and confirm the measurement catches it. Never a serving option.
         && (len_only || ring_len <= plen)
@@ -899,6 +931,23 @@ fn tree_accept_walk(parent: &[i32], tokens: &[u32], preds: &[u32]) -> (Vec<usize
     (path, emitted)
 }
 
+/// S-B16: the lossless auditor's per-lane cursor. The shadow decodes the GROUND-TRUTH stream
+/// (`gt_last` @ `gt_pos`, advancing on its own prediction — never on the MTP stream); `pred` is
+/// its prediction for position gt_pos+1, i.e. exactly what the lane's next emitted token must
+/// equal for the step to be lossless. `idx` counts the request's MTP-emitted tokens; `tag` is
+/// the per-request id in the log line.
+#[derive(Clone, Copy)]
+struct MtpAuditCursor {
+    gt_last: u32,
+    gt_pos: usize,
+    pred: u32,
+    idx: usize,
+    tag: u64,
+    diverged: bool,
+    /// False until the first audited step ran the zero+prime shadow decode.
+    primed: bool,
+}
+
 pub struct BatchScheduler {
     gpu: GpuModel,
     pool: Pool,
@@ -998,7 +1047,7 @@ pub struct BatchScheduler {
     prefix_cache: bool,
     /// GPU-side sampling (temp/top-k/top-p/multinomial in `sample_b`) rather than a full-logit dtoh
     /// plus a CPU sampler. Now the default — every run script already set it, and pulling a
-    /// 248k-entry logit vector to the host per token is strictly worse. `RUST_INFER_CPU_SAMPLE=1`
+    /// 248k-entry logit vector to the host per token is strictly worse. `--cpu-sample=1`
     /// keeps the old path available as an escape hatch.
     gpu_sample: bool,
     /// Captured decode+sample graphs (per batch size) for the GPU-sampling path, when enabled.
@@ -1024,6 +1073,19 @@ pub struct BatchScheduler {
     /// Reserved physical slot (never assigned to a lane) used as the GDN-rollback snapshot target.
     /// `copy_gdn_slot(state, phys, snapshot_slot)` snapshots; the reverse restores on partial reject.
     mtp_snapshot_slot: usize,
+    /// S-B16: env-gated (`--mtp-lossless-audit=1`) in-server lossless auditor — the bench's
+    /// lockstep shadow decode moved into the serving path. One extra plain decode forward per
+    /// emitted token; DIAGNOSTIC ONLY (halves serving throughput while on, one bool when off).
+    /// Refused under TP>1: the shadow decode joins the SPMD collectives, and an env var does not
+    /// ride TpConfig to the nodes — an unaudited node would desync the lockstep.
+    audit_on: bool,
+    /// The auditor's state slot: one extra slot appended after the normal band (valid iff audit_on).
+    audit_slot: usize,
+    /// Shadow decode buffers (batch 2, slot_ids preloaded with [audit_slot, 0]).
+    audit_bufs: Option<DecodeBuffers>,
+    /// Per-lane (batch index) audit cursor, armed at pf_finish with the request's install state.
+    audit_cur: Vec<Option<MtpAuditCursor>>,
+    audit_req_n: u64,
     /// Persistent penalty buffers for the MTP verify path (depth positions). Filled per-step from
     /// the lane's committed history so greedy MTP lanes keep their repetition/presence/frequency
     /// penalty (no repetition). Stored on the compute stream's device.
@@ -1116,6 +1178,9 @@ pub struct BatchScheduler {
     mtp_stat_accepted: u64,  // total drafts accepted (matched verify argmax)
     mtp_stat_emitted: u64,   // total tokens emitted via the MTP path (accepted drafts + bonuses)
     mtp_stat_verify_fwds: u64, // total main-model verify+reverify forwards (cost)
+    // B31: last mtp_stat_steps value handed to tel::publish_mtp — lets decode_step republish the
+    // live counters every step without re-publishing on plain-only steps.
+    mtp_stat_published: u64,
     // ---- S5F: DFlash2 lane telemetry (the MTP policy's curve stays MTP-only) ----
     df2_stat_steps: u64,
     df2_stat_drafts: u64,
@@ -1138,12 +1203,12 @@ pub struct BatchScheduler {
     /// When `spec_steps_on`, every speculation step (MTP or DFlash2 lane) pushes a record.
     spec_steps: Vec<SpecStepRec>,
     spec_steps_on: bool,
-    /// Env-gated (`MTP_DRAFT_LOG=path`) JSONL log of every chain-MTP step:
+    /// Option-gated (`--mtp-draft-log <path>`) JSONL log of every chain-MTP step:
     /// `{step, lane, pos, committed, drafts, preds, nacc}` (preds = verify argmax per column; empty
     /// on the stochastic path where the verify samples instead). This is the engine-side reference
     /// the head-finetune runbook's B0 parity gate diffs the HF MTP module against. Log-only.
     mtp_draft_log: Option<std::fs::File>,
-    /// Env-gated (`MTP_CURVE_FILE=path`) JSON dump of the cumulative accept-by-depth curve
+    /// Option-gated (`--mtp-curve-file <path>`) JSON dump of the cumulative accept-by-depth curve
     /// (`MtpPolicy::hazard_counts`), overwritten every 50 MTP steps — the runbook §0 baseline.
     mtp_curve_path: Option<String>,
     /// TP=2 serving (item A): set by `run_tp_head` / `run_tp_mirror`. Gates the cancel sweep in
@@ -1253,14 +1318,48 @@ impl BatchScheduler {
         // 2047-token re-prefill (~3.2 s at the mid-M lane) to <=511 tokens. b=1 deployments.)
         let n_state_slots = max_batch + n_ckpt
             + if prefix_cache { max_batch * (1 + RING_CKPT_K) } else { 0 };
+        // ---- S-B16: the env-gated in-server lossless auditor (--mtp-lossless-audit=1) ----
+        // A lockstep shadow decode of the greedy MTP lane's committed stream (bench_mtp_steps'
+        // slot-1 ground truth, moved into the serving path) that pins the FIRST divergence to an
+        // exact (request, emitted-index, position). DIAGNOSTIC ONLY: one extra plain decode
+        // forward per emitted token roughly halves serving throughput while on; off, it is one
+        // bool. TP>1 refuses the audit — see the field doc above.
+        let audit_on = crate::opts::var(crate::opt!("mtp-lossless-audit")).is_ok();
+        let audit_on = if audit_on && gpu.tp_world() > 1 {
+            eprintln!("[lossless-audit] REFUSED under TP={} — the shadow decode is single-node SPMD; run the audit at TP=1",
+                      gpu.tp_world());
+            false
+        } else { audit_on };
+        let audit_slot = n_state_slots; // one extra state slot appended after the normal band
+        let n_state_slots = n_state_slots + if audit_on { 1 } else { 0 };
         if prefix_cache {
             eprintln!("[cache] prefix cache ON — prompt ckpt + ring {RING_CKPT_K}x{RING_CKPT_STRIDE} \
                        GDN checkpoints per slot ({n_state_slots} state slots)");
         }
-        let mut state = gpu.new_batch_state(max_batch, n_state_slots, kv_stride);
+        crate::memwatch::phase(&format!("sched:pre-state slots={n_state_slots} kv_stride={kv_stride} max_batch={max_batch}"));
+        // S-B16: the auditor's shadow slot lives at index audit_slot in the STATE band, and KV
+        // rows are addressed as base + slot*k_bytes — so the KV cache must span that slot INDEX,
+        // not just max_batch. (v2/v3 bug: with kv_slots = max_batch = 1 the shadow's KV writes
+        // landed ~8 slots past the allocation — silent corruption in v2 (the bogus 99% accept),
+        // a wedged first request in v3.) Diagnostic-only: kv_slots = n_state_slots costs a few
+        // GB of extra KV allocation on an audit boot; the serving layout is UNCHANGED when off.
+        let kv_alloc_slots = if audit_on { n_state_slots } else { max_batch };
+        let mut state = gpu.new_batch_state(kv_alloc_slots, n_state_slots, kv_stride);
         gpu.dev().synchronize().unwrap(); // ensure state allocs visible to non-blocking stream
         let mut pool = Pool::new(gpu.dev().clone());
         let mut bufs = gpu.new_decode_buffers(max_batch);
+        crate::memwatch::phase("sched:post-state+bufs");
+        // The auditor's shadow decode buffers: batch 2 like the bench's slot-1 ground truth, with
+        // slot_ids preloaded so every shadow step reads/writes ONLY the audit slot's KV + GDN
+        // state (mirror of bench_mtp_steps' [1, 0] preload on its slot-1 bufs2).
+        let audit_bufs = if audit_on {
+            let mut ab = gpu.new_decode_buffers(2);
+            gpu.dev().htod_sync_copy_into(&[audit_slot as i32, 0i32], &mut ab.slot_ids_dev).unwrap();
+            eprintln!("[lossless-audit] ARMED slot={audit_slot} — one shadow decode per emitted token (throughput halves)");
+            Some(ab)
+        } else {
+            None
+        };
 
         // Capture decode graphs for all batch sizes, IF every kernel in the captured region fits the
         // default 48 KB/block limit.
@@ -1286,9 +1385,15 @@ impl BatchScheduler {
         let gdn_smem = crate::gpu::gdn_launch(c.lin_k_dim, c.lin_v_dim).1 as usize;
         let attn_smem = ((head_dim / 32) * head_dim + 2 * (head_dim / 32)) * 4;
         let smem_bytes = gdn_smem.max(attn_smem).max(1024 * 8);
-        // A/B switch: GB10_NO_DECODE_GRAPHS=1 forces the non-graph path, so the value of capture can be
+        // A/B switch: --no-decode-graphs=1 forces the non-graph path, so the value of capture can be
         // measured on any config without rebuilding (and gives an escape hatch if capture ever misbehaves).
-        let smem_bytes = if std::env::var("GB10_NO_DECODE_GRAPHS").is_ok() { usize::MAX } else { smem_bytes };
+        let smem_bytes = if crate::opts::var(crate::opt!("no-decode-graphs")).is_ok() { usize::MAX } else { smem_bytes };
+        // qwen4_exp with the PLE table on SSD: the forward has a host round-trip (row reads) —
+        // not capturable. Everything else keeps the graph path (PR #4 width/graph contract).
+        let smem_bytes = if gpu.decode_graphs_supported() { smem_bytes } else {
+            println!("Skipping CUDA graphs: PLE table is SSD-resident (host gather inside the forward).");
+            usize::MAX
+        };
         let mut graphs = std::collections::HashMap::new();
         if smem_bytes <= 48 * 1024 {
             print!("Attempting CUDA graph capture for batch sizes 1..={}... ", max_batch);
@@ -1317,7 +1422,7 @@ impl BatchScheduler {
         // When GPU sampling is enabled, also capture a decode+sample graph per batch size so that
         // sampling requests get the same graph speedup greedy does. Falls back to the non-graph
         // sample path if capture is unsupported.
-        let gpu_sample = std::env::var("RUST_INFER_CPU_SAMPLE").is_err();
+        let gpu_sample = crate::opts::var(crate::opt!("cpu-sample")).is_err();
         let mut sample_graphs: std::collections::HashMap<usize, CudaGraph> = std::collections::HashMap::new();
         if gpu_sample && !graphs.is_empty() {
             for b in 1..=max_batch {
@@ -1330,6 +1435,7 @@ impl BatchScheduler {
             gpu.dev().synchronize().unwrap();
             println!("captured {} GPU-sample graph(s).", sample_graphs.len());
         }
+        crate::memwatch::phase("sched:post-graphs");
 
         // Allocate per-slot MTP state when MTP is enabled. The MTP KV (`[nkv, kv_stride, hd]` bf16
         // per slot) must be zeroed: alloc_zeros is cuMemAllocAsync which does NOT zero, and stale
@@ -1341,7 +1447,13 @@ impl BatchScheduler {
              mtp_draft_pen_freq) =
             if mtp_has_head {
                 let cfg = gpu.cfg();
-                let h = cfg.hidden_size;
+                // PR #4 width contract: the hidden columns the scheduler moves for the MTP head
+                // (h_prev/save/scratch/cur) are the BACKBONE width — the hc-stream stack on
+                // qwen4_exp (4*hidden), the hidden size elsewhere (resid_width() == hidden_size
+                // whenever hc_count == 1, so this is a no-op for every existing model).
+                let h = gpu.mtp_hidden_width();
+                debug_assert_eq!(h, cfg.resid_width(),
+                    "MTP hidden columns must be the hc-stream (resid) width");
                 // §4.1: with --tp-shard-mtp the MTP attention is head-sharded and the draft cache
                 // holds only this rank's kv heads (mtp_kv_heads == num_kv_heads when unsharded).
                 let nkv = gpu.mtp_kv_heads();
@@ -1353,10 +1465,12 @@ impl BatchScheduler {
                 let mut vc: Vec<B> = Vec::with_capacity(max_batch);
                 let mut hp: Vec<B> = Vec::with_capacity(max_batch);
                 for _ in 0..max_batch {
-                    let k = dev.alloc_zeros::<half::bf16>(nkv * kv_stride * hd).unwrap();
+                    // qwen4_exp QSA: the head's raw-key cache rides at the end of its K buffer
+                    // (mtp_kc_elems) so the (kc, vc, kv_stride) plumbing stays untouched.
+                    let k = dev.alloc_zeros::<half::bf16>(gpu.mtp_kc_elems(kv_stride)).unwrap();
                     let v = dev.alloc_zeros::<half::bf16>(nkv * kv_stride * hd).unwrap();
                     let p = dev.alloc_zeros::<half::bf16>(h).unwrap();
-                    gpu.memset_compute_stream(*k.device_ptr(), kv_bytes);
+                    gpu.memset_compute_stream(*k.device_ptr(), gpu.mtp_kc_elems(kv_stride) * 2);
                     gpu.memset_compute_stream(*v.device_ptr(), kv_bytes);
                     kc.push(k);
                     vc.push(v);
@@ -1401,13 +1515,14 @@ impl BatchScheduler {
 
         // The graph replays with per-step (anchor, nprev) written to device ints; the R13
         // volatile kernels are stable under capture (the probe asserts determinism). Env
-        // GB10_NO_DF2_GRAPH=1 keeps the eager path (the captured-vs-eager measurement).
+        // --no-df2-graph=1 keeps the eager path (the captured-vs-eager measurement).
         // PLAN/25 Phase 1: `dflash2-tree` arms the WIDE (MAX_VERIFY-col) tap sink on the trunk —
         // the topo verify's n > BLOCK per-column taps land there; the accepted path is gathered
         // into the round's 8-col staging at commit. No-op for every other source.
         // WI1: arm the DSpark sinks BEFORE `gpu` moves into Self (the DF2 twins' pre-move
         // pattern), and bind the round to its sink (S5F3: keep the Arc; the lane copies the
         // sink's LIVE staging before each inject).
+        crate::memwatch::phase("sched:post-mtp-state");
         if let Some(ds) = dspark.as_mut() {
             if let Some(sk) = &dspark_sink { gpu.set_dspark_capture(sk.clone()); ds.attach_sink(sk); }
             if let Some(ps) = &dspark_prime { gpu.set_dspark_prime_sink(ps.clone()); }
@@ -1446,6 +1561,11 @@ impl BatchScheduler {
             mtp_h_scratch,
             mtp_cur_hidden,
             mtp_snapshot_slot,
+            audit_on,
+            audit_slot,
+            audit_bufs,
+            audit_cur: (0..max_batch).map(|_| None).collect(),
+            audit_req_n: 0,
             mtp_pen_tokens,
             mtp_pen_counts,
             mtp_pen_rep,
@@ -1485,6 +1605,7 @@ impl BatchScheduler {
             mtp_stat_accepted: 0,
             mtp_stat_emitted: 0,
             mtp_stat_verify_fwds: 0,
+            mtp_stat_published: 0,
             df2_tree_stat_steps: 0,
             df2_tree_stat_rescues: 0,
             df2_tree_stat_nodes: 0,
@@ -1500,13 +1621,13 @@ impl BatchScheduler {
             dflash_acc_n: [0; crate::dflash::MAX_BLOCK],
             spec_steps: Vec::new(),
             spec_steps_on: false,
-            mtp_draft_log: std::env::var("MTP_DRAFT_LOG").ok().and_then(|p| {
+            mtp_draft_log: crate::opts::var(crate::opt!("mtp-draft-log")).ok().and_then(|p| {
                 match std::fs::File::create(&p) {
                     Ok(f) => { eprintln!("[mtp] draft log -> {}", p); Some(f) }
-                    Err(e) => { eprintln!("[mtp] WARN: cannot open MTP_DRAFT_LOG {}: {}", p, e); None }
+                    Err(e) => { eprintln!("[mtp] WARN: cannot open --mtp-draft-log {}: {}", p, e); None }
                 }
             }),
-            mtp_curve_path: std::env::var("MTP_CURVE_FILE").ok(),
+            mtp_curve_path: crate::opts::var(crate::opt!("mtp-curve-file")).ok(),
             tp_serving: false,
             // Device-resident token loop: the first step must upload everything (the capture
             // warmup left stale values in token_ids_dev/pos/ring), so the state starts dirty.
@@ -1516,11 +1637,11 @@ impl BatchScheduler {
         // S5F: capture the DFlash2 draft-round CUDA graph once (the MTP verify-graph pattern).
         // The graph replays with per-step (anchor, nprev) written to device ints; the R13
         // volatile kernels are stable under capture (the probe asserts determinism). Env
-        // GB10_NO_DF2_GRAPH=1 keeps the eager path (the captured-vs-eager measurement).
-        if std::env::var("GB10_NO_DF2_GRAPH").is_err() {
+        // --no-df2-graph=1 keeps the eager path (the captured-vs-eager measurement).
+        if crate::opts::var(crate::opt!("no-df2-graph")).is_err() {
             if let Some(df2) = s.df2.as_mut() {
                 if df2.capture_round_graph() {
-                    eprintln!("[df2] draft-round CUDA graph captured (eager fallback via GB10_NO_DF2_GRAPH)");
+                    eprintln!("[df2] draft-round CUDA graph captured (eager fallback via --no-df2-graph)");
                 } else {
                     eprintln!("[df2] draft-round graph capture unsupported — staying eager");
                 }
@@ -1545,9 +1666,9 @@ impl BatchScheduler {
     /// most one window (12.6 s), and the window formula itself is unchanged (§3.2).
     pub async fn run(mut self) {
         loop {
-            // F8 diagnosis (temporary, GB10_LOOP_TRACE): split the wall around decode_step so the
+            // F8 diagnosis (temporary, --loop-trace): split the wall around decode_step so the
             // serve-vs-bench per-step gap (261 vs 188 ms) can be attributed.
-            let loop_trace = std::env::var("GB10_LOOP_TRACE").is_ok();
+            let loop_trace = crate::opts::var(crate::opt!("loop-trace")).is_ok();
             let t_admit = if loop_trace { Some(std::time::Instant::now()) } else { None };
             // Admit queued requests into free lanes (front-packed). Capacity counts BOTH the
             // decode-eligible lanes and the in-flight cursor: a mid-prefill request already owns a
@@ -1609,7 +1730,7 @@ impl BatchScheduler {
     /// or policy divergence flips it within one step. On mismatch: abort the link cooperatively
     /// (kernels no-op through the stream, I9) and return Err — the head's die-with-it guard exits
     /// the server and the mirror's supervisor re-arms, rather than serve one more divergent token.
-    /// `GB10_TP_AGREE_DRILL=<step>` corrupts this rank's hash at one step (the forced-divergence
+    /// `--tp-agree-drill=<step>` corrupts this rank's hash at one step (the forced-divergence
     /// drill gate; env read directly, test-only).
     fn tp_agree_step(&self, step: u64) -> anyhow::Result<()> {
         let mut h: u32 = 0x811c9dc5;                     // FNV-1a over the lane/policy state
@@ -1640,7 +1761,7 @@ impl BatchScheduler {
         // that disagree on the width execute different barrier sequences (I9 class). agree_ext
         // folds it into the hash word at bits [27..31); the depth IS the width for chain MTP.
         let k_verify = if self.mtp.active() { self.mtp.depth() as u8 } else { 0u8 };
-        if let Ok(d) = std::env::var("GB10_TP_AGREE_DRILL") {
+        if let Ok(d) = crate::opts::var(crate::opt!("tp-agree-drill")) {
             if d.parse::<u64>().ok() == Some(step) {
                 eprintln!("[tp-agree] DRILL: corrupting this rank's hash at step {step}");
                 h ^= 0xDEAD;
@@ -1766,11 +1887,11 @@ impl BatchScheduler {
             // policy is a pure function of state (one cursor, one window, no wall clock).
 
             step += 1;
-            // D3: serving-mode barrier histogram. GB10_TP_TRACE already timestamps every barrier
+            // D3: serving-mode barrier histogram. --tp-trace already timestamps every barrier
             // (K1 duration / peer bounce / K2 wait / whole barrier / gap) and the bench path dumps
             // it at exit; this makes the same table available while SERVING, every 512 steps, so
             // the fixed per-step cost can be split sync vs read without a bench harness.
-            if b > 0 && step % 512 == 0 && std::env::var("GB10_TP_TRACE").is_ok() {
+            if b > 0 && step % 512 == 0 && crate::opts::var(crate::opt!("tp-trace")).is_ok() {
                 self.gpu.tp_trace_dump(&format!("serve step {step}"));
             }
             // Yield to tokio so streaming handlers can flush SSE events between decode steps.
@@ -1879,6 +2000,7 @@ impl BatchScheduler {
                 rep_penalty: 1.0,
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
+                min_p: 0.0,
                 min_new: 0,
                 ignore_eos: false,
                 tx,
@@ -1938,7 +2060,7 @@ impl BatchScheduler {
         // W2: the request's compiled schema (moved into the lane below).
         let req_schema = req.schema.clone();
         // R9: register the live gpu+state once so net::agree's mismatch path can dump GDN state.
-        if std::env::var("GB10_TP_DIAG").is_ok() { r9_register_state(&self.gpu, &self.state); }
+        if crate::opts::var(crate::opt!("tp-diag")).is_ok() { r9_register_state(&self.gpu, &self.state); }
         // Each free slot offers TWO points we could resume from, because we hold the GDN state at two
         // moments of its last request:
         //
@@ -1969,8 +2091,8 @@ impl BatchScheduler {
         // to the 512-token grid — a hit re-prefills up to RING_CKPT_STRIDE-1 extra tokens
         // (<=0.75 s at ~690 tok/s TP2 prefill; typical ~0.35 s), and verbatim-replay clients
         // (opencode) re-prefill the round-down remainder instead of skipping 100%.
-        // GB10_PREFIX_GRID_REUSE=0 restores token-exact Live/Ckpt reuse (diagnostics-only A/B).
-        let grid_reuse = std::env::var("GB10_PREFIX_GRID_REUSE").map_or(true, |v| v != "0");
+        // --prefix-grid-reuse=0 restores token-exact Live/Ckpt reuse (diagnostics-only A/B).
+        let grid_reuse = crate::opts::var(crate::opt!("prefix-grid-reuse")).map_or(true, |v| v != "0");
         let best = if !self.prefix_cache { None } else { self.free_slots.iter().enumerate()
             .flat_map(|(i, &sl)| {
                 let live = common_prefix_len(&self.slot_cache[sl], &req.prompt);
@@ -2033,7 +2155,7 @@ impl BatchScheduler {
             }
             Some(From_::Ring(j)) => {
                 self.gpu.copy_gdn_slot(&self.state, self.ring_ckpt_slot + phys * RING_CKPT_K + j, phys);
-                if std::env::var("GB10_DUMP_PFHASH").is_ok() {
+                if crate::opts::var(crate::opt!("dump-pfhash")).is_ok() {
                     // Phase-8 [pfhash]: state ACTUALLY sitting in the slot right after the ring
                     // restore — compare against [ring-hash] printed at snapshot time (cold run).
                     eprintln!("[pre-hash] reuse={}{}", reuse, self.gpu.pf_hash(&self.state, phys, None));
@@ -2059,8 +2181,8 @@ impl BatchScheduler {
         let dspark_ring_slot = self.dspark.as_ref().and_then(|d| d.ring_slot());
         // Diagnostics-only negative control (PLAN/DSPARK_RING_IDENTITY_SPEC.md §4 gate 2): drop
         // ONLY the identity term, reproducing the pre-guard length-only carry so the hazard can be
-        // made to bite (the twin of DF2's GB10_DF2_CARRY_LEN_ONLY). Never set outside a gate run.
-        let dspark_ring_blind = std::env::var("GB10_DSPARK_RING_BLIND").is_ok();
+        // made to bite (the twin of DF2's --df2-carry-len-only). Never set outside a gate run.
+        let dspark_ring_blind = crate::opts::var(crate::opt!("dspark-ring-blind")).is_ok();
         let dspark_carry = reuse > 0 && src_early == SpecSource::Dspark
             && self.slot_dspark_len[phys] >= reuse
             && (dspark_ring_slot == Some(phys) || dspark_ring_blind);
@@ -2101,6 +2223,10 @@ impl BatchScheduler {
         let frequency_penalty = req.frequency_penalty;
         let _has_penalty = rep_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
         let will_use_mtp = self.mtp.active();
+        if mtp_dispatch_trace() {
+            eprintln!("[b31-trace] admit: active={} depth={} src={:?} reuse={} plen={}",
+                      will_use_mtp, self.mtp.depth(), self.mtp.spec_source(), reuse, plen);
+        }
         // S5F: does THIS lane take the DFlash2 path? Requires the source + a resident round + a
         // full prompt prime (reuse == 0 — a prefix-hit lane's ring cannot be trusted for the
         // reused prefix, so it falls back to MTP/batched; prefix-cache + DFlash2 is out of scope
@@ -2116,7 +2242,7 @@ impl BatchScheduler {
             .map(|d| (d.ring_slot(), d.ring_len())).unwrap_or((None, 0));
         let df2_carry = self.df2.is_some() && df2_carry_ok(
             self.df2_carry_enabled, is_df2_src(src), reuse, plen, phys,
-            ring_slot_in, ring_len_in, std::env::var("GB10_DF2_CARRY_LEN_ONLY").is_ok());
+            ring_slot_in, ring_len_in, crate::opts::var(crate::opt!("df2-carry-len-only")).is_ok());
         // Does the ring's claim on THIS slot survive this admit?
         //
         // The claim is "rows [N-RING, N) hold the k/v of tokens [0, N) of this slot's cached
@@ -2194,11 +2320,11 @@ impl BatchScheduler {
                        hard failure)");
             self.df2_fallback_logged = true;
         }
-        // TTFT fix 0 attribution (GB10_PREFILL_TRACE): admission-phase wall times. The window's
+        // TTFT fix 0 attribution (--prefill-trace): admission-phase wall times. The window's
         // prefill_batch and mtp_prime_prompt each end with a sync, so their timers are honest
         // without extra syncs; `other` is the residue (pool trim, slot zeroing, lane bookkeeping).
         let received_at = req.received_at;
-        let trace_pf = crate::env_knob("GB10_PREFILL_TRACE", "DSV4_PREFILL_TRACE").is_some();
+        let trace_pf = crate::opts::var(crate::opt!("prefill-trace")).ok().is_some();
         let admit_t0 = std::time::Instant::now();
         let mut pf_mark = admit_t0;
         let mut t_memsets = 0.0f64;
@@ -2218,8 +2344,9 @@ impl BatchScheduler {
         // depth + 8 (the τ floor's slop) when MTP is active, using the policy MAX depth so a later
         // depth-upswitch can't cross the line mid-request. Plain decode needs no such headroom (1 slot
         // of slop). All inputs are replicated state, so both TP ranks reject identically.
-        let mtp_depth = if will_use_mtp { crate::gpu::MAX_AUTO_DEPTH } else { 0 };
-        let mtp_headroom = if will_use_mtp { mtp_depth + 8 } else { 1 };
+        // (PR #4 expresses this as `decode_headroom(will_use_mtp)`; the depth it reserved is the
+        // same MAX_AUTO_DEPTH + 8 — dev's clamp-before-reject refinement below is kept.)
+        let mtp_headroom = decode_headroom(will_use_mtp);
         // BUG2 fix (2026-09-06, PLAN/FIX_8192_CHAT_TRUNCATION): CLAMP before rejecting. The server
         // grants room = max_seq_len - plen and cannot see this spec headroom, so with
         // --max-tokens >= max_seq_len every request that omitted max_tokens asked for the full
@@ -2442,7 +2569,7 @@ impl BatchScheduler {
         let Some(mut c) = self.pf.take() else { return };
         let phys = c.phys;
         let (plen, w0) = (c.plen, c.w0);
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         if w0 >= plen {
             // reuse == plen (a full prefix hit): today's inline loop never ran either, so the
             // post-loop tail must still execute (it streams the first token and installs the lane).
@@ -2502,7 +2629,7 @@ impl BatchScheduler {
             self.dflash_prime_done = true;
             self.dflash_prime_armed = false;
         }
-        if w1 == plen && std::env::var("GB10_DUMP_PFHASH").is_ok() {
+        if w1 == plen && crate::opts::var(crate::opt!("dump-pfhash")).is_ok() {
             // Phase-8 [pfhash]: warm-vs-cold prefill equality probe (diagnostics).
             c.pf_hash_str = self.gpu.pf_hash(&self.state, phys, Some((&hw, h, w1 - w0)));
         }
@@ -2594,7 +2721,7 @@ impl BatchScheduler {
             self.gpu.copy_gdn_slot(&self.state, phys,
                 self.ring_ckpt_slot + phys * RING_CKPT_K + j);
             self.slot_ring_len[phys][j] = w1;
-            if std::env::var("GB10_DUMP_PFHASH").is_ok() && (w1 % 1024 == 0 || w1 >= plen - 512) {
+            if crate::opts::var(crate::opt!("dump-pfhash")).is_ok() && (w1 % 1024 == 0 || w1 >= plen - 512) {
                 // Phase-8 [pfhash]: what the ring entry ACTUALLY holds at snapshot time, plus
                 // the live slot state it was copied from — both hashed after the copy lands.
                 eprintln!("[ring-hash] w1={} j={} src{} ring{}",
@@ -2692,9 +2819,43 @@ impl BatchScheduler {
             seed: c.seed,
             tp_cancelled: false,
         });
+        if mtp_dispatch_trace() {
+            eprintln!("[b31-trace] lane install: slot={} pos={} mtp_primed={} df2_primed={} greedy={} schema={}",
+                      slot, c.plen, c.will_use_mtp,
+                      (c.will_use_df2 && c.df2_primed_ok) || (c.will_use_dspark && c.dspark_primed_ok),
+                      c.greedy, c.schema.is_some());
+        }
         // Device-resident loop: the lane composition changed — the next batched step must
         // re-upload the full buffer set (tokens/pos/slot_ids/ring/keys).
         self.resident_dirty = true;
+        // S-B16: (re)arm the audit cursor for this request from the lane's INSTALL state —
+        // gt_last/gt_pos must be the prefill token and its position, captured BEFORE any MTP step
+        // advances the lane. The shadow's zero+prime decode is deferred to the first audited step
+        // (the cursor is only consumed by lanes that actually take the MTP path).
+        if self.audit_on {
+            // The shadow must start from a REAL prefill of this request's prompt. Zeroed KV rows
+            // are NOT softmax-neutral (exp(0)=1 per unwritten key): the v2 auditor's zero-only
+            // shadow predicted token 0 at every request's first token (false divergence, caught
+            // in the first v2 run). This mirrors bench_mtp_steps' slot-1 ground-truth prefill.
+            self.gpu.zero_slot_state(&mut self.state, self.audit_slot, self.kv_stride);
+            self.gpu.zero_slot_kv(&mut self.state, self.audit_slot, self.kv_stride);
+            let (a0s, hs) = self.gpu.prefill_batch(&mut self.pool, &c.prompt, &mut self.state,
+                                                   self.audit_slot, self.kv_stride, 0);
+            let mw = self.gpu.mtp_hidden_width();
+            self.pool.release_bf16(hs, mw * c.plen);
+            if a0s != c.first_tok {
+                eprintln!("[lossless-audit] WARN req={} shadow prefill a0={} != lane a0={}",
+                          self.audit_req_n, a0s, c.first_tok);
+            }
+            // The cursor's FIRST prediction must be real: with pred left at 0 the request's first
+            // emission compares against token 0 (run4's false "seq=0" divergence at emitted#0).
+            let pred0 = self.audit_shadow_decode(c.first_tok, c.plen, self.kv_stride);
+            self.audit_cur[slot] = Some(MtpAuditCursor {
+                gt_last: c.first_tok, gt_pos: c.plen, pred: pred0, idx: 0,
+                tag: self.audit_req_n, diverged: false, primed: true,
+            });
+            self.audit_req_n += 1;
+        }
     }
 
 
@@ -2818,6 +2979,10 @@ impl BatchScheduler {
         // `served[i]` = lane i was served by Phase A (speculation) this step — Phase B decodes
         // exactly the lanes Phase A did NOT serve (a lane is never double-served, never stranded).
         let mut served = vec![false; b];
+        if mtp_dispatch_trace() && b == 1 {
+            eprintln!("[b31-trace] dispatch: active={} src={:?} df2_live={} dflash_live={} dspark_live={} mtp_live={}",
+                      policy_active, src, df2_live, dflash_live, dspark_live, mtp_live);
+        }
         if df2_live {
             let lane = self.lanes[0].as_ref().unwrap();
             if lane.df2_primed && !lane.df2_stale {
@@ -2920,6 +3085,10 @@ impl BatchScheduler {
             } else if b == 1 {
                 let lane = self.lanes[0].as_ref().unwrap();
                 let is_greedy = lane.greedy;
+                if mtp_dispatch_trace() {
+                    eprintln!("[b31-trace] step b=1: use_mtp={} primed={} stale={} greedy={} schema={}",
+                              lane.use_mtp(true), lane.mtp_primed, lane.mtp_stale, lane.greedy, lane.schema.is_some());
+                }
                 if lane.use_mtp(true) {
                     served[0] = true;
                     if lane.df2_primed && !lane.df2_stale {
@@ -2937,6 +3106,20 @@ impl BatchScheduler {
         let mtp_ctx = self.lanes[..b].iter()
             .filter_map(|l| l.as_ref().map(|l| l.pos)).max().unwrap_or(0);
         self.mtp.tick(mtp_ctx);
+        // B31 FIX: publish the MTP telemetry EVERY decode step, not only where the `[mtp]` meter
+        // prints (every 50 steps). The 50-step cadence left a window where /health reported
+        // drafts=0 on a server that was actively speculating — a pinned-d4 short FIRST request
+        // finishes in ~32 steps and never crosses the boundary, so --probe-serve-pinned's
+        // engagement assert read a false FAIL (B31, reproduced x3 on .13/.14). The publish is a
+        // handful of Relaxed atomic stores against a ~70ms step; the watermark skips plain-only
+        // steps. The 50-step LOG cadence is unchanged.
+        if self.mtp_stat_steps != self.mtp_stat_published {
+            crate::tel::publish_mtp(self.mtp_stat_steps, self.mtp_stat_drafts,
+                                    self.mtp_stat_accepted, self.mtp_stat_emitted,
+                                    self.mtp_stat_verify_fwds, self.mtp.depth(),
+                                    &self.mtp.hazard_counts());
+            self.mtp_stat_published = self.mtp_stat_steps;
+        }
         // Device-resident loop: any MTP step emits 2+ tokens and advances pos by >1, which the
         // per-step ring push / pos increment cannot represent — the next batched step re-uploads.
         if policy_active { self.resident_dirty = true; }
@@ -2944,6 +3127,10 @@ impl BatchScheduler {
         // Phase B: batched decode for the lanes Phase A did NOT serve (the served set is the
         // single source of truth — a source switch can never strand or double-serve a lane).
         let batch_idx: Vec<usize> = (0..b).filter(|&i| !served[i]).collect();
+        if mtp_dispatch_trace() && policy_active && !batch_idx.is_empty() {
+            eprintln!("[b31-trace] phaseB: b={} unserved={:?} (policy active but lanes fell to plain decode)",
+                      b, batch_idx);
+        }
         if !batch_idx.is_empty() {
             // W2 (Phase 13): ARM THE DECODE MASK for this batch. `batched_decode` already refuses
             // the resident loop and the captured graphs for a schema batch, but the mask itself was
@@ -3070,6 +3257,72 @@ impl BatchScheduler {
         })
     }
 
+    /// S-B16: MTP verify penalty with PER-COLUMN histories. Plain decode penalizes with the
+    /// EVOLVING history (each emitted token enters it before the next argmax); the verify used
+    /// to share ONE stale (committed-only) history across all n columns — accepted drafts'
+    /// presence/frequency contributions were missed at every column > 0 — a real losslessness
+    /// break when penalties are active, with exposure growing with depth (A/B d2 PASS vs d3/d4
+    /// FAIL; run7 penalty-free was clean at every depth). Column t now gets H + drafts[0..t] —
+    /// exactly what plain decode would have penalized at that column. The kernel already reads
+    /// per-column slices (`pen_tokens[b * n_pen + i]`, per-column scalars), so this is a
+    /// host-side fill change only.
+    fn make_penalty_drafts(&mut self, history: &[u32], drafts: &[u32], rep_pen: f32,
+                           presence_pen: f32, freq_pen: f32, has_penalty: bool)
+                           -> Option<crate::gpu::VerifyPenalty> {
+        if !has_penalty { return None; }
+        let mp = crate::gpu::MAX_PEN_TOKENS;
+        let cap = crate::gpu::MAX_VERIFY;   // buffers are MAX_VERIFY-sized (forest may span that many cols)
+        let n = (drafts.len() + 1).min(cap); // verify width = 1 committed column + drafts
+        let mut pen_tokens = vec![-1i32; cap * mp];
+        let mut pen_counts = vec![0i16; cap * mp];
+        // Column 0: the committed history (dedup, most-recent-first) — same as plain decode at
+        // the first verify position.
+        let mut idx = 0usize;
+        for &t in history.iter().rev().take(mp) {
+            let ti = t as i32;
+            match (0..idx).position(|j| pen_tokens[j] == ti) {
+                Some(j) => { pen_counts[j] += 1; }
+                None => { if idx < mp { pen_tokens[idx] = ti; pen_counts[idx] = 1; idx += 1; } }
+            }
+        }
+        // Column t = column t-1 + one accepted draft (the token plain decode just emitted and
+        // would penalize with before the next argmax).
+        for c in 1..n {
+            let (dst, src) = (c * mp, (c - 1) * mp);
+            pen_tokens.copy_within(src..src + mp, dst);
+            pen_counts.copy_within(src..src + mp, dst);
+            let ti = drafts[c - 1] as i32;
+            match pen_tokens[dst..dst + idx].iter().position(|&x| x == ti) {
+                Some(j) => { pen_counts[dst + j] += 1; }
+                None => { if idx < mp { pen_tokens[dst + idx] = ti; pen_counts[dst + idx] = 1; idx += 1; } }
+            }
+        }
+        // Columns ≥ n are unused (the verify launches grid = n) — fill with the deepest prefix
+        // so no stale head copies linger if a wider launch ever reads them.
+        for c in n..cap {
+            let (dst, src) = (c * mp, (n - 1) * mp);
+            pen_tokens.copy_within(src..src + mp, dst);
+            pen_counts.copy_within(src..src + mp, dst);
+        }
+        let (rv, pv, fv) = (vec![rep_pen; cap], vec![presence_pen; cap], vec![freq_pen; cap]);
+        self.gpu.dev().htod_sync_copy_into(&pen_tokens, self.mtp_pen_tokens.as_mut().unwrap()).unwrap();
+        self.gpu.dev().htod_sync_copy_into(&pen_counts, self.mtp_pen_counts.as_mut().unwrap()).unwrap();
+        let key = (rep_pen.to_bits(), presence_pen.to_bits(), freq_pen.to_bits(), cap);
+        if self.pen_const_key != Some(key) {
+            self.gpu.dev().htod_sync_copy_into(&rv, self.mtp_pen_rep.as_mut().unwrap()).unwrap();
+            self.gpu.dev().htod_sync_copy_into(&pv, self.mtp_pen_presence.as_mut().unwrap()).unwrap();
+            self.gpu.dev().htod_sync_copy_into(&fv, self.mtp_pen_freq.as_mut().unwrap()).unwrap();
+            self.pen_const_key = Some(key);
+        }
+        Some(crate::gpu::VerifyPenalty {
+            tokens_ptr: *self.mtp_pen_tokens.as_ref().unwrap().device_ptr(),
+            counts_ptr: *self.mtp_pen_counts.as_ref().unwrap().device_ptr(),
+            rep_pen_ptr: *self.mtp_pen_rep.as_ref().unwrap().device_ptr(),
+            presence_ptr: *self.mtp_pen_presence.as_ref().unwrap().device_ptr(),
+            freq_ptr: *self.mtp_pen_freq.as_ref().unwrap().device_ptr(),
+        })
+    }
+
     /// FOREST per-column penalty: column c gets ITS lane's rep/presence/freq penalty (from that lane's
     /// deduped committed history). `lanes` is (start, len, rep, presence, freq, history) per packed lane;
     /// columns outside any lane and past the packed width are no-ops (rep=1, presence=freq=0, tokens=-1).
@@ -3127,7 +3380,7 @@ impl BatchScheduler {
     /// GDN checkpoint, re-primes MTP over the accepted path, and emits. Lossless: every emitted token is
     /// the target's argmax given its accepted prefix (same as the chain). Returns true if finished.
     fn mtp_tree_step(&mut self, i: usize) -> bool {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let depth = self.mtp.depth();
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let ckpt = self.mtp_snapshot_slot;   // tree checkpoints base (slots ckpt..ckpt+n-2)
@@ -3275,7 +3528,7 @@ impl BatchScheduler {
     /// This is `mtp_lane_step` generalized to L lanes sharing one main-model forward — the concurrency
     /// throughput win. Greedy, no-penalty lanes only (v1). Returns (lane_index, finished) per lane.
     fn mtp_forest_step(&mut self, lanes: &[usize]) -> Vec<(usize, bool)> {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let ck = self.gpu.cfg().conv_kernel;
         let mv = crate::gpu::MAX_VERIFY;
         let kv_stride = self.kv_stride;
@@ -3535,7 +3788,7 @@ impl BatchScheduler {
         results
     }
 
-    /// Append one MTP step to the env-gated draft log (`MTP_DRAFT_LOG`), if open. JSONL, one object
+    /// Append one MTP step to the option-gated draft log (`--mtp-draft-log`), if open. JSONL, one object
     /// per line. `preds` is the verify's per-column argmax (greedy paths); pass `&[]` where the verify
     /// samples instead. Costs nothing when the log is closed. This is the reference the head-finetune
     /// B0 parity gate diffs the HF MTP module against, so it records exactly what was fed and predicted.
@@ -3552,7 +3805,7 @@ impl BatchScheduler {
             self.mtp_stat_steps, lane, pos, committed, arr(drafts), arr(preds), nacc);
     }
 
-    /// Overwrite the accept-by-depth curve file (`MTP_CURVE_FILE`), if set, with the cumulative
+    /// Overwrite the accept-by-depth curve file (`--mtp-curve-file`), if set, with the cumulative
     /// per-position conditional acceptance — the runbook §0 baseline curve. Called on the periodic
     /// stats boundary so a running server keeps a fresh snapshot on disk.
     fn dump_accept_curve(&self) {
@@ -3584,7 +3837,7 @@ impl BatchScheduler {
         if self.tree_draft && self.mtp.depth() >= 3 {
             return self.mtp_tree_step(i);
         }
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let depth = self.mtp.depth();
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
@@ -3678,7 +3931,7 @@ impl BatchScheduler {
         // penalty (the same one the normal decode path applies). This keeps greedy MTP lanes free of
         // repetition without slowing them. htod on the NULL stream, then sync before the compute-side
         // verify reads it.
-        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let penalty = self.make_penalty_drafts(&history, &drafts, rep_pen, presence_pen, freq_pen, has_penalty);
         // Ping-pong GDN: the verify snapshots S1 (post committed-token state) into the snapshot slot
         // via the kernel checkpoint, so a rejected draft restores S1 with a dtod copy — no reverify.
         let verify_t0 = std::time::Instant::now();
@@ -3859,6 +4112,52 @@ impl BatchScheduler {
             }
         }
 
+        // ---- S-B16 lossless auditor (--mtp-lossless-audit=1, TP=1): lockstep shadow decode ----
+        // bench_mtp_steps' slot-1 ground truth, moved into the serving path: one plain decode
+        // forward per emitted token, ALWAYS advancing on the ground-truth token (never on the MTP
+        // stream), so the first divergence between the serving lane and plain decode is pinned to
+        // an exact (request, emitted-index, position). A lane that later takes plain (non-MTP)
+        // steps leaves its cursor behind — the audit for that request simply ends there.
+        if self.audit_on && emit_count > 0 && self.audit_cur[i].is_some() {
+            let need_prime = self.audit_cur[i].as_ref().map_or(false, |c| !c.primed);
+            if need_prime {
+                let (gt_last, gt_pos) = {
+                    let c = self.audit_cur[i].as_ref().unwrap();
+                    (c.gt_last, c.gt_pos)
+                };
+                self.gpu.zero_slot_state(&mut self.state, self.audit_slot, kv_stride);
+                // The shadow slot has no prefill: zero its KV extent too, or the prime decode
+                // attends over [0, pos) rows nothing wrote (garbage softmax → false divergence).
+                self.gpu.zero_slot_kv(&mut self.state, self.audit_slot, kv_stride);
+                let pred = self.audit_shadow_decode(gt_last, gt_pos, kv_stride);
+                {
+                    let c = self.audit_cur[i].as_mut().unwrap();
+                    c.pred = pred;
+                    c.primed = true;
+                }
+            }
+            for &e in &new_toks {
+                let (pred, gpos, tag, idx, already) = {
+                    let c = self.audit_cur[i].as_ref().unwrap();
+                    (c.pred, c.gt_pos, c.tag, c.idx, c.diverged)
+                };
+                if e != pred && !already {
+                    eprintln!("[lossless-audit] req={} FIRST DIVERGENCE: emitted#{} pos={} mtp={} seq={} (depth {} nacc {} step {})",
+                              tag, idx, gpos + 1, e, pred, depth, nacc, self.mtp_stat_steps);
+                    self.audit_cur[i].as_mut().unwrap().diverged = true;
+                }
+                // Advance the shadow on the GROUND-TRUTH token (pred), never on the MTP stream,
+                // mirroring bench_mtp_steps' slot-1 lockstep exactly.
+                let new_pred = self.audit_shadow_decode(pred, gpos + 1, kv_stride);
+                {
+                    let c = self.audit_cur[i].as_mut().unwrap();
+                    c.gt_last = pred;
+                    c.gt_pos = gpos + 1;
+                    c.pred = new_pred;
+                    c.idx += 1;
+                }
+            }
+        }
         // (committed_tok/main_pos/mtp_pos are all read above; no further bookkeeping needed.)
 
         // ---- Telemetry: accumulate per-step MTP stats and log a summary every 50 lane-steps. ----
@@ -3918,6 +4217,23 @@ impl BatchScheduler {
         finished
     }
 
+    /// S-B16 auditor: one plain decode forward on the audit slot (batch 1), mirroring the SERVE
+    /// path's decode flavor — max_pc PINNED to kv_stride, exactly like the captured decode graph
+    /// (capture pins max_pc to the run maximum; an eager pos+1 bound selects a different split-K
+    /// reduction and flips knife-edge positions — run5's two "divergences" were this artifact:
+    /// the seq arm's own text carries the LANE's token at both spots).
+    fn audit_shadow_decode(&mut self, tok: u32, pos: usize, kv_stride: usize) -> u32 {
+        {
+            let ab = self.audit_bufs.as_mut().unwrap();
+            self.gpu.dev().htod_sync_copy_into(&[tok as i32, 0], &mut ab.tokens_dev).unwrap();
+            self.gpu.dev().htod_sync_copy_into(&[pos as i32, 0], &mut ab.pos_dev).unwrap();
+        }
+        self.gpu.dev().synchronize().unwrap();
+        let ab = self.audit_bufs.as_mut().unwrap();
+        let next = self.gpu.forward_decode(&mut self.pool, ab, &mut self.state, kv_stride, kv_stride, 1);
+        next[0]
+    }
+
     /// Stochastic MTP step for a sampling lane (temperature > 0). Mirrors mtp_lane_step but:
     /// 1. Drafts GREEDILY via argmax_hidden (point-mass proposal q=1 — the rejection step corrects
     ///    the distribution; on hy_v3 the draft argmax is fp32-exact, gpu.rs argmax_hidden)
@@ -3930,7 +4246,7 @@ impl BatchScheduler {
     /// Returns true if the lane finished (EOS or max_new reached).
     fn mtp_lane_step_sample(&mut self, i: usize) -> bool {
         crate::tel::note_step();   // A.2: per-step interval for the status route (lock-free)
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let depth = self.mtp.depth();
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
@@ -3999,7 +4315,7 @@ impl BatchScheduler {
         let round_ms = step_t0.elapsed().as_secs_f32() * 1e3;
 
         // ---- Build verify penalty (same as greedy). ----
-        let verify_penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let verify_penalty = self.make_penalty_drafts(&history, &drafts, rep_pen, presence_pen, freq_pen, has_penalty);
 
         // ---- Build verify input + seeds for spec_verify_b. ----
         let mut verify_input = vec![committed_tok];
@@ -4207,7 +4523,7 @@ impl BatchScheduler {
              Serve block 16 with --spec-source dflash2 (chain) or use the tree at --df2-block 8.");
         assert_eq!(LEVELS, crate::dflash2::levels(),
             "df2 tree LEVELS {} != live levels {}", LEVELS, crate::dflash2::levels());
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let ckpt = self.mtp_snapshot_slot;   // per-column GDN checkpoint base (MAX_VERIFY slots)
         // /health (the tree rider): the tree step is otherwise invisible to the step ring (the
@@ -4426,7 +4742,7 @@ impl BatchScheduler {
     /// artifact's config.json — no geometry is assumed here).
     pub fn install_dflash_lane(&mut self, dir: &str) -> anyhow::Result<()> {
         use crate::dflash::{DflashDrafter, DflashKv};
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let stride = self.kv_stride;
         let draf = DflashDrafter::load_from_dir(std::path::Path::new(dir), stride + 16)?;
         let (nctx, block, mask) = (draf.nctx, draf.block, draf.mask_token_id);
@@ -4462,7 +4778,7 @@ impl BatchScheduler {
     /// chain's losslessness argument, with a block-wide verify instead of a chain.
     fn dflash_lane_step(&mut self, i: usize) -> bool {
         crate::tel::note_step();
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
         let kv_stride = self.kv_stride;
@@ -4575,7 +4891,7 @@ impl BatchScheduler {
             emitted: emit_count as u32, round_ms, verify_ms,
             step_ms: step_t0.elapsed().as_secs_f32() * 1e3,
         });
-        if std::env::var("GB10_DFLASH_STEP_LOG").is_ok() {
+        if crate::opts::var(crate::opt!("dflash-step-log")).is_ok() {
             // Field layout mirrors the DF2 line so `accept_gate.py dflash` can reuse its parser:
             // pos / nacc / emitted / committed / round / verify / step. `preds` rides along for the
             // same reason the DF2 line carries it — the FIRST thing to check when acceptance
@@ -4635,7 +4951,7 @@ impl BatchScheduler {
 
     fn df2_lane_step(&mut self, i: usize) -> bool {
         crate::tel::note_step();   // A.2: per-step interval for the status route (lock-free)
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
         let kv_stride = self.kv_stride;
@@ -4906,7 +5222,7 @@ impl BatchScheduler {
             emitted: emit_count as u32, round_ms, verify_ms,
             step_ms: step_t0.elapsed().as_secs_f32() * 1e3,
         });
-        if std::env::var("GB10_DF2_STEP_LOG").is_ok() {
+        if crate::opts::var(crate::opt!("df2-step-log")).is_ok() {
             let step_ms = step_t0.elapsed().as_secs_f32() * 1e3;
             eprintln!("[df2-step] pos={main_pos} nacc={nacc} emitted={emit_count} committed={committed_tok} \
                        drafts={:?} preds={:?} round={round_ms:.1}ms verify={verify_ms:.1}ms step={step_ms:.1}ms",
@@ -4943,7 +5259,7 @@ impl BatchScheduler {
     /// shared SpecStepRec telemetry); the confidence head is diagnostics-only in v1 (adaptive
     /// k_verify OFF — the recipe default).
     fn dspark_lane_step(&mut self, i: usize) -> bool {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
         let kv_stride = self.kv_stride;
@@ -4966,10 +5282,10 @@ impl BatchScheduler {
         // ---- Draft: the DSpark round (eager; graphs follow the DF2 pattern once oracle-proven).
         let step_t0 = std::time::Instant::now();
         static DUMP_REQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let dump_steps: u64 = std::env::var("GB10_DSPARK_DUMP_STEPS").ok()
+        let dump_steps: u64 = crate::opts::var(crate::opt!("dspark-dump-steps")).ok()
             .and_then(|v| v.parse().ok()).unwrap_or(6);
         if self.dspark_stat_steps < dump_steps {
-            if let Ok(dir) = std::env::var("GB10_DSPARK_DUMP_STEP0") {
+            if let Ok(dir) = crate::opts::var(crate::opt!("dspark-dump-step0")) {
                 let rseq = if self.dspark_stat_steps == 0 {
                     DUMP_REQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 } else { DUMP_REQ.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1) };
@@ -5084,18 +5400,18 @@ impl BatchScheduler {
             emitted: emit_count as u32, round_ms, verify_ms,
             step_ms: step_t0.elapsed().as_secs_f32() * 1e3,
         });
-        if std::env::var("GB10_DSPARK_STEP_LOG").is_ok() {
+        if crate::opts::var(crate::opt!("dspark-step-log")).is_ok() {
             let step_ms = step_t0.elapsed().as_secs_f32() * 1e3;
             eprintln!("[dspark-step] pos={main_pos} nacc={nacc} emitted={emit_count} committed={committed_tok} \
                        drafts={:?} preds={:?} round={round_ms:.1}ms verify={verify_ms:.1}ms step={step_ms:.1}ms",
                       &drafts[..drafts.len().min(4)], &preds[..preds.len().min(4)]);
         }
-        // GB10_DSPARK_DUMP_STEP0: for the FIRST N dspark steps (GB10_DSPARK_DUMP_STEPS, default
+        // --dspark-dump-step0: for the FIRST N dspark steps (--dspark-dump-steps, default
         // 6), dump the staging taps (the round's own [8, 25600] bf16 staging = the ctx-extension
         // the next draft saw), the anchor, the drafts and the trunk preds — the offline
         // oracle-vs-trunk comparison's raw material, and the per-step reconstruction basis.
         if self.dspark_stat_steps < dump_steps {
-            if let Ok(dir) = std::env::var("GB10_DSPARK_DUMP_STEP0") {
+            if let Ok(dir) = crate::opts::var(crate::opt!("dspark-dump-step0")) {
                 let rseq = DUMP_REQ.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1);
                 let sdir = format!("{dir}/r{rseq}/step{}", self.dspark_stat_steps);
                 let ds = self.dspark.as_mut().unwrap();
@@ -5149,7 +5465,7 @@ impl BatchScheduler {
     /// pattern; greedy drafts = a point-mass proposal, so rejection sampling reduces to the
     /// greedy accept + the residual replacement, distribution-exact by construction).
     fn dspark_lane_step_sample(&mut self, i: usize) -> bool {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
         let kv_stride = self.kv_stride;
@@ -5278,7 +5594,7 @@ impl BatchScheduler {
     /// al. 2023: accept with prob min(1, p(x)/q(x)) = p(x) since q = 1; else emit the residual).
     /// Distribution-exact by construction; gated by the DFlash2 chi-square probe.
     fn df2_lane_step_sample(&mut self, i: usize) -> bool {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
         let kv_stride = self.kv_stride;
@@ -5474,7 +5790,7 @@ impl BatchScheduler {
         self.df2_stat_emitted += emit_count as u64;
         // P2 Phase A finding: the sampled-greedy lane (temp>0 + Code) had NO [df2-step] line —
         // the step tables silently dropped every code-class step. Same format as the greedy lane.
-        if std::env::var("GB10_DF2_STEP_LOG").is_ok() {
+        if crate::opts::var(crate::opt!("df2-step-log")).is_ok() {
             eprintln!("[df2-step] pos={main_pos} nacc={nacc} emitted={emit_count} committed={committed_tok} \
                        round={round_ms:.1}ms verify={verify_ms:.1}ms step={:.1}ms",
                       step_t0.elapsed().as_secs_f32() * 1e3);
@@ -5491,7 +5807,7 @@ impl BatchScheduler {
     /// — the L2 chi-square gate's contract. Distribution-exact by construction; gated by
     /// `--bench-df2-sample-realq`.
     fn df2_lane_step_sample_rq(&mut self, i: usize) -> bool {
-        let h = self.gpu.cfg().hidden_size;
+        let h = self.gpu.mtp_hidden_width();   // backbone hidden width (hc streams on qwen4_exp)
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
         let kv_stride = self.kv_stride;
@@ -5667,7 +5983,7 @@ impl BatchScheduler {
         self.df2_stat_drafts += drafts.len() as u64;
         self.df2_stat_accepted += nacc as u64;
         self.df2_stat_emitted += emit_count as u64;
-        if std::env::var("GB10_DF2_STEP_LOG").is_ok() {
+        if crate::opts::var(crate::opt!("df2-step-log")).is_ok() {
             eprintln!("[df2-step] pos={main_pos} nacc={nacc} emitted={emit_count} committed={committed_tok} \
                        round={round_ms:.1}ms verify={verify_ms:.1}ms step={:.1}ms",
                       step_t0.elapsed().as_secs_f32() * 1e3);
@@ -5783,7 +6099,7 @@ impl BatchScheduler {
                             &mut self.pool, &mut self.bufs, &mut self.state, self.kv_stride, max_pc, s),
                     }
                 } else {
-                    // CPU-sampling escape (RUST_INFER_CPU_SAMPLE): the host needs the full
+                    // CPU-sampling escape (--cpu-sample): the host needs the full
                     // logits, so the resident loop is pointless AND its pos semantics differ (no
                     // ids_advance) — run today's sequence with today's uploads, then force the
                     // next step to re-upload (the pos_dev/tokens_dev left behind are in

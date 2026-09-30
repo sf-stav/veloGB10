@@ -187,6 +187,7 @@ typedef struct NetCtx {
     uint64_t* gpu_ts_h;              // mapped GPU timestamp ring (host view)
     uint64_t  tail_fires;            // tail-epoch guard fire count (payload never landed) — MUST stay 0
     uint64_t  tail_waits;            // times the tail-epoch wait engaged (reordered payload, recovered)
+    uint64_t  gpu_rx_skips;          // TP-G: epochs the GPU decode K2 proved itself (RX_DONE >= e) — no CPU proof needed
     uint64_t  len_waits;             // times the len-tag wait engaged (reordered tag, recovered)
     int       tail_drill;            // GB10_TP_TAIL_DRILL: invert commit/payload order every 4096th epoch
     uint64_t  posted_epochs, retired_epochs, released_epochs;
@@ -203,6 +204,50 @@ static inline uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 static inline void cpu_relax(void) { __asm__ __volatile__("yield" ::: "memory"); }
+
+// TP-E: the host-side wait policy of every CPU rendezvous wait (net_agree, net_exchange, the proxy's
+// len/tail placement waits). It used to be "spin 50 us, then nanosleep(1 ms) per retry" everywhere:
+// any inter-rank skew above 50 us (a GPU round finishing a few hundred us apart on the two ranks is
+// normal) became up to ~1.06 ms of dead time, and the rank that slept then arrived late at the next
+// collective. Now: spin (plain load + yield, I6) for a bounded budget, THEN the 1 ms sleeps, so a
+// healthy mid-request wait never sleeps and a genuinely idle/one-sided wait (peer model load, a dead
+// peer until the watchdog) still drops to ~0% CPU after the budget. The callers run on pinned cores
+// (TP scheduler/mirror thread core 9, proxy core 19), so the spin never steals a worker's core.
+// Timing only: no value, order or protocol changes. --tp-spin-us overrides the budget (diagnostic;
+// 50 = the pre-TP-E behaviour for A/B). Resolved lazily at the first wait, so the node sees the head's
+// shipped options (installed before the link carries any lockstep traffic).
+// CLI-1: the transport's options arrive from Rust (net_set_opts, called before every net_init) —
+// this shim reads no environment variables.
+#define TP_SPIN_DEFAULT_NS 20000000ull   /* 20 ms */
+static uint64_t g_tp_spin_ns = 0;        /* 0 = unresolved */
+static uint64_t g_tp_wait_sleeps = 0;    /* sleeps taken by the wait helper (all threads) */
+static unsigned long long g_opt_spin_us = 0;   /* --tp-spin-us (0 = unset / the default) */
+static int g_opt_tail_drill = 0;               /* --tp-tail-drill (test-only) */
+static int g_opt_oneshot = 0;                  /* --tp-oneshot (world == 4 only) */
+static int g_opt_tp_diag = 0;                  /* --tp-diag */
+void net_set_opts(unsigned long long spin_us, int tail_drill, int oneshot, int tp_diag) {
+    g_opt_spin_us = spin_us; g_opt_tail_drill = tail_drill; g_opt_oneshot = oneshot; g_opt_tp_diag = tp_diag;
+}
+static inline uint64_t tp_spin_budget_ns(void) {
+    uint64_t v = __atomic_load_n(&g_tp_spin_ns, __ATOMIC_RELAXED);
+    if (__builtin_expect(v == 0, 0)) {
+        unsigned long long us = g_opt_spin_us;
+        v = TP_SPIN_DEFAULT_NS;
+        if (us >= 1) v = (uint64_t)us * 1000ull;
+        __atomic_store_n(&g_tp_spin_ns, v, __ATOMIC_RELAXED);
+        fprintf(stderr, "[net] TP-E host wait policy: spin %llu us, then 1 ms sleeps%s\n",
+                (unsigned long long)(v / 1000ull), us >= 1 ? " (--tp-spin-us)" : " (default)");
+    }
+    return v;
+}
+// One retry step of a host wait that has been waiting `dt` ns.
+static inline void tp_host_backoff(uint64_t dt) {
+    if (dt >= tp_spin_budget_ns()) {
+        __atomic_fetch_add(&g_tp_wait_sleeps, 1, __ATOMIC_RELAXED);   // host counter, not a flag line (I6 n/a)
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; nanosleep(&ts, NULL);
+    } else cpu_relax();
+}
+uint64_t net_wait_sleeps(void) { return __atomic_load_n(&g_tp_wait_sleeps, __ATOMIC_RELAXED); }
 
 static inline volatile uint64_t* flagp(NetCtx* c, size_t off) {
     return (volatile uint64_t*)((char*)c->hbuf + off);
@@ -698,7 +743,7 @@ static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, cons
     c->port_num = 1; c->gid_idx = gid_idx; c->rank = rank; c->rng = 0x9E3779B9u ^ (unsigned)rank;
     c->payload_bytes = (unsigned)payload_bytes;
     c->world = 2; c->rounds = 1;
-    c->tail_drill = getenv("GB10_TP_TAIL_DRILL") != NULL;   // test-only: see post_range
+    c->tail_drill = g_opt_tail_drill != 0;   // test-only (--tp-tail-drill): see post_range
     if (c->tail_drill) LOGE("TAIL DRILL ON: inverting commit/payload order every 4096th epoch");
     // slot = payload capacity + 8 B tail epoch, 64 B aligned so no two slots share a line
     c->slot_stride = (unsigned)(((size_t)fp32_capacity_bytes + TP_TAIL_BYTES + TP_CL - 1) & ~(size_t)(TP_CL - 1));
@@ -810,16 +855,15 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
     c->port_num = 1; c->gid_idx = gid_idx; c->rank = rank; c->rng = 0x9E3779B9u ^ (unsigned)rank;
     c->payload_bytes = (unsigned)payload_bytes;
     c->world = world; c->rounds = 0; while ((1 << c->rounds) < world) c->rounds++;
-    // P3-1 one-shot push (GB10_TP_ONESHOT=1, world==4 only, DEFAULT OFF): the nway recv region
+    // P3-1 one-shot push (--tp-oneshot, world==4 only, DEFAULT OFF): the nway recv region
     // holds `world` SENDER-indexed rings instead of `rounds` per-round rings (world(4) > rounds(2)
-    // at world==4, so the region grows 2 slots — same allocation class). The env is the ONLY
-    // selector; every rank reads the same env at init (the head exports it before the cluster
-    // sync; a mismatch aborts at the first barrier, loud by construction).
-    c->oneshot = (world == 4 && getenv("GB10_TP_ONESHOT") != NULL
-                  && getenv("GB10_TP_ONESHOT")[0] != '0') ? 1u : 0u;
+    // at world==4, so the region grows 2 slots — same allocation class). The option is the ONLY
+    // selector; every rank resolves the same value at init (the head's option rides TpConfig to the
+    // node before the link comes up; a mismatch aborts at the first barrier, loud by construction).
+    c->oneshot = (world == 4 && g_opt_oneshot) ? 1u : 0u;
     if (c->oneshot) LOGE("P3-1 ONE-SHOT PUSH ACTIVE (world=%d): sender-indexed recv rings, "
                          "all-peers post, tp_wait_add_4way", world);
-    c->tail_drill = getenv("GB10_TP_TAIL_DRILL") != NULL;
+    c->tail_drill = g_opt_tail_drill != 0;
     if (c->tail_drill) LOGE("TAIL DRILL ON: inverting commit/payload order every 4096th epoch");
     c->slot_stride = (unsigned)(((size_t)fp32_capacity_bytes + TP_TAIL_BYTES + TP_CL - 1) & ~(size_t)(TP_CL - 1));
     // Layout: [world==2 rings: send R + recv R][per-round recv rings rounds*R][per-peer flags]
@@ -844,11 +888,11 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
     c->ctrl_recv_off  = c->nway_flags_off + TP_NWAY_FLAGS_BYTES;
     c->ctrl_last_off  = c->ctrl_recv_off + (size_t)world * TP_CTRL_RING * c->slot_stride;
     c->ctrl_send_off  = c->ctrl_last_off + (size_t)world * c->slot_stride;
-    // R9 DIAGNOSTIC (GB10_TP_DIAG=1): two (epoch, partner, fnv64) rings appended after the control
+    // R9 DIAGNOSTIC (--tp-diag): two (epoch, partner, fnv64) rings appended after the control
     // slots. Send-side first, then recv-side; both sized TP_DIAG_RING_EPOCHS deep. Everything stays
-    // zero/off unless the env knob is set, so production layout timing is unaffected at world>2 and
+    // zero/off unless the option is set, so production layout timing is unaffected at world>2 and
     // world==2 never reaches this initializer at all.
-    c->tp_diag = getenv("GB10_TP_DIAG") != NULL;
+    c->tp_diag = g_opt_tp_diag != 0;
     c->diag_send = c->ctrl_send_off + c->slot_stride;
     c->diag_recv = c->diag_send + (uint64_t)(c->tp_diag ? 1 : 0) * TP_DIAG_RING_EPOCHS * 3 * 8;
     c->region_bytes = c->diag_recv + (uint64_t)(c->tp_diag ? 1 : 0) * TP_DIAG_RING_EPOCHS * 3 * 8;
@@ -1019,6 +1063,7 @@ int net_set_recv_mode(NetCtx* c, int gpu) {
 // The GPU's receive watermark (TP_F_RX_DONE) — the watchdog's v2 debt signal + diagnostics.
 uint64_t net_rx_done(const NetCtx* c) { return *flagp(c, TP_F_RX_DONE); }
 
+const char* net_peer_ip(NetCtx* c) { return c->peer_ip; }   // TP-F: the aux rail dials the same peer
 void* net_ctx_dptr(NetCtx* c)   { return c->dev_ctx_d; }          // K1/K2 kernel arg (the ONLY one)
 void* net_flags_dptr(NetCtx* c) { return c->dbuf; }
 void* net_send_hptr(NetCtx* c)  { return (char*)c->hbuf + TP_RING_BASE; }                 // slot 0
@@ -1039,6 +1084,7 @@ unsigned long long net_device_epoch(NetCtx* c) { return c->dev_ctx_h->epoch; }
 unsigned long long net_gate_waits(NetCtx* c)   { return c->dev_ctx_h->gate_waits; }
 unsigned long long net_gpu_ready(NetCtx* c)    { return *flagp(c, TP_F_GPU_READY); }
 unsigned long long net_tail_fires(NetCtx* c)   { return c->tail_fires; }
+unsigned long long net_gpu_rx_skips(NetCtx* c) { return c->gpu_rx_skips; }   // TP-G
 unsigned long long net_abort_status(NetCtx* c) { return *flagp(c, TP_F_ABORT); }
 
 // Pin the CALLING thread to `core` (GB10 is big.LITTLE; a launch or poll thread parked on a little
@@ -1629,13 +1675,24 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
             int ok = 1;
             uint64_t e = next_release;
             volatile uint64_t* len_peer = (volatile uint64_t*)((char*)c->hbuf + TP_LEN_PEER_OFF);
+            // TP-G: the EXL3 decode K2 (xq_tp_wait_add_dec, GPU-side receive) validates an epoch's
+            // payload tail itself and RELEASE-publishes RX_DONE = e once it passed; the GPU then runs
+            // ahead of this loop, so by the time we look the slot may already hold generation e+R (the
+            // peer may reuse it once our K2(e) completed). An epoch the GPU proved needs no CPU proof:
+            // skip it. (RX_DONE is written in world-2 v1 mode ONLY by that kernel; every earlier epoch
+            // was consumed by a cpu_done-gated K2 first — stream order — so no skipped epoch is
+            // unvalidated. NVFP4 v1 never writes it: inert there.)
+            volatile uint64_t* rxd = flagp(c, TP_F_RX_DONE);
             for (; e <= pc; e++) {
+                if (*rxd >= e) { c->gpu_rx_skips++; continue; }
                 volatile uint64_t* lp = len_peer + (e & (TP_LEN_EPOCHS - 1));
                 uint64_t tag = *lp;
+                int gpu_done = 0;
                 if (TP_LEN_TAG_EPOCH(tag) != e) {
                     uint64_t t0 = now_ns();
                     for (;;) {
                         if (c->aborted || *flagp(c, TP_F_ABORT)) { ok = 0; break; }
+                        if (*rxd >= e) { gpu_done = 1; break; }
                         tag = *lp;
                         if (TP_LEN_TAG_EPOCH(tag) == e) break;
                         uint64_t dt = now_ns() - t0;
@@ -1650,10 +1707,10 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
                             ok = 0;
                             break;
                         }
-                        if (dt >= 50000ull) { struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; nanosleep(&ts, NULL); }
-                        else cpu_relax();
+                        tp_host_backoff(dt);
                     }
                     if (!ok) break;
+                    if (gpu_done) { c->gpu_rx_skips++; continue; }
                     c->len_waits++;
                     if (c->len_waits <= 8 || (c->len_waits & (c->len_waits - 1)) == 0)
                         LOGE("len-epoch wait engaged for epoch %llu (%lluth) — tag landed after the commit (recovered)",
@@ -1674,6 +1731,7 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
                 for (;;) {
                     if (c->aborted || *flagp(c, TP_F_ABORT)) { ok = 0; break; }
                     if (*tailp == e) break;
+                    if (*rxd >= e) { gpu_done = 1; break; }
                     uint64_t dt = now_ns() - t0;
                     if (dt > TP_TAIL_WAIT_NS) {
                         uint64_t tail = *tailp;
@@ -1687,10 +1745,10 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
                         ok = 0;
                         break;
                     }
-                    if (dt >= 50000ull) { struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; nanosleep(&ts, NULL); }
-                    else cpu_relax();
+                    tp_host_backoff(dt);
                 }
                 if (!ok) break;
+                if (gpu_done) { c->gpu_rx_skips++; continue; }
                 c->tail_waits++;
                 if (c->tail_waits <= 8 || (c->tail_waits & (c->tail_waits - 1)) == 0)
                     LOGE("tail-epoch wait engaged for epoch %llu (%lluth) — payload landed after the commit (recovered)",
@@ -1926,8 +1984,7 @@ static int nway_recv_slot(NetCtx* c, uint64_t e, int p) {
                 tp_set_abort(c, 2);
                 return 0;
             }
-            if (dt >= 50000ull) { struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; nanosleep(&ts, NULL); }
-            else cpu_relax();
+            tp_host_backoff(dt);
         }
     }
     uint64_t len = TP_LEN_TAG_BYTES(tag);
@@ -1958,8 +2015,7 @@ static int nway_recv_slot(NetCtx* c, uint64_t e, int p) {
             tp_set_abort(c, 2);
             return 0;
         }
-        if (dt >= 50000ull) { struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; nanosleep(&ts, NULL); }
-        else cpu_relax();
+        tp_host_backoff(dt);
     }
     // R9 DIAGNOSTIC: same, on the recovered path (tail landed after the commit).
     tp_diag_log_recv(c, e, p, nway_recv_slot_ptr(c, e), len);
@@ -2065,10 +2121,9 @@ int net_exchange(NetCtx* c, int nbytes) {
                     return -3;
                 }
             }
-            // Off the hot path: after 50 us of spin, drop to 1 ms nanosleeps (net_agree pattern) —
-            // a healthy idle wait is ~0% CPU, so a 100%-CPU process is once again a suspicious shape.
-            if (dt >= 50000ull) { struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; nanosleep(&ts, NULL); }
-            else cpu_relax();
+            // TP-E: spin for the bounded budget, then 1 ms nanosleeps (tp_host_backoff) — a healthy
+            // mid-request wait never sleeps; an idle wait still drops to ~0% CPU after the budget.
+            tp_host_backoff(dt);
             continue;
         }
         if (wc.status != IBV_WC_SUCCESS){ LOGE("wc status %d op %d", wc.status, wc.opcode); return -3; }
@@ -2108,8 +2163,7 @@ int net_exchange(NetCtx* c, int nbytes) {
                 tp_set_abort(c, 2);
                 return -3;
             }
-            if (dt >= 50000ull) { struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; nanosleep(&ts, NULL); }
-            else cpu_relax();
+            tp_host_backoff(dt);
         }
         __atomic_thread_fence(__ATOMIC_SEQ_CST);   // payload reads ordered behind the tag read
     }
@@ -2121,8 +2175,8 @@ int net_exchange(NetCtx* c, int nbytes) {
 // `val` must carry the step in its high bits so a stale peer value is distinguishable from a fresh one.
 // Returns the peer's token, or 0 if aborted/timed out. Called once per MTP step: ~1 wire RTT, not per barrier.
 // Deadline: without one, a peer whose main thread hangs (proxy/NIC still alive, so no error CQE ever)
-// hangs THIS thread forever, mid-step, silently. TP_WDOG_NS is ~10^5x the expected RTT; past 50 us we
-// escalate from tight spin to 1 ms nanosleeps so a slow-but-alive peer costs at most ~1 ms. Abort code 7.
+// hangs THIS thread forever, mid-step, silently. TP_WDOG_NS is ~10^5x the expected RTT; the wait spins
+// for the TP-E budget (tp_host_backoff, default 20 ms), then 1 ms nanosleeps. Abort code 7.
 uint64_t net_agree(NetCtx* c, uint64_t val, uint64_t step_mask, uint64_t step_val) {
     __atomic_store_n(flagp(c, TP_F_AGREE_OUT), val, __ATOMIC_RELEASE);
     const uint64_t t0 = now_ns();
@@ -2142,8 +2196,7 @@ uint64_t net_agree(NetCtx* c, uint64_t val, uint64_t step_mask, uint64_t step_va
             tp_set_abort(c, 7);
             return 0;
         }
-        if (dt >= 50000ull) { struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; nanosleep(&ts, NULL); }
-        else cpu_relax();
+        tp_host_backoff(dt);
     }
 }
 
@@ -2249,8 +2302,7 @@ int net_exchange_one(NetCtx* c, int peer_rank, int nbytes) {
                 return -3;
             }
         }
-        if (dt >= 50000ull) { struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; nanosleep(&ts, NULL); }
-        else cpu_relax();
+        tp_host_backoff(dt);
     }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);   // payload reads ordered behind the tag read
     // R10: copy the validated payload to the stable per-sender slot — net_ctrl_recv_hptr readers

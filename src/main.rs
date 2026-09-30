@@ -7,7 +7,7 @@ fn print_help() {
     let prog = std::path::Path::new(&arg0)
         .file_name().unwrap_or_default().to_string_lossy();
 
-    println!("gb10_inference â from-scratch Rust+CUDA inference for Qwen3.5/3.6 hybrid models on GB10");
+    println!("gb10_inference â from-scratch Rust+CUDA inference on NVIDIA GB10 (DGX Spark): Qwen3.5/3.6/3.8 incl. Qwen3.8-Flash-Next EXL3");
     println!();
     println!("USAGE:");
     println!("  {prog} <MODE> [OPTIONS]");
@@ -72,11 +72,31 @@ fn print_help() {
     println!("                               NOT bit-exact: reuse re-chunks the prefill and cuBLAS picks a");
     println!("                               kernel per shape, so a cached turn can word an answer");
     println!("                               differently than a cold one. Greedy MTP stays lossless.  [off]");
+    println!("    --prefix-ckpt-mem-gb <G>   EXL3: GiB cap (LRU) of the intermediate prefill checkpoints");
+    println!("                               (WP16): a new question on the same document or a new chat");
+    println!("                               on a shared system prompt resumes from the deepest aligned");
+    println!("                               checkpoint instead of re-prefilling — bit-identical to a");
+    println!("                               fresh prefill. 0 = off (--wp16-off=1 likewise).       [4]");
     println!();
     println!("  SAMPLING DEFAULTS  (server-level; every request may override in its JSON body)");
     println!("    --default-repetition-penalty <F>  Repetition penalty, 1.0 = off                    [1.0]");
     println!("    --default-presence-penalty <F>    Presence penalty       [2.0 on 2B, else 1.5]");
     println!("    --default-frequency-penalty <F>   Frequency penalty                                [0.0]");
+    println!("    --penalty-range <N>        EXL3: repetition/presence/frequency window, the reference");
+    println!("                               engine's semantics: N tokens at full strength + N fading   [1024]");
+    println!("    --loop-detect <on|off>     EXL3: end a response whose last --loop-window tokens are one");
+    println!("                               repeating sequence (period <= window / --loop-min-reps) as a");
+    println!("                               normal stop, stop_reason \"loop_detected\"                   [on]");
+    println!("    --loop-window <N> / --loop-min-reps <R>   Loop detector window and min repeats  [300 / 3]");
+    println!("    --cpu-affinity <auto|off>  EXL3: pin the scheduler + HTTP threads to the big cores (detected");
+    println!("                               from sysfs cpu_capacity, as the rival's taskset)        [auto]");
+    println!("    --spec-sampling <match|ratio>  EXL3: how SAMPLED requests verify MTP drafts. ratio (default)");
+    println!("                               drafts, a verify row accepts while its sample equals the draft;");
+    println!("                               ratio = real-q speculative sampling (drafts sampled from the");
+    println!("                               head's top-32, accept min(1, p/q), exact residual). Both are");
+    println!("                               distribution-exact; ratio changes seeded output bytes. Greedy");
+    println!("                               requests are unaffected                                  [match]");
+    println!("    --draft-temperature <T>    EXL3 ratio mode: the draft sampling temperature  [= request's T]");
     println!("    (temperature / top_p / top_k / seed are per-REQUEST only â defaults 0.7 / 0.8 / 20)");
     println!();
     println!("  VISION  (optional capability â never a boot blocker)");
@@ -174,7 +194,7 @@ fn print_help() {
     println!("    --nodes <ip[:port],...>  Explicit node address(es); skips UDP discovery");
     println!("    --discover-wait <S>      Discovery broadcast window instead of --nodes      [3]");
     println!("    --rdma-dev <d1[,d2]>     RoCE devices if the defaults (rocep1s0f1, roceP2p1s0f1)");
-    println!("                             don't match the platform (also GB10_RDMA_DEV)");
+    println!("                             don't match the platform (also --rdma-dev)");
     println!("    --no-shard-mixers        Escape hatch: DON'T shard attention/GDN mixers + KV");
     println!("                             (default is ON under --tp/--head — it's where the speed is)");
     println!("    --tp-graph               CUDA-graph the TP decode (bench path)");
@@ -253,10 +273,8 @@ fn print_help() {
     println!("                             optional for dflash2-auto/mtp/none (no dir = MTP");
     println!("                             fallback). A dir that does not exist always stops the app,");
     println!("                             and a failed load refuses to start — never a silent");
-    println!("                             downgrade. Env equivalent: GB10_DRAFT_DIR.");
-    println!("                             (`--dflash-dir` / GB10_DFLASH_DIR are DEPRECATED P14-era");
-    println!("                             aliases for the dflash source only; they warn and will be");
-    println!("                             removed.)");
+    println!("                             downgrade. (`--dflash-dir` is a DEPRECATED P14-era alias");
+    println!("                             for the dflash source only; it warns and will be removed.)");
     println!("    --df2-round-shard <on|off> P2: shard the DFlash2 drafter round across the TP ranks");
     println!("    --df2-carry <on|off>       Keep DFlash2 in the draft seat across a prefix-cache");
     println!("                               hit (default off). Off = a cache hit falls back to MTP,");
@@ -300,16 +318,14 @@ fn print_help() {
     println!("                             (orchestrator fans out 6 cell-groups across .11/.12).");
     println!("                             [--df2-step-dump <dir>] (S5F3) dump-only per-verify-step");
     println!("                             records (drafts, p, top-20, taps checksums/raw, accept) —");
-    println!("                             the draft-parity instrument; also env GB10_DF2_STEP_DUMP.");
+    println!("                             the draft-parity instrument.");
     println!();
-    println!("  TP ENV-VAR ALIASES (the CLI flags above are preferred; env stays for back-compat.");
-    println!("  Set on the HEAD only — the sync ships the config to the node, which needs nothing):");
-    println!("    GB10_TP_SHARD_MIXERS=1 ↔ default-on under --tp/--head (--no-shard-mixers turns off)");
-    println!("    GB10_TP_GRAPH=1 ↔ --tp-graph    GB10_TP_FP32_PARTIALS=1 ↔ --tp-fp32-partials");
-    println!("    GB10_TP_TRACE=1 ↔ --tp-trace    GB10_TP_CACHE=<dir> ↔ --tp-cache <dir>");
-    println!("    GB10_TP_MTP=1 ↔ --mtp=on (bench rig)   GB10_TP_MTP_DEPTH=N ↔ --mtp-depth N");
-    println!("    GB10_TP_TAIL_DRILL=1     TEST: invert commit/payload every 4096th epoch");
-    println!("    GB10_TP_AGREE_DRILL=N    TEST: corrupt this rank's agree hash at step N");
+    println!("  TP OPTIONS: every engine option is a flag set on the HEAD only — the sync ships the");
+    println!("  head's resolved options (TpConfig) to the node, whose command line carries only its");
+    println!("  per-box options (--port, --rdma-dev, --tp-cache). Mixer sharding is default-on under");
+    println!("  --tp/--head (--no-shard-mixers turns it off). Test drills: --tp-tail-drill (invert");
+    println!("  commit/payload every 4096th epoch), --tp-agree-drill N (corrupt this rank's agree hash");
+    println!("  at step N) — see --help-diag.");
     println!();
     println!("  TYPICAL");
     println!("    peer: ./gb10_inference --node --port 29500");
@@ -333,6 +349,16 @@ fn print_help() {
     println!("  --probe-dispatch         Dispatch assert: N<=16 never takes the prefill dequant arm,");
     println!("                           and N=17 DOES (the negative control that makes it non-vacuous)");
     println!("  --probe-state            GDN recurrent-state divergence probe (must be 0.0)");
+    println!("  --probe-exl3-wp16        EXL3 WP16 gate: prompt B resumed from a checkpoint of prompt A");
+    println!("                           == B prefilled fresh, bitwise (state, first-token logits,");
+    println!("                           greedy continuation; prints WP16 PROBE: EXACT)");
+    println!("                           (--model-dir <d> --prompt-ids <A> [--wp16-b-ids <B>]");
+    println!("                            [--wp16-split S] [--prefill-chunk C] [--max-seq-len N] [--max-new-tokens N])");
+    println!("  --probe-q4              qwen4_exp bring-up probe: tokenize, prefill, greedy decode");
+    println!("                           (--model-dir <d> [--prompt <text>] [--max-new-tokens N]");
+    println!("                            [--max-seq-len N] [--chat] [--tokens 1,2,3]");
+    println!("                            [--dump-logits <dir>])");
+    println!("  --ple-offload <ssd|none> qwen4_exp (Qwen3.8-Flash-Next): keep the PLE n-gram table on SSD [none = GPU-resident]");
     println!("  --tripwire <posture>     Permanent pool/OOB tripwire: off|observe|assert (default off;");
     println!("                           assert is downgraded to observe on a TP rank). Counters move");
     println!("                           in every posture — a `debug_assert!` used to be dead in release");
@@ -343,6 +369,15 @@ fn print_help() {
     println!("                           prefill path + per-prefill-window (n, tp64) records. NEVER on");
     println!("                           for a timing run");
     println!("  --probe-reject           Reject-path checkpoint/rollback 3-way probe");
+    println!("  --probe-exl3-hcw4        EXL3 xq_hc_w4 alone (synthetic): bitwise vs the p4c hc path, m 1..8,");
+    println!("                           grids x flags, then the standalone DRAM-cold timing table (TP-I3 (b))");
+    println!("  --probe-exl3-ltrows      Sequence-parallel precondition (synthetic): prefill cuBLASLt GEMMs per-row");
+    println!("                           bit-identical at m = c/2 vs m = c, own-heuristic vs pinned plan");
+    println!("                           [--ltrows-c 2048,1024,... | A-B (sweep)] [--ltrows-shapes all|hc] (TP-I3 (a) rung 1)");
+    println!("  --probe-exl3-sppin       TP-SP1 gate (synthetic): the sequence-parallel prefill's pinned-plan GEMM call on every");
+    println!("                           rank block vs the replicated m = c call, bitwise, every c of [--sppin-c A-B] (default");
+    println!("                           128-4095 = the split range) for the hc down/up shapes [--sppin-world W] (default 2);");
+    println!("                           also the EXL3-SP-PIN section of --probe-exl3-binv");
     println!("  --probe-gemm             cuBLAS bf16 GEMM per-shape batch-invariance audit");
     println!("  --probe-tq [goldens-dir] TurboQuant KV kernel validation vs the E4 reference");
     println!("                           goldens (packed rows, scores, PV; default /tmp/tq_ref2/goldens)");
@@ -350,12 +385,61 @@ fn print_help() {
     println!("  --probe-bandwidth-sustained [--seconds N]   thermal derating under load");
     println!("  --tp-barrier-bench       Doorbell transport adversarial gates (no model needed)");
     println!("                           [--world N] N-way recursive-doubling round schedule (power of 2)");
+    println!("  --tp-reduce-bench        TP-F prefill-sized fp32 all-reduce on the real transport, every reduce");
+    println!("                           bitwise-checked: --rank 0|1 [--peer IP] --mode serial|pipe [--dev2 DEV]");
+    println!("                           [--io f32|f16|f16w|f32to16] [--lookahead G] [--blocks B] [--mix K]");
+    println!("                           EXL3 TP knob --tp-prefill-xport = 2 (default, dual rail) | 1 | 0 (serial)");
+    println!("                           --mode decold|decl|declg|decmix1..3 --floats 20480: TP-G decode-sized reduces");
+    println!("                           EXL3 TP knobs (TP-G, bitwise): --tp-dec-xport = 1 (default: decode K1 folded");
+    println!("                           into the producer's last block + multi-block K2 with the f16 cvt folded) | 0;");
+    println!("                           --tp-route-fold = 1 (default: EP route folded into the router fold) | 0;");
+    println!("                           --tp-dec-grecv = 1 (default: GPU-side payload-tail receive OR cpu_done) | 0");
+    println!("                           EXL3 TP knob (TP-H, bitwise greedy): --tp-vp-head = 1 (default: vocab-parallel");
+    println!("                           lm_head, each rank runs half the vocab GEMM + argmax key exchange; sampled/penalized");
+    println!("                           rows keep the replicated head) | 0");
+    println!("                           --tp-dh-shard = 1 (default: each rank screens half of the MTP draft head's 2-bit");
+    println!("                           screen blocks, bmax reassembled through the decode doorbell — bitwise) | 0");
+    println!("                           --tp-boot-delay = <rank>:<secs> (TEST-ONLY failure injection: that rank sleeps before");
+    println!("                           the post-load boot rendezvous, which is probe-tolerant since TP-I/C6)");
+    println!("                           --tp-dds-prior = on (default: the WP23 DDS cost guard's prior is 2.7 ms/draft on TP");
+    println!("                           lanes, the TP=2 marginal draft cost) | 0 (6.0, the TP=1 constant) | <ms>");
+    println!("                           --ep-deal = interleave (default) | freq (per-layer frequency-balanced expert deal,");
+    println!("                           data/ep_deal/*.json; changes the fp32 grouping of the MoE partials: output-changing)");
+    println!("                           --tp-ep-hist = <path> (diagnostic: per-(layer, expert) decode routing histogram JSON)");
+    println!("                           --tp-ks-target = <blocks> (opt-in: split-K of the TP-sliced dense quads from this");
+    println!("                           resident-block target, cap 16; unset = the TP=1 heuristic's 200; output-changing)");
+    println!("  --tp-prefill-overlap <off|on|inline[:ROWS]|dual[:ROWS]|fold>  EXL3 TP=2 (TP-I2, bitwise): run the next hc_pre's");
+    println!("                           inject+norm (and the mixer's output svh) per landed ROWS-row range (default 128) of each");
+    println!("                           pipelined prefill all-reduce: inline = between the K1m/K2m launches on the compute stream;");
+    println!("                           dual = K1m/K2m on the transport's own stream, concurrent with it; on = dual:128 = DEFAULT;");
+    println!("                           off = the TP-F path. fold (TP-I3 (c1), bitwise) = whole-row epochs, each epoch's K2m");
+    println!("                           replaced by the fused consumer (K2m gate + canonical sum + the inject+norm / the");
+    println!("                           mixer's output Hadamard+svh), one stream.");
+    println!("                           Head flag; rides TpConfig (v20) to the node.");
+    println!("  --tp-vp-sampled <on|off> EXL3 TP=2 (TP-H2, bitwise): the vocab-parallel lm_head for sampled / penalized /");
+    println!("                           ratio-rule rows (plain steps and verify rows): each rank runs the lm_head GEMM on its");
+    println!("                           own vocab shard, the shard rows are all-gathered through the decode doorbell into the");
+    println!("                           full logits rows, and the unchanged penalty / argmax / sampler run on them (bitwise the");
+    println!("                           replicated head). Needs the TP-H #4 shard (--tp-vp-head on). off = the replicated");
+    println!("                           head for those rows. on = DEFAULT (TP-H2 A/B GO). Head flag; rides TpConfig (v21).");
+    println!("  --tp-seq-parallel <on|off|hc|router> EXL3 TP=2 (TP-SP1/SP2, bitwise by construction where");
+    println!("                           --probe-exl3-sppin holds): sequence-parallel prefill — for chunks of 128..=4095 rows each");
+    println!("                           rank runs every hc_pre (inject+norm, the hc down/up GEMMs with the full chunk's cuBLASLt");
+    println!("                           plan PINNED on its rows, silu, mix) on its own half of the rows; x is all-gathered");
+    println!("                           before every mixer / router; the 96 all-reduces become reduce-scatters; the streams are");
+    println!("                           gathered once per chunk for the MTP head fill (= hc). router = hc + the MoE router");
+    println!("                           (fp32 GEMM + top-k) on the own rows and one ids/weights all-gather per layer (SP-2).");
+    println!("                           on = the posture the SP-2 A/B picked (= hc). Composes with --tp-prefill-overlap");
+    println!("                           on|dual|inline|off (not fold). DEFAULT ON (TP-SP2 A/B GO); off = the replicated");
+    println!("                           prefill. Head flag; rides TpConfig (v22).");
+    println!("  --xtp-sp-fault L[:R]     TP-SP2 G-T1-b proof (probe only, --probe-exl3-xtp with --tp-seq-parallel): rank R");
+    println!("                           (default 1) flips one ulp of its first OWN stream row after layer L in the first split");
+    println!("                           chunk; the redesigned rank-identity gate must report RANK_IDENTITY_FAIL");
     println!("  --dump-rank-weights      Per-rank weight accounting: which tensors are resident whole");
     println!("                           (replication targets) vs sharded; [--rank R --world W] applies the");
-    println!("                           exact TP weight layout offline (set GB10_TP_SHARD_MIXERS to match)");
-    println!("  --tp-shard-mtp           Shard the MTP draft block under TP (fc m-slice + attn heads +");
-    println!("                           FFN/experts) — draft path carries reduce sites; DEFAULT OFF");
-    println!("                           (GB10_TP_SHARD_MTP=1 alias, harness/A-B)");
+    println!("                           exact TP weight layout offline (pass --tp to match the sharded layout)");
+    println!("  --tp-shard-mtp on|off     Shard the MTP draft block under TP (fc m-slice + attn heads +");
+    println!("                           FFN/experts) — draft path carries reduce sites; DEFAULT ON");
     println!("  --net-test               Transport + FP32-partial audit, 2 procs (--rank 0|1 --peer)");
     println!("  --sweep-gemm             GEMM shape sweep");
     println!("  --perplexity             PPL on held-out text (--text <file> --window N --max-windows N)");
@@ -363,12 +447,13 @@ fn print_help() {
     println!("  --capture-layers         Dump per-layer hidden states for raw token ids (--ids <f> --out <f>)");
     println!();
     println!("════════════════════════════════════════════════════════════════════════════════");
-    println!("  SESSION BEHAVIOR FLAGS (env aliases in parentheses, back-compat; CLI wins)");
+    println!("  SESSION BEHAVIOR FLAGS");
     println!("════════════════════════════════════════════════════════════════════════════════");
     println!();
-    println!("  --kv-cache bf16|q4|tq|k8v4|k8v8  KV cache format (q4 = 4-bit GB10_KV_QUANT; tq = 3.5-bit");
-    println!("                           TurboQuant GB10_KV_TQ=1; k8v4 = int8-K + q4-V GB10_KV_K8V4=1;");
-    println!("                           =0 restores bf16/q4 byte-for-byte)");
+    println!("  --kv-cache bf16|q4|tq|tq3|k8v4|k8v8  KV cache format (q4 = 4-bit; tq = 3.5-bit");
+    println!("                           TurboQuant; k8v4 = int8-K + q4-V; k8v8 = int8 K+V; bf16 = default)");
+    println!("  --kv-cache f32|f16|fp8|q8  EXL3 packs: attention KV format (default q8 = H32-rotated int8");
+    println!("                           + f16 per-32 scale, the rival's -cq 8; f32 = exact)");
     println!("  --reasoning-effort <e>   reasoning level in the chat template (no_think|low|high|medium|xhigh)");
     println!("  --thinking <mode>        server: engine's thinking override — auto (default: pass nothing, the");
     println!("                           model's own chat_template.jinja decides) | on | off. Per-request");
@@ -376,12 +461,30 @@ fn print_help() {
     println!("  --output-prompts [n]     server: log each chat request human-readable (params, messages,");
     println!("                           rendered prompt, first n chars; default n=6000, absent = off)");
     println!("                           (default: model's own template default — xhigh for Qwen, low for hy_v3)");
-    println!("  --no-decode-graphs       Disable decode CUDA graphs    (GB10_NO_DECODE_GRAPHS)");
-    println!("  --no-gqpack              Per-head q4 attention fallback  (GB10_NO_GQPACK)");
-    println!("  --fuse-residual          Fused residual+norm epilogue    (GB10_FUSE_RESIDUAL)");
-    println!("  --cpu-sample             Sample on CPU instead of GPU    (RUST_INFER_CPU_SAMPLE)");
-    println!("  --prefill-scalar         Scalar (non-tiled) attn prefill (RUST_INFER_PREFILL_SCALAR)");
-    println!("  --zero-kv                Restore cold-admit KV zeroing   (RUST_INFER_ZERO_KV)");
+    println!("  --no-decode-graphs       Disable decode CUDA graphs");
+    println!("  --no-gqpack              Per-head q4 attention fallback");
+    println!("  --fuse-residual          Fused residual+norm epilogue");
+    println!("  --cpu-sample             Sample on CPU instead of GPU");
+    println!("  --prefill-scalar         Scalar (non-tiled) attn prefill");
+    println!("  --zero-kv                Restore cold-admit KV zeroing");
+    println!("  --hc-fp16                EXL3: bit-exact fp16 hyper-connection mixers (the DEFAULT");
+    println!("                           is int8 with per-row scales — rival's served config)");
+    println!("  --tune-table auto|off|<path>  EXL3 server: autotune table (default auto = a matching");
+    println!("                           ./tune/*.json, S section; off = built-in defaults; a mismatch");
+    println!("                           falls back loudly). --tune-draft on adds section D (draft-only);");
+    println!("                           --tune-profile <MHz> picks the clock profile (stock 2400)");
+    println!("  --autotune --selftest    EXL3: the tuner's measurement self-test (A/A null, 0.2 ms known");
+    println!("                           positive, trajectory invariance) — idle .13/.14 only");
+    println!("  --autotune               EXL3: offline tune of the bitwise schedule knobs (S class) at the");
+    println!("                           served posture (--max-batch/--max-seq-len/--kv-cache/--prefill-chunk/");
+    println!("                           --draft-confidence as served); writes tune/<model8>.<posture8>.tp1.<MHz>.json");
+    println!("                           after the final LI A/B + hash gate. --autotune-budget <min> (20),");
+    println!("                           --autotune-skip-sparse / -skip-prefill, --autotune-families a,b — idle .13/.14 only");
+    println!("                           measurement protocol (both modes): --autotune-warmup <0..4> untimed base");
+    println!("                           replays per round (2), --autotune-stratify on|off position model (on);");
+    println!("                           self-test A/A: --autotune-selftest-tau <ms> (0.02) and -tau-pct <pct> (0.05):");
+    println!("                           PASS = |HL| < tau AND (CI95 covers 0 OR CI95 within +-tau), tau = max(both)");
+    println!("  --autotune-report <table>  print a tune table (decisions, CI, runner-ups, statuses, gate)");
     println!("  --exact-gemm             DSV4: locked bit-exact olo/compressor kernels (the");
     println!("                           tolerance-class fast paths are DEFAULT ON — item 2.5)");
     println!("  --splitk-gemm            QWEN/HY3: NVFP4 serving-GEMM split-K (long-K GEMVs — the");
@@ -395,7 +498,7 @@ fn print_help() {
     println!("  --probe-moe-gemm         E11 MoE slot-fold A/B: synthetic weights at the fold decode");
     println!("                           shapes (default Hy3 gate_up/down), interleaved best-of-N");
     println!("                           across the E11 variants + the PDL overlap mechanism test");
-    println!("  GB10_MOE_VARIANT=...     E11: decode fold-GEMM variant plain|u4|x2|rast|lb5|lb4|pdl");
+    println!("  --moe-variant=...     E11: decode fold-GEMM variant plain|u4|x2|rast|lb5|lb4|pdl");
     println!("  --probe-mxfp4-xchain     MXFP4-native Phase A: same real prompt through the native");
     println!("                           OMMA chain AND the bf16 chain — per-layer rel-L2 curve,");
     println!("                           per-GEMM-input quant roundtrip on real hiddens, logit/");
@@ -405,18 +508,16 @@ fn print_help() {
     println!("                           --probe-mxfp4-xchain2-compare <a.bin>,<b.bin>)");
     println!("  --probe-fold-xchain-compare <a.bin>,<b.bin>");
     println!("                           fold-vs-nofold per-layer comparison (FOLDX dumps from the");
-    println!("                           TP head via GB10_FOLD_XCHAIN_DUMP=<path>)");
-    println!("  --draft-vocab N          FR-Spec draft vocab subset; 0=off (RUST_INFER_DRAFT_VOCAB)");
-    println!("  GB10_RDMA_DEV=<d1[,d2]>  RoCE device override (see --rdma-dev)");
+    println!("                           TP head via --fold-xchain-dump=<path>)");
+    println!("  --draft-vocab N          FR-Spec draft vocab subset; 0=off");
+    println!("  --rdma-dev <d1[,d2]>     RoCE device(s) (per box: rail 1[,rail 2])");
     println!();
-    println!("  GENERIC ENV KNOBS (AGENTS.md §7 — one name per knob, all families. The DSV4_*");
-    println!("  names survive as back-compat aliases that log a deprecation warning):");
-    println!("    GB10_MAX_SEQ_LEN=N       KV-ring depth override, DSV4 serve/probe paths");
-    println!("                             (deprecated alias DSV4_MAX_SEQ_LEN)");
-    println!("    GB10_PREFILL_TRACE=1     Per-chunk/path prefill timers (alias DSV4_PREFILL_TRACE)");
-    println!("    GB10_BISECT_LEN=N        Deterministic prompt pad/truncate (alias DSV4_BISECT_LEN)");
+    println!("  NO ENVIRONMENT VARIABLES (AGENTS.md §7, CLI-1): every engine option is a command-line");
+    println!("  flag. An environment variable the engine used to read (GB10_*, RUST_INFER_*, DSV4_*, ...)");
+    println!("  stops the binary at startup with the flag that replaced it. --print-config shows every");
+    println!("  option's resolved value; the generated sections below list them (diagnostics: --help-diag).");
     println!();
-    println!("Note: there are NO MTP on/off env vars — speculation is auto-tuned per request");
+    println!("Note: speculation is auto-tuned per request");
     println!("(greedy => argmax verify, bitwise lossless; temp>0 => speculative rejection");
     println!("sampling, distribution-exact). --mtp=on|off and --mtp-depth exist for benches.");
     println!();
@@ -443,6 +544,14 @@ fn load_model_gpu(dir: &str, tp_rank: Option<i32>, world: i32)
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    // CLI-1 (AGENTS §7): every engine option is a command-line flag. An environment variable the
+    // engine used to read is refused here, loudly, naming its flag; then the registry is filled
+    // from argv once, before any worker / GPU thread starts.
+    gb10_inference::opts::reject_env();
+    if let Err(e) = gb10_inference::opts::parse_cli(&args) {
+        eprintln!("FATAL: {e}");
+        std::process::exit(2);
+    }
     // DF2 block-16: resolve the draft block FIRST, before any DFlash2 buffer or round is built.
     // It is a process global read by every sizing/launch site in src/dflash2/, so it must be
     // installed once and never changed; block 8 reproduces today's allocations and launches
@@ -455,7 +564,15 @@ fn main() {
         });
         gb10_inference::dflash2::set_block(b).unwrap_or_else(|e| panic!("--df2-block: {e}"));
     }
-    cli_env_bridge(&args);
+    cli_opts_bridge(&args);
+
+    // PR veloGB10#4 (memwatch): host-memory watchdog for the unified-memory box — a process
+    // that EXITS under pressure frees everything; the kernel OOM path can hang the machine.
+    // --mem-watchdog-gb=<floor> (default 5, 0 = off).
+    gb10_inference::memwatch::start();
+    // S-B14: the 1 Hz unified-memory timeline (--mem-trace=1) — starts at boot so the
+    // serve-prep sink window is fully covered by the trace, not just the phase probes.
+    gb10_inference::memwatch::trace_loop();
 
     // ---- PLAN/TRIPWIRE_SPEC.md (P10 W2): the permanent host-side OOB / alloc tripwire --------
     // `--tripwire <off|observe|assert>` sets the posture; `--pool-census` turns on the per-alloc
@@ -491,7 +608,31 @@ fn main() {
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
+        print!("{}", gb10_inference::opts::help_text(false));
         return;
+    }
+    // CLI-1: the diagnostics / test-drill options (kept out of --help so it stays readable).
+    if args.iter().any(|a| a == "--help-diag") {
+        print!("{}", gb10_inference::opts::help_text(true));
+        return;
+    }
+    // CLI-1: every registry option with its resolved value (+ the resolvers' view), then exit. Pass
+    // it the same command line as a run to see that run's effective configuration.
+    if args.iter().any(|a| a == "--print-config") {
+        print!("{}", gb10_inference::opts::print_config());
+        print!("{}", gb10_inference::opts::print_resolved());
+        return;
+    }
+
+    // TUNE T1 (PLAN/AUTOTUNE_DESIGN.md §5.7): the autotuner's measurement core + self-test.
+    //   ./gb10_inference --autotune --selftest --model-dir <EXL3 pack> [--max-seq-len 8192]
+    //       [--max-new-tokens 384] [--autotune-li-steps 64] [--autotune-out tune/receipts]
+    //       [--autotune-corpus prompts.json] [--autotune-seed N] [--tune-table off|auto|<path>]
+    // Refuses unless this is an idle .13/.14 (AGENTS §1.0, design §12 G-T8). The search / table
+    // writer (plain --autotune) is T2.
+    // TUNE T2: plain --autotune = the search + table writer; --autotune-report <table> = the report.
+    if args.iter().any(|a| a == "--autotune" || a == "--autotune-report") {
+        std::process::exit(gb10_inference::exl3_forward::autotune::cli(&args));
     }
 
     // Check for server mode
@@ -508,6 +649,10 @@ fn main() {
 
     // TP=2 doorbell barrier microbench — the adversarial gate the protocol must pass BEFORE the model
     // depends on it (tp_doorbell_ref/BENCH_PLAN.md). Runs on the real transport with no model.
+    if args.iter().any(|a| a == "--tp-reduce-bench") {
+        run_tp_reduce_bench(&args);
+        return;
+    }
     if args.iter().any(|a| a == "--tp-barrier-bench") {
         run_tp_barrier_bench(&args);
         return;
@@ -554,7 +699,7 @@ fn main() {
     // DSV4 single-process isolated prefill bench (R2.2): loads the full trunk single-process and
     // times `forward` (auto-chunked at PREFILL_CHUNK) over a synthetic prompt. This is the
     // isolated-prefill measurement the audit lacks (the --head path is wall-derived). Set
-    // GB10_PREFILL_TRACE so the per-chunk + path timers fire too. `--dsv4-bench-prefill
+    // --prefill-trace so the per-chunk + path timers fire too. `--dsv4-bench-prefill
     // --model-dir <bundle> --seq-len N [--reps R]`.
     if args.iter().any(|a| a == "--dsv4-bench-prefill") {
         run_dsv4_bench_prefill(&args);
@@ -575,9 +720,23 @@ fn main() {
         return;
     }
 
+    // qwen4_exp (Qwen3.8-Flash-Next): `--ple-offload ssd` keeps the ~31 GB PLE n-gram table on
+    // disk and reads rows per forward; `none`/absent = device-resident. (The env var is internal
+    // transport only — the user interface is this CLI flag; read by GpuModel::ple_offload_ssd.)
+    // S-H0.4a fix: this MUST run before any dispatch that loads a model (--probe-q4's footprint
+    // check reads it) — it previously sat BELOW the --probe-q4 dispatch, so the flag was dead on
+    // the probe path and the single-node check refused with the table counted as resident.
+    // (CLI-1: --ple-offload ssd|none is a registry option, parsed and validated at startup.)
     // GDN state-divergence probe (verify_forward vs forward_decode recurrent state)
     if args.iter().any(|a| a == "--probe-state") {
         run_probe_state(&args);
+        return;
+    }
+    // qwen4_exp bring-up probe (PR #4): smallest end-to-end generation on the GpuModel path —
+    // tokenize, prefill, greedy decode, print. Family-agnostic; `--dump-logits <dir>` writes the
+    // reference-oracle logits.
+    if args.iter().any(|a| a == "--probe-q4") {
+        run_probe_q4(&args);
         return;
     }
     // Reject-path checkpoint/rollback three-way probe
@@ -732,7 +891,7 @@ fn main() {
     }
     // TP4-campaign Step-0 audit: per-rank weight accounting. `--rank R --world W` reproduces the
     // exact TP weight layout offline (shard-at-load + in-place shard, NO RDMA attach — the
-    // transport never touches weights). Remember to export the same env (GB10_TP_SHARD_MIXERS…)
+    // transport never touches weights). Remember to export the same env ([tp-shard-mixers]…)
     // as the live configuration being audited.
     if args.iter().any(|a| a == "--dump-rank-weights") {
         let dir = parse_arg(&args, "--model-dir").expect("--dump-rank-weights requires --model-dir <DIR>");
@@ -899,12 +1058,511 @@ fn main() {
     // fragments against today's quant(+silu)+GEMM chain, {dense, slot, grouped} x {XSILU 0,1}
     // x N in {1,2,4,8,16} x K in {1536,4096,13312} + the edge sweep. Prints FUSED_BIT_IDENTITY
     // OK when all byte-compares pass. Native mode must be on at load.
-    //   ./gb10_inference --probe-mxfp4-fused --model-dir <DIR>   (GB10_MXFP4=1 implied)
+    //   ./gb10_inference --probe-mxfp4-fused --model-dir <DIR>   (--mxfp4=1 implied)
     if args.iter().any(|a| a == "--probe-mxfp4-fused") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-mxfp4-fused requires --model-dir <DIR>");
-        std::env::set_var("GB10_MXFP4", "1");   // native mode at load (OMMA modules resident)
+        gb10_inference::opts::set(gb10_inference::opt!("mxfp4"), "1");   // native mode at load (OMMA modules resident)
         let (gpu, _) = load_model_gpu(dir, None, 1);
         gpu.probe_mxfp4_fused();
+        return;
+    }
+    // S-A3-b Phase 1 (track A3): EXL3 pack census — directory parse + quadruple
+    // completeness + manifest compare, NO model load. See PLAN/A3_EXL3_FORMAT_SPEC.md.
+    //   ./gb10_inference --probe-exl3 --model-dir <EXL3-pack-dir>
+    // API-parity G2 gate: device sampler distribution-exactness (no model load).
+    //   ./gb10_inference --probe-sampler
+    if args.iter().any(|a| a == "--probe-sampler") {
+        gb10_inference::exl3_bench::probe_sampler().unwrap_or_else(|e| {
+            eprintln!("PROBE_SAMPLER_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // WP15 gate: device penalties vs a dense transcription of the rival's rep_pen.cu, verify-row
+    // == plain-row exactness, ring commits, draft mirror. Synthetic rows; no model.
+    //   ./gb10_inference --probe-penalties
+    if args.iter().any(|a| a == "--probe-penalties") {
+        gb10_inference::exl3_bench::probe_penalties().unwrap_or_else(|e| {
+            eprintln!("PROBE_PENALTIES_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // WP24 gate: real-q speculative sampling distribution-exactness (reference-free two-sample
+    // chi-square, 4 configs T 0.7/1.0 x top_p 0.8/0.95, top_k 20, >= 2 seeds). Stage A: kernel
+    // level on synthetic rows (no model; plain-vs-plain control, negative control). Stage B with
+    // --model-dir: the served scheduler, ratio MTP vs plain decode with a match-MTP control.
+    //   ./gb10_inference --probe-spec-sampling [--model-dir <pack>] [--launches 200]
+    //       [--trials-per-launch 512] [--seeds 2] [--top-k 20] [--draft-temperature T]
+    //       [--trials 600] [--positions 6] [--max-batch 4] [--prompt ..] [--kv-cache ..] [--skip-kernel]
+    //       [--quick (stage B: T 1.0 / top_p 0.95 only)]
+    if args.iter().any(|a| a == "--probe-spec-sampling") {
+        gb10_inference::wp24::probe_spec_sampling(&args).unwrap_or_else(|e| {
+            eprintln!("PROBE_SPEC_SAMPLING_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // TP-A (EXL3 TP bring-up, PLAN/TP2_DESIGN_EXL3_2026-09-28.md §6 T1):
+    //   --probe-exl3-slice --model-dir <pack> [--slice-experts N] [--gpu]   G-T1-0 slice oracle
+    //   --exl3-pack-manifest --model-dir <pack>                            the D-T0-6 pack hash
+    //   --probe-exl3-xtp --model-dir <pack> [--prompt s|--prompt-ids f] [--xtp-gen N]
+    //       [--max-seq-len N] --xtp-out <dir>        TP=1 reference + bit-0 ulp floor (single box)
+    //   --head --tp 2 --probe-exl3-xtp --model-dir <pack> --xtp-ref <dir> [--nodes ip] [--tp-trace]
+    //       + `--node` on the peer                    the TP=2 run: G-T1-b + cross-TP tier
+    if args.iter().any(|a| a == "--probe-exl3-slice") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-slice requires --model-dir <DIR>");
+        let ne: usize = parse_arg(&args, "--slice-experts").and_then(|s| s.parse().ok()).unwrap_or(4);
+        let gpu = args.iter().any(|a| a == "--gpu");
+        gb10_inference::exl3_forward::xtp::probe_slice(dir, ne, gpu).unwrap_or_else(|e| {
+            eprintln!("PROBE_SLICE_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    if args.iter().any(|a| a == "--exl3-pack-manifest") {
+        let dir = parse_arg(&args, "--model-dir").expect("--exl3-pack-manifest requires --model-dir <DIR>");
+        let t0 = std::time::Instant::now();
+        match gb10_inference::cluster::pack_manifest(std::path::Path::new(dir)) {
+            Ok(m) => {
+                for (r, h, s) in &m.files { println!("EXL3_PACK_FILE {h} {s:>12} {r}"); }
+                println!("EXL3_PACK_IGNORED (not read by the engine): {}", m.ignored.join(", "));
+                let dt = t0.elapsed().as_secs_f64();
+                println!("EXL3_PACK_MANIFEST {} files={} bytes={} dir={dir} ({dt:.1}s; hashed now {:.2} GB{})",
+                         m.hash, m.files.len(), m.bytes, m.hashed_now as f64 / 1e9,
+                         if m.hashed_now > 0 && dt > 0.0 { format!(" = {:.2} GB/s", m.hashed_now as f64 / 1e9 / dt) } else { String::new() });
+            }
+            Err(e) => { eprintln!("EXL3_PACK_MANIFEST_FAIL: {e:#}"); std::process::exit(1); }
+        }
+        return;
+    }
+    // TP-C: the spec program (the served scheduler offline; G-T1-e / G-T1-g / speed / G-T1-h) at TP=1:
+    //   --probe-exl3-tpspec --model-dir <pack> --spec-prompts name=ids.json,... [--spec-gen N]
+    //       [--spec-reps N] [--spec-depths 1,2,..] [--spec-dds 0|1] [--max-batch N] [--spec-prefix 0|1]
+    //       [--spec-samp 0|quick|full] [--spec-trials N] [--spec-ident 0|1] [--max-seq-len N]
+    //   (TP=2: the same flags with --head --tp 2 --nodes ip:port; the node runs it from TpConfig)
+    if args.iter().any(|a| a == "--probe-exl3-tpspec") && !args.iter().any(|a| a == "--head") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-tpspec requires --model-dir <DIR>");
+        let max_pos: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
+        let opts = exl3_spec_opts(&args);
+        let prompts = exl3_spec_prompts(&args);
+        gb10_inference::exl3_serve::run_spec(dir, None, Some(prompts), max_pos, &opts).unwrap_or_else(|e| {
+            eprintln!("PROBE_TPSPEC_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    if args.iter().any(|a| a == "--probe-exl3-xtp") && !args.iter().any(|a| a == "--head") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-xtp requires --model-dir <DIR>");
+        let out = parse_arg(&args, "--xtp-out").expect("--probe-exl3-xtp (TP=1 reference) requires --xtp-out <DIR>");
+        let gen: usize = parse_arg(&args, "--xtp-gen").and_then(|s| s.parse().ok()).unwrap_or(64);
+        let max_pos: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
+        let ids = exl3_xtp_prompt_ids(&args, dir);
+        let opts = exl3_xtp_opts(&args);
+        gb10_inference::exl3_forward::xtp::probe_xtp_ref(dir, &ids, gen, max_pos, out, &opts).unwrap_or_else(|e| {
+            eprintln!("PROBE_XTP_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    if args.iter().any(|a| a == "--probe-exl3") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3 requires --model-dir <DIR>");
+        gb10_inference::exl3::probe_census(&dir).unwrap_or_else(|e| {
+            eprintln!("EXL3_CENSUS_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-A3-b Phase 2 (track A3): G-A3-1 decode oracle — our Rust decode vs pinned
+    // ext.reconstruct dumps, BITWISE (mxfp4 lesson: external reference, never
+    // self-consistency). Ref dir from scripts/a3b/a3b_gen_ref.py on .13.
+    //   ./gb10_inference --probe-exl3-oracle --model-dir <EXL3-pack> --oracle-dir <REF_DIR>
+    if args.iter().any(|a| a == "--probe-exl3-oracle") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-oracle requires --model-dir <DIR>");
+        let ref_dir = parse_arg(&args, "--oracle-dir").expect("--probe-exl3-oracle requires --oracle-dir <REF_DIR>");
+        gb10_inference::exl3::probe_oracle(&dir, &ref_dir).unwrap_or_else(|e| {
+            eprintln!("ORACLE_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-A3-c (track A3): G-A3-1 through the KERNEL — the CUDA decode path (funnel shift +
+    // magic-mul + dp4a + fp16 HFMA) dumped via exl3_decode_dump, bitwise vs the Rust oracle
+    // (which is G-A3-1-green vs ext.reconstruct). Probe-only; loads src/ptx/exl3_bench.ptx.
+    //   ./gb10_inference --probe-exl3-kernel --model-dir <EXL3-pack>
+    if args.iter().any(|a| a == "--probe-exl3-kernel") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-kernel requires --model-dir <DIR>");
+        gb10_inference::exl3_bench::probe_kernel_decode(&dir).unwrap_or_else(|e| {
+            eprintln!("EXL3_KERNEL_DECODE_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // w5/PFIX: the chunked-prefill flash kernels (hd 128 + 256, scalar / bitwise twin / CAUSAL twin)
+    // vs the sweep kernel on synthetic data (no model).
+    //   ./gb10_inference --probe-exl3-flashpf
+    if args.iter().any(|a| a == "--probe-exl3-flashpf") {
+        gb10_inference::exl3_bench::probe_flash_prefill().unwrap_or_else(|e| {
+            eprintln!("EXL3_FLASHPF_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // WP25: KV cache formats through the SERVED device helpers vs the q8 host reference (no model).
+    //   ./gb10_inference --probe-exl3-kvq
+    if args.iter().any(|a| a == "--probe-exl3-kvq") {
+        gb10_inference::exl3_forward::probe_kv_q8_selftest().unwrap_or_else(|e| {
+            eprintln!("PROBE_KVQ_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // WP25 rung 1: one KV-format arm of the quality gate (format = --kv-cache / [kv-cache];
+    // q4x = the broken positive control via [kv-cache]=q4x). scripts/kvnll_arms.sh runs them all.
+    //   ./gb10_inference --probe-exl3-kvnll --model-dir <EXL3-pack> --kvnll-text corpus.txt \
+    //     [--kvnll-windows 8192,32768,131072] [--kvnll-tf 2048] [--kvnll-dump-ref f32.bin | --kvnll-ref f32.bin]
+    //     [--kvnll-csv arm.csv] [--kvnll-needles on|off] [--kvnll-accept 256] [--kvnll-accept-ctx 0]
+    //     [--kvnll-label name] [--prefill-chunk 2048] [--max-seq-len 262144]
+    if args.iter().any(|a| a == "--probe-exl3-kvnll") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-kvnll requires --model-dir <DIR>");
+        let num = |k: &str, d: usize| parse_arg(&args, k).and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
+        let a = gb10_inference::exl3_forward::KvNllArgs {
+            dir: dir.to_string(),
+            max_pos: num("--max-seq-len", 262144),
+            chunk: num("--prefill-chunk", 2048),
+            text: parse_arg(&args, "--kvnll-text").map(|s| s.to_string()),
+            ids: parse_arg(&args, "--kvnll-ids").map(|s| s.to_string()),
+            windows: parse_arg(&args, "--kvnll-windows").unwrap_or("8192,32768,131072")
+                .split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+            tf: num("--kvnll-tf", 2048),
+            dump_ref: parse_arg(&args, "--kvnll-dump-ref").map(|s| s.to_string()),
+            ref_path: parse_arg(&args, "--kvnll-ref").map(|s| s.to_string()),
+            out_csv: parse_arg(&args, "--kvnll-csv").map(|s| s.to_string()),
+            needles: parse_arg(&args, "--kvnll-needles") != Some("off"),
+            accept_new: num("--kvnll-accept", 256),
+            accept_ctx: num("--kvnll-accept-ctx", 0),
+            label: parse_arg(&args, "--kvnll-label").unwrap_or("arm").to_string(),
+        };
+        gb10_inference::exl3_forward::probe_kv_nll(&a).unwrap_or_else(|e| {
+            eprintln!("PROBE_KVNLL_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-A3-f-d: chunked-prefill vs token-by-token equivalence on the EXL3 engine —
+    // the serve-text correctness gate the prose smoke could not see (chat prompts
+    // derailed through prefill_chunk while bench token-by-token was exact).
+    //   ./gb10_inference --probe-exl3-prefillx --model-dir <EXL3-pack> [--prompt-ids <file>]
+    // The absolute verdict (RESULT: EXACT | DIVERGES) can never be EXACT on the served posture
+    // (Q1: ulp-amplification floor + the decode-side int8 HC mixer). L10 re-baseline:
+    //   always   PREFILLX_SIG <12 hex> = md5 of the reference / chunk C= / absolute RESULT lines
+    //            (== the scripts' historical grep | md5sum | cut -c1-12; served default, ids16:
+    //            12baeb3946b5)
+    //   --prefillx-expect-sig=<hex>  bitwise tier (S-class changes):
+    //            RESULT: PREFILLX_SIG_OK | PREFILLX_SIG_MISMATCH
+    //   --prefillx-tier=1            tolerance tier (N-class / output-changing prefill work;
+    //            implies --prefillx-rel=1 and the bit-0 --prefillx-ulp floor): every arm's
+    //            S and KV relL2 median <= 3x the run's own one-f32-ulp floor AND the chunked first
+    //            token at reference rank <= 5 within 1.0 logit -> RESULT: PREFILLX_TIER_OK | _FAIL
+    //   Exit code: legacy (1 on DIVERGES) unless EXPECT_SIG or TIER is set — then 0 iff every
+    //   requested check passed. Diagnostics: --prefillx-rel=1|2, --prefillx-ulp=none,0,13,
+    //   --prefillx-widths=2048,256 (served widths), --prefillx-qsa-keys=1.
+    if args.iter().any(|a| a == "--probe-exl3-prefillx") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-prefillx requires --model-dir <DIR>");
+        let a = gb10_inference::exl3_forward::FwdArgs {
+            dir: dir.to_string(),
+            prompt: parse_arg(&args, "--prompt").map(|s| s.to_string()),
+            ids_file: parse_arg(&args, "--prompt-ids").map(|s| s.to_string()),
+            max_new: 16,
+            width: 1,
+            ladder_dir: None,
+            ladder_layers: Vec::new(),
+            ladder_step: None,
+            max_pos: parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+            bench_steps: 0,
+            widths: Vec::new(),
+            prefill_chunk: None,
+        };
+        gb10_inference::exl3_forward::probe_prefill_x(&a).unwrap_or_else(|e| {            eprintln!("PROBE_PREFILLX_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // WP16: intermediate recurrent checkpoints — resumed == fresh, bitwise (single process).
+    //   ./gb10_inference --probe-exl3-wp16 --model-dir <EXL3-pack> --prompt-ids <A> \
+    //       [--wp16-b-ids <B> | --wp16-split S] [--prefill-chunk 2048] [--max-seq-len N] [--max-new-tokens 16]
+    if args.iter().any(|a| a == "--probe-exl3-wp16") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-wp16 requires --model-dir <DIR>");
+        let p = gb10_inference::exl3_forward::Wp16ProbeArgs {
+            base: gb10_inference::exl3_forward::FwdArgs {
+                dir: dir.to_string(),
+                prompt: parse_arg(&args, "--prompt").map(|s| s.to_string()),
+                ids_file: parse_arg(&args, "--prompt-ids").map(|s| s.to_string()),
+                max_new: parse_arg(&args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(16),
+                width: 2,
+                ladder_dir: None,
+                ladder_layers: Vec::new(),
+                ladder_step: None,
+                max_pos: parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(40960),
+                bench_steps: 0,
+                widths: Vec::new(),
+                prefill_chunk: parse_arg(&args, "--prefill-chunk").and_then(|s| s.parse().ok()),
+            },
+            split: parse_arg(&args, "--wp16-split").and_then(|s| s.parse().ok()),
+            b_ids: parse_arg(&args, "--wp16-b-ids").map(|s| s.to_string()),
+        };
+        gb10_inference::exl3_forward::probe_wp16(&p).unwrap_or_else(|e| {
+            eprintln!("PROBE_WP16_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-A3-f-d night: per-stage trace diff (forward_step reference vs
+    // prefill_chunk C=1) + first-divergent-token sweep — the family-isolation
+    // instrument for the serve-prefill blocker.
+    //   ./gb10_inference --probe-exl3-pfxtrace --model-dir <EXL3-pack> [--prompt-ids <file>]
+    if args.iter().any(|a| a == "--probe-exl3-pfxtrace") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-pfxtrace requires --model-dir <DIR>");
+        let a = gb10_inference::exl3_forward::FwdArgs {
+            dir: dir.to_string(),
+            prompt: parse_arg(&args, "--prompt").map(|s| s.to_string()),
+            ids_file: parse_arg(&args, "--prompt-ids").map(|s| s.to_string()),
+            max_new: 16,
+            width: 1,
+            ladder_dir: None,
+            ladder_layers: Vec::new(),
+            ladder_step: None,
+            max_pos: parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+            bench_steps: 0,
+            widths: Vec::new(),
+            prefill_chunk: None,
+        };
+        gb10_inference::exl3_forward::probe_pfx_trace(&a).unwrap_or_else(|e| {
+            eprintln!("PROBE_PFXTRACE_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-A3-c: G-A3-5 — batch invariance (y_raw/y row 0 bitwise across verify widths) +
+    // GEMM correctness vs the host reference (kernel-mirrored Hadamards, fp32 GEMM).
+    //   ./gb10_inference --probe-exl3-binv --model-dir <EXL3-pack> [--exl3-widths 1,2,4,8]
+    if args.iter().any(|a| a == "--probe-exl3-binv") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-binv requires --model-dir <DIR>");
+        let widths: Vec<usize> = parse_arg(&args, "--exl3-widths")
+            .unwrap_or("1,2,4,8")
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let slab: usize = parse_arg(&args, "--exl3-slab-cols")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1280);
+        gb10_inference::exl3_bench::probe_gemm(&dir, &widths, slab).unwrap_or_else(|e| {
+            eprintln!("EXL3_BINV_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // TP-I3 (b): the EXL3-HC-W4 section alone (synthetic; bitwise gate + standalone timing table).
+    if args.iter().any(|a| a == "--probe-exl3-hcw4") {
+        gb10_inference::exl3_bench::probe_hcw4().unwrap_or_else(|e| {
+            eprintln!("EXL3_HCW4_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // TP-SP1: the sequence-parallel prefill's pinned-plan gate (synthetic, the served calls).
+    if args.iter().any(|a| a == "--probe-exl3-sppin") {
+        let spec = parse_arg(&args, "--sppin-c").unwrap_or("128-4095");
+        let cs: Vec<usize> = if let Some((a, b)) = spec.split_once('-') {
+            let (a, b): (usize, usize) = (a.trim().parse().unwrap_or(128), b.trim().parse().unwrap_or(2048));
+            (a..=b).collect()
+        } else {
+            spec.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        };
+        let world: usize = parse_arg(&args, "--sppin-world").and_then(|s| s.parse().ok()).unwrap_or(2);
+        gb10_inference::exl3_forward::probe_sp_pinned(&cs, world).unwrap_or_else(|e| {
+            eprintln!("EXL3_SPPIN_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // TP-I3 (a) rung 1: per-row identity of the prefill Lt GEMMs under a row split (synthetic).
+    if args.iter().any(|a| a == "--probe-exl3-ltrows") {
+        // a list "2048,1024,..." or a range "A-B" (sweep: every c in [A, B], failing cases only)
+        let spec = parse_arg(&args, "--ltrows-c").unwrap_or("2048,2047,1782,1024,775,513,351,96,64,35,34");
+        let cs: Vec<usize> = if let Some((a, b)) = spec.split_once('-') {
+            let (a, b): (usize, usize) = (a.trim().parse().unwrap_or(2), b.trim().parse().unwrap_or(2048));
+            (a..=b).collect()
+        } else {
+            spec.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        };
+        let shapes = parse_arg(&args, "--ltrows-shapes").unwrap_or("all");
+        gb10_inference::exl3_forward::probe_lt_rows(&cs, shapes).unwrap_or_else(|e| {
+            eprintln!("EXL3_LTROWS_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-A3-f-b: WIDE-M GEMM gate — bitwise across MT at every M + bitwise vs the
+    // m16 kernel at M=16 + rel-L2 vs the host reference. Gates the chunked-prefill
+    // wide path before serving use.
+    //   ./gb10_inference --probe-exl3-wide --model-dir <EXL3-pack> \
+    //     [--exl3-wide-ms 1,4,16,17,32,64,256,512] [--exl3-wide-mts 1,2,4,8]
+    if args.iter().any(|a| a == "--probe-exl3-wide") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-wide requires --model-dir <DIR>");
+        let ms: Vec<usize> = parse_arg(&args, "--exl3-wide-ms")
+            .unwrap_or("1,4,16,17,32,64,256,512")
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let mts: Vec<usize> = parse_arg(&args, "--exl3-wide-mts")
+            .unwrap_or("1,2,4,8")
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let slab: usize = parse_arg(&args, "--exl3-slab-cols")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1280);
+        gb10_inference::exl3_bench::probe_wide(&dir, &ms, &mts, slab).unwrap_or_else(|e| {
+            eprintln!("EXL3_WIDE_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-A3-f-b: wide-M GEMM bench — the chunked-prefill weight sweep (rows/s).
+    //   ./gb10_inference --bench-exl3-wide --model-dir <EXL3-pack> \
+    //     [--exl3-wide-ms 32,64,128,256,512,1024] [--exl3-wide-mt 4] [--exl3-iters 20]
+    if args.iter().any(|a| a == "--bench-exl3-wide") {
+        let dir = parse_arg(&args, "--model-dir").expect("--bench-exl3-wide requires --model-dir <DIR>");
+        let ms: Vec<usize> = parse_arg(&args, "--exl3-wide-ms")
+            .unwrap_or("32,64,128,256,512,1024")
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let mt: usize = parse_arg(&args, "--exl3-wide-mt")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let iters: usize = parse_arg(&args, "--exl3-iters")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        gb10_inference::exl3_bench::bench_wide(&dir, &ms, mt, iters).unwrap_or_else(|e| {
+            eprintln!("EXL3_WIDE_BENCH_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-A3-c cross-chain mode: x [M,K] u16 in -> full kernel chain -> y [M,N] u16 out.
+    // Driven by scripts/a3c/a3c_xchain.py (their ext chain = reference; rel-L2 < 1e-3).
+    if args.iter().any(|a| a == "--probe-exl3-xchain") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-xchain requires --model-dir <DIR>");
+        let x_in = parse_arg(&args, "--x-in").expect("--probe-exl3-xchain requires --x-in <FILE>");
+        let y_out = parse_arg(&args, "--y-out").expect("--probe-exl3-xchain requires --y-out <FILE>");
+        let module = parse_arg(&args, "--module")
+            .unwrap_or("model.language_model.layers.0.linear_attn.in_proj_qkv");
+        gb10_inference::exl3_bench::probe_xchain(&dir, &x_in, &y_out, &module).unwrap_or_else(|e| {
+            eprintln!("EXL3_XCHAIN_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-A3-c: standalone weight-path GEMM bench — per-class GB/s at verify widths,
+    // vs the 238 GB/s roofline and the 79-83 GB/s naive decode floor (spec §10.4).
+    //   ./gb10_inference --bench-exl3-gemm --model-dir <EXL3-pack> [--exl3-widths 1,2,4,8] [--exl3-iters 20]
+    if args.iter().any(|a| a == "--bench-exl3-gemm") {
+        let dir = parse_arg(&args, "--model-dir").expect("--bench-exl3-gemm requires --model-dir <DIR>");
+        let widths: Vec<usize> = parse_arg(&args, "--exl3-widths")
+            .unwrap_or("1,2,4,8")
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let iters: usize = parse_arg(&args, "--exl3-iters")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        let grouped_e: usize = parse_arg(&args, "--exl3-grouped-e")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        // S-A3-f-a X3: alias the grouped expert offset table so the whole run reads an
+        // L2-resident trellis footprint (default 16 MB) — the H-MEM/H-SM discriminator.
+        // Off = normal streaming bench.
+        let l2_alias_mb: usize = if args.iter().any(|a| a == "--exl3-l2-alias") {
+            parse_arg(&args, "--exl3-l2-alias")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(16)
+        } else {
+            0
+        };
+        gb10_inference::exl3_bench::bench_gemm(&dir, &widths, iters, grouped_e, l2_alias_mb)
+            .unwrap_or_else(|e| {
+            eprintln!("EXL3_BENCH_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-A3-d: whole-model OFFLINE forward on the EXL3 pack (probe-only; no server,
+    // no scheduler, no MTP, no TP; PLE lands in Phase 0b).
+    //   ./gb10_inference --bench-exl3-forward --model-dir <EXL3-pack> --prompt "..." \
+    //       [--prompt-ids ids.json] [--max-new-tokens 64] [--exl3-widths 1,4,8] \
+    //       [--ladder-dir /tmp/a3d_ladder --ladder-layers 0,8,16,24,32,40,47] \
+    //       [--max-seq-len 8192] [--exl3-bench-steps 32]
+    if args.iter().any(|a| a == "--bench-exl3-forward") {
+        let dir = parse_arg(&args, "--model-dir")
+            .expect("--bench-exl3-forward requires --model-dir <DIR>")
+            .to_string();
+        let widths: Vec<usize> = parse_arg(&args, "--exl3-widths")
+            .unwrap_or("")
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let ladder_layers: Vec<usize> = parse_arg(&args, "--ladder-layers")
+            .unwrap_or("0,8,16,24,32,40,47")
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let a = gb10_inference::exl3_forward::FwdArgs {
+            dir,
+            prompt: parse_arg(&args, "--prompt").map(|s| s.to_string()),
+            ids_file: parse_arg(&args, "--prompt-ids").map(|s| s.to_string()),
+            max_new: parse_arg(&args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(32),
+            width: widths.first().copied().unwrap_or(1),
+            ladder_dir: parse_arg(&args, "--ladder-dir").map(|s| s.to_string()),
+            ladder_layers,
+            ladder_step: parse_arg(&args, "--ladder-step").and_then(|s| s.parse().ok()),
+            max_pos: parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+            bench_steps: parse_arg(&args, "--exl3-bench-steps").and_then(|s| s.parse().ok()).unwrap_or(0),
+            widths,
+            prefill_chunk: parse_arg(&args, "--prefill-chunk").and_then(|s| s.parse().ok()),
+        };
+        gb10_inference::exl3_forward::run(&a).unwrap_or_else(|e| {
+            eprintln!("EXL3_FORWARD_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    //   S-A3-e: M1 draft-quality harness (the G-A3-4 instrument).
+    //   ./gb10_inference --bench-exl3-mtp --model-dir <EXL3-pack> --prompt "..." [--mtp-depth N]
+    if args.iter().any(|a| a == "--bench-exl3-mtp") {
+        let dir = parse_arg(&args, "--model-dir")
+            .expect("--bench-exl3-mtp requires --model-dir <DIR>")
+            .to_string();
+        let depth: usize = parse_arg(&args, "--mtp-depth").and_then(|s| s.parse().ok()).unwrap_or(4);
+        let a = gb10_inference::exl3_forward::FwdArgs {
+            dir,
+            prompt: parse_arg(&args, "--prompt").map(|s| s.to_string()),
+            ids_file: parse_arg(&args, "--prompt-ids").map(|s| s.to_string()),
+            max_new: parse_arg(&args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(64),
+            width: 1,
+            ladder_dir: None,
+            ladder_layers: Vec::new(),
+            ladder_step: None,
+            max_pos: parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+            bench_steps: 0,
+            widths: Vec::new(),
+            prefill_chunk: parse_arg(&args, "--prefill-chunk").and_then(|s| s.parse().ok()),
+        };
+        gb10_inference::exl3_forward::run_mtp_bench(&a, depth).unwrap_or_else(|e| {
+            eprintln!("EXL3_MTP_BENCH_FAIL: {e:#}");
+            std::process::exit(1);
+        });
         return;
     }
     // P14 DFlash v1 local lane probe (single process, greedy):
@@ -919,11 +1577,9 @@ fn main() {
         let dir = parse_arg(&args, "--model-dir")
             .expect("--probe-dflash-local requires --model-dir <target DIR>").to_string();
         let ddir = resolve_draft_dir(&args, Some(gb10_inference::batch::SpecSource::DFlash))
-            .expect("--probe-dflash-local requires --draft-dir <DIR> (or GB10_DRAFT_DIR)");
-        // the trunk's tap sink arms at load; set BOTH spellings so a harness that still exports the
-        // P14-era alias keeps working (readers inside the engine use the generic name)
-        std::env::set_var("GB10_DRAFT_DIR", &ddir);
-        std::env::set_var("GB10_DFLASH_DIR", &ddir);
+            .expect("--probe-dflash-local requires --draft-dir <DIR>");
+        // the trunk's tap sink arms at load (it reads the internal [draft-dir] option)
+        gb10_inference::opts::set(gb10_inference::opt!("draft-dir"), &ddir);
         let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&dir).expect("model load");
         let tokenizer = QwenTokenizer::from_file(&format!("{}/tokenizer.json", dir.trim_end_matches('/')))
             .expect("tokenizer");
@@ -945,10 +1601,10 @@ fn main() {
     //   ./gb10_inference --probe-mxfp4-xchain --model-dir /path/to/3.6-27b-nvfp4-full
     if args.iter().any(|a| a == "--probe-mxfp4-xchain") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-mxfp4-xchain requires --model-dir <DIR>");
-        std::env::set_var("GB10_MXFP4", "1");   // native mode at load (both layouts resident)
+        gb10_inference::opts::set(gb10_inference::opt!("mxfp4"), "1");   // native mode at load (both layouts resident)
         // The xchain capture hooks cannot run inside the verify-graph stream capture (sync/dtoh
         // during capture invalidates it) — probes force the EAGER verify path.
-        std::env::set_var("GB10_NO_VERIFY_GRAPH", "1");
+        gb10_inference::opts::set(gb10_inference::opt!("no-verify-graph"), "1");
         let (gpu, _) = load_model_gpu(dir, None, 1);
         let tokenizer = QwenTokenizer::from_file(&format!("{}/tokenizer.json", dir.trim_end_matches('/')))
             .expect("tokenizer");
@@ -982,7 +1638,7 @@ fn main() {
     // in-process probe (prefill col, per-layer rel-L2, final logits, tokens, texts).
     if let Some(path) = parse_arg(&args, "--probe-mxfp4-xchain2") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-mxfp4-xchain2 requires --model-dir <DIR>");
-        std::env::set_var("GB10_NO_VERIFY_GRAPH", "1");   // eager verify: capture hooks vs verify-graph capture are incompatible
+        gb10_inference::opts::set(gb10_inference::opt!("no-verify-graph"), "1");   // eager verify: capture hooks vs verify-graph capture are incompatible
         let (gpu, _) = load_model_gpu(dir, None, 1);
         let tokenizer = QwenTokenizer::from_file(&format!("{}/tokenizer.json", dir.trim_end_matches('/')))
             .expect("tokenizer");
@@ -1010,7 +1666,7 @@ fn main() {
         return;
     }
     // E13: fold-vs-nofold cross-chain compare (two FOLDX dumps from the TP head — see the
-    // GB10_FOLD_XCHAIN_DUMP hook in tp_serve). Per-step first-divergent layer + full per-layer
+    // --fold-xchain-dump hook in tp_serve). Per-step first-divergent layer + full per-layer
     // rel-L2 curve at step 1, token-chain divergence position.
     //   ./gb10_inference --probe-fold-xchain-compare /tmp/fold_off.bin,/tmp/fold_on.bin
     if let Some(pair) = parse_arg(&args, "--probe-fold-xchain-compare") {
@@ -1255,7 +1911,7 @@ fn main() {
         return;
     }
 
-    // TP cached-model ops (node-side; pure local file ops on GB10_TP_CACHE / ~/.cache/gb10_tp).
+    // TP cached-model ops (node-side; pure local file ops on --tp-cache / ~/.cache/gb10_tp).
     // New MODEL-centric names; the old blob-centric names are deprecated aliases (warn once).
     if args.iter().any(|a| a == "--cached-models-list" || a == "--list-model-blobs") {
         let old = args.iter().any(|a| a == "--list-model-blobs");
@@ -1350,96 +2006,85 @@ fn main() {
         return;
     }
 
-    // MTP end-to-end speculative-decoding probe
-    if args.iter().any(|a| a == "--bench-mtp") {
+    // MTP end-to-end speculative-decoding probe. B30: this used to dispatch ONLY on
+    // --bench-mtp, so a bare `--bench-file <path>` (what scripts/r6a/bench_file_leg.sh runs)
+    // never reached run_bench_mtp's --bench-file handling and fell through to run_cli — which
+    // opened the CWD-relative default model 'qwen3.5-0.8b-packed' and died with a bare
+    // "Error: No such file or directory (os error 2)", IDENTICAL for an existing and a
+    // nonexistent battery file. Dispatch on either flag.
+    if args.iter().any(|a| a == "--bench-mtp" || a == "--bench-file") {
         run_bench_mtp(&args);
         return;
+    }
+
+    // B29 gate: exercise the REAL serving path at a PINNED depth -- the exact blind spot that
+    // let the recorded serving abort (r6a d2 arm, B29) past every existing gate (the bench/probe
+    // paths never touched the server route). Boots this same binary as a server three times
+    // (pinned d2, auto, pinned d4), sends ONE greedy chat request to each over HTTP, and asserts:
+    //   (a) clean completion (an empty response is a FAIL, not a pass -- AGENTS §3),
+    //   (b) MTP actually ENGAGED on the pinned arms (/health telemetry drafts > 0),
+    //   (c) byte-identical greedy output across all three arms (pinned depth changes SPEED,
+    //       never OUTPUT -- AGENTS §2.7).
+    // scripts/r6a/gate_serve_pinned_controls.sh adds the negative controls (boot-fail RED,
+    // mid-serve abort RED -- the recorded failure class).
+    if args.iter().any(|a| a == "--probe-serve-pinned") {
+        let code = run_probe_serve_pinned(&args);
+        std::process::exit(code);
     }
 
     // CLI mode
     run_cli(&args);
 }
 
-/// Maps operator-facing CLI flags onto the env vars the engine reads internally (the
-/// `--rdma-dev` pattern). Every session option is a CLI flag; the env vars remain as
-/// back-compat aliases, and an explicit CLI flag always wins (it sets/removes the env
-/// before anything reads it). Dev/debug probes stay env-only by design. Under TP the
-/// head ships the resulting config to the node (TpConfig), so flags only need to exist
-/// on the head/serve path and the node stays zero-config.
-fn cli_env_bridge(args: &[String]) {
-    fn set(args: &[String], flag: &str, var: &str) {
-        if args.iter().any(|a| a == flag) { std::env::set_var(var, "1"); }
-    }
-    // F8/P1: --fp8-prefill on|off — the native e4m3 W8A8 prefill lane. Bridged HERE so
-    // EVERY entry path (server/probe/bench) sees it before the PF8_ON OnceLock reads the
-    // env. Under --tp the flag ALSO rides TpConfig (the node installs the env) — the
-    // bridge covers the head, TpConfig covers the ranks.
-    if let Some(v) = parse_arg(args, "--fp8-prefill") {
-        if matches!(&v[..], "on" | "true" | "1" | "yes") { std::env::set_var("GB10_FP8_PREFILL", "1"); }
-    }
-    // TP feature flags.
-    set(args, "--tp-fp32-partials", "GB10_TP_FP32_PARTIALS");
-    set(args, "--tp-graph", "GB10_TP_GRAPH");
-    set(args, "--tp-trace", "GB10_TP_TRACE");
-    // Serving behavior.
-    set(args, "--no-decode-graphs", "GB10_NO_DECODE_GRAPHS");
-    set(args, "--no-gqpack", "GB10_NO_GQPACK");
-    set(args, "--fuse-residual", "GB10_FUSE_RESIDUAL");
-    set(args, "--cpu-sample", "RUST_INFER_CPU_SAMPLE");
-    set(args, "--prefill-scalar", "RUST_INFER_PREFILL_SCALAR");
-    set(args, "--zero-kv", "RUST_INFER_ZERO_KV");
-    // Item 2.5: tolerance-class fast paths are DEFAULT ON (wo_a fp8 einsum + compressor pair);
-    // --exact-gemm selects the locked bit-exact kernels. The bridge makes it a CLI-only
-    // user-facing knob (AGENTS.md §7); the env var is internal transport that rides TpConfig
-    // to the node (consumers resolve env-first, then the shipped config).
-    set(args, "--exact-gemm", "GB10_EXACT_GEMM");
-    // Split-K revival (splitk-shelved PRINCIPLE, re-derived 2026-08-06): DEFAULT OFF — the split
-    // reassociates the fp32 k-sum. --splitk-gemm enables the per-shape auto choice; the env is
-    // internal transport (rides TpConfig to the node; GB10_GEMM_SPLITK=<S>=2..8 still forces a
-    // count as a diagnostics-only override). Verdict in SPLITK_REVIVAL_REPORT.md.
-    set(args, "--splitk-gemm", "GB10_GEMM_SPLITK");
-    // MXFP4-native serving mode (QWEN_MXFP4_NATIVE_DESIGN.md): fp4 decode/verify GEMMs run the
-    // sm_121a OMMA path (lossless NVFP4 storage, same artifacts) instead of the bf16 chain.
-    // DEFAULT OFF — the bit-exact path stays the default; on = the tolerance-fork native chain.
-    if let Some(v) = parse_arg(args, "--mxfp4") {
-        match v {
-            "on" => std::env::set_var("GB10_MXFP4", "1"),
-            "off" => std::env::remove_var("GB10_MXFP4"),
-            other => { eprintln!("--mxfp4 must be on|off (got '{other}')"); std::process::exit(1); }
-        }
-    }
-    // KV cache format.
+/// CLI-1: the flags whose value WRITES other registry options (the old env bridge, now registry
+/// writes — no env anywhere). Every one-to-one flag (`--tp-trace`, `--no-decode-graphs`, `--mxfp4`,
+/// `--fp8-prefill`, `--exact-gemm`, `--hc-fp16`, `--splitk-gemm`, `--draft-vocab`, `--tp-cache`, …) is
+/// a registry option parsed by `opts::parse_cli`; what is left here maps one user-facing flag onto
+/// several internal options. Under TP the head ships the resolved registry (TpConfig.opts), so the
+/// node never parses these flags itself.
+fn cli_opts_bridge(args: &[String]) {
+    use gb10_inference::{opt, opts};
+    // KV cache format (NVFP4 formats write the kv-* internals; EXL3 formats write kv-cache).
     if let Some(v) = parse_arg(args, "--kv-cache") {
+        let (q4, tq, k8v4, k8v8) = (opt!("kv-quant"), opt!("kv-tq"), opt!("kv-k8v4"), opt!("kv-k8v8"));
         match v {
-            "q4" => { std::env::set_var("GB10_KV_QUANT", "1"); std::env::remove_var("GB10_KV_TQ"); std::env::remove_var("GB10_KV_K8V4"); }
-            "tq" => { std::env::set_var("GB10_KV_TQ", "1"); std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_K8V4"); }
-            "tq3" => { std::env::set_var("GB10_KV_TQ", "3"); std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_K8V4"); }
-            "k8v4" => { std::env::set_var("GB10_KV_K8V4", "1"); std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_TQ"); std::env::remove_var("GB10_KV_K8V8"); }
-            "k8v8" => { std::env::set_var("GB10_KV_K8V8", "1"); std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_TQ"); std::env::remove_var("GB10_KV_K8V4"); }
-            "bf16" => { std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_TQ"); std::env::remove_var("GB10_KV_K8V4"); }
-            other => { eprintln!("--kv-cache must be bf16|q4|tq|tq3|k8v4|k8v8 (got '{other}')"); std::process::exit(1); }
+            "q4" => { opts::set(q4, "1"); opts::unset(tq); opts::unset(k8v4); }
+            "tq" => { opts::set(tq, "1"); opts::unset(q4); opts::unset(k8v4); }
+            "tq3" => { opts::set(tq, "3"); opts::unset(q4); opts::unset(k8v4); }
+            "k8v4" => { opts::set(k8v4, "1"); opts::unset(q4); opts::unset(tq); opts::unset(k8v8); }
+            "k8v8" => { opts::set(k8v8, "1"); opts::unset(q4); opts::unset(tq); opts::unset(k8v4); }
+            "bf16" => { opts::unset(q4); opts::unset(tq); opts::unset(k8v4); }
+            // EXL3 engine formats (exl3_forward::kv_fmt_from_opts; WP25 q8 = the rival's scheme).
+            // This bridge runs for every mode, so without these arms `--kv-cache fp8` on an EXL3
+            // server/probe exited here before exl3_serve ever parsed it. An NVFP4 model never reads
+            // [kv-cache], so these values are refused there rather than silently serving bf16.
+            // q4x = the WP25 kvnll probe's deliberately broken positive control (never served:
+            // exl3_serve refuses it)
+            "f32" | "f16" | "fp8" | "q8" | "q4x" => {
+                if !parse_arg(args, "--model-dir").map_or(false, gb10_inference::exl3_serve::is_exl3_pack) {
+                    eprintln!("--kv-cache {v} is an EXL3-pack format (needs an EXL3 --model-dir); NVFP4 formats are bf16|q4|tq|tq3|k8v4|k8v8");
+                    std::process::exit(1);
+                }
+                opts::set(opt!("kv-cache"), v);
+            }
+            other => { eprintln!("--kv-cache must be bf16|q4|tq|tq3|k8v4|k8v8 (NVFP4) or f32|f16|fp8|q8 (EXL3) (got '{other}')"); std::process::exit(1); }
         }
     }
-    // MTP: unify the bench-path GB10_TP_MTP env with the server CLI (`--mtp=on|off`, `--mtp-depth`).
+    // MTP: the bench-path [tp-mtp] / [tp-mtp-depth] internals from the server CLI (`--mtp=on|off`, `--mtp-depth`).
     if let Some(v) = parse_arg(args, "--mtp") {
         match v {
-            "on" => std::env::set_var("GB10_TP_MTP", "1"),
-            "off" => std::env::remove_var("GB10_TP_MTP"),
+            "on" => opts::set(opt!("tp-mtp"), "1"),
+            "off" => opts::unset(opt!("tp-mtp")),
             _ => {}   // auto: nothing to translate
         }
     }
-    if let Some(d) = parse_arg(args, "--mtp-depth") { std::env::set_var("GB10_TP_MTP_DEPTH", d); }
-    // FR-Spec draft vocabulary subset size (0 = full-vocab draft).
-    if let Some(n) = parse_arg(args, "--draft-vocab") { std::env::set_var("RUST_INFER_DRAFT_VOCAB", n); }
-    // Node blob cache dir.
-    if let Some(d) = parse_arg(args, "--tp-cache") { std::env::set_var("GB10_TP_CACHE", d); }
+    if let Some(d) = parse_arg(args, "--mtp-depth") { opts::set(opt!("tp-mtp-depth"), d); }
     // Mixer sharding: DEFAULT ON under --tp/--head — Hy3 requires it, and it is where TP's speed
-    // comes from on every model (halved mixer bytes + halved KV). --no-shard-mixers is the escape
-    // hatch (and also wins over an inherited env, so a stale shell cannot surprise a bench).
+    // comes from on every model (halved mixer bytes + halved KV). --no-shard-mixers is the escape.
     if args.iter().any(|a| a == "--no-shard-mixers") {
-        std::env::remove_var("GB10_TP_SHARD_MIXERS");
+        opts::unset(opt!("tp-shard-mixers"));
     } else if parse_tp_world(args).is_some() || args.iter().any(|a| a == "--head") {
-        std::env::set_var("GB10_TP_SHARD_MIXERS", "1");
+        opts::set(opt!("tp-shard-mixers"), "1");
     }
 }
 
@@ -1485,9 +2130,7 @@ fn required_dir_arg(args: &[String], flag: &str, what: &str) -> String {
 fn warn_deprecated_alias(old: &str, new: &str) {
     use std::sync::Once;
     static FLAG: Once = Once::new();
-    static ENV: Once = Once::new();
-    let w = if old.contains("--") { &FLAG } else { &ENV };
-    w.call_once(|| eprintln!("[warn] {old} is deprecated — use {new} (still honored for now)"));
+    FLAG.call_once(|| eprintln!("[warn] {old} is deprecated — use {new} (still honored for now)"));
 }
 
 /// Does `--spec-source` name a drafter that CANNOT run without an artifact? An explicit drafter
@@ -1501,16 +2144,13 @@ fn draft_source_requires_artifact(src: Option<gb10_inference::batch::SpecSource>
 
 /// THE drafter-artifact resolver — ONE flag, `--draft-dir <dir>`, for every speculative source
 /// (`--spec-source` is the only selector; AGENTS §7 "one knob, one generic name"). Precedence:
+/// `--draft-dir` > `--dflash-dir` (deprecated, v1 source only). CLI-1: the GB10_DRAFT_DIR /
+/// GB10_DFLASH_DIR env fallbacks are gone (refused at startup, naming --draft-dir).
 ///
-///   `--draft-dir`  >  `--dflash-dir`  >  `GB10_DRAFT_DIR`  >  `GB10_DFLASH_DIR`
-///                     (deprecated,        (generic env:      (deprecated alias,
-///                      v1 source only)     any source)        v1 source only)
+/// The deprecated spelling is P14's first interface for the v1 block drafter and is honored ONLY
+/// for that source — a `--dflash-dir` can never silently stand in for a DF2/DSpark artifact.
 ///
-/// The two deprecated spellings are P14's first interface for the v1 block drafter and are honored
-/// ONLY for that source — so an existing command line or launcher keeps working while a
-/// `--dflash-dir` can never silently stand in for a DF2/DSpark artifact.
-///
-/// A flag or env var that IS provided but points nowhere is always a hard stop, whatever the source.
+/// A flag that IS provided but points nowhere is always a hard stop, whatever the source.
 fn resolve_draft_dir(args: &[String], src: Option<gb10_inference::batch::SpecSource>) -> Option<String> {
     let is_v1 = matches!(src, Some(gb10_inference::batch::SpecSource::DFlash));
     let from_flag = parse_arg(args, "--draft-dir").map(str::to_string).or_else(|| {
@@ -1520,13 +2160,9 @@ fn resolve_draft_dir(args: &[String], src: Option<gb10_inference::batch::SpecSou
             d.to_string()
         })
     });
-    let dir = match from_flag {
-        Some(d) => Some(d),
-        // The generic env knob is honored for every source; the P14-era DFLASH alias only for v1.
-        // `env_knob` prints its own one-time deprecation warning when the alias wins.
-        None if is_v1 => gb10_inference::env_knob("GB10_DRAFT_DIR", "GB10_DFLASH_DIR"),
-        None => std::env::var("GB10_DRAFT_DIR").ok(),
-    };
+    // CLI-1: the old GB10_DRAFT_DIR / GB10_DFLASH_DIR env fallbacks are gone (the startup guard
+    // names --draft-dir); the flag is the only source.
+    let dir = from_flag;
     match dir {
         Some(d) => {
             if !std::path::Path::new(&d).is_dir() {
@@ -1536,8 +2172,7 @@ fn resolve_draft_dir(args: &[String], src: Option<gb10_inference::batch::SpecSou
             Some(d)
         }
         None if draft_source_requires_artifact(src) => {
-            eprintln!("FATAL: --spec-source {} requires --draft-dir <artifact dir> \
-                       (or GB10_DRAFT_DIR); there is no default path",
+            eprintln!("FATAL: --spec-source {} requires --draft-dir <artifact dir>; there is no default path",
                       src.map(|s| s.cli_name()).unwrap_or("?"));
             std::process::exit(2);
         }
@@ -1592,7 +2227,7 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
                    dev: &std::sync::Arc<cudarc::driver::CudaDevice>)
                    -> std::sync::Arc<cudarc::driver::CudaSlice<bf16>> {
         let mut out = vec![bf16::default(); DV * DH];
-        let nthreads = std::env::var("GB10_DF2_MIRROR_THREADS").ok()
+        let nthreads = gb10_inference::opts::var(gb10_inference::opt!("df2-mirror-threads")).ok()
             .and_then(|v| v.parse::<usize>().ok()).filter(|&n| (1..=16).contains(&n)).unwrap_or(8);
         let rows_per = (DV + nthreads - 1) / nthreads;
         std::thread::scope(|sc| {
@@ -1665,7 +2300,7 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
         let mut round = gb10_inference::dspark::round::DsparkRound::load_pinned(
             draft_dir, Some(head_w), Some(embed_w), 4096, pin).expect("DsparkRound load (real tables)");
 
-        // captured inputs: walk every request dir r{N} (GB10_DSPARK_DUMP_STEPS steps each)
+        // captured inputs: walk every request dir r{N} (--dspark-dump-steps steps each)
         let mut reqdirs: Vec<usize> = std::fs::read_dir(dir).expect("dump dir")
             .filter_map(|e| e.ok())
             .filter_map(|e| {
@@ -1819,7 +2454,7 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
                     let np = stream.len() - 1;          // nprev: ring rows [0..np)
                     let mut gt = prime_cols(&stream[..np]); // GT taps for [0..np)
                     // A/B: reverse the 5 tap chunks per column (fc pairing convention)
-                    if std::env::var("GB10_DSPARK_TAP_REV").map(|v| v == "1").unwrap_or(false) {
+                    if gb10_inference::opts::var(gb10_inference::opt!("dspark-tap-rev")).map(|v| v == "1").unwrap_or(false) {
                         let c5 = TAP_CONCAT_DIM / 5;
                         for col in gt.chunks_mut(TAP_CONCAT_DIM) {
                             for i in 0..2 {
@@ -2386,7 +3021,7 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
     }
 
     // ---- Layer bisect (ctx0): device h after each layer vs a host replicate. ----
-    if std::env::var("GB10_DSPARK_BISECT").is_ok() {
+    if gb10_inference::opts::var(gb10_inference::opt!("dspark-bisect")).is_ok() {
         println!("== layer bisect (ctx0) ==");
         // host replicate of the block pass (the oracle's exact math on the artifact weights)
         let w = &art.weights;
@@ -2691,7 +3326,7 @@ fn run_probe_ppsplit(args: &[String]) {
 /// DSV4 single-process isolated prefill bench (R2.2). Loads the full trunk (43 layers)
 /// single-process and times `Dsv4GpuModel::forward` (auto-chunked at PREFILL_CHUNK=4096) over a
 /// synthetic prompt of `--seq-len` tokens. Reports per-rep and best prefill tok/s. When
-/// GB10_PREFILL_TRACE is set, the per-chunk timers + attention-path logs (batched vs
+/// --prefill-trace is set, the per-chunk timers + attention-path logs (batched vs
 /// SEQ-per-token) fire too — the audit's "is the batched chunk-prefill path engaged for chunks
 /// 2+?" probe. Single-process (rank 0/1, no TP) — measures the prefill path in isolation, not the
 /// TP=2 serve path. `--dsv4-bench-prefill --model-dir <bundle> --seq-len N [--reps R]`.
@@ -2818,10 +3453,10 @@ fn run_dsv4_bench_decode(args: &[String]) {
     println!("=== DSV4 decode (single-process, {n} layers, prompt={prompt_len}, {max_new} tokens) ===", n = cfg.n_layers);
     println!("  per-token ms: min {min:.1}  median {med:.1}  mean {mean:.1}");
     println!("  tok/s:        max {:.2}  median {:.2}  mean {:.2}", 1e3 / min, 1e3 / med, 1e3 / mean);
-    // GB10_BENCH_LOGITS_HASH: serving-level A/B fingerprint (e.g. GB10_PACKED_CACHE on vs
+    // --bench-logits-hash: serving-level A/B fingerprint (e.g. --packed-cache on vs
     // off) — FNV-1a over the final logits' f32 bits + the emitted argmax chain. Identical
     // hashes across arms = bitwise-identical serving decode at this depth.
-    if std::env::var("GB10_BENCH_LOGITS_HASH").is_ok() {
+    if gb10_inference::opts::var(gb10_inference::opt!("bench-logits-hash")).is_ok() {
         let lg: Vec<f32> = m.rt.dev.dtoh_sync_copy(&logits).expect("dtoh final logits");
         let mut h: u64 = 0xcbf29ce484222325;
         for v in &lg {
@@ -3226,7 +3861,7 @@ fn run_bench_accept(args: &[String]) {
 }
 
 /// Compact acceptance discriminator, shared by --bench-accept and the TP=2 variant
-/// (GB10_TP_ACCEPT in tp_serve): overall rate, the target-confidence buckets that separate
+/// (--tp-accept in tp_serve): overall rate, the target-confidence buckets that separate
 /// HARD TEXT (target unsure where the head misses) from a WEAK HEAD (misses even when the
 /// target is confident), and top-2/3 fork coverage by draft depth.
 fn bench_accept_report(depth: usize, s: &[gb10_inference::gpu::AcceptSample]) {
@@ -3344,7 +3979,7 @@ fn run_bench_tau(args: &[String]) {
                 let mut state = gpu.new_batch_state(n_slots, n_slots, max_seq_len);
                 // COUNTED tau (assert-the-signal rule): bench_mtp_steps returns the loop's verify-forward
                 // count; tau = emitted tokens / verify forwards. Never a closed-form approximation.
-                let (mt, _st, mtok, stok, acc, n_steps) =
+                let (mt, _st, mtok, stok, acc, n_steps, _acc_k, _dr_k) =
                     gpu.bench_mtp_steps(&mut pool, &mut state, &prompt, max_seq_len, depth, max_new);
                 assert!(n_steps > 0, "bench-tau: zero steps measured — harness failure, not a pass");
                 let tau = mt.len() as f32 / n_steps as f32;
@@ -4785,7 +5420,7 @@ fn load_df2_round_dir(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize, dra
         return None;
     }
     // S9F (the TP-DF2 leg): the round now loads on EVERY rank under TP — the trunk's full
-    // pre-shard lm_head is kept for the borrow (GB10_DF2_TP=1, gpu.rs tp_shard_weights), the
+    // pre-shard lm_head is kept for the borrow ([df2-tp]=1, gpu.rs tp_shard_weights), the
     // drafter artifact ships via --draft-dir / the shipped config, and every rank drafts the
     // SAME tokens (bit-identical taps from the all-reduced hiddens) so the verify all-reduces
     // stay in lockstep. The residency decision rides the post-load CalibTable message.
@@ -5396,12 +6031,11 @@ fn run_bench_df2_matrix(args: &[String]) {
     println!("S5F matrix cell-group: source={} temp={} top_p={top_p} top_k={top_k} domains={:?} reps={} \
              max_new={} thinking={:?} ({} jobs)",
              spec_source.cli_name(), temp, domains, reps, max_new, thinking, jobs.len());
-    // S5F3: the draft-parity step dump (dump-only; `--df2-step-dump <dir>` / GB10_DF2_STEP_DUMP).
-    // Built BEFORE the scheduler — the dump is attached to the run (job_start/job_end + the
-    // lane-step records).
+    // S5F3: the draft-parity step dump (dump-only; `--df2-step-dump <dir>`; CLI-1: the old env
+    // alias is gone). Built BEFORE the scheduler — the dump is attached to the run (job_start/job_end
+    // + the lane-step records).
     let dump_dir = parse_arg(args, "--df2-step-dump")
-        .map(str::to_string)
-        .or_else(|| std::env::var("GB10_DF2_STEP_DUMP").ok());
+        .map(str::to_string);
     let mut step_dump = match &dump_dir {
         Some(dir) => {
             let d = gb10_inference::dflash2::stepdump::StepDump::new(dir)
@@ -6040,7 +6674,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     let mut head_bf16 = vec![bf16::default(); hm * hk];
     {
         // CPU courtesy: cap the decode pool (default 8; S3Q's CPU-only session shares this box)
-        let nthreads = std::env::var("GB10_DF2_MIRROR_THREADS").ok()
+        let nthreads = gb10_inference::opts::var(gb10_inference::opt!("df2-mirror-threads")).ok()
             .and_then(|v| v.parse::<usize>().ok()).filter(|&n| (1..=16).contains(&n)).unwrap_or(8);
         let rows_per = (hm + nthreads - 1) / nthreads;
         let mut outs: Vec<&mut [bf16]> = Vec::new();
@@ -6093,9 +6727,9 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
 
 
     // ---- Part R1: trunk tap capture (bit-identity; free-when-off is the R6 gate) ----
-    // Minimal determinism repro (memcheck target): GB10_DF2_DET_ONLY=1 skips R1/R2/R3/R5 and
+    // Minimal determinism repro (memcheck target): --df2-det-only=1 skips R1/R2/R3/R5 and
     // runs ONLY the R4 loop (prime + rounds). A few thousand launches, not the full suite.
-    let det_only = std::env::var("GB10_DF2_DET_ONLY").is_ok();
+    let det_only = gb10_inference::opts::var(gb10_inference::opt!("df2-det-only")).is_ok();
     if det_only {
         let gen_taps = |c: usize| -> Vec<f32> {
             let mut t = vec![0f32; c * TAP_CONCAT_DIM];
@@ -6133,8 +6767,8 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             ("h_final", Vec::new()), ("ringK_regions", Vec::new()), ("ringV_regions", Vec::new()),
             ("attn_pre_o", Vec::new()),
         ];
-        let post = std::env::var("GB10_DF2_DET_POST").is_ok();
-        let dual = std::env::var("GB10_DF2_DET_DUAL").is_ok();
+        let post = gb10_inference::opts::var(gb10_inference::opt!("df2-det-post")).is_ok();
+        let dual = gb10_inference::opts::var(gb10_inference::opt!("df2-det-dual")).is_ok();
         for _ in 0..30 {
             let o = round.draft_round_stages(12345, 2048, false, dual, false, 1, post).unwrap();
             sets[0].1.push(round.dump_block_normed().unwrap());
@@ -7120,8 +7754,116 @@ fn run_bench_verify(args: &[String]) {
 /// are numerically identical in their GDN state update; a nonzero diff at N=1 means a real kernel
 /// bug, while nonzero only at N>=2 implicates cuBLAS batch-size-dependent bf16 rounding in the
 /// projection GEMMs (decode uses N=1, verify uses N=K).
+/// `--probe-q4 --model-dir <d> [--prompt <text>] [--max-new-tokens N] [--max-seq-len N] [--chat]`
+/// The smallest end-to-end generation on the GpuModel path: tokenize, prefill, greedy decode,
+/// print. Family-agnostic (used to bring up qwen4_exp, works on any GpuModel model). `--chat`
+/// renders the prompt through the model's chat template. Ported verbatim from PR #4 except the
+/// chat-template call, which grew tools/effort/tpl_kwargs/thinking arguments in dev's P13.
+fn run_probe_q4(args: &[String]) {
+    let dir = parse_arg(args, "--model-dir").expect("--probe-q4 requires --model-dir <DIR>");
+    let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
+    let max_new: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(32);
+    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(2048);
+    let chat = args.iter().any(|a| a == "--chat");
+    let t0 = std::time::Instant::now();
+    let (gpu, cfg) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+    eprintln!("[probe-q4] loaded in {:.1}s (family {:?}, layers {}, rw {})", t0.elapsed().as_secs_f32(), cfg.family, cfg.num_layers, cfg.resid_width());
+    // `--tokens 1,2,3` feeds raw ids (synthetic models have no tokenizer).
+    let raw_tokens: Option<Vec<u32>> = parse_arg(args, "--tokens").map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+    let tok = if raw_tokens.is_some() { None } else {
+        Some(gb10_inference::tokenizer::QwenTokenizer::from_file(&format!("{}/tokenizer.json", dir.trim_end_matches('/'))).expect("tokenizer"))
+    };
+    let prompt: Vec<u32> = if let Some(t) = raw_tokens { t } else {
+        let text = if chat {
+            let msgs = vec![gb10_inference::tokenizer::ChatMessage::user(prompt_text)];
+            tok.as_ref().unwrap().apply_chat_template(&msgs, None, None, None,
+                gb10_inference::tokenizer::ThinkingMode::Auto).expect("chat template")
+        } else { prompt_text.to_string() };
+        tok.as_ref().unwrap().encode(&text, false).expect("encode")
+    };
+    eprintln!("[probe-q4] prompt {} tokens: {:?}", prompt.len(), &prompt[..prompt.len().min(24)]);
+    assert!(prompt.len() + max_new + 1 <= max_seq_len, "prompt+gen exceeds --max-seq-len");
+    let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+    let mut state = gpu.new_batch_state(1, 1, max_seq_len);
+    let kv_stride = max_seq_len;
+    let mut bufs = gpu.new_decode_buffers(1);
+    let tp = std::time::Instant::now();
+    let (first, hout) = gpu.prefill_batch(&mut pool, &prompt, &mut state, 0, kv_stride, 0);
+    gpu.sync_stream();
+    pool.release_bf16(hout, cfg.resid_width() * prompt.len());
+    eprintln!("[probe-q4] prefill {} tok in {:.0} ms ({:.0} tok/s)", prompt.len(), tp.elapsed().as_secs_f32() * 1e3, prompt.len() as f32 / tp.elapsed().as_secs_f32());
+    // `--dump-logits <dir>`: write prompt/generated tokens (JSON) and the per-step f32 logits
+    // (prefill last column + every decode step) for the reference-oracle comparison.
+    let dump: Option<String> = parse_arg(args, "--dump-logits").map(|s| s.to_string());
+    let mut logit_steps: Vec<Vec<f32>> = Vec::new();
+    if dump.is_some() {
+        // Re-run the prefill on a fresh slot to read the last column's logits (the first one
+        // consumed hout above).
+        gpu.zero_slot_state(&mut state, 0, kv_stride);
+        let (_, hout2) = gpu.prefill_batch(&mut pool, &prompt, &mut state, 0, kv_stride, 0);
+        logit_steps.push(gpu.probe_logits_of_hidden_col(&mut pool, &hout2, prompt.len() - 1));
+        pool.release_bf16(hout2, cfg.resid_width() * prompt.len());
+    }
+    let mut out = vec![first];
+    let mut pos = prompt.len();
+    let td = std::time::Instant::now();
+    for _ in 1..max_new {
+        if *out.last().unwrap() == cfg.eos_token_id && dump.is_none() { break; }
+        let toks_i32 = vec![*out.last().unwrap() as i32];
+        let pos_i32 = vec![pos as i32];
+        gpu.dev().htod_sync_copy_into(&toks_i32, &mut bufs.tokens_dev).unwrap();
+        gpu.dev().htod_sync_copy_into(&pos_i32, &mut bufs.pos_dev).unwrap();
+        gpu.dev().synchronize().unwrap();
+        let next = if dump.is_some() {
+            let (lg, t) = gpu.probe_decode_logits(&mut pool, &mut bufs, &mut state, kv_stride, pos + 1);
+            logit_steps.push(lg);
+            t
+        } else {
+            gpu.forward_decode(&mut pool, &mut bufs, &mut state, kv_stride, pos + 1, 1)[0]
+        };
+        out.push(next);
+        pos += 1;
+    }
+    let dt = td.elapsed().as_secs_f32();
+    eprintln!("[probe-q4] decode {} tok in {:.2}s ({:.1} tok/s)", out.len() - 1, dt, (out.len() - 1) as f32 / dt.max(1e-6));
+    println!("TOKENS: {:?}", out);
+    if let Some(t) = &tok { println!("TEXT: {}", t.decode(&out, false).unwrap_or_default()); }
+    if let Some(dir) = dump {
+        std::fs::create_dir_all(&dir).expect("dump dir");
+        let meta = serde_json::json!({ "prompt": prompt, "generated": out, "vocab": cfg.vocab_size, "steps": logit_steps.len() });
+        std::fs::write(format!("{dir}/tokens.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+        let mut raw: Vec<u8> = Vec::with_capacity(logit_steps.len() * cfg.vocab_size * 4);
+        for st in &logit_steps { for x in st { raw.extend_from_slice(&x.to_le_bytes()); } }
+        std::fs::write(format!("{dir}/logits.f32"), raw).unwrap();
+        eprintln!("[probe-q4] dumped {} logit steps to {dir}", logit_steps.len());
+    }
+}
+
 fn run_probe_state(args: &[String]) {
     let (model_path, tokenizer_path) = if let Some(dir) = parse_arg(args, "--model-dir") {
+        // S-A3-f-e: EXL3 packs route to the exl3 engine (the generic loader cannot
+        // read this container — see the note in run_bench_mtp).
+        if gb10_inference::exl3_serve::is_exl3_pack(dir) {
+            let a = gb10_inference::exl3_forward::FwdArgs {
+                dir: dir.to_string(),
+                prompt: parse_arg(args, "--prompt").map(|s| s.to_string()),
+                ids_file: parse_arg(args, "--prompt-ids").map(|s| s.to_string()),
+                max_new: parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(16),
+                width: 1,
+                ladder_dir: None,
+                ladder_layers: Vec::new(),
+                ladder_step: None,
+                max_pos: parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+                bench_steps: 0,
+                widths: Vec::new(),
+                prefill_chunk: None,
+            };
+            gb10_inference::exl3_forward::probe_state_exl3(&a).unwrap_or_else(|e| {
+                eprintln!("PROBE_STATE_EXL3_FAIL: {e:#}");
+                std::process::exit(1);
+            });
+            return;
+        }
         (dir.to_string(), format!("{}/tokenizer.json", dir.trim_end_matches('/')))
     } else {
         (parse_arg(args, "--model").unwrap_or("model/model.safetensors").to_string(),
@@ -7226,6 +7968,35 @@ fn run_probe_reject(args: &[String]) {
     let mut state = gpu.new_batch_state(3, 3, max_seq_len);
     let kv_stride = max_seq_len;
     gpu.probe_reject_path(&mut pool, &mut state, &prompt, kv_stride);
+}
+
+/// TP-F `--tp-reduce-bench` — prefill-sized fp32 all-reduce (serial vs pipelined schedule, 1..2 rails)
+/// on the real transport, every reduce validated bitwise. Same command on both boxes (--rank 0 / --rank 1
+/// --peer <head-ip>), identical flags.
+fn run_tp_reduce_bench(args: &[String]) {
+    let g = |k: &str, d: u64| parse_arg(args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
+    let a = gb10_inference::tp_bench::ReduceArgs {
+        rank: parse_arg(args, "--rank").and_then(|s| s.parse().ok()).expect("--tp-reduce-bench needs --rank 0|1"),
+        peer: parse_arg(args, "--peer").unwrap_or("").to_string(),
+        port: g("--port", 29700) as u16,
+        dev: parse_arg(args, "--dev").unwrap_or("rocep1s0f1").to_string(),
+        gid: g("--gid", 3) as i32,
+        dev2: parse_arg(args, "--dev2").unwrap_or("").to_string(),
+        floats: g("--floats", 2048 * 2560) as usize,
+        reduces: g("--reduces", 200) as usize,
+        mode: parse_arg(args, "--mode").unwrap_or("pipe").to_string(),
+        lookahead: g("--lookahead", 4) as usize,
+        blocks: g("--blocks", 16) as u32,
+        mix: g("--mix", 0) as usize,
+        io: parse_arg(args, "--io").unwrap_or("f32").to_string(),
+        proxy_core: g("--proxy-core", 19) as i32,
+        proxy_core2: g("--proxy-core2", 18) as i32,
+        main_core: g("--main-core", 9) as i32,
+    };
+    if let Err(e) = gb10_inference::tp_bench::run_reduce(a) {
+        eprintln!("\n[tp-reduce-bench] FAILED: {e:#}");
+        std::process::exit(1);
+    }
 }
 
 /// `--tp-barrier-bench` — adversarial proof of the doorbell all-reduce on the real transport, no model.
@@ -7346,7 +8117,7 @@ fn run_net_test(args: &[String]) {
 /// the head over the link, and runs the IDENTICAL greedy generate loop — the per-layer FFN all-reduces
 /// keep it bit-for-bit in step with the head, which owns the printing.
 fn run_cluster_node(args: &[String]) {
-    if let Some(d) = parse_arg(args, "--rdma-dev") { std::env::set_var("GB10_RDMA_DEV", d); }
+    // (--rdma-dev is a registry option: parsed at startup, node-local, never shipped)
     let port: u16 = parse_arg(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(29500);
 
     // RESIDENT by default (TP item B): supervise one-shot sessions, re-arming after each so the node
@@ -7354,10 +8125,10 @@ fn run_cluster_node(args: &[String]) {
     // isolation story: the process-global TP config, the mem::forget'd link + proxy thread, and the
     // freshly-sharded weights (attach_tp shards in place — a model cannot be re-attached) all die
     // with the child, so the next head sync starts from a provably clean process. `--once` (or the
-    // GB10_NODE_CHILD marker the supervisor sets on its children) runs a single session, for
+    // `--once` the supervisor passes its children — CLI-1: no env marker) runs a single session, for
     // debugging. A graceful per-request serve loop (no reload between requests) is item A's server
     // mode; until then a session = one sync + one SPMD run.
-    let once = args.iter().any(|a| a == "--once") || std::env::var("GB10_NODE_CHILD").is_ok();
+    let once = args.iter().any(|a| a == "--once");
     if once { run_cluster_node_once(port); return; }
 
     let exe = std::env::current_exe().expect("current_exe");
@@ -7366,8 +8137,7 @@ fn run_cluster_node(args: &[String]) {
     loop {
         let t0 = std::time::Instant::now();
         let status = std::process::Command::new(&exe)
-            .args(["--node", "--once", "--port", &port.to_string()])
-            .env("GB10_NODE_CHILD", "1")
+            .args(node_child_args(&args, port))
             .status();
         match status {
             Ok(s) => eprintln!("[node-resident] session ended ({s}) after {:.1}s — re-arming for the next head",
@@ -7381,6 +8151,7 @@ fn run_cluster_node(args: &[String]) {
 
 /// One head session: sync (model + config) -> bring up the RDMA link -> serve one SPMD run -> exit.
 fn run_cluster_node_once(port: u16) {
+    println!("{}", gb10_inference::exl3_forward::xtp::identity_line("node"));
     let (dir, draft_dir, head_ip, mut tpc, stream) = match gb10_inference::cluster::run_node(port) {
         Ok(x) => x,
         Err(e) => { eprintln!("node error: {e:#}"); std::process::exit(1); }
@@ -7398,11 +8169,28 @@ fn run_cluster_node_once(port: u16) {
         }
         None => { tpc.df2_draft_dir.clear(); }
     }
+    // CLI-1: the head's resolved option registry (TpConfig v23 `opts`) — installed FIRST, before any
+    // consumer reads an option: the node's own command line carries only node-local options.
+    if let Err(e) = gb10_inference::opts::install_head(&tpc.opts) {
+        // PACK-FIX: tell the head (blocked in its link bring-up) why, then exit
+        let mut stream = stream;
+        gb10_inference::cluster::node_report_failure(&mut stream, &format!("head options refused: {e}"));
+        eprintln!("node error: {e}"); std::process::exit(1);
+    }
+    println!("[node] options from the head: {}", gb10_inference::opts::set_summary());
     // The head's TP config, shipped during the sync — install BEFORE any TP consumer reads a setting,
-    // so the node reproduces the head's behavior with ZERO GB10_TP_* env vars.
+    // so the node reproduces the head's behavior with zero local configuration.
     gb10_inference::tp::set_tp_config(tpc.clone());
     let node_rank = tpc.node_rank;
     let world = tpc.world as i32;
+    if tpc.exl3 {
+        // TP-A: the EXL3 engine — local pack (manifest-verified), zero-config knobs. TP-D: the
+        // serve mode keeps the control stream (the Step / HeadFlag plane); the programs drop it.
+        if let Err(e) = run_exl3_tp_node(&tpc, head_ip, stream) {
+            eprintln!("node exl3 tp error: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
     println!("NODE SYNCED (rank {node_rank}/{world}) — model ready at {}", dir.display());
     let r = if tpc.mode_serve && is_dsv4_bundle(&dir) {
         // DSV4 persistent server: load once, loop over broadcast_prompt → decode. The control
@@ -7479,7 +8267,7 @@ fn mem_budget_report(model_dir: &str, cfg: &gb10_inference::qwen::Config,
     // Bytes per element per K/V channel: bf16 = 2; q4 = 12 B/16 elems = 0.75;
     // k8v4 = (20 B K + 12 B V per 16 elems) / 2 channels / 16 = 32/32 = 1.0 for every hd;
     // TQ = (52 B K + 50 B V) rows / 2 / hd = 102/256 = 0.3984 (the E4 layout); the b=3 K
-    // variant = (68 B K + 50 B V) / 2 / hd = 118/256 = 0.4609 (GB10_KV_TQ=3).
+    // variant = (68 B K + 50 B V) / 2 / hd = 118/256 = 0.4609 ([kv-tq]=3).
     let (elem_b, quantized) = match kv_mode {
         KM::Bf16 => (2.0, false),
         KM::Q4 => (0.75, true),
@@ -7487,7 +8275,7 @@ fn mem_budget_report(model_dir: &str, cfg: &gb10_inference::qwen::Config,
         // k8v8: 20 B per 16 elems on BOTH channels = 40/32 = 1.25 B/elem (vs bf16 2.0).
         KM::K8v8 => (1.25, true),
         KM::Tq => {
-            let row = if std::env::var("GB10_KV_TQ").ok().as_deref() == Some("3") { 118.0 } else { 102.0 };
+            let row = if gb10_inference::opts::var(gb10_inference::opt!("kv-tq")).ok().as_deref() == Some("3") { 118.0 } else { 102.0 };
             (row / (2.0 * hd as f64), true)
         }
     };
@@ -7558,58 +8346,58 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
     ctx.sanity()?;
     println!("NODE (rank {}/{}) — TP LINK UP (serving mode)", ctx.rank, ctx.world);
 
-    // These are read as ENV at model LOAD (GB10_KV_QUANT selects the 4-bit KV cache layout and the
+    // These are read as ENV at model LOAD ([kv-quant] selects the 4-bit KV cache layout and the
     // q4 attention path at GpuModel::load_from_dir_tp) and inside BatchScheduler::new (graph capture,
     // gpu-sample probes). The head ships its values in the config and the node installs them
     // process-wide BEFORE THE LOAD — this used to sit below load_from_dir_tp, so a serve-mode node
     // silently built a bf16 KV cache + bf16 per-head attention while the head ran q4: the node
     // became the straggler (the "32K anomaly" — 34.6 GB/token of bf16 per-head re-reads at 26K)
     // and every serve-mode "q4" number was really a mixed q4-head/bf16-node number.
-    if tpc.no_decode_graphs { std::env::set_var("GB10_NO_DECODE_GRAPHS", "1"); }
-    if tpc.fp8_prefill { std::env::set_var("GB10_FP8_PREFILL", "1"); }
-    if tpc.cpu_sample { std::env::set_var("RUST_INFER_CPU_SAMPLE", "1"); }
-    if tpc.no_verify_graph { std::env::set_var("GB10_NO_VERIFY_GRAPH", "1"); }
+    if tpc.no_decode_graphs { gb10_inference::opts::set(gb10_inference::opt!("no-decode-graphs"), "1"); }
+    if tpc.fp8_prefill { gb10_inference::opts::set(gb10_inference::opt!("fp8-prefill"), "1"); }
+    if tpc.cpu_sample { gb10_inference::opts::set(gb10_inference::opt!("cpu-sample"), "1"); }
+    if tpc.no_verify_graph { gb10_inference::opts::set(gb10_inference::opt!("no-verify-graph"), "1"); }
     // The 4-bit KV cache must match on BOTH ranks (the caches are all-reduced-consistent).
-    if tpc.kv_quant { std::env::set_var("GB10_KV_QUANT", "1"); }
+    if tpc.kv_quant { gb10_inference::opts::set(gb10_inference::opt!("kv-quant"), "1"); }
     // TurboQuant KV (E4) — same SPMD rule (the cache layout must match on both ranks). Value-
-    // based like the loader's GB10_KV_TQ read: "1" = b=2 K, "3" = b=3 K.
-    if tpc.kv_tq { std::env::set_var("GB10_KV_TQ", if tpc.kv_tq_b3 { "3" } else { "1" }); }
+    // based like the loader's [kv-tq] read: "1" = b=2 K, "3" = b=3 K.
+    if tpc.kv_tq { gb10_inference::opts::set(gb10_inference::opt!("kv-tq"), if tpc.kv_tq_b3 { "3" } else { "1" }); }
     // k8v4 KV (int8-K + q4-V) — same SPMD rule; mutually exclusive with the two above.
-    if tpc.kv_k8v4 { std::env::set_var("GB10_KV_K8V4", "1"); }
-    if tpc.kv_k8v8 { std::env::set_var("GB10_KV_K8V8", "1"); }
+    if tpc.kv_k8v4 { gb10_inference::opts::set(gb10_inference::opt!("kv-k8v4"), "1"); }
+    if tpc.kv_k8v8 { gb10_inference::opts::set(gb10_inference::opt!("kv-k8v8"), "1"); }
     // FFN-epilogue fusion (E14) must match on BOTH ranks — one-sided fusion rounds the residual
     // differently and the all-reduce mixes divergent hiddens. None = default ON (both sides).
     match tpc.fuse_residual {
-        Some(true) => std::env::set_var("GB10_FUSE_RESIDUAL", "1"),
-        Some(false) => std::env::set_var("GB10_FUSE_RESIDUAL", "0"),
+        Some(true) => gb10_inference::opts::set(gb10_inference::opt!("fuse-residual"), "1"),
+        Some(false) => gb10_inference::opts::set(gb10_inference::opt!("fuse-residual"), "0"),
         None => {}
     }
     // Device-resident token loop (--device-loop): SPMD-relevant — the mirror replays identical
     // decode_steps, so both ranks must run the same (resident or host-bookkeeping) sequence.
-    if tpc.device_loop { std::env::set_var("GB10_DEVICE_LOOP", "1"); }
-    // v2 GPU-direct all-reduce receive (GB10_TP_GPU_RECV): SPMD-relevant — both ranks must pick the
+    if tpc.device_loop { gb10_inference::opts::set(gb10_inference::opt!("device-loop"), "1"); }
+    // v2 GPU-direct all-reduce receive (--tp-gpu-recv): SPMD-relevant — both ranks must pick the
     // same K2 variant or the barrier gates diverge (K2 on cpu_done vs K2' on the payload tail).
     match tpc.gpu_recv {
-        Some(true) => std::env::set_var("GB10_TP_GPU_RECV", "1"),
-        Some(false) => std::env::set_var("GB10_TP_GPU_RECV", "0"),
+        Some(true) => gb10_inference::opts::set(gb10_inference::opt!("tp-gpu-recv"), "1"),
+        Some(false) => gb10_inference::opts::set(gb10_inference::opt!("tp-gpu-recv"), "0"),
         None => {}
     }
-    // AR landing 2 fused reduce+residual+norm epilogue (GB10_TP_REDUCE_FUSE): SPMD-relevant — the
+    // AR landing 2 fused reduce+residual+norm epilogue (--tp-reduce-fuse): SPMD-relevant — the
     // fused kernel replaces the K2 + norm two-launch chain at the mixer/FFN epilogue sites, so both
     // ranks must fuse the same launches or the barrier sequences diverge.
     match tpc.reduce_fuse {
-        Some(true) => std::env::set_var("GB10_TP_REDUCE_FUSE", "1"),
-        Some(false) => std::env::set_var("GB10_TP_REDUCE_FUSE", "0"),
+        Some(true) => gb10_inference::opts::set(gb10_inference::opt!("tp-reduce-fuse"), "1"),
+        Some(false) => gb10_inference::opts::set(gb10_inference::opt!("tp-reduce-fuse"), "0"),
         None => {}
     }
     // MXFP4-native mode (--mxfp4=on) + the MTP-head allowlist escape hatch: SPMD-relevant — both
     // ranks must build the same OMMA repacks / make the same allowlist decision or the decode and
     // verify chains diverge across the all-reduce. The head's env snapshot ships in the config.
-    if tpc.mxfp4 { std::env::set_var("GB10_MXFP4", "1"); }
-    if tpc.mxfp4_mtp_native { std::env::set_var("GB10_MXFP4_MTP_NATIVE", "1"); }
+    if tpc.mxfp4 { gb10_inference::opts::set(gb10_inference::opt!("mxfp4"), "1"); }
+    if tpc.mxfp4_mtp_native { gb10_inference::opts::set(gb10_inference::opt!("mxfp4-mtp-native"), "1"); }
     // S4F DFlash2 tap capture (--df2-capture): both ranks capture or neither — the sink feeds
     // the drafter's fc; config-shipped beats env drift.
-    if tpc.df2_capture { std::env::set_var("GB10_DF2_CAPTURE", "1"); }
+    if tpc.df2_capture { gb10_inference::opts::set(gb10_inference::opt!("df2-capture"), "1"); }
     // DF2 block-16: install the HEAD's block on this node BEFORE the early round load below.
     // SPMD-critical: the round's MASK row count and the verify column count are collective, so a
     // one-sided block desyncs the verify all-reduce (and the round would size different buffers).
@@ -7621,7 +8409,7 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
     // value is read from `tpc` at the node's own `set_df2_carry` call site.
     println!("NODE — DF2 block = {} (from the head's config)", gb10_inference::dflash2::block());
     // S9F (TP-DF2 leg): the head's resolved spec source ships on the config; when it is a DF2
-    // variant the node installs GB10_DF2_TP=1 BEFORE its load so attach_tp keeps the FULL
+    // variant the node installs [df2-tp]=1 BEFORE its load so attach_tp keeps the FULL
     // lm_head for the round (the rank-local half is vocab-sharded). SPMD-relevant: a one-sided
     // capture is a weight-handle mismatch that drafts different tokens on the node.
     // WI1: DSPARK borrows the same full-vocab head — same arming (see the head-side comment).
@@ -7630,21 +8418,21 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
             .unwrap_or(gb10_inference::batch::SpecSource::Mtp);
         if gb10_inference::batch::is_df2_src(src)
             || src == gb10_inference::batch::SpecSource::Dspark {
-            std::env::set_var("GB10_DF2_TP", "1");
+            gb10_inference::opts::set(gb10_inference::opt!("df2-tp"), "1");
         }
     }
     // E12/E8/E9 escapes: SPMD-relevant — the fold changes the MoE launch sequence, the E8 shard
     // changes the WEIGHT LAYOUT at load, and E9 changes the launch attributes; a one-sided escape
     // desyncs the all-reduce epochs or mismatches the sharded tensors. The loader reads these as
     // env, so the node installs them BEFORE the load (the interim launcher exports were head-only).
-    if tpc.moe_fold { std::env::set_var("GB10_MOE_FOLD", "1"); }
-    else { std::env::set_var("GB10_MOE_NO_FOLD", "1"); }
-    if !tpc.e8_shard { std::env::set_var("GB10_E8_NO_SHARD", "1"); }
-    if !tpc.e9_fold { std::env::set_var("GB10_E9_NO_FOLD", "1"); }
+    if tpc.moe_fold { gb10_inference::opts::set(gb10_inference::opt!("moe-fold"), "1"); }
+    else { gb10_inference::opts::set(gb10_inference::opt!("moe-no-fold"), "1"); }
+    if !tpc.e8_shard { gb10_inference::opts::set(gb10_inference::opt!("e8-no-shard"), "1"); }
+    if !tpc.e9_fold { gb10_inference::opts::set(gb10_inference::opt!("e9-no-fold"), "1"); }
     // P3-1 one-shot push: SPMD-critical ring-layout selector. The transport reads this env at
     // init on BOTH ranks (head: its own env; node: installed here from the shipped config) — a
     // one-sided setting is a ring-layout mismatch, which dies loudly at the first barrier.
-    if tpc.oneshot { std::env::set_var("GB10_TP_ONESHOT", "1"); }
+    if tpc.oneshot { gb10_inference::opts::set(gb10_inference::opt!("tp-oneshot"), "1"); }
 
     {
         let cfg = gb10_inference::qwen::Config::from_config_json(
@@ -7863,7 +8651,7 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
 /// the main engine's `--max-tokens` knob (the main engine defaults 8192; 4096 here is conservative
 /// for TP=2 where a runaway 8K-token decode is a long stall; real chat turns send max_tokens).
 fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
-    if let Some(d) = parse_arg(args, "--rdma-dev") { std::env::set_var("GB10_RDMA_DEV", d); }
+    // (--rdma-dev is a registry option: parsed at startup, node-local, never shipped)
     let explicit = parse_arg(args, "--nodes").map(|s| {
         s.split(',').map(|p| {
             let p = p.trim();
@@ -7873,13 +8661,13 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
     });
     let wait = std::time::Duration::from_secs(
         parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
-    let mut tpc = gb10_inference::tp::TpConfig::from_env();
-    if std::env::var("GB10_TPC_DEBUG").is_ok() {
-        eprintln!("[tpc-debug] serve from_env: kv_k8v8={} kv_k8v4={} env={:?}",
-                  tpc.kv_k8v8, tpc.kv_k8v4, std::env::var("GB10_KV_K8V8").ok());
+    let mut tpc = gb10_inference::tp::TpConfig::from_opts();
+    if gb10_inference::opts::var(gb10_inference::opt!("tpc-debug")).is_ok() {
+        eprintln!("[tpc-debug] serve from_opts: kv_k8v8={} kv_k8v4={} env={:?}",
+                  tpc.kv_k8v8, tpc.kv_k8v4, gb10_inference::opts::var(gb10_inference::opt!("kv-k8v8")).ok());
     }
     tpc.mode_serve = true;
-    // Same flag as qwen serving; the serve loops resolve env GB10_MAX_SEQ_LEN > this > 4096.
+    // Same flag as qwen serving; the serve loops resolve env --max-seq-len > this > 4096.
     tpc.max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
     // item 2.3: --prefix-cache <on|off> (AGENTS §7 CLI flag; rides TpConfig to the node).
     // DEFAULT ON for the dsv4 server (the pre-flag always-on behavior); the A/B uses off.
@@ -7899,14 +8687,14 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
                                     "on" | "true" | "1" | "yes");
     // F8/P1: --fp8-prefill <on|off> — native e4m3 W8A8 tensor-core prefill GEMM for FP8
     // trunks (1.35x TP2 / 1.63x TP1 prefill at 1500 MHz; engine cross-check 2.5e-3..1.8e-2
-    // rel-L2). DEFAULT OFF until the owner's release gate; GB10_FP8_PREFILL stays as the
+    // rel-L2). DEFAULT OFF until the owner's release gate; --fp8-prefill stays as the
     // diagnostics/back-compat alias. Requires --mxfp4=on (allow_pf4), batch >= 256, %128
     // geometry. Rides TpConfig so the zero-config node dispatches identically (SPMD).
     if let Some(v) = parse_arg(args, "--fp8-prefill") {
         tpc.fp8_prefill = matches!(&v[..], "on" | "true" | "1" | "yes");
     }
     if tpc.fp8_prefill {
-        std::env::set_var("GB10_FP8_PREFILL", "1");
+        gb10_inference::opts::set(gb10_inference::opt!("fp8-prefill"), "1");
     }
     // E5 (512K mandate): --rope-yarn-factor <f> — TRUNK YaRN rope override (default 1.0 =
     // legacy tables byte-identical). f=2 on the 256K-native trunk extends the rope tables to
@@ -7918,7 +8706,7 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
     // into the env — build_rope_tables resolves env-first. Startup-time set_var, before any
     // threads that could race it; under --tp the value ALSO rides TpConfig to the node.
     if tpc.rope_yarn_factor > 1.0 {
-        std::env::set_var("GB10_ROPE_YARN_FACTOR", tpc.rope_yarn_factor.to_string());
+        gb10_inference::opts::set(gb10_inference::opt!("rope-yarn-factor"), tpc.rope_yarn_factor.to_string());
     }
     // item 3.3/3.4: --dspark-depth N pins the drafted-row count (None = ADAPTIVE). The pin is
     // the adaptive-depth DISABLE path — N=block reproduces the pre-3.3 fixed-depth behavior
@@ -7957,9 +8745,331 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
     }
 }
 
+/// TP-A: the xtp probe's prompt ids (--prompt-ids <json|ws file> | --prompt <text> | the gate
+/// sentence), tokenized with the pack's own tokenizer.
+fn exl3_xtp_prompt_ids(args: &[String], dir: &str) -> Vec<u32> {
+    if let Some(f) = parse_arg(args, "--prompt-ids") {
+        let s = std::fs::read_to_string(f).expect("read --prompt-ids");
+        return serde_json::from_str(&s).unwrap_or_else(|_| s.split_whitespace().map(|x| x.parse::<u32>().expect("bad id")).collect());
+    }
+    let text = parse_arg(args, "--prompt").unwrap_or(
+        "The theory of general relativity states that gravity is the curvature of spacetime itself").to_string();
+    let tok = gb10_inference::tokenizer::QwenTokenizer::from_file(&format!("{dir}/tokenizer.json")).expect("tokenizer.json");
+    tok.encode(&text, false).expect("encode")
+}
+
+/// TP-B: the xtp program options from the CLI (the TP=1 reference and the TP=2 head take the
+/// same flags; the head ships them to the node inside TpConfig.exl3_mode):
+///   --xtp-pf-chunk N   prefill the prompt through the served chunked prefill (chunk N)
+///   --xtp-gates N      G-T1-c / G-T1-d for verify widths 1..=N
+///   --xtp-ident-only   no TP=1 reference: rank identity + greedy agreement only (head: --prompt-ids + --xtp-gen)
+///   --xtp-time N       an untraced greedy timing pass of N tokens (not a perf claim)
+fn exl3_xtp_opts(args: &[String]) -> gb10_inference::exl3_forward::xtp::XtpOpts {
+    gb10_inference::exl3_forward::xtp::XtpOpts {
+        pf_chunk: parse_arg(args, "--xtp-pf-chunk").map(|s| s.parse().expect("--xtp-pf-chunk N")),
+        gates: parse_arg(args, "--xtp-gates").map(|s| s.parse().expect("--xtp-gates N")).unwrap_or(0),
+        ident_only: args.iter().any(|a| a == "--xtp-ident-only"),
+        time_tokens: parse_arg(args, "--xtp-time").map(|s| s.parse().expect("--xtp-time N")).unwrap_or(0),
+        // TP-SP2: the G-T1-b fault injection (probe only): --xtp-sp-fault L[:R] (rank R, default 1)
+        sp_fault: parse_arg(args, "--xtp-sp-fault").map(|s| {
+            let (l, r) = s.split_once(':').unwrap_or((s, "1"));
+            (l.trim().parse().expect("--xtp-sp-fault L[:R]"), r.trim().parse().expect("--xtp-sp-fault L[:R]"))
+        }),
+    }
+}
+
+/// TP-C: the spec program's options from the CLI (shipped to the node in TpConfig.exl3_mode).
+fn exl3_spec_opts(args: &[String]) -> gb10_inference::exl3_serve::SpecOpts {
+    let mut o = gb10_inference::exl3_serve::SpecOpts::default();
+    let num = |n: &str| parse_arg(args, n).map(|s| s.parse::<usize>().unwrap_or_else(|_| panic!("{n} N")));
+    if let Some(v) = num("--spec-gen") { o.gen = v; }
+    if let Some(v) = num("--spec-reps") { o.reps = v; }
+    if let Some(v) = num("--max-batch") { o.width = v; }
+    if let Some(v) = num("--spec-trials") { o.trials = v; }
+    if let Some(v) = parse_arg(args, "--spec-depths") {
+        o.depths = if v.is_empty() || v == "none" { Vec::new() } else { v.split(',').map(|x| x.parse().expect("--spec-depths a,b")).collect() };
+    }
+    if let Some(v) = parse_arg(args, "--spec-dds") { o.dds = v == "1"; }
+    if let Some(v) = parse_arg(args, "--spec-prefix") { o.prefix = v == "1"; }
+    if let Some(v) = parse_arg(args, "--spec-ident") { o.ident = v == "1"; }
+    if let Some(v) = parse_arg(args, "--spec-samp") {
+        o.samp = match v { "0" | "off" => 0, "quick" | "1" => 1, "full" | "2" => 2, _ => panic!("--spec-samp 0|quick|full") };
+    }
+    // validate through the wire format (the node parses exactly this)
+    gb10_inference::exl3_serve::SpecOpts::parse(&o.to_mode()).expect("spec options")
+}
+
+/// TP-C: --spec-prompts name=ids.json,... (JSON id arrays; names <= 16 bytes).
+fn exl3_spec_prompts(args: &[String]) -> Vec<(String, Vec<u32>)> {
+    let v = parse_arg(args, "--spec-prompts").expect("--probe-exl3-tpspec requires --spec-prompts name=ids.json,...");
+    v.split(',').map(|kv| {
+        let (n, f) = kv.split_once('=').expect("--spec-prompts name=file");
+        assert!(n.len() <= 16, "prompt name '{n}' longer than 16 bytes");
+        let s = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("read {f}: {e}"));
+        (n.to_string(), serde_json::from_str::<Vec<u32>>(&s).unwrap_or_else(|e| panic!("{f}: {e}")))
+    }).collect()
+}
+
+/// CLI-1: the node supervisor's session child: `--node --once --port N` plus the supervisor's own
+/// node-local registry options (`--rdma-dev`, `--tp-cache`, `--mem-watchdog-gb`, `--mem-trace`) —
+/// flags, never an inherited env (every other option arrives from the head in TpConfig.opts).
+fn node_child_args(args: &[String], port: u16) -> Vec<String> {
+    let _ = args;
+    let mut v: Vec<String> = vec!["--node".into(), "--once".into(), "--port".into(), port.to_string()];
+    for (i, o) in gb10_inference::opts::REG.iter().enumerate() {
+        if o.scope != gb10_inference::opts::Scope::Local { continue; }
+        if let Ok(val) = gb10_inference::opts::var(gb10_inference::opts::OptId(i as u16)) {
+            v.push(format!("--{}={val}", o.flag));
+        }
+    }
+    v
+}
+
+/// TP-I2: resolve the head's CLI-flag knobs of the EXL3 TP engine, install them in this process, and
+/// put them into the TpConfig the node receives (owner rule: CLI flags ride TpConfig, never env).
+fn exl3_tp_cli_knobs(args: &[String], tpc: &mut gb10_inference::tp::TpConfig) {
+    use gb10_inference::exl3_forward::xtp;
+    let _ = args;
+    // CLI-1: the three are registry options (parsed at startup; --print-config shows them)
+    let pfo_v = gb10_inference::opts::get(gb10_inference::opt!("tp-prefill-overlap"));
+    let pfo = xtp::parse_pf_overlap(pfo_v.as_deref())
+        .unwrap_or_else(|e| { eprintln!("{e:#}"); std::process::exit(2); });
+    xtp::set_pf_overlap(pfo);
+    tpc.exl3_pf_overlap = Some(pfo);
+    // TP-H2: the vocab-parallel lm_head for sampled / penalized / ratio-rule rows (TpConfig v21)
+    let vps_v = gb10_inference::opts::get(gb10_inference::opt!("tp-vp-sampled"));
+    let vps = xtp::parse_vp_sampled(vps_v.as_deref())
+        .unwrap_or_else(|e| { eprintln!("{e:#}"); std::process::exit(2); });
+    xtp::set_vp_sampled(vps);
+    tpc.exl3_vp_sampled = Some(vps);
+    // TP-SP1: sequence-parallel prefill (TpConfig v22)
+    let spv_v = gb10_inference::opts::get(gb10_inference::opt!("tp-seq-parallel"));
+    let spv = spv_v.as_deref();
+    let mut spp = xtp::parse_seq_parallel(spv)
+        .unwrap_or_else(|e| { eprintln!("{e:#}"); std::process::exit(2); });
+    if spp != 0 && xtp::pf_overlap_fold() {
+        if spv.is_some() {
+            eprintln!("--tp-seq-parallel {} is not composed with --tp-prefill-overlap fold (TP-SP1: use on|dual|inline|off)",
+                      spv.unwrap_or(""));
+            std::process::exit(2);
+        }
+        // TP-SP2: the default (ON) yields to an explicit fold — the two are not composed
+        println!("[head] --tp-prefill-overlap fold: sequence-parallel prefill OFF (not composed with fold; the default yields)");
+        spp = 0;
+    }
+    xtp::set_seq_parallel(spp);
+    tpc.exl3_seq_parallel = Some(spp);
+}
+
+/// TP-A: the EXL3 TP head (rank 0). Rung 3 program: `--probe-exl3-xtp`.
+fn run_exl3_tp_head(args: &[String], model_dir: &str) {
+    println!("{}", gb10_inference::exl3_forward::xtp::identity_line("head rank=0"));
+    let world = parse_tp_world(args).unwrap_or(2);
+    if world != 2 { eprintln!("EXL3 TP: rung 3 supports --tp 2 only (got {world})"); std::process::exit(2); }
+    let spec = args.iter().any(|a| a == "--probe-exl3-tpspec");
+    if !spec && !args.iter().any(|a| a == "--probe-exl3-xtp") {
+        eprintln!("EXL3 TP: the programs wired are --probe-exl3-xtp and --probe-exl3-tpspec (serving is rung 5)");
+        std::process::exit(2);
+    }
+    let spec_opts = if spec { Some(exl3_spec_opts(args)) } else { None };
+    let spec_prompts = if spec { Some(exl3_spec_prompts(args)) } else { None };
+    // the spec program's prefix cache allocates its snapshots at load: the node must see the same env
+    if spec_opts.as_ref().map_or(false, |o| o.prefix) { gb10_inference::opts::set(gb10_inference::opt!("exl3-prefix"), "1"); }
+    let opts = if spec { Default::default() } else { exl3_xtp_opts(args) };
+    let ref_dir = if opts.ident_only || spec { parse_arg(args, "--xtp-ref").unwrap_or("").to_string() } else {
+        parse_arg(args, "--xtp-ref").expect("--head --probe-exl3-xtp requires --xtp-ref <DIR> (the TP=1 reference) or --xtp-ident-only").to_string()
+    };
+    let head_prompt = if opts.ident_only {
+        let gen: usize = parse_arg(args, "--xtp-gen").and_then(|s| s.parse().ok()).unwrap_or(16);
+        Some((exl3_xtp_prompt_ids(args, model_dir), gen))
+    } else { None };
+    let max_pos: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
+    let dir_abs = std::fs::canonicalize(model_dir).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| model_dir.to_string());
+    let explicit = parse_arg(args, "--nodes").map(|s| {
+        s.split(',').map(|p| {
+            let p = p.trim();
+            if p.contains(':') { p.parse::<std::net::SocketAddr>().expect("bad --nodes addr (ip:port)") }
+            else { std::net::SocketAddr::new(p.parse::<std::net::IpAddr>().expect("bad --nodes ip"), 29500) }
+        }).collect::<Vec<_>>()
+    });
+    let wait = std::time::Duration::from_secs(parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
+    let mut tpc = gb10_inference::tp::TpConfig::from_opts();
+    tpc.world = 2;
+    tpc.exl3 = true;
+    tpc.exl3_pack_dir = dir_abs.clone();
+    // --ep-deal interleave|contig|freq: a registry option (validated at startup; CLI-1 merged the
+    // old GB10_TP_EP_DEAL=freq env override into it)
+    tpc.exl3_ep_deal = gb10_inference::opts::get(gb10_inference::opt!("ep-deal")).unwrap_or_else(|| "interleave".into());
+    tpc.exl3_mode = match &spec_opts { Some(o) => o.to_mode(), None => opts.to_mode() };
+    tpc.max_seq_len = max_pos;
+    if args.iter().any(|a| a == "--tp-trace") { tpc.trace = true; }
+    exl3_tp_cli_knobs(args, &mut tpc);
+    println!("[head] EXL3 TP config: deal {} max_pos {max_pos} trace {} options shipped {:?}",
+             tpc.exl3_ep_deal, tpc.trace, gb10_inference::opts::snapshot());
+    gb10_inference::tp::set_tp_config(tpc.clone());
+    // PACK-FIX: the sync streams are retained through the RDMA bring-up so a node that refuses (or
+    // dies) before the link is reported here instead of the head blocking in the QP handshake.
+    let streams = match gb10_inference::cluster::run_head_retain(std::path::Path::new(&dir_abs), explicit, wait, &tpc) {
+        Ok((_, s)) => s,
+        Err(e) => { eprintln!("head error: {e:#}"); std::process::exit(1); }
+    };
+    let ctx = exl3_head_bring_up_watched(&streams);
+    drop(streams);   // the programs have no control plane past the link (pre-PACK-FIX: dropped at sync)
+    let r = ctx.and_then(|ctx| match &spec_opts {
+        Some(o) => gb10_inference::exl3_serve::run_spec(&dir_abs, Some(ctx), spec_prompts.clone(), max_pos, o),
+        None => gb10_inference::exl3_forward::xtp::run_tp_xtp(&dir_abs, ctx,
+                    if ref_dir.is_empty() { None } else { Some(&ref_dir) }, head_prompt, max_pos, &opts),
+    });
+    if let Err(e) = r { eprintln!("head exl3 tp error: {e:#}"); std::process::exit(1); }
+}
+
+
+/// PACK-FIX: the head's RDMA data-plane bring-up with every node's control stream watched — a node
+/// that refuses (pack mismatch, option/argv error, its own link failure) or exits before the link
+/// makes the head print the node's reason and exit 1 (cluster::watch_nodes_during_bring_up) instead
+/// of blocking forever in the QP handshake accept(). The probe programs' variant: the watch ends
+/// (blocking reads restored) once the link is up — a program node that finishes first must not read
+/// as a failure; their post-link node deaths are the liveness probe's job (net_shim, abort code 10).
+/// The served head keeps the watch armed through its load + boot (run_exl3_tp_serve_head).
+fn exl3_head_bring_up_watched(streams: &[std::net::TcpStream]) -> anyhow::Result<gb10_inference::tp::TpContext> {
+    let watch = gb10_inference::cluster::watch_nodes_during_bring_up(streams)?;
+    let ctx = gb10_inference::tp::TpContext::bring_up_head(2);
+    watch.disarm(streams);
+    ctx
+}
+
+/// TP-D: the EXL3 TP=2 SERVED head — `--server --tp 2 --model-dir <exl3 pack> [--nodes ip:port]`
+/// plus every TP=1 serve flag. The head ships its whole argv to the node (TpConfig.exl3_mode =
+/// "serve:<json argv>"), so the node resolves every serve knob exactly as the head does (AGENTS §7:
+/// knobs ride TpConfig), then both ranks load their shard, agree the resolved config, and the head
+/// binds HTTP once the node's mirror is armed.
+fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
+    // (--rdma-dev is a registry option: parsed at startup, node-local, never shipped)
+    println!("{}", gb10_inference::exl3_forward::xtp::identity_line("head rank=0 (serve)"));
+    let world = parse_tp_world(args).unwrap_or(2);
+    if world != 2 { eprintln!("EXL3 TP serve: --tp 2 only (got {world})"); std::process::exit(2); }
+    let dir_abs = std::fs::canonicalize(model_dir).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| model_dir.to_string());
+    let explicit = parse_arg(args, "--nodes").map(|s| {
+        s.split(',').map(|p| {
+            let p = p.trim();
+            if p.contains(':') { p.parse::<std::net::SocketAddr>().expect("bad --nodes addr (ip:port)") }
+            else { std::net::SocketAddr::new(p.parse::<std::net::IpAddr>().expect("bad --nodes ip"), 29500) }
+        }).collect::<Vec<_>>()
+    });
+    let wait = std::time::Duration::from_secs(parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
+    let mut tpc = gb10_inference::tp::TpConfig::from_opts();
+    tpc.world = 2;
+    tpc.mode_serve = true;
+    tpc.exl3 = true;
+    tpc.exl3_pack_dir = dir_abs.clone();
+    // --ep-deal interleave|contig|freq: a registry option (validated at startup; CLI-1 merged the
+    // old GB10_TP_EP_DEAL=freq env override into it)
+    tpc.exl3_ep_deal = gb10_inference::opts::get(gb10_inference::opt!("ep-deal")).unwrap_or_else(|| "interleave".into());
+    // the node re-parses exactly this argv (the model dir is the head's canonical path)
+    let mut node_args: Vec<String> = args.to_vec();
+    if let Some(i) = node_args.iter().position(|a| a == "--model-dir") {
+        if i + 1 < node_args.len() { node_args[i + 1] = dir_abs.clone(); }
+    }
+    tpc.exl3_mode = format!("serve:{}", serde_json::to_string(&node_args).expect("argv json"));
+    tpc.max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    if args.iter().any(|a| a == "--tp-trace") { tpc.trace = true; }
+    exl3_tp_cli_knobs(args, &mut tpc);
+    println!("[head] EXL3 TP serve config: deal {} options shipped {:?}; node argv {:?}", tpc.exl3_ep_deal,
+             gb10_inference::opts::snapshot(), node_args);
+    gb10_inference::tp::set_tp_config(tpc.clone());
+    let streams = match gb10_inference::cluster::run_head_retain(std::path::Path::new(&dir_abs), explicit, wait, &tpc) {
+        Ok((_, s)) => s,
+        Err(e) => { eprintln!("head error: {e:#}"); std::process::exit(1); }
+    };
+    // PACK-FIX: every node's control stream is watched from here through the head's own load + boot
+    // agree (run_tp_head_serve disarms it right before it reads the node's Ready): a node that fails
+    // its link bring-up, load or boot — or dies — makes the head print the node's reason and exit 1
+    // within ~0.1 s, instead of blocking in the QP-handshake accept() or loading for minutes first.
+    let r = gb10_inference::cluster::watch_nodes_during_bring_up(&streams).and_then(|watch|
+        gb10_inference::tp::TpContext::bring_up_head(2)
+            .and_then(|ctx| gb10_inference::exl3_serve::run_tp_head_serve(args, &dir_abs, ctx, streams, watch)));
+    if let Err(e) = r { eprintln!("head exl3 tp serve error: {e:#}"); std::process::exit(1); }
+}
+
+/// TP-A: the EXL3 TP node (rank >= 1) — zero-config: knobs from the shipped snapshot, the pack
+/// from the local copy at the head's path, proven identical by the manifest hash.
+/// PACK-FIX: every failure BEFORE the RDMA data-plane link (pack mismatch, a missing/unreadable
+/// pack file, an unparsable program from the head, the node's own link bring-up) is reported to the
+/// head over the control stream before this returns Err — the head is blocked in its link bring-up
+/// and prints the reason and exits instead of hanging (cluster::watch_nodes_during_bring_up). The
+/// stream stays open for the whole session in every mode (a close before the link is exactly what
+/// the head's watch treats as "the node quit").
+fn run_exl3_tp_node(tpc: &gb10_inference::tp::TpConfig, head_ip: std::net::IpAddr,
+                    mut stream: std::net::TcpStream) -> anyhow::Result<()> {
+    let program = match exl3_tp_node_prelink(tpc) {
+        Ok(p) => p,
+        Err(e) => { gb10_inference::cluster::node_report_failure(&mut stream, &format!("{e:#}")); return Err(e); }
+    };
+    let ctx = match gb10_inference::tp::TpContext::bring_up_node(head_ip, tpc.node_rank, tpc.world as i32) {
+        Ok(c) => c,
+        Err(e) => {
+            let e = e.context("the node's RDMA data-plane link bring-up failed");
+            gb10_inference::cluster::node_report_failure(&mut stream, &format!("{e:#}"));
+            return Err(e);
+        }
+    };
+    match program {
+        // TP-D: the served mirror — the head's argv, re-parsed here by the same serve boot
+        Exl3NodeProgram::Serve(argv) =>
+            gb10_inference::exl3_serve::run_tp_node_serve(&argv, &tpc.exl3_pack_dir, ctx, stream),
+        Exl3NodeProgram::Spec(o) => {
+            let _ctl = stream;   // held to the end (the head's watch reads a close as a refusal)
+            gb10_inference::exl3_serve::run_spec(&tpc.exl3_pack_dir, Some(ctx), None, tpc.max_seq_len, &o)
+        }
+        Exl3NodeProgram::Xtp(opts) => {
+            let _ctl = stream;
+            gb10_inference::exl3_forward::xtp::run_tp_xtp(&tpc.exl3_pack_dir, ctx, None, None, tpc.max_seq_len, &opts)
+        }
+    }
+}
+
+/// The EXL3 TP node's program, resolved from the head's `exl3_mode` before the link comes up.
+enum Exl3NodeProgram {
+    Serve(Vec<String>),
+    Spec(gb10_inference::exl3_serve::SpecOpts),
+    Xtp(gb10_inference::exl3_forward::xtp::XtpOpts),
+}
+
+/// The EXL3 TP node's pre-link phase: install the head's knobs, prove the local pack identical to
+/// the head's (PACK-FIX: the files the engine reads; a mismatch names every differing file, head hash
+/// vs node hash), and resolve the program. Any Err here is reported to the head by the caller.
+fn exl3_tp_node_prelink(tpc: &gb10_inference::tp::TpConfig) -> anyhow::Result<Exl3NodeProgram> {
+    // (CLI-1: the head's option registry was installed at the sync — run_cluster_node_once)
+    // TP-I2: the head's CLI-flag knobs (TpConfig v19) — the node never parses its own
+    gb10_inference::exl3_forward::xtp::set_pf_overlap(tpc.exl3_pf_overlap.unwrap_or(0));
+    // TP-H2 (v21): None (a pre-v21 head) = off, the pre-TP-H2 replicated sampled tail
+    gb10_inference::exl3_forward::xtp::set_vp_sampled(tpc.exl3_vp_sampled.unwrap_or(0));
+    // TP-SP1 (v22): None (a pre-v22 head) = off, the replicated prefill
+    gb10_inference::exl3_forward::xtp::set_seq_parallel(tpc.exl3_seq_parallel.unwrap_or(0));
+    println!("[node] EXL3 TP CLI knobs from the head: --tp-prefill-overlap {} --tp-vp-sampled {}{}",
+             gb10_inference::exl3_forward::xtp::pf_overlap_desc(tpc.exl3_pf_overlap.unwrap_or(0)),
+             gb10_inference::exl3_forward::xtp::vp_sampled_desc(tpc.exl3_vp_sampled.unwrap_or(0)),
+             if tpc.exl3_seq_parallel.unwrap_or(0) != 0 {
+                 format!(" --tp-seq-parallel {}", gb10_inference::exl3_forward::xtp::seq_parallel_desc(tpc.exl3_seq_parallel.unwrap_or(0)))
+             } else { String::new() });
+    if let Some(j) = tpc.exl3_mode.strip_prefix("serve:") {
+        let argv: Vec<String> = serde_json::from_str(j).map_err(|e| anyhow::anyhow!("serve argv from the head: {e}"))?;
+        println!("[node] EXL3 TP serve: head argv {argv:?}");
+        return Ok(Exl3NodeProgram::Serve(argv));
+    }
+    if tpc.exl3_mode.starts_with("spec") {
+        return Ok(Exl3NodeProgram::Spec(gb10_inference::exl3_serve::SpecOpts::parse(&tpc.exl3_mode)?));
+    }
+    Ok(Exl3NodeProgram::Xtp(gb10_inference::exl3_forward::xtp::XtpOpts::parse(&tpc.exl3_mode)?))
+}
+
 fn run_cluster_head(args: &[String]) {
-    if let Some(d) = parse_arg(args, "--rdma-dev") { std::env::set_var("GB10_RDMA_DEV", d); }
+    // (--rdma-dev is a registry option: parsed at startup, node-local, never shipped)
     let model_dir = parse_arg(args, "--model-dir").expect("--head requires --model-dir <DIR>").to_string();
+    if gb10_inference::exl3::is_exl3_dir(&model_dir) {
+        run_exl3_tp_head(args, &model_dir);
+        return;
+    }
     let prompt_text = match parse_arg(args, "--prompt-file") {
         Some(f) => std::fs::read_to_string(f).expect("read --prompt-file"),   // verbatim — `$(cat)` strips trailing newlines and changes the last token
         None => parse_arg(args, "--prompt").unwrap_or("The capital of France is").to_string(),
@@ -7976,7 +9086,7 @@ fn run_cluster_head(args: &[String]) {
         parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
     // Snapshot our GB10_TP_* env as THE config, install it process-globally, and ship it to every
     // node during the sync (nodes run with zero TP env and reproduce this behavior).
-    let mut tpc = gb10_inference::tp::TpConfig::from_env();
+    let mut tpc = gb10_inference::tp::TpConfig::from_opts();
     tpc.world = parse_tp_world(args).unwrap_or(2);   // --tp [N] is the single authority (bare = 2)
     tpc.dspark = args.iter().any(|a| a == "--bench-dspark" || a == "--dspark");
     // S4F DFlash2 tap capture: DEFAULT OFF (capture is a dead branch until the round turns on).
@@ -8006,14 +9116,14 @@ fn run_cluster_head(args: &[String]) {
                                     "on" | "true" | "1" | "yes");
     // F8/P1: --fp8-prefill <on|off> — native e4m3 W8A8 tensor-core prefill GEMM for FP8
     // trunks (1.35x TP2 / 1.63x TP1 prefill at 1500 MHz; engine cross-check 2.5e-3..1.8e-2
-    // rel-L2). DEFAULT OFF until the owner's release gate; GB10_FP8_PREFILL stays as the
+    // rel-L2). DEFAULT OFF until the owner's release gate; --fp8-prefill stays as the
     // diagnostics/back-compat alias. Requires --mxfp4=on (allow_pf4), batch >= 256, %128
     // geometry. Rides TpConfig so the zero-config node dispatches identically (SPMD).
     if let Some(v) = parse_arg(args, "--fp8-prefill") {
         tpc.fp8_prefill = matches!(&v[..], "on" | "true" | "1" | "yes");
     }
     if tpc.fp8_prefill {
-        std::env::set_var("GB10_FP8_PREFILL", "1");
+        gb10_inference::opts::set(gb10_inference::opt!("fp8-prefill"), "1");
     }
     // E5 (512K mandate): --rope-yarn-factor <f> — TRUNK YaRN rope override (default 1.0 =
     // legacy tables byte-identical). f=2 on the 256K-native trunk extends the rope tables to
@@ -8025,7 +9135,7 @@ fn run_cluster_head(args: &[String]) {
     // into the env — build_rope_tables resolves env-first. Startup-time set_var, before any
     // threads that could race it; under --tp the value ALSO rides TpConfig to the node.
     if tpc.rope_yarn_factor > 1.0 {
-        std::env::set_var("GB10_ROPE_YARN_FACTOR", tpc.rope_yarn_factor.to_string());
+        gb10_inference::opts::set(gb10_inference::opt!("rope-yarn-factor"), tpc.rope_yarn_factor.to_string());
     }
     let dspark = args.iter().any(|a| a == "--bench-dspark" || a == "--dspark");
     // item 3.3: --dspark-depth N pins the drafted-row count (None = adaptive). Rides TpConfig so
@@ -8114,73 +9224,73 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
     // Node-side TP env that must agree with the head before load (the 4-bit KV cache changes the
     // cache layout on BOTH ranks; the head ships it in the TpConfig).
     if gb10_inference::tp::tp_config().map(|c| c.kv_quant).unwrap_or(false) {
-        std::env::set_var("GB10_KV_QUANT", "1");
+        gb10_inference::opts::set(gb10_inference::opt!("kv-quant"), "1");
     }
     // TurboQuant KV (E4): same SPMD rule as kv_quant — the cache layout must match both ranks.
     let tpc_tq = gb10_inference::tp::tp_config();
     if tpc_tq.map(|c| c.kv_tq).unwrap_or(false) {
         let v = if tpc_tq.map(|c| c.kv_tq_b3).unwrap_or(false) { "3" } else { "1" };
-        std::env::set_var("GB10_KV_TQ", v);
+        gb10_inference::opts::set(gb10_inference::opt!("kv-tq"), v);
     }
     // k8v4 KV (int8-K + q4-V): same SPMD rule; mutually exclusive with kv_quant/kv_tq.
     if gb10_inference::tp::tp_config().map(|c| c.kv_k8v4).unwrap_or(false) {
-        std::env::set_var("GB10_KV_K8V4", "1");
+        gb10_inference::opts::set(gb10_inference::opt!("kv-k8v4"), "1");
     }
     // Same class for the verify-graph escape (eager verify on BOTH ranks — the serving install at
     // node_serve_tp covers that path; the bench path (tp_serve) needs its own here).
     if gb10_inference::tp::tp_config().map(|c| c.no_verify_graph).unwrap_or(false) {
-        std::env::set_var("GB10_NO_VERIFY_GRAPH", "1");
+        gb10_inference::opts::set(gb10_inference::opt!("no-verify-graph"), "1");
     }
     // MXFP4-native mode (--mxfp4=on) + the MTP-head allowlist escape hatch — SPMD-relevant, same
-    // rule as kv_quant: the loader reads GB10_MXFP4 as env on BOTH ranks; the bench node installs
+    // rule as kv_quant: the loader reads --mxfp4 as env on BOTH ranks; the bench node installs
     // the head's shipped decision here (the serving path installs at node_serve_tp).
     if gb10_inference::tp::tp_config().map(|c| c.mxfp4).unwrap_or(false) {
-        std::env::set_var("GB10_MXFP4", "1");
+        gb10_inference::opts::set(gb10_inference::opt!("mxfp4"), "1");
     }
     if gb10_inference::tp::tp_config().map(|c| c.mxfp4_mtp_native).unwrap_or(false) {
-        std::env::set_var("GB10_MXFP4_MTP_NATIVE", "1");
+        gb10_inference::opts::set(gb10_inference::opt!("mxfp4-mtp-native"), "1");
     }
 
     // SPMD branch resolution: WHICH program both ranks run. Every gate resolves env-first
     // (override), then the installed TpConfig (shipped by the head during the sync), then the
     // no-env default. An env-ONLY gate would put the zero-config node on a different program than
-    // the head — that was the GB10_TP_ACCEPT split-brain: two ranks, one link, deterministically
+    // the head — that was the --tp-accept split-brain: two ranks, one link, deterministically
     // mismatched all-reduce epochs (silent garbage, healthy-looking output). Resolve in ONE place,
     // then prove agreement over the link before any kernel runs (branch_check).
     use gb10_inference::tp::TpBranch;
     let tpc = gb10_inference::tp::tp_config();
     let branch = {
-        let capture = std::env::var("GB10_TP_CAPTURE").ok()
+        let capture = gb10_inference::opts::var(gb10_inference::opt!("tp-capture")).ok()
             .or_else(|| tpc.and_then(|c| c.capture.clone()));
-        let accept = std::env::var("GB10_TP_ACCEPT").ok().map(|v| v.parse().unwrap_or(2))
+        let accept = gb10_inference::opts::var(gb10_inference::opt!("tp-accept")).ok().map(|v| v.parse().unwrap_or(2))
             .or(tpc.and_then(|c| c.accept));
         if let Some(cap_out) = capture { TpBranch::Capture(cap_out) }
         else if let Some(d) = accept { TpBranch::Accept(d) }
-        else if std::env::var("GB10_TP_MTP").is_ok() || tpc.map(|c| c.mtp).unwrap_or(false) {
+        else if gb10_inference::opts::var(gb10_inference::opt!("tp-mtp")).is_ok() || tpc.map(|c| c.mtp).unwrap_or(false) {
             TpBranch::Mtp
         }
         // Phase-7 F9 gate: the TP batch-invariance probe (SPMD, both ranks).
-        else if std::env::var("GB10_TP_BINV_TP").is_ok()
+        else if gb10_inference::opts::var(gb10_inference::opt!("tp-binv-tp")).is_ok()
             || tpc.map(|c| c.binv_tp).unwrap_or(false) {
             TpBranch::BinvTp
         }
-        else if std::env::var("GB10_TP_STATE_TP").is_ok()
+        else if gb10_inference::opts::var(gb10_inference::opt!("tp-state-tp")).is_ok()
             || tpc.map(|c| c.state_tp).unwrap_or(false) {
             TpBranch::StateTp
         } else {
-            let step_probe = match std::env::var("GB10_TP_STEP_PROBE") {
+            let step_probe = match gb10_inference::opts::var(gb10_inference::opt!("tp-step-probe")) {
                 Ok(d) => Some(d.parse().unwrap_or(4)),
                 Err(_) => tpc.and_then(|c| c.step_probe),
             };
-            let batch_probe = match std::env::var("GB10_TP_BATCH_PROBE") {
+            let batch_probe = match gb10_inference::opts::var(gb10_inference::opt!("tp-batch-probe")) {
                 Ok(n) => Some(n.parse().unwrap_or(1)),
                 Err(_) => tpc.and_then(|c| c.batch_probe),
             };
-            // P0-2: GB10_TP_DECODE_CTX rode env-ONLY here while every other gate resolved
+            // P0-2: --tp-decode-ctx rode env-ONLY here while every other gate resolved
             // env-first-then-shipped-config — a head-only env put the zero-config node on
             // TpBranch::Generate against the head's DecodeCtx (the observed "rank 1 selector
             // 0x00, head 0x60", 2026-08-15). Same resolution ladder as the rest now.
-            let decode_ctx = match std::env::var("GB10_TP_DECODE_CTX") {
+            let decode_ctx = match gb10_inference::opts::var(gb10_inference::opt!("tp-decode-ctx")) {
                 Ok(c) => Some(c.parse().unwrap_or(2048)),
                 Err(_) => tpc.and_then(|c| c.decode_ctx),
             };
@@ -8221,16 +9331,37 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
             let n = prompt.len();
             let h = gpu.cfg().hidden_size;
             let nlayers = gpu.cfg().num_layers;
+            if gpu.cfg().is_q4() {
+                // qwen4_exp (B15): the residual is rw-wide (hc streams × h) — capture_prefill
+                // cannot see it. Run the SAME PP-prefix ladder as --capture-layers' q4 branch on
+                // BOTH ranks in SPMD lockstep (the all-reduces fire inside); each rank writes its
+                // own dump, the two files must be bit-identical (SPMD check), and both are
+                // layer-comparable to the TP=1 capture (the sharding localization).
+                let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+                let named = capture_layers_q4(&mut gpu, &mut pool, &prompt);
+                let rw = gpu.cfg().resid_width();
+                let views: Vec<(String, TensorView)> = named.iter()
+                    .map(|(name, dmp)| {
+                        let bytes: &[u8] = bytemuck::cast_slice(&dmp[..]);
+                        (name.clone(), TensorView::new(Dtype::BF16, vec![n, rw], bytes).expect("view"))
+                    }).collect();
+                safetensors::serialize_to_file(views, None, std::path::Path::new(&cap_out))
+                    .expect("write safetensors");
+                println!("{role} — TP q4 capture: {n} tokens x {rw} wide x {} boundaries -> {cap_out}",
+                         nlayers + 1);
+                println!("CAPTURE_OK {cap_out}");
+                return Ok(());
+            }
             let kv_stride = n.max(16);
             let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
             let mut state = gpu.new_batch_state(1, 1, kv_stride);
             let dumps = gpu.capture_prefill(&mut pool, &prompt, &mut state, kv_stride);
-            // GB10_CAP_DEBUG interleaves mixer/mlp_out dumps per layer (count check only without it).
-            if std::env::var("GB10_CAP_DEBUG").is_err() {
+            // --cap-debug interleaves mixer/mlp_out dumps per layer (count check only without it).
+            if gb10_inference::opts::var(gb10_inference::opt!("cap-debug")).is_err() {
                 assert_eq!(dumps.len(), nlayers + 2, "capture count: embed + L layers + final_norm");
             }
             let mut named: Vec<(String, Vec<half::bf16>)> = Vec::with_capacity(dumps.len());
-            let dbg = std::env::var("GB10_CAP_DEBUG").is_ok();
+            let dbg = gb10_inference::opts::var(gb10_inference::opt!("cap-debug")).is_ok();
             for (i, dmp) in dumps.into_iter().enumerate() {
                 // Debug mode: mixer/mlp_out dumps are interleaved per layer — name by index (unique).
                 let name = if dbg { format!("dump.{i:03}") }
@@ -8248,7 +9379,7 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
             println!("{role} — TP capture: {n} tokens x {nlayers} layers -> {cap_out}");
             return Ok(());
         }
-        // TP=2 acceptance diagnosis (GB10_TP_ACCEPT=<depth>): both ranks run bench_accept in SPMD
+        // TP=2 acceptance diagnosis (--tp-accept=<depth>): both ranks run bench_accept in SPMD
         // (the main forwards barrier; the replicated drafter cannot diverge), rank 0 prints the
         // discriminator report. This is the instrument for "is the draft head weak or is the text hard".
         TpBranch::Accept(depth) => {
@@ -8264,7 +9395,7 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
         }
         // v1 MTP under TP: run the real speculative loop on the sharded model.
         TpBranch::Mtp => {
-            let depth: usize = std::env::var("GB10_TP_MTP_DEPTH").ok()
+            let depth: usize = gb10_inference::opts::var(gb10_inference::opt!("tp-mtp-depth")).ok()
                 .and_then(|v| v.parse().ok())
                 .or(tpc.and_then(|c| c.mtp_depth)).unwrap_or(4);
             let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
@@ -8272,7 +9403,7 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
             let mut st = gpu.new_batch_state(slots, slots, max_seq_len);
             // E13: the load-time MTP-calibration forwards pollute the capture sink — reset right
             // before the bench so a PRFX/FOLDX dump holds exactly this run's prefill + steps.
-            if std::env::var("GB10_FOLD_XCHAIN_DUMP").is_ok() {
+            if gb10_inference::opts::var(gb10_inference::opt!("fold-xchain-dump")).is_ok() {
                 gb10_inference::gpu::xchain_capture_reset();
             }
             let (mtp_toks, seq_toks, mtp_tps, seq_tps, acc) =
@@ -8284,12 +9415,12 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
             if is_head {
                 println!("GATE_TOKENS {}", mtp_toks.iter().map(|t| t.to_string())
                          .collect::<Vec<_>>().join(","));
-                // E13: wide-prefill dump (GB10_FOLD_XCHAIN_DUMP=<path> +
-                // GB10_MXFP4_XCHAIN_CAPTURE=1) — the batched prefill's per-layer final-row
+                // E13: wide-prefill dump (--fold-xchain-dump=<path> +
+                // --mxfp4-xchain-capture=1) — the batched prefill's per-layer final-row
                 // hiddens. The fold fires only at batch > MAX_VERIFY (the wide prefill) and is
                 // NONDETERMINISTIC there — two fold-on runs of the same prompt differ. The dump
                 // localizes which layers race (compare two runs of the same config).
-                if let Ok(path) = std::env::var("GB10_FOLD_XCHAIN_DUMP") {
+                if let Ok(path) = gb10_inference::opts::var(gb10_inference::opt!("fold-xchain-dump")) {
                     let caps = gb10_inference::gpu::xchain_capture_take();
                     let mut chain = prompt.clone();
                     chain.extend_from_slice(&mtp_toks);
@@ -8346,11 +9477,12 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
             return Ok(());
         }
         TpBranch::Generate => {}
+        TpBranch::Exl3Xtp => anyhow::bail!("the EXL3 xtp program runs through exl3_forward::xtp::run_tp_xtp, never tp_serve"),
     }
     let t0 = std::time::Instant::now();
     // E29-B2: the capture sink accumulates MTP-calibration steps at load (batch==1 too) — reset
     // right before generation so the DFCTX dump holds exactly this run's prefill + decode steps.
-    if std::env::var("GB10_XCHAIN_CTX_DUMP").is_ok() || std::env::var("GB10_FOLD_XCHAIN_DUMP").is_ok() {
+    if gb10_inference::opts::var(gb10_inference::opt!("xchain-ctx-dump")).is_ok() || gb10_inference::opts::var(gb10_inference::opt!("fold-xchain-dump")).is_ok() {
         gb10_inference::gpu::xchain_capture_reset();
     }
     let out = gpu.tp_generate(&prompt, max_new, max_seq_len);
@@ -8365,10 +9497,10 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
         println!("{text}");
         println!("===== token ids: {:?}", out);
         println!("GATE_TOKENS {}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
-        // E29-B2: DFlash context-chain dump — GB10_XCHAIN_CTX_DUMP=<path> arms the xchain
-        // capture (GB10_MXFP4_XCHAIN_CAPTURE=1 must also be set) and writes the drafter's
+        // E29-B2: DFlash context-chain dump — --xchain-ctx-dump=<path> arms the xchain
+        // capture (--mxfp4-xchain-capture=1 must also be set) and writes the drafter's
         // conditioning hiddens (layers 1/20/39/58/77) per step + the full token chain.
-        if let Ok(path) = std::env::var("GB10_XCHAIN_CTX_DUMP") {
+        if let Ok(path) = gb10_inference::opts::var(gb10_inference::opt!("xchain-ctx-dump")) {
             let caps = gb10_inference::gpu::xchain_capture_take();
             anyhow::ensure!(caps.len() - 1 == out.len(),
                 "xchain ctx dump: {} captures vs {} generated tokens (sink must be [final prefill step, decode steps...])",
@@ -8379,11 +9511,11 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
                 .map_err(|e| anyhow::anyhow!("xchain ctx dump: {e}"))?;
             println!("XCHAIN_CTX {} decode steps -> {}", out.len(), path);
         }
-        // E13: fold-vs-nofold cross-chain dump — GB10_FOLD_XCHAIN_DUMP=<path> (+
-        // GB10_MXFP4_XCHAIN_CAPTURE=1) writes ALL layers' per-step outputs + the token chain.
-        // Run the same prompt once with GB10_MOE_NO_FOLD=1 (reference) and once with
-        // GB10_MOE_FOLD=1, then compare with --probe-fold-xchain-compare.
-        if let Ok(path) = std::env::var("GB10_FOLD_XCHAIN_DUMP") {
+        // E13: fold-vs-nofold cross-chain dump — --fold-xchain-dump=<path> (+
+        // --mxfp4-xchain-capture=1) writes ALL layers' per-step outputs + the token chain.
+        // Run the same prompt once with --moe-no-fold=1 (reference) and once with
+        // --moe-fold=1, then compare with --probe-fold-xchain-compare.
+        if let Ok(path) = gb10_inference::opts::var(gb10_inference::opt!("fold-xchain-dump")) {
             let caps = gb10_inference::gpu::xchain_capture_take();
             anyhow::ensure!(caps.len() == out.len(),
                 "fold xchain dump: {} captures vs {} generated tokens", caps.len(), out.len());
@@ -8491,16 +9623,16 @@ fn dsv4_tp_serve(
         Some((text, max_new)) => {
             let tok = QwenTokenizer::from_file(&tok_path)?;
             let mut ids = tok.encode(text, true)?;
-            // GB10_BISECT_LEN=N: pad/truncate to exactly N tokens (deterministic valid ids) — drives
+            // --bisect-len=N: pad/truncate to exactly N tokens (deterministic valid ids) — drives
             // the TP prefill-length bisect with precise token counts (the prompt text is just a seed pool).
-            if let Some(len_str) = gb10_inference::env_knob("GB10_BISECT_LEN", "DSV4_BISECT_LEN") {
-                let len: usize = len_str.parse().expect("GB10_BISECT_LEN N");
+            if let Some(len_str) = gb10_inference::opts::var(gb10_inference::opt!("bisect-len")).ok() {
+                let len: usize = len_str.parse().expect("--bisect-len N");
                 ids.truncate(len.min(ids.len()));
                 while ids.len() < len {
                     // deterministic valid non-EOS ids (mirrors the single-process --prompt-len bisect)
                     ids.push((((7 + ids.len() as i64 * 9973) % 129040) as u32).max(2));
                 }
-                eprintln!("[dsv4-bisect] prompt → {} tokens (GB10_BISECT_LEN={len})", ids.len());
+                eprintln!("[dsv4-bisect] prompt → {} tokens (--bisect-len={len})", ids.len());
             } else {
                 println!("{role} — prompt {text:?} → {} tokens", ids.len());
             }
@@ -8520,9 +9652,9 @@ fn dsv4_tp_serve(
     let cfg = dsv4_load::load_config(std::path::Path::new(model_dir))
         .map_err(|e| anyhow::anyhow!("load_config {model_dir}: {e:#}"))?;
     let prompt_len = prompt.len();
-    // GB10_MAX_SEQ_LEN overrides the derived cache depth (memory-budget probes: 1M-sized
+    // --max-seq-len overrides the derived cache depth (memory-budget probes: 1M-sized
     // caches with a short prompt). Default: prompt + generation headroom.
-    let max_seq_len = gb10_inference::env_knob("GB10_MAX_SEQ_LEN", "DSV4_MAX_SEQ_LEN")
+    let max_seq_len = gb10_inference::opts::var(gb10_inference::opt!("max-seq-len")).ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or((prompt_len + max_new + 256).max(2048));
     let s_max = (prompt_len + 16).max(256).min(gb10_inference::dsv4_model::PREFILL_CHUNK);
@@ -8581,7 +9713,7 @@ fn dsv4_tp_serve(
 /// A depth-D DSpark step drafts D rows (ONE parallel-row network pass at width D) and verifies
 /// D+1 trunk rows, emitting `1 + accepted` tokens. The step pays iff `yield(D) > r(D)` with
 /// `r(D) = (carry + draft(D) + verify(D+1)) / carry` — MEASURED at serve start (the
-/// `GB10_DSPARK_PHASE_MS` protocol) — and `yield(D)` from the live per-position hazards.
+/// `--dspark-phase-ms` protocol) — and `yield(D)` from the live per-position hazards.
 /// The policy re-picks the depth every 128 steps and drops to the minimum (D=1) when no depth
 /// beats a plain decode. LOSSLESS is structural: the committed/corrected tokens are always the
 /// trunk's argmaxes, so a depth change never touches acceptance semantics.
@@ -8825,7 +9957,7 @@ fn dsv4_tp_dspark_serve(
 
     let cfg = dsv4_load::load_config(std::path::Path::new(model_dir))?;
     let prompt_len = prompt.len();
-    let max_seq_len = gb10_inference::env_knob("GB10_MAX_SEQ_LEN", "DSV4_MAX_SEQ_LEN")
+    let max_seq_len = gb10_inference::opts::var(gb10_inference::opt!("max-seq-len")).ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or((prompt_len + max_new + 256).max(2048));
     // DSpark warm/gates use forward_capture_main which is one-shot — keep the prompt ≤ chunk.
@@ -8861,11 +9993,11 @@ fn dsv4_tp_dspark_serve(
     // 128-step re-pick). Rides TpConfig so the zero-config node runs the SAME policy inputs.
     let depth_pin = gb10_inference::tp::tp_config()
         .map(|c| c.dspark_depth.map(|d| d as usize)).unwrap_or(None);
-    let graph_armed = std::env::var("GB10_DSPARK_GRAPH").is_ok();
+    let graph_armed = gb10_inference::opts::var(gb10_inference::opt!("dspark-graph")).is_ok();
     let pin_eff = if graph_armed && depth_pin.is_none() {
         // The drafter graph bakes width=block into its capture; adaptive width needs the eager
         // draft. Pin at block so the graph path keeps its current behavior (loud, once).
-        eprintln!("{role} — [dspark-depth] GB10_DSPARK_GRAPH armed → adaptive depth disabled \
+        eprintln!("{role} — [dspark-depth] --dspark-graph armed → adaptive depth disabled \
                    (the graph bakes width {block}); pin --dspark-depth N for the graph path");
         Some(block)
     } else {
@@ -8891,10 +10023,10 @@ fn dsv4_tp_dspark_serve(
     let mut t_draft = 0.0f64;     // DSpark draft forward (3 stages + Markov)
     let mut t_verify = 0.0f64;    // trunk verify forward (depth+1 tokens)
     let mut t_reforward = 0.0f64; // rejection re-forward (committed prefix)
-    // GB10_DSPARK_PHASE_MS: synchronize around each phase so the timers measure GPU time,
+    // --dspark-phase-ms: synchronize around each phase so the timers measure GPU time,
     // not host launch time (the default async timers under-report ~0.1-0.3 ms phases).
-    let phase_sync = std::env::var("GB10_DSPARK_PHASE_MS").is_ok();
-    // GB10_DSPARK_GRAPH=1 arms the graphed drafter; a capture/classify failure falls back
+    let phase_sync = gb10_inference::opts::var(gb10_inference::opt!("dspark-phase-ms")).is_ok();
+    // --dspark-graph=1 arms the graphed drafter; a capture/classify failure falls back
     // to the eager draft ONCE (loud) and stays eager for the rest of the run.
     let mut dspark_graph_ok = true;
     let t0 = std::time::Instant::now();
@@ -9072,7 +10204,7 @@ fn dsv4_tp_dspark_serve(
         let t_r = t_reforward / n;
         let rd_with = t_decode + t_d + t_v + t_r; // current (re-forward on rejection)
         let rd_fast = t_decode + t_d + t_v;       // projected (fast selective rollback — no re-forward)
-        println!("--- r(d) cost breakdown (per step, {n_steps} steps{}) ---", if phase_sync { ", GPU-synced" } else { ", HOST-LAUNCH ONLY (set GB10_DSPARK_PHASE_MS for GPU time)" });
+        println!("--- r(d) cost breakdown (per step, {n_steps} steps{}) ---", if phase_sync { ", GPU-synced" } else { ", HOST-LAUNCH ONLY (set --dspark-phase-ms for GPU time)" });
         println!("    carry-fwd (1 decode): {t_decode:.4}s   draft: {t_d:.4}s   verify(mean {:.0} tok): {t_v:.4}s   re-forward: {t_r:.4}s",
                  n_offered as f64 / n_steps.max(1) as f64 + 1.0);
         if phase_sync {
@@ -9087,7 +10219,7 @@ fn dsv4_tp_dspark_serve(
     Ok(())
 }
 
-/// GPU-sync both streams (the GB10_DSPARK_PHASE_MS protocol — `dev.synchronize()` does NOT cover
+/// GPU-sync both streams (the --dspark-phase-ms protocol — `dev.synchronize()` does NOT cover
 /// `rt.stream`). Free fn so the step loop's `&mut` borrows of `m`/`ds` stay disjoint.
 fn dspark_stream_sync(m: &gb10_inference::dsv4_model::Dsv4GpuModel, ds: &gb10_inference::dsv4_dspark::Dsv4DSpark, phase_sync: bool) {
     if phase_sync {
@@ -9321,7 +10453,7 @@ impl DsparkServeState {
             eos: 1u32,
             block,
             vocab: cfg.vocab_size,
-            phase_sync: std::env::var("GB10_DSPARK_PHASE_MS").is_ok(),
+            phase_sync: gb10_inference::opts::var(gb10_inference::opt!("dspark-phase-ms")).is_ok(),
             next_calib_at: 0,
             t_carryfwd: 0.0, t_draft: 0.0, t_verify: 0.0, t_reforward: 0.0,
             n_steps: 0, n_offered: 0, n_accepted: 0, n_fast: 0, reforward_toks: 0,
@@ -9571,9 +10703,9 @@ fn dsv4_tp_serve_server(
         .unwrap_or_else(|| DSV4_MODEL_ID.to_string());
     println!("[dsv4-server] model ID: {model_id_str}");
     let dev = CudaDevice::new(0)?;
-    // max_seq_len (KV-ring depth): env GB10_MAX_SEQ_LEN (operator override) > the shipped
+    // max_seq_len (KV-ring depth): env --max-seq-len (operator override) > the shipped
     // TpConfig (--max-seq-len on the head, zero-config to the node) > 4096.
-    let max_seq_len = gb10_inference::env_knob("GB10_MAX_SEQ_LEN", "DSV4_MAX_SEQ_LEN")
+    let max_seq_len = gb10_inference::opts::var(gb10_inference::opt!("max-seq-len")).ok()
         .and_then(|v| v.parse::<usize>().ok())
         .or_else(|| gb10_inference::tp::tp_config().map(|c| c.max_seq_len).filter(|&v| v > 0))
         .unwrap_or(4096);
@@ -9745,7 +10877,7 @@ fn dsv4_tp_serve_server(
         // rejected requests, so no SPMD desync is possible). Over-limit → HTTP 400
         // `context_length_exceeded`, server keeps listening. A boundary prompt of exactly
         // `max_seq_len − max_new` passes (strict `>`); the guard uses the SAME `max_seq_len`
-        // binding the shard was loaded with (env DSV4_MAX_SEQ_LEN > shipped TpConfig > 4096).
+        // binding the shard was loaded with (env --max-seq-len > shipped TpConfig > 4096).
         if prompt_ids.len() + max_new > max_seq_len {
             let n = prompt_ids.len();
             let msg = format!(
@@ -10191,8 +11323,8 @@ fn dsv4_tp_serve_node_loop(
     let cfg = dsv4_load::load_config(std::path::Path::new(model_dir))
         .map_err(|e| anyhow::anyhow!("load_config: {e:#}"))?;
     let dev = CudaDevice::new(0)?;
-    // max_seq_len: env override (GB10_MAX_SEQ_LEN) > shipped TpConfig (--max-seq-len from the head) > 4096.
-    let max_seq_len = gb10_inference::env_knob("GB10_MAX_SEQ_LEN", "DSV4_MAX_SEQ_LEN")
+    // max_seq_len: env override (--max-seq-len) > shipped TpConfig (--max-seq-len from the head) > 4096.
+    let max_seq_len = gb10_inference::opts::var(gb10_inference::opt!("max-seq-len")).ok()
         .and_then(|v| v.parse::<usize>().ok())
         .or_else(|| gb10_inference::tp::tp_config().map(|c| c.max_seq_len).filter(|&v| v > 0))
         .unwrap_or(4096);
@@ -11066,7 +12198,7 @@ fn run_probe_dspark(args: &[String]) {
     let draft_bf16: Vec<bf16> = draft_mh.iter().map(|&v| bf16::from_f32(v)).collect();
     let draft_dev = dev.htod_sync_copy(&draft_bf16).expect("htod draft main_hidden");
     let t0 = std::time::Instant::now();
-    if std::env::var("GB10_DSPARK_DEBUG_RING").is_ok() {
+    if gb10_inference::opts::var(gb10_inference::opt!("dspark-debug-ring")).is_ok() {
         // R4 audit: dump the ring RIGHT AFTER warm (before any draft advances it) and compare
         // against the CPU reference's ring — validates the warm path content.
         let ring_bf = dev.dtoh_sync_copy(&ds.states[0].kv_cache).expect("ring dtoh");
@@ -11098,7 +12230,7 @@ fn run_probe_dspark(args: &[String]) {
         }
         std::process::exit(0);
     }
-    if std::env::var("GB10_DSPARK_DEBUG").is_ok() {
+    if gb10_inference::opts::var(gb10_inference::opt!("dspark-debug")).is_ok() {
         // R4 d3-cliff audit: bisect where the chain diverges from the reference oracle.
         let (out2, stages, sublayers, logits) = ds.draft_capture(&draft_dev, real_tok, start_pos).expect("draft_capture");
         let cmp = |name: &str, key: &str, got: &[f32]| {
@@ -11963,6 +13095,21 @@ fn run_quantize(args: &[String]) {
     // and for the SYNTHESIZED fused MTP-expert stacks below, so both paths are byte-identical.
     // 3D experts [E,M,K] flatten to [E*M,K] (the per-16-block E4M3 scales absorb per-expert magnitude
     // variation; M is 16-aligned so a block never straddles two experts). Vision tower stays bf16.
+    //
+    // S-H0.4a: the qwen4_exp PLE n-gram table is handled INSIDE emit, before the generic gate —
+    // its shards are [2,500,012, 160] and 2,500,012 % 16 != 0, so the GEMM `m_eff % 16` gate would
+    // silently copy the table through as bf16 (95 GiB of dead weight) and the artifact would then
+    // FAIL TO LOAD: attach_ple_table (gpu.rs) requires the ple_ngram_nvfp4.json sidecar. The row
+    // codec quantizes each row independently at a fixed 96 B (80 B E2M1 + 10 B E4M3 + 6 B pad), so
+    // no M/K alignment is needed. Records stream to ple_ngram_nvfp4.bin; the tensors do NOT enter
+    // the artifact safetensors; the sidecar is written in FINALIZE below.
+    // The PLE row-record state lives in a RefCell so `emit` stays a shared (Fn) closure —
+    // fuse_base below calls emit and must not become FnMut itself.
+    let ple_state = std::cell::RefCell::new((
+        std::fs::File::create(outd.join("ple_ngram_nvfp4.bin")).expect("create ple_ngram_nvfp4.bin"),
+        Vec::<(u64, usize, f32, String)>::new(), // (shard i, rows, global scale, tensor prefix)
+        0usize,                                  // total rows
+    ));
     let emit = |name: String, dtype: Dtype, shape: Vec<usize>, data: &[u8],
                 outs: &mut Vec<Out>, n_q4: &mut usize, n_q8: &mut usize, n_copy: &mut usize,
                 bytes_out: &mut u64| {
@@ -11970,6 +13117,20 @@ fn run_quantize(args: &[String]) {
         let last = *shape.last().unwrap_or(&0);
         let m_eff = if shape.len() == 3 { shape[0] * shape[1] }
                     else if shape.len() == 2 { shape[0] } else { 0 };
+        if fmt != Fmt::Bf16 && dtype == Dtype::BF16 && shape.len() == 2
+                && last == quant::PLE_DIM && name.contains(".ngram_embedding.shard_") {
+            let ple_shard_i: u64 = name.rsplit_once("shard_").unwrap().1
+                .split('.').next().unwrap().parse().expect("ple shard index");
+            let (rec, gs) = quant::quantize_ple_rows(bytemuck::cast_slice(data), m_eff);
+            use std::io::Write;
+            let mut st = ple_state.borrow_mut();
+            st.0.write_all(&rec).expect("write ple records");
+            let prefix = name.rsplit_once(".shard_").unwrap().0.to_string();
+            st.1.push((ple_shard_i, m_eff, gs, prefix));
+            st.2 += m_eff;
+            *bytes_out += rec.len() as u64;
+            return;
+        }
         let quantizable = fmt != Fmt::Bf16
             && (shape.len() == 2 || shape.len() == 3)
             && dtype == Dtype::BF16
@@ -11977,6 +13138,23 @@ fn run_quantize(args: &[String]) {
             && m_eff % 16 == 0
             && !name.contains(".visual.");
         if !quantizable {
+            // S-B4 footgun guard: a PLE-eligible tensor that MISSED the row-codec branch above
+            // would previously copy through silently as bf16 — bake #1 shipped a 95 GiB dead
+            // table that way and produced an artifact `attach_ple_table` rejects. If the name
+            // says ngram_embedding but the row-codec gate did not take it, scream: the only
+            // ways to land here are shape/naming mismatches, and every one of them yields an
+            // unloadable artifact. (A bf16-recipe copy-through is legitimate and stays quiet.)
+            if fmt != Fmt::Bf16 && dtype == Dtype::BF16 && name.contains("ngram_embedding") {
+                eprintln!(
+                    "[quantize] WARNING: PLE-eligible tensor `{name}` shape {shape:?} was NOT \
+                     handled by the PLE row codec (expected 2-D bf16 [rows, {}] named \
+                     `*.ngram_embedding.shard_<i>.weight`); it is being copied through \
+                     UNQUANTIZED into the safetensors and `attach_ple_table` will REJECT the \
+                     finished artifact (missing ple_ngram_nvfp4.json sidecar). Fix the gate \
+                     condition or the checkpoint naming before shipping this bake.",
+                    quant::PLE_DIM
+                );
+            }
             // Copy through unchanged: norms, conv1d, A_log, dt_bias, router (if bf16), vision, bf16 head.
             outs.push(Out { name, dtype, shape, data: data.to_vec() });
             *n_copy += 1;
@@ -12076,10 +13254,14 @@ fn run_quantize(args: &[String]) {
         println!("  fused experts: {base} → gate_up_proj [{e},{},{hidden}] + down_proj [{e},{hidden},{inter}]", 2 * inter);
     };
 
-    // STREAM the output to disk in ~12 GB shards as we go, so peak RAM is ~one shard + one input shard.
+    // STREAM the output to disk in ~4 GiB shards as we go, so peak RAM is ~one shard + one input shard.
     // A 397B's ~220 GB of quantized output can't be buffered in 128 GB host RAM (the old accumulate-then-
     // shard path OOM'd past ~100 GB). Small models still collapse to one `model.safetensors` at the end.
-    const SHARD_BYTES: usize = 12 * 1024 * 1024 * 1024;
+    // S-H0.4a: 12 GiB shards made the biggest output shard 13.6 GB, and the loader's single-node
+    // transient model (3x max shard + pipeline) then exceeded what a 128 GB box has free even with
+    // the PLE offloaded — the load refused before it started. 4 GiB shards keep max-shard ~6 GB and
+    // the transient ~28 GB, so qwen4_exp TP=1 loads pass the guard honestly (no --load-force).
+    const SHARD_BYTES: usize = 4 * 1024 * 1024 * 1024;
     let meta = std::collections::HashMap::from([
         ("format".to_string(), "pt".to_string()),
         ("quant_recipe".to_string(), recipe_s.to_string()),
@@ -12164,6 +13346,36 @@ fn run_quantize(args: &[String]) {
         let src = ind.join(f);
         if src.exists() { let _ = std::fs::copy(&src, outd.join(f)); }
     }
+    // S-H0.4a: the PLE row-record table's sidecar — the loader's PleTableMeta::load and
+    // ref_forward.py's dequant_ple_table both key off this file. Shard scales are stored in
+    // NUMERIC shard order (the hash offsets are running sums over that order).
+    let (ple_bin, mut ple_shards, ple_rows_total) = ple_state.into_inner();
+    drop(ple_bin);
+    if !ple_shards.is_empty() {
+        ple_shards.sort_by_key(|s| s.0);
+        let rows_per_shard = ple_shards[0].1;
+        for s in &ple_shards[1..] {
+            assert_eq!(s.1, rows_per_shard, "PLE shards must be uniform");
+            assert_eq!(s.3, ple_shards[0].3, "PLE shard prefixes must agree");
+        }
+        let side = serde_json::json!({
+            "format": "ple-rows-nvfp4-v1",
+            "complete": true,
+            "dim": quant::PLE_DIM,
+            "record_bytes": quant::PLE_REC_BYTES,
+            "num_shards": ple_shards.len(),
+            "rows_per_shard": rows_per_shard,
+            "total_rows": ple_rows_total,
+            "file": "ple_ngram_nvfp4.bin",
+            "tensor_prefix": ple_shards[0].3,
+            "shard_global_scales": ple_shards.iter().map(|s| s.2).collect::<Vec<f32>>(),
+        });
+        std::fs::write(outd.join("ple_ngram_nvfp4.json"),
+                       serde_json::to_string_pretty(&side).unwrap()).expect("write ple sidecar");
+        println!("  ple table: {} shards x {} rows -> ple_ngram_nvfp4.bin ({:.2} GB), sidecar written",
+                 ple_shards.len(), rows_per_shard,
+                 (ple_rows_total * quant::PLE_REC_BYTES) as f64 / 1e9);
+    }
     let cfg_path = outd.join("config.json");
     if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
         if let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -12186,7 +13398,7 @@ fn run_quantize(args: &[String]) {
 
 /// `--perplexity --model-dir <d> --text <file>` â perplexity on held-out text.
 ///
-/// The quality gate for quantization. Combine with `RUST_INFER_FAKE_QUANT=<groups>` to measure what
+/// The quality gate for quantization. Combine with `--fake-quant=<groups>` to measure what
 /// 4 bits actually costs, per tensor group, in the real engine â without needing any 4-bit kernel.
 // Derive a gdn4 (GDN-nvfp4) artifact from a mixed (GDN-fp8) one — no bf16 needed. Only the fp8 GDN
 // in/out-proj tensors are re-quantized (dequant fp8 → bf16 → nvfp4); everything else (already nvfp4 or
@@ -12907,9 +14119,9 @@ fn run_probe_tq(args: &[String]) {
     const KV_HEADS: usize = 4;
     const N_TOK: usize = 32;
     const NROWS: usize = LAYERS * KV_HEADS * N_TOK;   // 10240 golden rows
-    // K channel bit width from the env: GB10_KV_TQ=3 -> b=3 K (68-B rows, gpu_batch_b3.ptx);
+    // K channel bit width from the env: [kv-tq]=3 -> b=3 K (68-B rows, gpu_batch_b3.ptx);
     // otherwise the golden-anchored b=2 layout (52-B rows). V is 3-bit in both.
-    let b3 = std::env::var("GB10_KV_TQ").ok().as_deref() == Some("3");
+    let b3 = gb10_inference::opts::var(gb10_inference::opt!("kv-tq")).ok().as_deref() == Some("3");
     let row_bytes = if b3 { 68usize } else { 52usize };   // TQ_ROW_BYTES (_B3)
     const ROW2: usize = 52;               // b=2 row size (the golden k_packed layout)
     const ENC_SMEM_B3: u32 = 4176;        // TQ_ENCODE_SMEM_BYTES_B3
@@ -13363,49 +14575,98 @@ fn run_probe_tq(args: &[String]) {
     if !pass { std::process::exit(1); }
 }
 
-/// DEBUG CAPTURE: `--capture-layers --model-dir <D> --ids <f> --out <f>` — teacher-force one prompt
-/// of RAW token ids (whitespace-separated, NOT re-tokenized text) through the prefill path and dump
-/// the hidden state at every layer boundary as a safetensors file of bf16 [seq, hidden] tensors:
-/// `layer.00.in` (embed out), `layer.NN.out` (residual after layer NN), `final_norm`. This is the
-/// engine side of the Hy3 oracle comparison (scripts/compare_hy3_oracle.py consumes these dumps).
+/// qwen4_exp per-layer capture: the residual is rw-wide (hc streams × h), so the per-layer
+/// boundaries are captured with PREFIX runs of the PP layer-range prefill instead of
+/// `capture_prefill` (which is FullAttention/hy_v3-only): `prefill_batch_range(0..i)` returns the
+/// residual leaving layer i-1, value-exactly (that is the PP hand-off contract). Each prefix
+/// re-prefills from a zeroed slot — cheap on a slice (a handful of prefills). i=0 dumps the
+/// expanded embed output (layer.00.in). Shared by `--capture-layers` (TP=1) and the
+/// `--tp-capture` SPMD branch (TP=2: both ranks run the identical prefix ladder, the
+/// all-reduces fire inside, and the two dumps must be bit-identical).
+fn capture_layers_q4(gpu: &mut gb10_inference::gpu::GpuModel,
+                     pool: &mut gb10_inference::gpu::Pool,
+                     ids: &[u32]) -> Vec<(String, Vec<half::bf16>)> {
+    let n = ids.len();
+    let rw = gpu.cfg().resid_width();
+    let nlayers = gpu.cfg().num_layers;
+    let kv_stride = n.max(16);
+    let mut state = gpu.new_batch_state(1, 1, kv_stride);
+    let mut named: Vec<(String, Vec<half::bf16>)> = Vec::with_capacity(nlayers + 1);
+    for i in 0..=nlayers {
+        gpu.zero_slot_state(&mut state, 0, kv_stride);
+        let (_, hout) = gpu.prefill_batch_range(pool, ids, &mut state, 0, kv_stride, 0, 0, i, None);
+        let v: Vec<half::bf16> = gpu.dev().dtoh_sync_copy(&hout).unwrap();
+        pool.release_bf16(hout, rw * n);
+        assert_eq!(v.len(), rw * n, "q4 capture: expected rw-wide residual");
+        let name = if i == 0 { "layer.00.in".to_string() } else { format!("layer.{:02}.out", i - 1) };
+        named.push((name, v));
+    }
+    named
+}
+
+/// DEBUG CAPTURE: `--capture-layers --model-dir <D> [--ids <f> | --prompt <text>] --out <f>` —
+/// teacher-force one prompt through the prefill path and dump the hidden state at every layer
+/// boundary as a safetensors file of bf16 [seq, width] tensors: `layer.00.in` (embed out),
+/// `layer.NN.out` (residual after layer NN), `final_norm`. The prompt is RAW token ids
+/// (whitespace-separated, NOT re-tokenized text) or `--prompt` text tokenized with the model dir's
+/// own tokenizer — the same encode the TP bench head broadcasts, so a TP=1 and a TP=2 capture of
+/// the same `--prompt` see bit-identical ids. This is the engine side of the Hy3 oracle comparison
+/// (scripts/compare_hy3_oracle.py consumes these dumps) and the B15 TP=2-vs-TP=1 localization.
 fn run_capture_layers(args: &[String]) {
     use safetensors::{Dtype, tensor::TensorView};
     let dir = parse_arg(args, "--model-dir").expect("--capture-layers requires --model-dir").to_string();
-    let ids_path = parse_arg(args, "--ids").expect("--capture-layers requires --ids <file>").to_string();
     let out_path = parse_arg(args, "--out").expect("--capture-layers requires --out <file>").to_string();
 
-    let ids_txt = std::fs::read_to_string(&ids_path).expect("read --ids file");
-    let ids: Vec<u32> = ids_txt.split_whitespace()
-        .map(|t| t.parse().expect("token id")).collect();
+    let ids: Vec<u32> = match parse_arg(args, "--prompt") {
+        Some(text) => {
+            let tok_path = format!("{}/tokenizer.json", dir.trim_end_matches('/'));
+            let tokenizer = QwenTokenizer::from_file(&tok_path).expect("tokenizer.json");
+            let ids = tokenizer.encode(&text, true).expect("tokenize --prompt");
+            println!("capture-layers: --prompt {:?} -> {} tokens", text, ids.len());
+            ids
+        }
+        None => {
+            let ids_path = parse_arg(args, "--ids")
+                .expect("--capture-layers requires --ids <file> or --prompt <text>").to_string();
+            let ids_txt = std::fs::read_to_string(&ids_path).expect("read --ids file");
+            ids_txt.split_whitespace()
+                .map(|t| t.parse().expect("token id")).collect()
+        }
+    };
     assert!(!ids.is_empty(), "empty --ids file");
     let n = ids.len();
 
-    let (gpu, cfg) = load_model_gpu(&dir, None, 1);
+    let (mut gpu, cfg) = load_model_gpu(&dir, None, 1);
     let h = cfg.hidden_size;
     let nlayers = gpu.cfg().num_layers;
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
     let kv_stride = n.max(16);
     let mut state = gpu.new_batch_state(1, 1, kv_stride);
 
-    let dumps = gpu.capture_prefill(&mut pool, &ids, &mut state, kv_stride);
-    let debug = std::env::var("GB10_CAP_DEBUG").is_ok();
-    if !debug {
-        assert_eq!(dumps.len(), nlayers + 2, "capture count: embed + L layers + final_norm");
-    }
+    let (named, width) = if cfg.is_q4() {
+        (capture_layers_q4(&mut gpu, &mut pool, &ids), cfg.resid_width())
+    } else {
+        let dumps = gpu.capture_prefill(&mut pool, &ids, &mut state, kv_stride);
+        let debug = gb10_inference::opts::var(gb10_inference::opt!("cap-debug")).is_ok();
+        if !debug {
+            assert_eq!(dumps.len(), nlayers + 2, "capture count: embed + L layers + final_norm");
+        }
 
-    // Name per the oracle convention and serialize as bf16 [seq, hidden] (token-major — the
-    // engine's [h, n] column-major activations are byte-identical to [n, h] row-major rows).
-    let mut named: Vec<(String, Vec<half::bf16>)> = Vec::with_capacity(dumps.len());
-    for (i, dmp) in dumps.into_iter().enumerate() {
-        let name = if debug { format!("dump.{i:03}") } else if i == 0 { "layer.00.in".to_string() }
-                   else if i <= nlayers { format!("layer.{:02}.out", i - 1) }
-                   else { "final_norm".to_string() };
-        named.push((name, dmp));
-    }
+        // Name per the oracle convention and serialize as bf16 [seq, hidden] (token-major — the
+        // engine's [h, n] column-major activations are byte-identical to [n, h] row-major rows).
+        let mut named: Vec<(String, Vec<half::bf16>)> = Vec::with_capacity(dumps.len());
+        for (i, dmp) in dumps.into_iter().enumerate() {
+            let name = if debug { format!("dump.{i:03}") } else if i == 0 { "layer.00.in".to_string() }
+                       else if i <= nlayers { format!("layer.{:02}.out", i - 1) }
+                       else { "final_norm".to_string() };
+            named.push((name, dmp));
+        }
+        (named, h)
+    };
     let views: Vec<(String, TensorView)> = named.iter()
         .map(|(name, dmp)| {
             let bytes: &[u8] = bytemuck::cast_slice(&dmp[..]);
-            (name.clone(), TensorView::new(Dtype::BF16, vec![n, h], bytes).expect("view"))
+            (name.clone(), TensorView::new(Dtype::BF16, vec![n, width], bytes).expect("view"))
         }).collect();
     safetensors::serialize_to_file(views, None, std::path::Path::new(&out_path)).expect("write safetensors");
     eprintln!("capture-layers: {} tokens x {} layers -> {} ({} tensors)", n, nlayers, out_path, named.len());
@@ -13588,6 +14849,35 @@ fn run_bench_mtp_sample(args: &[String]) {
 }
 
 fn run_bench_mtp(args: &[String]) {
+    if parse_arg(args, "--bench-file").is_some() { run_bench_mtp_file(args); return; }
+    // S-A3-f-e: an EXL3 pack cannot go through the generic GpuModel loader (the
+    // container is EXL3-native; the generic load panicked at "Shard 1/9"). Run the
+    // gate on the EXL3 engine instead — same LOSSLESS_OK contract, exl3 semantics.
+    if let Some(dir) = parse_arg(args, "--model-dir") {
+        if gb10_inference::exl3_serve::is_exl3_pack(dir) {
+            let depth: usize = parse_arg(args, "--depth").or_else(|| parse_arg(args, "--mtp-depth"))
+                .and_then(|s| s.parse().ok()).unwrap_or(2);
+            let a = gb10_inference::exl3_forward::FwdArgs {
+                dir: dir.to_string(),
+                prompt: parse_arg(args, "--prompt").map(|s| s.to_string()),
+                ids_file: parse_arg(args, "--prompt-ids").map(|s| s.to_string()),
+                max_new: parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(24),
+                width: 1,
+                ladder_dir: None,
+                ladder_layers: Vec::new(),
+                ladder_step: None,
+                max_pos: parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+                bench_steps: 0,
+                widths: Vec::new(),
+                prefill_chunk: parse_arg(&args, "--prefill-chunk").and_then(|s| s.parse().ok()),
+            };
+            gb10_inference::exl3_forward::bench_mtp_exl3(&a, depth).unwrap_or_else(|e| {
+                eprintln!("BENCH_MTP_EXL3_FAIL: {e:#}");
+                std::process::exit(1);
+            });
+            return;
+        }
+    }
     let (model_path, tokenizer_path) = if let Some(dir) = parse_arg(args, "--model-dir") {
         (dir.to_string(), format!("{}/tokenizer.json", dir.trim_end_matches('/')))
     } else {
@@ -13652,6 +14942,98 @@ fn run_bench_mtp(args: &[String]) {
     }
 }
 
+/// S-B4 (MTP truth): multi-prompt acceptance battery. Each JSONL line of `--bench-file <path>`:
+///   {"text": "...", "regime": "prose", "depth": 2, "max_new": 64}
+/// Default renders `text` through the model's OWN chat template with thinking OFF and encodes the
+/// result WITHOUT add_special_tokens — the exact serving prompt (`--no-chat` for raw completions,
+/// `--thinking-on` to prime reasoning). One `bench_mtp_steps` run per line: the MTP draft chain
+/// PLUS the interleaved greedy ground truth, so every line carries its own losslessness gate —
+/// a MISMATCH is a finding (chain/re-prime corruption), never retried away. Aggregates per
+/// (regime, depth) with per-position accept@k (accepted_at_k[k]/drafts_at_k[k]).
+fn run_bench_mtp_file(args: &[String]) {
+    use gb10_inference::tokenizer::ThinkingMode;
+    let file = parse_arg(args, "--bench-file").unwrap().to_string();
+    // B30: read the battery BEFORE the multi-minute model load and NAME the path on failure.
+    // A missing battery file used to surface only after the full load as a bare os-error-2 —
+    // identical for an existing and a nonexistent file — which made the flag undiagnosable.
+    let raw = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+        eprintln!("[bench-file] ERROR: cannot read battery file '{file}': {e}");
+        std::process::exit(1);
+    });
+    let model_path = parse_arg(args, "--model-dir").expect("--bench-file needs --model-dir").to_string();
+    let max_new_default: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(64);
+    let chat = !args.iter().any(|a| a == "--no-chat");
+    let thinking = if args.iter().any(|a| a == "--thinking-on") { ThinkingMode::On } else { ThinkingMode::Off };
+    let tokenizer = QwenTokenizer::from_file(
+        &format!("{}/tokenizer.json", model_path.trim_end_matches('/'))).expect("tokenizer");
+    println!("[bench-file] {} chat={} thinking={:?}", file, chat, thinking);
+    let gpu = { let (gpu, _) = load_model_gpu(&model_path, None, 1); gpu };
+    if !gpu.mtp_present() { println!("No MTP head — cannot run MTP bench."); std::process::exit(1); }
+    let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+
+    #[derive(serde::Deserialize)]
+    struct Ent { text: String, regime: String, depth: usize, max_new: Option<usize> }
+    let ents: Vec<Ent> = raw.lines().filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("bad jsonl line in --bench-file")).collect();
+
+    struct Agg { steps: usize, drafts: usize, accepted: usize, mt_n: usize,
+                 mtp_tok_s: f32, seq_tok_s: f32, lossless: usize, runs: usize,
+                 acc_k: Vec<usize>, dr_k: Vec<usize> }
+    let mut agg: std::collections::HashMap<(String, usize), Agg> = Default::default();
+
+    for (i, e) in ents.iter().enumerate() {
+        let ptoks = if chat {
+            let msgs = vec![gb10_inference::tokenizer::ChatMessage {
+                role: "user".to_string(), content: Some(e.text.clone()), images: vec![],
+                tool_calls: None, tool_call_id: None, name: None, reasoning_content: None,
+            }];
+            let s = tokenizer.apply_chat_template(&msgs, None, None, None, thinking)
+                .expect("chat template render");
+            tokenizer.encode(&s, false).expect("encode chat prompt")
+        } else {
+            tokenizer.encode(&e.text, true).expect("encode prompt")
+        };
+        let depth = e.depth.max(1);
+        let max_new = e.max_new.unwrap_or(max_new_default);
+        let kv_stride = (ptoks.len() + max_new + depth + 8).max(512);
+        let n_slots = 2 + depth.saturating_sub(1).max(1);
+        let mut state = gpu.new_batch_state(n_slots, n_slots, kv_stride);
+        let (mt, st, mtok, stok, acc, n_steps, acc_k, dr_k) =
+            gpu.bench_mtp_steps(&mut pool, &mut state, &ptoks, kv_stride, depth, max_new);
+        let lossless = mt == st;
+        let ak: Vec<String> = acc_k.iter().zip(dr_k.iter()).enumerate()
+            .map(|(i, (a, d))| format!("k{}={:.1}%", i + 1, if *d > 0 { *a as f32 / *d as f32 * 100.0 } else { 0.0 }))
+            .collect();
+        println!("[bench-file] {:2}/{:2} regime={:9} depth={} plen={:5} accept {:5.1}% accept@k [{}] tok/step {:.2} mtp {:5.1} seq {:5.1} tok/s {}",
+            i + 1, ents.len(), e.regime, depth, ptoks.len(), acc * 100.0, ak.join(" "),
+            if n_steps > 0 { mt.len() as f32 / n_steps as f32 } else { 0.0 }, mtok, stok,
+            if lossless { "LOSSLESS_OK" } else { "MISMATCH" });
+        let v = agg.entry((e.regime.clone(), depth)).or_insert(Agg {
+            steps: 0, drafts: 0, accepted: 0, mt_n: 0, mtp_tok_s: 0.0, seq_tok_s: 0.0,
+            lossless: 0, runs: 0, acc_k: vec![0; depth.saturating_sub(1)], dr_k: vec![0; depth.saturating_sub(1)] });
+        v.steps += n_steps; v.drafts += dr_k.iter().sum::<usize>(); v.accepted += acc_k.iter().sum::<usize>();
+        v.mt_n += mt.len(); v.mtp_tok_s += mtok; v.seq_tok_s += stok;
+        if lossless { v.lossless += 1; } v.runs += 1;
+        for (x, a) in v.acc_k.iter_mut().enumerate() { *a += acc_k.get(x).copied().unwrap_or(0); }
+        for (x, d) in v.dr_k.iter_mut().enumerate() { *d += dr_k.get(x).copied().unwrap_or(0); }
+    }
+
+    println!("[bench-file] SUMMARY — accept@k = accepted_at_k[k]/drafts_at_k[k] (per-position); accept = all positions pooled:");
+    let mut keys: Vec<_> = agg.keys().cloned().collect();
+    keys.sort();
+    for (regime, depth) in keys {
+        let v = &agg[&(regime.clone(), depth)];
+        let ak: Vec<String> = v.acc_k.iter().zip(v.dr_k.iter()).enumerate()
+            .map(|(i, (a, d))| format!("k{}={:.1}%", i + 1, if *d > 0 { *a as f32 / *d as f32 * 100.0 } else { 0.0 }))
+            .collect();
+        let rate = if v.drafts > 0 { v.accepted as f32 / v.drafts as f32 * 100.0 } else { 0.0 };
+        let tps = if v.steps > 0 { v.mt_n as f32 / v.steps as f32 } else { 0.0 };
+        println!("[bench-file]   {:9} d={} runs={} lossless={}/{} accept {:5.1}% [{}] tok/step {:.2} mtp {:5.1} seq {:5.1} tok/s (means)",
+            regime, depth, v.runs, v.lossless, v.runs, rate, ak.join(" "), tps,
+            v.mtp_tok_s / v.runs as f32, v.seq_tok_s / v.runs as f32);
+    }
+}
+
 /// S9F: resolve `--spec-source` (default `dflash2-auto`, the S8F routing flip) — ONE parse shared
 /// by the serving path and the pre-load TP config build (the shipped source must equal the head's
 /// resolved source or the zero-config node takes a different lane branch and the verify
@@ -13668,17 +15050,23 @@ fn resolve_spec_source(args: &[String]) -> gb10_inference::batch::SpecSource {
 }
 
 fn run_server(args: &[String]) {
+    // Ported from sf-stav/veloGB10 PR#5 (Morxi): honor --rdma-dev → --rdma-dev here. The TP
+    // data-plane (tp::rdma_dev / cluster run_head_ session) reads ONLY the env var; on the
+    // bench/`serve` paths the flag was already folded in, but the `--server` path never set it,
+    // so it silently fell back to the DEFAULT_RDMA_DEV (rocep1s0f1). On a GB10 whose RoCE rail
+    // is the P2P1 port, bringing the QP up on the wrong device makes the RTR ibv_modify_qp fail
+    // ("[net_shim] RTR" → "TP bring-up: net_init failed").
+    // (--rdma-dev is a registry option: parsed at startup, node-local, never shipped)
     // Validate the draft-dir rule FIRST — an explicit drafter --spec-source without a valid
     // --draft-dir must stop HERE, before any model load or GPU work (resolve_draft_dir is pure:
     // exits 2 on the violation, returns the dir otherwise; every downstream consumer re-resolves
     // the identical value from the same flag).
     let _ = resolve_draft_dir(args, Some(resolve_spec_source(args)));
-    // PLAN/25 Phase 0: the coverage-trace dump (--df2-step-dump <dir> / GB10_DF2_STEP_DUMP).
+    // PLAN/25 Phase 0: the coverage-trace dump (--df2-step-dump <dir>).
     // Diagnostic-only: with it unset the server is byte-identical to the standing path. A dump
     // dir we cannot create is an operator error — refuse loudly rather than serve silently
     // undumped (the FAILS-OPEN rule).
-    let cov_dump_dir: Option<String> = parse_arg(args, "--df2-step-dump").map(|s| s.to_string())
-        .or_else(|| std::env::var("GB10_DF2_STEP_DUMP").ok());
+    let cov_dump_dir: Option<String> = parse_arg(args, "--df2-step-dump").map(|s| s.to_string());
     let cov_dump = match cov_dump_dir.as_deref()
     {
         Some(dir) => match gb10_inference::dflash2::stepdump::StepDump::new(&dir) {
@@ -13702,12 +15090,24 @@ fn run_server(args: &[String]) {
         (model.to_string(), tokenizer.to_string())
     };
 
+    // S-A3-e: an EXL3 pack routes to the dedicated serve backend (SAME HTTP surface via the
+    // shared BatchRequest protocol; TP=1 - EXL3 TP is S-A3-g). Detection: quantization_config
+    // manifest + a .trellis-carrying index.
+    if gb10_inference::exl3_serve::is_exl3_pack(&model_path) {
+        // TP-D: --server --tp 2 on an EXL3 pack = the TP=2 served head (rank 0; node = --node)
+        if parse_tp_world(args).map_or(false, |w| w >= 2) {
+            run_exl3_tp_serve_head(args, &model_path);
+            return;
+        }
+        gb10_inference::exl3_serve::run(args, &model_path).expect("exl3 serve");
+        return;
+    }
     let port = parse_arg(args, "--port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(8000);
     // E5 (512K mandate): --rope-yarn-factor <f> — trunk YaRN override, mirrored into the env
     // BEFORE the model load (rope tables build at load; single-box has no TpConfig channel).
     // Under --tp the value also rides TpConfig to the node (SPMD — both ranks' tables match).
     if let Some(f) = parse_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok()) {
-        if f >= 1.0 { std::env::set_var("GB10_ROPE_YARN_FACTOR", f.to_string()); }
+        if f >= 1.0 { gb10_inference::opts::set(gb10_inference::opt!("rope-yarn-factor"), f.to_string()); }
     }
     let max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
     let max_batch = parse_arg(args, "--max-batch").and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
@@ -13728,7 +15128,7 @@ fn run_server(args: &[String]) {
     // `--tp [N]` is the single authority for the rank count (bare --tp = 2; absent = no TP run).
     let tp_world: Option<u32> = parse_tp_world(args);
     let tp = tp_world.is_some();
-    // S9F (TP-DF2 leg): set GB10_DF2_TP BEFORE the model load — the shard-at-load path's Q4
+    // S9F (TP-DF2 leg): set [df2-tp] BEFORE the model load — the shard-at-load path's Q4
     // assembly reads it in the worker (the round's full-lm_head capture); attach_tp's
     // tp_shard_weights reads it later for the non-shard-at-load path. The node installs the
     // same env from the shipped config before ITS load. WI1: the DSPARK source needs the SAME
@@ -13741,7 +15141,7 @@ fn run_server(args: &[String]) {
         let src = resolve_spec_source(args);
         if tp && (gb10_inference::batch::is_df2_src(src)
                   || src == gb10_inference::batch::SpecSource::Dspark) {
-            std::env::set_var("GB10_DF2_TP", "1");
+            gb10_inference::opts::set(gb10_inference::opt!("df2-tp"), "1");
         }
     }
 
@@ -13847,7 +15247,7 @@ fn run_server(args: &[String]) {
             });
             let wait = std::time::Duration::from_secs(
                 parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
-            let mut tpc = gb10_inference::tp::TpConfig::from_env();
+            let mut tpc = gb10_inference::tp::TpConfig::from_opts();
             tpc.world = tp_world.unwrap_or(2);   // --tp [N] is the single authority (bare = 2)
             tpc.mode_serve = true;
             tpc.max_seq_len = max_seq_pre;
@@ -13859,10 +15259,10 @@ fn run_server(args: &[String]) {
             tpc.mtp_lanes = matches!(parse_arg(args, "--mtp-lanes").unwrap_or("off"), "on"|"true"|"1"|"yes");
             tpc.mtp_force = mtp_force_pre;
             tpc.mtp_depth_pin = mtp_depth_pre;
-            tpc.no_decode_graphs = std::env::var("GB10_NO_DECODE_GRAPHS").is_ok();
-                    tpc.fp8_prefill = std::env::var("GB10_FP8_PREFILL").is_ok();
-        tpc.fp8_prefill = std::env::var("GB10_FP8_PREFILL").is_ok();
-            tpc.cpu_sample = std::env::var("RUST_INFER_CPU_SAMPLE").is_ok();
+            tpc.no_decode_graphs = gb10_inference::opts::var(gb10_inference::opt!("no-decode-graphs")).is_ok();
+                    tpc.fp8_prefill = gb10_inference::opts::var(gb10_inference::opt!("fp8-prefill")).is_ok_and(|v| v != "0");
+        tpc.fp8_prefill = gb10_inference::opts::var(gb10_inference::opt!("fp8-prefill")).is_ok_and(|v| v != "0");
+            tpc.cpu_sample = gb10_inference::opts::var(gb10_inference::opt!("cpu-sample")).is_ok();
             tpc.eos = tok_pre.stop_token_ids(pre.eos_token_id);
             tpc.calib_prompt = tok_pre.encode("The capital of France is", true)
                 .expect("probe encode");
@@ -13899,7 +15299,7 @@ fn run_server(args: &[String]) {
             tpc.df2_step_dump = cov_dump.is_some();
             // Installing before the load is behavior-neutral: the only loader consumer
             // (gpu.rs shard-at-load shard_mixers) ORs tp_config with the very env var
-            // TpConfig::from_env mirrors, so it reads the same value either way.
+            // TpConfig::from_opts mirrors, so it reads the same value either way.
             gb10_inference::tp::set_tp_config(tpc.clone());
             // The session overlaps our pre-load CPU work (config/tokenizer above); the transfer
             // itself is 0 bytes warm. On a cold first sync it serializes ahead of the load —
@@ -13941,10 +15341,10 @@ fn run_server(args: &[String]) {
                     std::process::exit(1);
                 }
             };
-            let km = if matches!(std::env::var("GB10_KV_TQ").ok().as_deref(), Some("1") | Some("3")) { gb10_inference::gpu::KVCacheMode::Tq }
-                     else if std::env::var("GB10_KV_K8V8").ok().as_deref() == Some("1") { gb10_inference::gpu::KVCacheMode::K8v8 }
-                     else if std::env::var("GB10_KV_K8V4").ok().as_deref() == Some("1") { gb10_inference::gpu::KVCacheMode::K8v4 }
-                     else if std::env::var("GB10_KV_QUANT").is_ok() { gb10_inference::gpu::KVCacheMode::Q4 }
+            let km = if matches!(gb10_inference::opts::var(gb10_inference::opt!("kv-tq")).ok().as_deref(), Some("1") | Some("3")) { gb10_inference::gpu::KVCacheMode::Tq }
+                     else if gb10_inference::opts::var(gb10_inference::opt!("kv-k8v8")).ok().as_deref() == Some("1") { gb10_inference::gpu::KVCacheMode::K8v8 }
+                     else if gb10_inference::opts::var(gb10_inference::opt!("kv-k8v4")).ok().as_deref() == Some("1") { gb10_inference::gpu::KVCacheMode::K8v4 }
+                     else if gb10_inference::opts::var(gb10_inference::opt!("kv-quant")).is_ok() { gb10_inference::gpu::KVCacheMode::Q4 }
                      else { gb10_inference::gpu::KVCacheMode::Bf16 };
             mem_budget_report(&model_path, &cfg_pre, tp, max_seq_len, max_batch, km);
         }
@@ -13984,7 +15384,7 @@ fn run_server(args: &[String]) {
         // E5 (512K mandate): a trunk YaRN factor > 1 EXTENDS the rope tables (build_rope_tables
         // sizes them to factor x native), so the seq-len ceiling rises with it - clamp against
         // the extended ceiling, not the native one. No yarn -> native clamp, unchanged.
-        let yarn = std::env::var("GB10_ROPE_YARN_FACTOR").ok()
+        let yarn = gb10_inference::opts::var(gb10_inference::opt!("rope-yarn-factor")).ok()
             .and_then(|v| v.parse::<f32>().ok()).filter(|f| *f >= 1.0).unwrap_or(1.0f32);
         let eff_max = ((model_max as f64) * (yarn as f64)).ceil() as usize;
         let max_seq_len = if max_seq_len > eff_max {
@@ -14026,14 +15426,10 @@ fn run_server(args: &[String]) {
         // directive); `--spec-source mtp` is unchanged and permanently selectable; none = plain
         // decode. Rides TpConfig (SPMD) under TP.
         let spec_source = resolve_spec_source(args);
-        // (GB10_DF2_TP is set EARLY — right after the `tp` determination, BEFORE the model
+        // ([df2-tp] is set EARLY — right after the `tp` determination, BEFORE the model
         // load — because the shard-at-load Q4 assembly reads it in the worker.)
-        for stale in ["RUST_INFER_MTP", "RUST_INFER_MTP_STOCHASTIC", "RUST_INFER_GPU_SAMPLE"] {
-            if std::env::var(stale).is_ok() {
-                println!("note: {} is obsolete and ignored (MTP is auto-tuned; GPU sampling is the \
-                          default). Use --mtp=on|off to force MTP.", stale);
-            }
-        }
+        // (CLI-1: the obsolete RUST_INFER_MTP / RUST_INFER_MTP_STOCHASTIC / RUST_INFER_GPU_SAMPLE vars
+        // are refused at startup by opts::reject_env, naming --mtp on|off.)
 
         let tokenizer = match pre_tokenizer {
             // The TP parallel-load path already loaded it (and printed) before the weight load.
@@ -14088,24 +15484,24 @@ fn run_server(args: &[String]) {
                         parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
                     // TpConfig v2: env snapshot for the bench knobs, serving fields from the server args.
                     // batch_probe = max_batch so attach_tp sizes the all-reduce payload for batched decode.
-                    let mut tpc = gb10_inference::tp::TpConfig::from_env();
+                    let mut tpc = gb10_inference::tp::TpConfig::from_opts();
                     tpc.world = tp_world.unwrap_or(2);   // --tp [N] is the single authority (bare = 2)
                     tpc.mode_serve = true;
                     tpc.max_seq_len = max_seq_len;
                     tpc.max_batch = max_batch;
                     tpc.prefix_cache = prefix_cache;
-                    // §4.1 MTP-block sharding: CLI flag wins, env alias (already in from_env) ORs in.
-                    tpc.shard_mtp = tpc.shard_mtp || args.iter().any(|a| a == "--tp-shard-mtp");
+                    // §4.1 MTP-block sharding: --tp-shard-mtp on|off is a registry option (default on),
+                    // already resolved by from_opts (CLI-1: `--tp-shard-mtp off` must not be ORed back on).
                     tpc.ngram_draft = ngram_draft;
                     tpc.tree_draft = tree_draft;
                     tpc.mtp_lanes = mtp_lanes;
                     tpc.pf_sched_inline = pf_sched_inline;
                     tpc.mtp_force = mtp_force;
                     tpc.mtp_depth_pin = mtp_depth;
-                    tpc.no_decode_graphs = std::env::var("GB10_NO_DECODE_GRAPHS").is_ok();
-                    tpc.fp8_prefill = std::env::var("GB10_FP8_PREFILL").is_ok();
-                    tpc.cpu_sample = std::env::var("RUST_INFER_CPU_SAMPLE").is_ok();
-                    tpc.no_verify_graph = std::env::var("GB10_NO_VERIFY_GRAPH").is_ok();
+                    tpc.no_decode_graphs = gb10_inference::opts::var(gb10_inference::opt!("no-decode-graphs")).is_ok();
+                    tpc.fp8_prefill = gb10_inference::opts::var(gb10_inference::opt!("fp8-prefill")).is_ok_and(|v| v != "0");
+                    tpc.cpu_sample = gb10_inference::opts::var(gb10_inference::opt!("cpu-sample")).is_ok();
+                    tpc.no_verify_graph = gb10_inference::opts::var(gb10_inference::opt!("no-verify-graph")).is_ok();
                     // --device-loop (device-resident token loop): OFF by default until gated.
                     tpc.device_loop = matches!(parse_arg(args, "--device-loop").unwrap_or("off"),
                                                 "on" | "true" | "1" | "yes");
@@ -14260,6 +15656,8 @@ fn run_server(args: &[String]) {
         }
         let policy = gb10_inference::batch::MtpPolicy::with_source(
             gpu.mtp_present(), mtp_force, mtp_depth, mtp_r, spec_source);
+        // Captured before `policy` moves into the scheduler (PR #4: the HTTP clamp mirror).
+        let mtp_active_at_start = policy.active();
         if !gpu.mtp_present() {
             println!("MTP: model has no MTP head — plain decode.");
         } else {
@@ -14392,6 +15790,7 @@ fn run_server(args: &[String]) {
                 });
             }
         }
+        gb10_inference::memwatch::phase("srv:post-scheduler");
 
         // Vision tower load, geometry-driven. The whole Qwen3.5/3.8 VL family is supported:
         // dimensions come from `config.json` `vision_config` (TowerDims) and the `nvfp4-*` dirs'
@@ -14413,6 +15812,7 @@ fn run_server(args: &[String]) {
             }
         };
         let vision_cpu = parse_arg(args, "--vision-cpu").is_some();
+        gb10_inference::memwatch::phase("srv:post-vision-cpu-flag");
         // GPU vision fast path: build on the shared device (same primary context as the serving model).
         // Soft-fail — a GPU-less / PTX-less box keeps the CPU tower (or text-only behavior).
         let vision_gpu = if vision_cpu { None } else {
@@ -14441,6 +15841,7 @@ fn run_server(args: &[String]) {
             }
             None => None,
         };
+        gb10_inference::memwatch::phase("srv:post-otel");
 
         // --tool-call-format <xml|json>: Froggeric-class templates accept a `tool_call_format`
         // kwarg; 'json' selects the model's NATIVE Qwen tool-call syntax (what our server's
@@ -14459,7 +15860,12 @@ fn run_server(args: &[String]) {
         if args.iter().any(|a| a == "--auto-disable-thinking-with-tools") {
             tokenizer.auto_disable_think_tools = true;
         }
+        // Keep the HTTP clamp aligned with the scheduler reserve (PR #4). Auto may re-enable
+        // later, so retain the startup value for the server lifetime; the scheduler's own
+        // `admit` re-checks per request (its clamp is authoritative).
+        let decode_headroom = gb10_inference::batch::decode_headroom(mtp_active_at_start);
         let state = AppState {
+            sampling_defaults: gb10_inference::server::SamplingDefaults::LEGACY,
             scheduler: stx,
             tokenizer: Arc::new(tokenizer),
             model_name: model_name.clone(),
@@ -14493,6 +15899,7 @@ fn run_server(args: &[String]) {
                 .map(|i| args.get(i + 1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(6000))
                 .unwrap_or(0),
             max_seq_len,
+            decode_headroom,
             prefix_cache,
             // Vision tower(s) (v3): load the 333 model.visual.* tensors, and build the GPU fast path
             // on the shared device. Fails softly — a text-only / GPU-less server keeps its exact
@@ -14558,6 +15965,7 @@ fn run_server(args: &[String]) {
                 pf_sched_boot, fp8_pf_boot, draft_boot,
                 gb10_inference::gpu::tripwire_get(), gb10_inference::gpu::census_on());
         }
+        gb10_inference::memwatch::phase("serve:pre-bind");
         let app = create_router(state);
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
         println!("OpenAI-compatible server running on http://0.0.0.0:{}", port);
@@ -14565,7 +15973,164 @@ fn run_server(args: &[String]) {
         println!("POST /v1/chat/completions   max_batch={}  default max_tokens={}", max_batch, default_max_tokens);
         println!("POST /v1/tokenize           vLLM-compatible: {{tokens, count, max_model_len}} — pure tokenizer, no forward (prompt | messages)");
         println!("POST /v1/detokenize         vLLM-compatible: {{model, prompt}} — decode half of the pair (exact-N prompt building)");
-        axum::serve(listener, app).await.unwrap();
+        // WP01: TCP_NODELAY on accepted sockets — SSE token chunks are small writes that Nagle +
+        // delayed-ACK can hold for tens of ms. Bytes on the wire are unchanged, only when they
+        // leave. --wp01-off=1 = legacy (OS default, Nagle on).
+        let wp01_off = gb10_inference::opts::var(gb10_inference::opt!("wp01-off")).map_or(false, |v| !v.is_empty() && v != "0");
+        let srv = axum::serve(listener, app);
+        let srv = if wp01_off { srv } else { srv.tcp_nodelay(true) };
+        srv.await.unwrap();
     });
 }
 
+
+/// B29 gate: serve-path probe at pinned MTP depth. See the dispatch-site comment.
+fn run_probe_serve_pinned(args: &[String]) -> i32 {
+    let model_dir = parse_arg(args, "--model-dir")
+        .expect("--probe-serve-pinned requires --model-dir <DIR>").to_string();
+    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_tokens: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(128);
+    let port0: u16 = parse_arg(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(8140);
+    let prompt = parse_arg(args, "--prompt").unwrap_or(
+        "What are the necessary preconditions for the possibility of the existence of logic? Answer the question and explain your answer within 1000 words.").to_string();
+    let arms: Vec<(&str, Vec<&str>)> = vec![
+        ("pinned-d2", vec!["--mtp=on", "--mtp-depth", "2"]),
+        ("auto", vec!["--mtp=auto"]),
+        ("pinned-d4", vec!["--mtp=on", "--mtp-depth", "4"]),
+    ];
+    let mut outputs: Vec<(String, String, u64)> = Vec::new();
+    let mut failed = false;
+    for (i, (label, mtp_args)) in arms.iter().enumerate() {
+        let port = port0 + i as u16;
+        match serve_probe_arm(&model_dir, mtp_args, max_seq_len, port, &prompt, max_tokens) {
+            Ok((content, drafts)) => {
+                println!("[serve-pinned] arm {label}: {} chars, completion ok, mtp_drafts={drafts}", content.len());
+                outputs.push((label.to_string(), content, drafts));
+            }
+            Err(e) => {
+                eprintln!("[serve-pinned] FAIL arm {label}: {e:#}");
+                failed = true;
+            }
+        }
+    }
+    if failed { return 1; }
+    for (label, content, _) in &outputs {
+        if content.trim().is_empty() {
+            eprintln!("[serve-pinned] FAIL arm {label}: EMPTY completion — an empty response is a FAIL, not a pass (AGENTS §3)");
+            return 1;
+        }
+    }
+    for (label, _, drafts) in &outputs {
+        if label.starts_with("pinned") && *drafts == 0 {
+            eprintln!("[serve-pinned] FAIL arm {label}: MTP did not engage on the pinned arm (drafts=0) — the gate did not exercise the speculative path");
+            return 1;
+        }
+    }
+    let reference = outputs[1].1.clone();
+    for (label, content, _) in &outputs {
+        if *content != reference {
+            eprintln!("[serve-pinned] FAIL arm {label}: greedy output differs from the auto-depth reference — pinned depth must never change OUTPUT (AGENTS §2.7)");
+            return 1;
+        }
+    }
+    println!("[serve-pinned] PASS: pinned-d2 == auto == pinned-d4, {} chars byte-identical, MTP engaged on pinned arms, clean completions", reference.len());
+    0
+}
+
+/// Boot THIS binary as a server with the given MTP flags, wait for /health, send ONE greedy chat
+/// request, return (content, mtp_drafts). Kills the child on the way out; server log at
+/// <tmp>/gb10_serve_pinned_<port>.log.
+fn serve_probe_arm(model_dir: &str, mtp_args: &[&str], max_seq_len: usize, port: u16,
+                   prompt: &str, max_tokens: usize) -> Result<(String, u64), anyhow::Error> {
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe()?;
+    let log_path = std::env::temp_dir().join(format!("gb10_serve_pinned_{port}.log"));
+    let log = std::fs::File::create(&log_path)?;
+    let mut child = Command::new(&exe)
+        .args(["--server", "--model-dir", model_dir, "--thinking", "off",
+               "--max-seq-len", &max_seq_len.to_string(), "--max-batch", "8",
+               "--port", &port.to_string()])
+        .args(mtp_args)
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn server: {e}"))?;
+    let result = (|| -> Result<(String, u64), anyhow::Error> {
+        // Wait for /health (boot can take minutes on a cold page cache).
+        let mut ready = false;
+        for _ in 0..600 {
+            if let Ok(resp) = http_req(port, "GET", "/health", None, 5) {
+                if resp.contains(" 200 ") { ready = true; break; }
+            }
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("server exited early (status {status}); log {log_path:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if !ready {
+            anyhow::bail!("server never became healthy within 300s; log {log_path:?}");
+        }
+        let body = format!(
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":{}}}],\"max_tokens\":{max_tokens},\"temperature\":0}}",
+            serde_json::to_string(prompt)?);
+        let resp = http_req(port, "POST", "/v1/chat/completions", Some(&body), 300)?;
+        if !resp.contains(" 200 ") {
+            anyhow::bail!("chat request returned {}", resp.lines().next().unwrap_or("?"));
+        }
+        let j: serde_json::Value = serde_json::from_str(resp_body(&resp))
+            .map_err(|e| anyhow::anyhow!("chat response is not JSON: {e}"))?;
+        let content = j["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+        let health = http_req(port, "GET", "/health", None, 10)?;
+        let hj: serde_json::Value = serde_json::from_str(resp_body(&health))
+            .map_err(|e| anyhow::anyhow!("health response is not JSON: {e}"))?;
+        let drafts = hj["telemetry"]["mtp"]["drafts"].as_u64().unwrap_or(0);
+        Ok((content, drafts))
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+/// Minimal HTTP/1.1 client (std only): returns "<status-line>\r\n\r\n<decoded-body>".
+fn http_req(port: u16, method: &str, path: &str, body: Option<&str>, timeout_s: u64)
+    -> Result<String, anyhow::Error> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let mut s = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| anyhow::anyhow!("connect 127.0.0.1:{port}: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(timeout_s)))?;
+    s.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let req = match body {
+        Some(b) => format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len()),
+        None => format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"),
+    };
+    s.write_all(req.as_bytes())?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)?;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let (head, b) = text.split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response from {path}"))?;
+    let status = head.lines().next().unwrap_or("HTTP/1.1 0 ?").to_string();
+    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        let mut out = String::new();
+        let mut rest: &str = b;
+        loop {
+            let Some((size_line, after)) = rest.split_once("\r\n") else { break };
+            let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+            if size == 0 { break; }
+            let end = after.len().min(size);
+            out.push_str(&after[..end]);
+            rest = &after[end..];
+            rest = rest.strip_prefix("\r\n").unwrap_or(rest);
+        }
+        out
+    } else {
+        b.to_string()
+    };
+    Ok(format!("{status}\r\n\r\n{body}"))
+}
+
+fn resp_body(resp: &str) -> &str {
+    resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+}

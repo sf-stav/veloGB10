@@ -18,8 +18,8 @@
 //!
 //! Postures (three, mirroring `PLAN/TRIPWIRE_SPEC.md` §3.3):
 //!  * **off** (default) — one relaxed load per dispatch; no record kept. Production.
-//!  * **count** (`GB10_DISPATCH_LOG=count`) — counters per (format, arm) + max batch per arm.
-//!  * **assert** (`--probe-dispatch`, or `GB10_DISPATCH_LOG=assert`) — count PLUS the invariant
+//!  * **count** (`--dispatch-log=count`) — counters per (format, arm) + max batch per arm.
+//!  * **assert** (`--probe-dispatch`, or `--dispatch-log=assert`) — count PLUS the invariant
 //!    evaluated per record; a violation panics with the full record. Probe/gate only.
 //!
 //! The counter is **never** on for timing runs (rule 16): `stats_line()` prints its own posture so
@@ -66,14 +66,14 @@ fn counters() -> &'static Mutex<Counters> {
     C.get_or_init(|| Mutex::new(Counters::default()))
 }
 
-/// Read the posture from the environment once (`GB10_DISPATCH_LOG=count|assert`), unless already
+/// Read the posture from the environment once (`--dispatch-log=count|assert`), unless already
 /// forced by `--probe-dispatch` (which sets `assert`). Diagnostics-only knob, so an env var is
 /// acceptable (AGENTS §7); the user-facing surface is the `--probe-dispatch` flag.
-pub fn init_from_env() {
+pub fn init_from_opts() {
     if posture() != POSTURE_OFF {
         return;
     }
-    match std::env::var("GB10_DISPATCH_LOG").ok().as_deref() {
+    match crate::opts::var(crate::opt!("dispatch-log")).ok().as_deref() {
         Some("1") | Some("count") => set_posture(POSTURE_COUNT),
         Some("assert") => set_posture(POSTURE_ASSERT),
         _ => {}
@@ -91,7 +91,7 @@ pub fn posture_name() -> &'static str {
 }
 
 /// Record one dispatch. The hot path in the default posture is a single relaxed load + a
-/// predictable-not-taken branch (the `GB10_TRACE_WIDE` idiom already used in `gemm_act`).
+/// predictable-not-taken branch (the `--trace-wide` idiom already used in `gemm_act`).
 ///
 /// `MAX_VERIFY` is passed in rather than imported so this module stays free of a gpu.rs dependency.
 #[inline]

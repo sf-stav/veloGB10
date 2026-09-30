@@ -18,7 +18,7 @@
 //! `(1+w)` convention does NOT apply to this artifact); rope pairing is NeoX half-split
 //! (`rotate_half`); YaRN mscale (0.1·ln(factor)+1) folds into the cos/sin tables; the YaRN
 //! correction range is low=find(beta_fast), high=find(beta_slow). Legacy arms:
-//! GB10_DSPARK_NORM_G1 / GB10_DSPARK_D0_PLAIN / GB10_DSPARK_ROPE_IL / GB10_DSPARK_NOMSCALE.
+//! --dspark-norm-g1 / --dspark-d0-plain / --dspark-rope-il / --dspark-nomscale.
 //!
 //! The borrowed head/embed contract is DF2's verbatim (`GpuModel::df2_borrow`, including the
 //! F8 two-stage head). Greedy losslessness is verify-protected: the trunk's argmax stream is
@@ -272,8 +272,8 @@ impl DsparkRound {
             // trains with HF Qwen3RMSNorm = plain w·x; the TRUNK's ≈0-mean weights are the
             // (1+w) family — the §7 norm-convention trap cuts BOTH ways). The rmsnorm kernels
             // compute (1 + uploaded)·x, so upload w−1 to get w_file·x — DF2's convention after
-            // all. GB10_DSPARK_NORM_G1=1 restores the old (1+w_file)·x upload for A/B.
-            let legacy = std::env::var("GB10_DSPARK_NORM_G1").map(|v| v == "1" || v == "on").unwrap_or(false);
+            // all. --dspark-norm-g1=1 restores the old (1+w_file)·x upload for A/B.
+            let legacy = crate::opts::var(crate::opt!("dspark-norm-g1")).map(|v| v == "1" || v == "on").unwrap_or(false);
             let m: Vec<f32> = if legacy {
                 data.to_vec()
             } else {
@@ -341,9 +341,9 @@ impl DsparkRound {
             HEAD_DIM, rope.theta, rope.factor, rope.orig_ctx, rope.beta_fast, rope.beta_slow);
         // YaRN mscale folds into the cos/sin cache (vLLM yarn_scaling_rope.py:
         // cos = freqs.cos() * mscale, sin likewise; q and k both scale, scores scale by
-        // mscale² = 1.813 at factor 32). GB10_DSPARK_NOMSCALE=1 restores the old unscaled
+        // mscale² = 1.813 at factor 32). --dspark-nomscale=1 restores the old unscaled
         // tables for A/B.
-        let mscale = if std::env::var("GB10_DSPARK_NOMSCALE").map(|v| v == "1" || v == "on").unwrap_or(false) {
+        let mscale = if crate::opts::var(crate::opt!("dspark-nomscale")).map(|v| v == "1" || v == "on").unwrap_or(false) {
             1.0f32
         } else if rope.factor > 1.0 {
             0.1f32 * rope.factor.ln() + 1.0f32
@@ -552,9 +552,9 @@ impl DsparkRound {
         // from HF qwen3 and vLLM's get_rope defaults is_neox_style=True — both references
         // pair (j, j+half). DF2's rope_b implements exactly that. The interleaved kernel
         // (dspark_rope_b, pairs (2j, 2j+1)) is kept as a diagnostic arm:
-        // GB10_DSPARK_ROPE_IL=1 selects it; GB10_DSPARK_ROPE_HS=1 is accepted as an explicit
+        // --dspark-rope-il=1 selects it; GB10_DSPARK_ROPE_HS=1 is accepted as an explicit
         // no-op (half-split is now the default).
-        let il = std::env::var("GB10_DSPARK_ROPE_IL").map(|v| v == "1" || v == "on").unwrap_or(false);
+        let il = crate::opts::var(crate::opt!("dspark-rope-il")).map(|v| v == "1" || v == "on").unwrap_or(false);
         if il {
             klaunch!(self, "dspark_rope_b", grid(b * heads * (HEAD_DIM / 2)), (256, 1, 1), 0,
                 (d(x), d(cos), d(sin), heads as i32, HEAD_DIM as i32, HEAD_DIM as i32, b as i32));
@@ -704,7 +704,7 @@ impl DsparkRound {
     }
 
     fn upload_scalars(&mut self, anchor: u32) -> Result<()> {
-        let s: i32 = std::env::var("GB10_DSPARK_BLOCK_POS").ok()
+        let s: i32 = crate::opts::var(crate::opt!("dspark-block-pos")).ok()
             .and_then(|v| v.parse().ok()).unwrap_or(0);
         self.consts_pin[0] = anchor as i32;
         self.consts_pin[1] = self.nprev as i32;
@@ -721,9 +721,9 @@ impl DsparkRound {
     /// The pure-launch body (eager). `graph_mode` packs nothing yet (v1 eager) — the flag
     /// mirrors DF2's for the graph follow-up.
     fn draft_round_kernels(&mut self, anchor: u32) -> Result<()> {
-        // GB10_DSPARK_ROUND_BISECT=<n>: run only the first n backbone layers (diagnostics —
+        // --dspark-round-bisect=<n>: run only the first n backbone layers (diagnostics —
         // marginal cost per layer + head/chain residual from the round-trace totals).
-        let nl: usize = std::env::var("GB10_DSPARK_ROUND_BISECT").ok()
+        let nl: usize = crate::opts::var(crate::opt!("dspark-round-bisect")).ok()
             .and_then(|v| v.parse().ok()).unwrap_or(N_LAYERS);
         self.draft_round_kernels_partial(anchor, nl.min(N_LAYERS))
     }
@@ -752,8 +752,8 @@ impl DsparkRound {
         // ---- the markov chain, REFERENCE semantics: the bias W2@W1[prev] applies at EVERY
         // position 0..6 with prev seeded by the ANCHOR (vLLM _sample_sequential seeds
         // prev = input_ids[query_off 0]; dspark.py apply_block_logits is teacher-forced).
-        // GB10_DSPARK_D0_PLAIN=1 restores the old plain-argmax d0 for A/B.
-        let legacy_d0 = std::env::var("GB10_DSPARK_D0_PLAIN").map(|v| v == "1" || v == "on").unwrap_or(false);
+        // --dspark-d0-plain=1 restores the old plain-argmax d0 for A/B.
+        let legacy_d0 = crate::opts::var(crate::opt!("dspark-d0-plain")).map(|v| v == "1" || v == "on").unwrap_or(false);
         if legacy_d0 {
             klaunch!(self, "dspark_row0_argmax_b", (1, 1, 1), (256, 1, 1), 256,
                 (d(&self.walk_tokens), d(&self.prev_dev), d(&self.logits),
@@ -771,9 +771,9 @@ impl DsparkRound {
         } else {
             // prev_dev[0] = anchor — already expanded by dspark_scalars_b above.
             // F8: chain_c (coalesced, exact ascending-i order) is the default; the legacy
-            // broadcast kernel stays behind GB10_DSPARK_CHAIN_A=1 for A/B (19 ms vs ~0.6 ms
+            // broadcast kernel stays behind --dspark-chain-a=1 for A/B (19 ms vs ~0.6 ms
             // per call at rank 256 / vocab 248320).
-            let legacy_chain = std::env::var("GB10_DSPARK_CHAIN_A")
+            let legacy_chain = crate::opts::var(crate::opt!("dspark-chain-a"))
                 .map(|v| v == "1" || v == "on").unwrap_or(false);
             for k in 0..BLOCK {
                 if legacy_chain {
@@ -822,12 +822,12 @@ impl DsparkRound {
         let packed = (((ntot as u64) << 42) | ((self.c_ring as u64) << 21) | self.ring_stride as u64);
         // F8/B4: dspark_attn_full_ring_e (flash-decode on mma.sync tensor cores) is the
         // default — 0.56 ms/call at ntot=30K vs _d's 4.78 (KV roofline 0.52), oracle
-        // 43/43. GB10_DSPARK_ATTN={b,c,d} selects the legacy/scalar kernels explicitly
+        // 43/43. --dspark-attn={b,c,d} selects the legacy/scalar kernels explicitly
         // (diagnostic A/B escapes — logged, never silent).
-        let attn_sel = std::env::var("GB10_DSPARK_ATTN").unwrap_or_default();
+        let attn_sel = crate::opts::var(crate::opt!("dspark-attn")).unwrap_or_default();
         match attn_sel.as_str() {
             "b" => {
-                eprintln!("[dspark] GB10_DSPARK_ATTN=b — legacy untiled _b (diagnostic)");
+                eprintln!("[dspark] --dspark-attn=b — legacy untiled _b (diagnostic)");
                 let smem = ((HEAD_DIM + 32) * 4) as u32;
                 klaunch!(self, "dspark_attn_full_ring_b", ((BLOCK * NUM_HEADS) as u32, 1, 1),
                          (HEAD_DIM as u32, 1, 1), smem,
@@ -836,7 +836,7 @@ impl DsparkRound {
                      d(&self.scores_g), self.score_stride as i32, fbits(scale)));
             }
             "c" => {
-                eprintln!("[dspark] GB10_DSPARK_ATTN=c — smem-tiled _c (diagnostic)");
+                eprintln!("[dspark] --dspark-attn=c — smem-tiled _c (diagnostic)");
                 let pitch = HEAD_DIM + 16;
                 let smem = (((HEAD_DIM + 32) * 4) + DSPARK_ATTN_TILE * pitch * 2) as u32;
                 klaunch!(self, "dspark_attn_full_ring_c", ((BLOCK * NUM_HEADS) as u32, 1, 1),
@@ -974,10 +974,10 @@ impl DsparkRound {
 
     /// Run the eager draft round for `anchor`; returns the 7 drafted tokens (readback).
     pub fn draft_round_dev(&mut self, anchor: u32) -> Result<Vec<u32>> {
-        // GB10_DSPARK_ROUND_TRACE=1: per-phase host timing (first 40 rounds) — the round
+        // --dspark-round-trace=1: per-phase host timing (first 40 rounds) — the round
         // runs on its own CUDA context, invisible to a default nsys capture, so the split
         // must come from the engine itself.
-        let trace = std::env::var("GB10_DSPARK_ROUND_TRACE").is_ok();
+        let trace = crate::opts::var(crate::opt!("dspark-round-trace")).is_ok();
         static ROUND_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = if trace { ROUND_N.fetch_add(1, std::sync::atomic::Ordering::SeqCst) } else { 0 };
         let t0 = std::time::Instant::now();

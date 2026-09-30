@@ -1,4 +1,4 @@
-//! DSpark fp8 draft-logits gate (Tier 1.1b, GB10_DSPARK_FP8_LOGITS=1):
+//! DSpark fp8 draft-logits gate (Tier 1.1b, --dspark-fp8-logits):
 //!   1. GRAPH ARM: the graphed fp8 draft must equal the eager fp8 draft BITWISE (same
 //!      kernels/args — the bf16 readout path included).
 //!   2. QUALITY: the fp8 draft logits must stay close to the bf16-head logits (rel-L2) and
@@ -38,11 +38,9 @@ fn argmax(row: &[f32]) -> usize {
 #[test]
 fn dspark_fp8_logits_quality_and_graph_bitwise() {
     let _g = gate();
-    // SAFETY: single test thread in this binary touches the env before any GPU work.
-    unsafe {
-        std::env::set_var("GB10_DSPARK_FP8_LOGITS", "1");
-        std::env::set_var("GB10_DSPARK_GRAPH", "1");
-    }
+    // CLI-1: the options registry (no env); set before any GPU work.
+    gb10_inference::opts::test_set(gb10_inference::opt!("dspark-fp8-logits"), Some("1"));
+    gb10_inference::opts::test_set(gb10_inference::opt!("dspark-graph"), Some("1"));
     let bundle = Path::new(BUNDLE);
     let cfg = dsv4_load::load_config(bundle).unwrap();
     let dev = Arc::new(CudaDevice::new(0).unwrap());

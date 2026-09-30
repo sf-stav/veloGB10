@@ -17,8 +17,25 @@ use crate::batch::{BatchRequest, TokEvent};
 use crate::tokenizer::{QwenTokenizer, ChatMessage, ToolCall, ThinkingMode};
 use crate::{Usage, Timings, make_timings};
 
+/// Sampling values used for the parameters a request leaves out, per thinking mode.
+#[derive(Clone, Copy, Debug)]
+pub struct SamplingDefaults {
+    pub think: (f32, f32, usize),   // (temperature, top_p, top_k) when the prompt opens a <think> block
+    pub no_think: (f32, f32, usize), // ... when it does not
+}
+
+impl SamplingDefaults {
+    /// The historical server-wide values, one set for both modes.
+    pub const LEGACY: Self = Self { think: (0.7, 0.8, 20), no_think: (0.7, 0.8, 20) };
+    /// Qwen3.8-Flash-Next model card: thinking temperature=1.0 top_p=0.95 top_k=20; instruct
+    /// (non-thinking) temperature=0.7 top_p=0.80 top_k=20 (min_p 0 in both).
+    pub const QWEN38_CARD: Self = Self { think: (1.0, 0.95, 20), no_think: (0.7, 0.8, 20) };
+}
+
 #[derive(Clone)]
 pub struct AppState {
+    /// Per-mode fallback sampling (a request's explicit values always win).
+    pub sampling_defaults: SamplingDefaults,
     pub scheduler: mpsc::UnboundedSender<BatchRequest>,
     pub tokenizer: Arc<QwenTokenizer>,
     pub model_name: String,
@@ -42,6 +59,9 @@ pub struct AppState {
     /// KV cache depth, in positions. NOTHING used to check a prompt against it: an over-long prompt
     /// ran `write_kv_prefill` straight past the end of the cache and corrupted the next allocation.
     pub max_seq_len: usize,
+    /// Decode positions reserved beyond `max_tokens` for speculative verification/re-prime.
+    /// Mirrors the scheduler reserve so an HTTP-clamped request is always admissible. (PR #4.)
+    pub decode_headroom: usize,
     /// Scheduler prefix-cache flag (mirror of TpConfig.prefix_cache). The message-boundary
     /// checkpoint (`ckpt_at`) is only ever USED when the scheduler's prefix cache is on
     /// (batch.rs filters it again); gating its render+tokenize here saves the double
@@ -134,7 +154,20 @@ pub fn model_id_from_dir(model_path: &str) -> String {
 }
 
 fn esc(t: &str) -> String {
-    t.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    // SSE chunks interpolate this inside a JSON string. Hand-escaping only backslashes,
+    // quotes and newlines left literal tabs (common in Go), carriage returns and other
+    // control characters in the payload. Clients discard that invalid JSON, which looks
+    // like the first characters of indented lines were truncated. Use the complete JSON
+    // escaping rules (PR #4), then remove the surrounding quotes supplied by the serializer.
+    let quoted = serde_json::to_string(t).expect("serializing a Rust string cannot fail");
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// Generation room left in the KV cache after the prompt and the scheduler's decode reserve.
+/// None = the prompt (plus reserve) does not fit at all. (PR #4 — mirrors `batch::admit`.)
+fn generation_room(max_seq_len: usize, prompt_len: usize, decode_headroom: usize) -> Option<usize> {
+    let used = prompt_len.checked_add(decode_headroom)?;
+    max_seq_len.checked_sub(used).filter(|&room| room > 0)
 }
 
 /// (The think close marker is resolved per-request from the model's vocab — see
@@ -144,7 +177,7 @@ fn esc(t: &str) -> String {
 /// of the marker arriving across decode chunks, and so must be held back rather than forwarded.
 /// `--output-prompts [cap]` — log the chat-completion call in human-readable form: effective
 /// parameters, one line per message turn, and the exact rendered prompt the model sees
-/// (excerpt up to `cap` chars; RUST_INFER_DUMP_PROMPT=1 still writes the full string to /tmp
+/// (excerpt up to `cap` chars; --dump-prompt=1 still writes the full string to /tmp
 /// for diffing). Diagnostic output only; nothing here touches the serving path.
 #[allow(clippy::too_many_arguments)]
 fn log_request_human(
@@ -162,7 +195,8 @@ fn log_request_human(
         req.stream,
         req.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "server-default".into()),
         req.seed.map(|s| s.to_string()).unwrap_or_else(|| "-".into()));
-    eprintln!("  temperature={}  top_p={}  top_k={}", req.temperature, req.top_p, req.top_k);
+    eprintln!("  temperature={}  top_p={}  top_k={}", opt_f32(&req.temperature), opt_f32(&req.top_p),
+        req.top_k.map(|k| k.to_string()).unwrap_or_else(|| "default".into()));
     eprintln!("  penalties: repetition={}  presence={}  frequency={}",
         opt_f32(&req.repetition_penalty), opt_f32(&req.presence_penalty), opt_f32(&req.frequency_penalty));
     eprintln!("  reasoning_effort={} (effective: {})  stop={:?}  include_usage={}",
@@ -201,7 +235,7 @@ fn log_request_human(
     let head: String = prompt.chars().take(trunc).collect();
     for l in head.lines() { eprintln!("    | {l}"); }
     if total > trunc {
-        eprintln!("    … (+{} more chars of {total} — full dump: RUST_INFER_DUMP_PROMPT=1)", total - trunc);
+        eprintln!("    … (+{} more chars of {total} — full dump: --dump-prompt=1)", total - trunc);
     }
     eprintln!("[prompt] ══════════════════════════════════════════════════════════════════");
 }
@@ -211,6 +245,77 @@ fn partial_overlap(s: &str, marker: &str) -> usize {
 }
 
 fn partial_think_overlap(s: &str, marker: &str) -> usize { partial_overlap(s, marker) }
+
+/// WP02: incremental first-occurrence search over a buffer that only GROWS (the streaming `acc`).
+/// `find(hay, base, needle)` returns exactly `hay[base..].find(needle).map(|i| base + i)` as long as
+/// every `hay` is a prefix of the same growing buffer and `base` never decreases (a decrease falls
+/// back to a full scan). It skips what an earlier miss already cleared — no occurrence lies wholly
+/// inside [seen_base, seen_upto) — so a long stream costs O(new bytes) per token, not O(n).
+#[derive(Default)]
+struct GrowFind {
+    base: usize,
+    upto: usize,
+}
+
+impl GrowFind {
+    fn find(&mut self, hay: &str, base: usize, needle: &str) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(base); // str::find("") == Some(0)
+        }
+        let mut start = base;
+        if base >= self.base {
+            let known = self.upto.min(hay.len());
+            let s = known.saturating_sub(needle.len() - 1);
+            if s > start {
+                start = s;
+                while !hay.is_char_boundary(start) { start -= 1; } // base is a boundary: stops >= base
+            }
+        }
+        let r = hay[start..].find(needle).map(|i| start + i);
+        if r.is_none() && (base < self.base || hay.len() > self.upto) {
+            self.base = base;
+            self.upto = hay.len();
+        }
+        r
+    }
+}
+
+/// WP02 liveness: the serving engine's state, read by /health and admission. One engine per
+/// process; a backend marks it DEAD when its scheduler can no longer serve (sticky CUDA error,
+/// scheduler thread panic). Backends that never set it stay OK.
+pub static ENGINE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(ENGINE_OK);
+pub const ENGINE_OK: u8 = 0;
+pub const ENGINE_DEAD: u8 = 1;
+
+pub fn engine_ok() -> bool {
+    ENGINE_STATE.load(std::sync::atomic::Ordering::Acquire) == ENGINE_OK
+}
+
+pub fn set_engine_dead(why: &str) {
+    ENGINE_STATE.store(ENGINE_DEAD, std::sync::atomic::Ordering::Release);
+    eprintln!("[engine] state DEAD: {why} (/health and new requests answer 503)");
+}
+
+/// WP02: 503 for a request the engine cannot take (DEAD, or its scheduler channel is gone).
+fn engine_unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": {
+        "message": "engine stopped: the inference engine hit a fatal error and cannot serve; restart the server",
+        "type": "server_error", "code": "engine_unavailable",
+    }}))).into_response()
+}
+
+/// WP02: HTTP status for an engine error reason (busy / stopped = 503, anything else = 500).
+fn engine_error_status(reason: &str) -> StatusCode {
+    if reason.contains("busy") || reason.contains("engine stopped") { StatusCode::SERVICE_UNAVAILABLE }
+    else { StatusCode::INTERNAL_SERVER_ERROR }
+}
+
+/// WP02: the SSE error event for a generation that ended in an engine error (OpenAI SDKs raise
+/// on a chunk carrying `error`); the final chunk after it carries a spec finish_reason.
+fn sse_error_event(reason: &str) -> String {
+    serde_json::json!({"error": {"message": reason, "type": "server_error",
+                                 "code": engine_error_status(reason).as_u16()}}).to_string()
+}
 
 /// The opening marker of a tool call. While streaming we must never forward this (or a partial prefix
 /// of it) to the client as CONTENT: a harness would render raw XML in the chat and never invoke the
@@ -244,20 +349,25 @@ struct ChatCompletionRequest {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     max_tokens: Option<usize>,
-    #[serde(default = "default_temperature")]
-    temperature: f32,
+    /// None = not sent: the server's per-mode default applies (AppState::sampling_defaults).
+    #[serde(default)]
+    temperature: Option<f32>,
     #[serde(default)]
     stream: bool,
-    #[serde(default = "default_top_p")]
-    top_p: f32,
-    #[serde(default = "default_top_k")]
-    top_k: usize,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<usize>,
     #[serde(default)]
     repetition_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
     #[serde(default)]
     frequency_penalty: Option<f32>,
+    /// WP08: min-p truncation in [0, 1] (0 = off), applied after temperature (the rival's
+    /// ComboSampler order). Honoured by the EXL3 serve path; the NVFP4 sampler has none.
+    #[serde(default)]
+    min_p: Option<f32>,
     /// Optional PRNG seed for reproducible sampling (used by stochastic MTP path).
     #[serde(default)]
     seed: Option<u64>,
@@ -312,6 +422,16 @@ struct ChatCompletionRequest {
     /// non-object value, or a non-bool `enable_thinking`, is a loud 400 — never accepted-and-ignored.
     #[serde(default)]
     chat_template_kwargs: Option<serde_json::Value>,
+    /// OpenAI's current name for the output cap (`max_tokens` is the deprecated alias). When both
+    /// are sent it WINS, as in vLLM (`max_completion_tokens or max_tokens`). It used to be dropped
+    /// by serde, so a client sending max_completion_tokens=65536 next to a default max_tokens was
+    /// silently capped at the latter.
+    #[serde(default)]
+    max_completion_tokens: Option<usize>,
+    /// Every top-level field this server does not read, kept only so it can be LOGGED by name:
+    /// an accepted-and-ignored parameter must be visible in the log, never silent.
+    #[serde(flatten)]
+    unused_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -367,12 +487,73 @@ struct ChatChoice {
     index: usize,
     message: ResponseMessage,
     finish_reason: String,
+    /// vLLM's extension field: WHY a `stop` happened when it was not a stop token/string —
+    /// here only "loop_detected" (WP08). Omitted otherwise, so normal replies are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_reason: Option<String>,
 }
 
 /// The scheduler's internal backstop reason (batch.rs) is not an OpenAI value — the spec is
 /// stop|length|tool_calls|content_filter. Map it to what it means: generation ran out of room.
 fn spec_finish_reason(reason: &str) -> &str {
-    if reason == "context_length_exceeded" { "length" } else { reason }
+    match reason {
+        "context_length_exceeded" => "length",
+        // WP08: the loop detector ends a response as a normal stop (the rival's eos_reason
+        // "loop_detected"); the reason itself rides `stop_reason`.
+        "loop_detected" => "stop",
+        // WP02: an engine error / cancel is not a spec value; the SSE error event carries the reason
+        r if r.starts_with("error") || r == "cancelled" => "stop",
+        _ => reason,
+    }
+}
+
+/// WP08: the `stop_reason` extension for a scheduler finish reason (None = omit the field).
+fn stop_reason_of(reason: &str) -> Option<String> {
+    (reason == "loop_detected").then(|| reason.to_string())
+}
+
+/// WP08: validate a request's penalty / min_p values (the OpenAI/vLLM 400 contract; semantics are
+/// the rival's ComboSampler, WP15). repetition_penalty must be finite and > 0 — a value < 1
+/// REWARDS repetition and is accepted as the rival accepts it, with a log warning (owner decision
+/// 2026-09-26); presence/frequency_penalty finite in [-2, 2]; min_p finite in [0, 1].
+/// Err = the client-facing message.
+pub fn validate_penalties(rep: Option<f32>, pres: Option<f32>, freq: Option<f32>,
+                          min_p: Option<f32>) -> Result<(), String> {
+    if let Some(r) = rep {
+        if !r.is_finite() || r <= 0.0 {
+            return Err(format!("repetition_penalty must be a finite number > 0 (got {r})"));
+        }
+        if r < 1.0 {
+            eprintln!("[req] WARNING: repetition_penalty {r} < 1 rewards repetition (accepted, as the reference engine does)");
+        }
+    }
+    for (name, v) in [("presence_penalty", pres), ("frequency_penalty", freq)] {
+        if let Some(x) = v {
+            if !x.is_finite() || !(-2.0..=2.0).contains(&x) {
+                return Err(format!("{name} must be a number in [-2, 2] (got {x})"));
+            }
+        }
+    }
+    if let Some(m) = min_p {
+        if !m.is_finite() || !(0.0..=1.0).contains(&m) {
+            return Err(format!("min_p must be a number in [0, 1] (got {m})"));
+        }
+    }
+    Ok(())
+}
+
+/// WP08: a request body that does not parse (wrong JSON types, missing required fields) is the
+/// client's error — 400 invalid_request_error, as OpenAI/vLLM answer — never axum's bare 422.
+fn bad_json(e: axum::extract::rejection::JsonRejection) -> Response {
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
+        "message": e.body_text(), "type": "invalid_request_error", "code": "invalid_request_body",
+    }}))).into_response()
+}
+
+fn bad_param(msg: String) -> Response {
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
+        "message": msg, "type": "invalid_request_error", "code": "invalid_sampling_parameter",
+    }}))).into_response()
 }
 
 /// The chat-template reasoning effort for THIS request: the request's per-call override, else the
@@ -457,15 +638,28 @@ fn attach_schema_unenforced_header(resp: &mut Response, unenforced: bool) {
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<ChatCompletionRequest>,
+    payload: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(mut req) = match payload { Ok(j) => j, Err(e) => return bad_json(e) };
     // Log the request parameters the client sent (useful for debugging OpenWebUI behavior)
     eprintln!(
-        "[req] params  temp={:?} top_p={:?} top_k={} max_tok={:?} rep_pen={:?} presence={:?} freq={:?} stream={}",
+        "[req] params  temp={:?} top_p={:?} top_k={:?} max_tok={:?} max_completion_tok={:?} rep_pen={:?} presence={:?} freq={:?} stream={} effort={:?} ctk={}",
         req.temperature, req.top_p, req.top_k,
-        req.max_tokens, req.repetition_penalty, req.presence_penalty, req.frequency_penalty,
-        req.stream
+        req.max_tokens, req.max_completion_tokens, req.repetition_penalty, req.presence_penalty, req.frequency_penalty,
+        req.stream, req.reasoning_effort,
+        req.chat_template_kwargs.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "-".into())
     );
+    if !req.unused_fields.is_empty() {
+        let names: Vec<&str> = req.unused_fields.keys().map(|k| k.as_str()).collect();
+        eprintln!("[req] fields not used by this server: {names:?}");
+    }
+    if let Err(msg) = validate_penalties(req.repetition_penalty, req.presence_penalty,
+                                         req.frequency_penalty, req.min_p) {
+        return bad_param(msg);
+    }
+    if let Some(m) = req.max_completion_tokens {
+        req.max_tokens = Some(m);
+    }
     if let Some(t) = &req.tools {
         let names: Vec<&str> = t.iter()
             .filter_map(|x| x.pointer("/function/name").and_then(|v| v.as_str())).collect();
@@ -531,6 +725,16 @@ async fn chat_completions(
             "message": e.to_string(), "type": "invalid_request_error", "code": "invalid_chat_template_kwargs",
         }}))).into_response();
     }
+    // An unknown effort is the CLIENT's error: a 400 naming the accepted values, never the
+    // template's raise surfacing as a plain-text 500.
+    if let Some(e) = req.reasoning_effort.as_deref() {
+        if !matches!(e, "" | "none" | "off" | "minimal" | "no_think" | "low" | "medium" | "high" | "xhigh" | "max") {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
+                "message": format!("reasoning_effort must be one of none|minimal|low|medium|high|xhigh|max (got '{e}')"),
+                "type": "invalid_request_error", "code": "invalid_reasoning_effort",
+            }}))).into_response();
+        }
+    }
     let effort_owned = resolve_reasoning_effort(&state.tokenizer, req.reasoning_effort.as_deref(),
                                                 state.reasoning_effort.as_deref());
     let effort: Option<&str> = effort_owned.as_deref();
@@ -580,8 +784,8 @@ async fn chat_completions(
 
     // Optional diagnostic: dump the exact rendered prompt string so the bytes a model
     // actually sees can be inspected/diffed across models or turns. Enable with
-    // RUST_INFER_DUMP_PROMPT=1. Writes /tmp/rust_infer_prompt_<n>.txt per request.
-    if std::env::var("RUST_INFER_DUMP_PROMPT").is_ok() {
+    // --dump-prompt=1. Writes /tmp/rust_infer_prompt_<n>.txt per request.
+    if crate::opts::var(crate::opt!("dump-prompt")).is_ok() {
         static DUMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = DUMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dump_path = format!("/tmp/rust_infer_prompt_{}.txt", n);
@@ -596,8 +800,8 @@ async fn chat_completions(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
-    // TTFT fix 0 attribution (GB10_PREFILL_TRACE): the request-path pre-model costs.
-    if crate::env_knob("GB10_PREFILL_TRACE", "DSV4_PREFILL_TRACE").is_some() {
+    // TTFT fix 0 attribution (--prefill-trace): the request-path pre-model costs.
+    if crate::opts::var(crate::opt!("prefill-trace")).ok().is_some() {
         eprintln!("[pf] server render={render_ms:.3}ms encode={encode_ms:.3}ms");
     }
 
@@ -681,27 +885,37 @@ async fn chat_completions(
     // out of bounds — silently, corrupting whatever allocation followed, which showed up as two
     // identical prefills disagreeing. Reject what cannot fit, and cap generation at the room left:
     // running short is a `finish_reason: "length"`, which is in the contract. Corruption is not.
-    if prompt_len >= state.max_seq_len {
+    if generation_room(state.max_seq_len, prompt_len, state.decode_headroom).is_none() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
             "message": format!("This model's maximum context length is {} tokens, but your messages \
-                                came to {} tokens. Shorten the input or restart the server with a \
-                                larger --max-seq-len.", state.max_seq_len, prompt_len),
+                                came to {} tokens and decoding reserves {} more positions. Shorten the input or \
+                                restart the server with a larger --max-seq-len.",
+                                state.max_seq_len, prompt_len, state.decode_headroom),
             "type": "invalid_request_error", "code": "context_length_exceeded",
         }}))).into_response();
     }
-    let room = state.max_seq_len - prompt_len;
+    let room = generation_room(state.max_seq_len, prompt_len, state.decode_headroom)
+        .expect("context room checked above");
     let asked = req.max_tokens.unwrap_or(state.default_max_tokens);
     let req_max = asked.min(room);
     // If the KV cache forced generation shorter than asked, SAY SO. A thinking model spends a big fixed
     // chunk on its <think> block, so a silently-shrunk budget looks like "truncated output / only
     // reasoning" as a conversation grows — which is exactly how this surfaced in the wild. Raise
     // --max-seq-len (graphs cost ~nothing here; KV is ~64 KB/token) to give multi-turn room.
-    if req_max < asked {
-        eprintln!("[req] max_tokens clamped {} -> {} (KV cache room: {} of {} used by the {}-token prompt; \
-                   raise --max-seq-len)", asked, req_max, prompt_len, state.max_seq_len, prompt_len);
+    if req_max < asked && req.max_tokens.is_some() {
+        eprintln!("[req] max_tokens clamped {} -> {} (KV cache: {}-token prompt + {} reserved decode positions of {}; \
+                   raise --max-seq-len)", asked, req_max, prompt_len, state.decode_headroom, state.max_seq_len);
     }
-    let temperature = req.temperature;
-    let top_p = req.top_p.max(0.01);
+    // Sampling: explicit request values win; anything left out takes the server's default for
+    // THIS request's mode (the rendered prompt opens a <think> block or it does not).
+    let thinking_on = prompt.trim_end().ends_with(state.tokenizer.think_tags().0);
+    let (d_temp, d_top_p, d_top_k) = if thinking_on { state.sampling_defaults.think }
+                                     else { state.sampling_defaults.no_think };
+    let temperature = req.temperature.unwrap_or(d_temp);
+    let top_p = req.top_p.unwrap_or(d_top_p).max(0.01);
+    let top_k = req.top_k.unwrap_or(d_top_k);
+    eprintln!("[req] sampling temp={temperature} top_p={top_p} top_k={top_k} (thinking={thinking_on}; \
+               sent: temp={:?} top_p={:?} top_k={:?})", req.temperature, req.top_p, req.top_k);
 
     // Submit to the batching scheduler and receive tokens on a channel.
     // Use request's penalties if explicitly set, else fall back to server defaults.
@@ -717,10 +931,11 @@ async fn chat_completions(
         temperature,
         received_at: std::time::Instant::now(),
         top_p,
-        top_k: req.top_k,
+        top_k,
         rep_penalty,
         presence_penalty,
         frequency_penalty,
+        min_p: req.min_p.unwrap_or(0.0),
         min_new: req.min_tokens.unwrap_or(0),
         ignore_eos: req.ignore_eos.unwrap_or(false),
         tx,
@@ -731,7 +946,10 @@ async fn chat_completions(
         image_spans,
         schema: schema_mask.clone(),
     };
-    let _ = state.scheduler.send(request);
+    // WP02: a DEAD engine or a gone scheduler is a 503, never a request that hangs or reads "length"
+    if !engine_ok() || state.scheduler.send(request).is_err() {
+        return engine_unavailable();
+    }
 
     // SESSION identity for the OTel generation-telemetry (crate::otel::SessionRegistry). One
     // resolution per REQUEST, only when the emitter is on (off = no session work at all):
@@ -829,8 +1047,15 @@ async fn chat_completions(
             let mut n = 0usize;
             let mut last_tok: Option<u32> = None;
             let mut stop_hit = false;
-            let mut finish = "length".to_string();
+            // WP02: a channel closed without a Finish is an engine failure, not "length"
+            let mut finish = "error: engine stopped".to_string();
             let mut first_tok: Option<std::time::Instant> = None;
+            // WP02: tail-window scans (O(new bytes) per token, identical results — see GrowFind)
+            let mut f_close = GrowFind::default();
+            let mut f_tool_r = GrowFind::default();
+            let mut f_open = GrowFind::default();
+            let mut f_tool_c = GrowFind::default();
+            let mut f_stops: Vec<GrowFind> = stops.iter().map(|_| GrowFind::default()).collect();
             // Thinking-model split: qwen's prompt is primed with `<think>\n`, so the generated stream
             // is `…reasoning…</think>\n\nanswer`. Pre-close text -> reasoning_content, post-close
             // -> content. hy_v3's no_think prompt already closed the (empty) block, so it starts as
@@ -852,7 +1077,7 @@ async fn chat_completions(
                                     None => {
                                         // Search the close tag from reason_emitted, not from 0:
                                         // a second think block must not match the first one's close.
-                                        if let Some(idx) = acc[reason_emitted..].find(think_close).map(|i| reason_emitted + i) {
+                                        if let Some(idx) = f_close.find(&acc, reason_emitted, think_close) {
                                             if idx > reason_emitted {
                                                 let c = reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..idx]);
                                                 if let Some(r) = &otel_req { r.delta(&c); }
@@ -896,8 +1121,8 @@ async fn chat_completions(
                                             // parsed into the tool_calls delta or surfaced
                                             // post-loop by held_back_remainder.
                                             let region = &acc[reason_emitted..safe];
-                                            let safe_end = match region.find(TOOL_OPEN) {
-                                                Some(i) => reason_emitted + i,
+                                            let safe_end = match f_tool_r.find(&acc[..safe], reason_emitted, TOOL_OPEN) {
+                                                Some(i) => i,
                                                 None => safe - partial_overlap(region, TOOL_OPEN),
                                             };
                                             if safe_end > reason_emitted {
@@ -915,8 +1140,7 @@ async fn chat_completions(
                                         // reasoning until the close tag. Without this the raw
                                         // think tags would leak into `content`.
                                         let region = &acc[cs..];
-                                        if let Some(tp) = region.find(think_open) {
-                                            let upto = cs + tp;
+                                        if let Some(upto) = f_open.find(&acc, cs, think_open) {
                                             if upto > content_emitted {
                                                 let c = content_chunk(&completion_id, created, &model_name, &acc[content_emitted..upto]);
                                                 if let Some(r) = &otel_req { r.delta(&c); }
@@ -929,8 +1153,8 @@ async fn chat_completions(
                                         // Forwarding `<tool_call>` as content makes the harness render
                                         // XML in the chat and never invoke the tool. Same hold-back
                                         // for a think-open prefix spanning decode chunks.
-                                        let safe_end = match region.find(TOOL_OPEN) {
-                                            Some(i) => cs + i,          // a call has started: emit nothing more
+                                        let safe_end = match f_tool_c.find(&acc, cs, TOOL_OPEN) {
+                                            Some(i) => i,               // a call has started: emit nothing more
                                             None => acc.len() - partial_overlap(region, TOOL_OPEN)
                                                 .max(partial_overlap(region, think_open)),
                                         };
@@ -945,7 +1169,8 @@ async fn chat_completions(
                                 }
                             }
                         if !stops.is_empty() {
-                            if let Some(p) = stops.iter().filter_map(|s| acc.find(s)).min() {
+                            if let Some(p) = stops.iter().zip(f_stops.iter_mut())
+                                .filter_map(|(s, f)| f.find(&acc, 0, s)).min() {
                                 acc.truncate(p);
                                 stop_hit = true;
                                 finish = "stop".to_string();
@@ -956,6 +1181,13 @@ async fn chat_completions(
                     TokEvent::Finish { reason } => { finish = reason; break; }
                 }
             }
+            // WP02: release the lane NOW (a stop-string hit cancels it within one scheduler step)
+            drop(rx);
+            if finish.starts_with("error") {
+                // WP02: a mid-stream engine error is an SSE error event (+ a spec finish_reason below)
+                eprintln!("[req] stream ended in an engine error after {n} tokens: {finish}");
+                yield Ok(Event::default().data(sse_error_event(&finish)));
+            }
             // The call was buffered, not streamed (see the hold-back above). The DECISION is
             // crate::tools::finalize_parsed — the one canonical serializer shared with the
             // non-streaming mode — and the held-back text is surfaced by
@@ -965,7 +1197,7 @@ async fn chat_completions(
             let (_, done_content) = split_think(&acc, think_open, think_close);
             let parsed = crate::tools::parse(&done_content, req_tools.as_deref());
             if req_tools.is_some() {
-                let dump = std::env::var("RUST_INFER_DUMP_TOOLS").is_ok();
+                let dump = crate::opts::var(crate::opt!("dump-tools")).is_ok();
                 if dump || parsed.tool_calls.is_empty() {
                     eprintln!("[req] raw model output ({} chars): {:?}", done_content.chars().count(),
                               done_content.chars().take(1200).collect::<String>());
@@ -1006,8 +1238,11 @@ async fn chat_completions(
                                tool_calls.len(), req_tools.as_ref().map(|t| t.len()).unwrap_or(0),
                                effort_for_log.as_deref(), presence_penalty, pp_source);
             }
-            let final_chunk = format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"}}]}}",
-                completion_id, created, model_name, spec_finish_reason(&finish));
+            // WP08: `stop_reason` only when the loop detector ended the stream (else unchanged).
+            let stop_reason_field = stop_reason_of(&finish)
+                .map(|r| format!(",\"stop_reason\":\"{r}\"")).unwrap_or_default();
+            let final_chunk = format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"{}}}]}}",
+                completion_id, created, model_name, spec_finish_reason(&finish), stop_reason_field);
             if let Some(r) = &otel_req { r.end(&final_chunk); }   // event=stream_end (carries finish_reason)
             yield Ok(Event::default().data(final_chunk));
             if include_usage {
@@ -1037,7 +1272,8 @@ async fn chat_completions(
         eprintln!("[req] sync   prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
         let t0 = std::time::Instant::now();
         let mut tokens = Vec::new();
-        let mut finish = "length".to_string();
+        // WP02: a channel closed without a Finish is an engine failure, not "length"
+        let mut finish = "error: engine stopped".to_string();
         let mut first_tok: Option<std::time::Instant> = None;
         while let Some(ev) = rx.recv().await {
             match ev {
@@ -1051,12 +1287,16 @@ async fn chat_completions(
                     if !req.stop.is_empty() && tokens.len() % 4 == 0 {
                         let tail = &tokens[tokens.len().saturating_sub(96)..];
                         let s = state.tokenizer.decode(tail, true).unwrap_or_default();
-                        if req.stop.iter().any(|x| !x.is_empty() && s.contains(x.as_str())) { break; }
+                        if req.stop.iter().any(|x| !x.is_empty() && s.contains(x.as_str())) {
+                            finish = "stop".to_string();
+                            break;
+                        }
                     }
                 }
                 TokEvent::Finish { reason } => { finish = reason; break; }
             }
         }
+        drop(rx); // WP02: release the lane now
         let dt = t0.elapsed().as_secs_f32();
         let mut text = state.tokenizer.decode(&tokens, true).unwrap_or_default();
         if !req.stop.is_empty() {
@@ -1065,6 +1305,13 @@ async fn chat_completions(
             }
         }
         eprintln!("[req] done   tok={} ({:.1} tok/s wall) finish={}", tokens.len(), if dt>1e-6 {tokens.len() as f32/dt} else {0.0}, finish);
+        // An engine error is an HTTP error, never a 200 that a client (or a benchmark) would read
+        // as an answer. WP02: also when some tokens came first (the text is incomplete).
+        if finish.starts_with("error") {
+            return (engine_error_status(&finish), Json(serde_json::json!({"error": {
+                "message": finish, "type": "server_error", "completion_tokens": tokens.len(),
+            }}))).into_response();
+        }
         let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
         let (think_open, think_close, _) = state.tokenizer.think_tags();
         let (reasoning, content) = split_think(&text, think_open, think_close);
@@ -1076,12 +1323,12 @@ async fn chat_completions(
         // canonical serializer shared with the streaming mode, so the two can never diverge again
         // (2026-08-27 user report: a malformed call block vanished in streaming and leaked in JSON).
         // With tools offered, the model's LITERAL output is the only artifact that settles a "the tool
-        // ran but nothing happened" report. Log it when asked (RUST_INFER_DUMP_TOOLS=1), and ALWAYS log
+        // ran but nothing happened" report. Log it when asked (--dump-tools=1), and ALWAYS log
         // it when tools were offered and we parsed nothing — that combination means either the model
         // declined, or it emitted a call we failed to understand, and those need very different fixes.
         let parsed = crate::tools::parse(&content, req.tools.as_deref());
         if req.tools.is_some() {
-            let dump = std::env::var("RUST_INFER_DUMP_TOOLS").is_ok();
+            let dump = crate::opts::var(crate::opt!("dump-tools")).is_ok();
             if dump || parsed.tool_calls.is_empty() {
                 eprintln!("[req] raw model output ({} chars): {:?}", content.chars().count(),
                           content.chars().take(1200).collect::<String>());
@@ -1124,6 +1371,7 @@ async fn chat_completions(
                     reasoning_content: reasoning, tool_calls,
                 },
                 finish_reason: spec_finish_reason(&finish).to_string(),
+                stop_reason: stop_reason_of(&finish),
             }],
             usage: Usage {
                 prompt_tokens: prompt_len,
@@ -1138,14 +1386,14 @@ async fn chat_completions(
         resp
     }
 }
-/// Diagnostics-only (env `RUST_INFER_DUMP_TOKENS=1`): one line per generation with the EXACT
+/// Diagnostics-only (env `--dump-tokens=1`): one line per generation with the EXACT
 /// generated token ids. Why it exists: a served-text comparison cannot distinguish "the same
 /// tokens" from "different tokens that detokenize alike", and the bitwise-losslessness claim for a
 /// speculative lane (AGENTS §2.6/§3, P14's `--spec-source dflash` A/B) is a statement about the
 /// TOKEN sequence. Harness plumbing only — no response byte, no scheduler behaviour is touched.
-/// (Twin of `RUST_INFER_DUMP_PROMPT`, which does the same for the prompt ids.)
+/// (Twin of `--dump-prompt`, which does the same for the prompt ids.)
 fn dump_tokens(id: &str, tokens: &[u32]) {
-    if std::env::var("RUST_INFER_DUMP_TOKENS").is_err() { return; }
+    if crate::opts::var(crate::opt!("dump-tokens")).is_err() { return; }
     let ids: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
     eprintln!("[gen-ids] id={id} n={} ids=[{}]", tokens.len(), ids.join(","));
 }
@@ -1180,8 +1428,13 @@ fn log_generation(tok: &QwenTokenizer, stop_ids: &[u32], id: &str, finish: &str,
 /// (tokens per verify forward), step p50/p90. Lock-free read; it never touches a decode step.
 /// Clients (owner harness, accept_gate.py) use it to see TRUE alpha instead of inferring it
 /// from wall-clock tokens. `status` stays "ok" so existing liveness probes are unaffected.
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok", "telemetry": crate::tel::snapshot_json()}))
+async fn health() -> Response {
+    // WP02: a DEAD engine answers 503 (a supervisor / load balancer acts on it)
+    if !engine_ok() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"status": "dead", "telemetry": crate::tel::snapshot_json()}))).into_response();
+    }
+    Json(serde_json::json!({"status": "ok", "telemetry": crate::tel::snapshot_json()})).into_response()
 }
 
 // ─── POST /v1/tokenize ────────────────────────────────────────────────────────────────
@@ -1437,12 +1690,27 @@ struct CompletionRequest {
     ignore_eos: Option<bool>,
     #[serde(default)]
     seed: Option<u64>,
+    /// WP08/WP15: the same penalty / min_p fields and validation as the chat endpoint (unset =
+    /// off: raw completions never took the server-wide penalty defaults).
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    min_p: Option<f32>,
 }
 
 async fn completions(
     State(state): State<AppState>,
-    Json(req): Json<CompletionRequest>,
+    payload: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(req) = match payload { Ok(j) => j, Err(e) => return bad_json(e) };
+    if let Err(msg) = validate_penalties(req.repetition_penalty, req.presence_penalty,
+                                         req.frequency_penalty, req.min_p) {
+        return bad_param(msg);
+    }
     let prompt_tokens: Vec<u32> = match req.prompt.as_ref() {
         Some(serde_json::Value::String(t)) => match state.tokenizer.encode(t, true) {
             Ok(v) => v,
@@ -1454,12 +1722,14 @@ async fn completions(
                      "prompt must be a string or a non-empty token-id array".to_string()).into_response(),
     };
     let prompt_len = prompt_tokens.len();
-    if prompt_len + 8 >= state.max_seq_len {
+    // WP02: the same context budget as the chat path — the decode headroom is reserved (this cap
+    // ignored it and ran 3 rows past the KV window at the end of an uncapped request)
+    let room = generation_room(state.max_seq_len, prompt_len, state.decode_headroom);
+    if prompt_len + 8 >= state.max_seq_len || room.is_none() {
         return (StatusCode::BAD_REQUEST, format!(
             "prompt {} tokens leaves no room within max_seq_len {}", prompt_len, state.max_seq_len)).into_response();
     }
-    let req_max = req.max_tokens.unwrap_or(16)
-        .min(state.max_seq_len - prompt_len);
+    let req_max = req.max_tokens.unwrap_or(16).min(room.unwrap_or(0));
     let (tx, mut rx) = mpsc::unbounded_channel::<TokEvent>();
     let request = BatchRequest {
         prompt: prompt_tokens.clone(),
@@ -1467,9 +1737,10 @@ async fn completions(
         temperature: req.temperature.unwrap_or_else(default_temperature),
         top_p: req.top_p.unwrap_or_else(default_top_p),
         top_k: req.top_k.unwrap_or_else(default_top_k),
-        rep_penalty: 1.0,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
+        rep_penalty: req.repetition_penalty.unwrap_or(1.0),
+        presence_penalty: req.presence_penalty.unwrap_or(0.0),
+        frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+        min_p: req.min_p.unwrap_or(0.0),
         min_new: req.min_tokens.unwrap_or(0).min(req_max),
         ignore_eos: req.ignore_eos.unwrap_or(false),
         tx,
@@ -1482,7 +1753,9 @@ async fn completions(
         schema: None,
     };
     let (_mn, _ie) = (request.min_new, request.ignore_eos);
-    let _ = state.scheduler.send(request);
+    if !engine_ok() || state.scheduler.send(request).is_err() {
+        return engine_unavailable(); // WP02
+    }
     eprintln!("[req] completions prompt_tokens={} max_tokens={} min_tokens={} ignore_eos={} stream={}",
               prompt_len, req_max, _mn, _ie, req.stream);
     let model_name = req.model.clone().unwrap_or_else(|| state.model_name.clone());
@@ -1494,6 +1767,8 @@ async fn completions(
         let stream = async_stream::stream! {
             let mut ntok: usize = 0;
             let mut first_tok: Option<std::time::Instant> = None;
+            // WP02: closed without a Finish = engine failure; errors are an SSE error event + "stop"
+            let mut finish = "error: engine stopped".to_string();
             while let Some(ev) = rx.recv().await {
                 match ev {
                     TokEvent::Tok(t) => {
@@ -1507,41 +1782,63 @@ async fn completions(
                         });
                         yield Ok::<_, std::convert::Infallible>(Event::default().data(chunk.to_string()));
                     }
-                    TokEvent::Finish { reason } => {
-                        let fr = if reason == "length" { "length" } else { "stop" };
-                        let chunk = serde_json::json!({
-                            "id": cid, "object": "text_completion.chunk", "created": created,
-                            "model": model_name,
-                            "choices": [{"index": 0, "text": "", "finish_reason": fr}],
-                        });
-                        yield Ok::<_, std::convert::Infallible>(Event::default().data(chunk.to_string()));
-                        yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
-                        let dt = t0.elapsed().as_secs_f32();
-                        eprintln!("[req] done   completions tok={} ({:.1} tok/s wall) finish={}", ntok, if dt>1e-6 {ntok as f32/dt} else {0.0}, fr);
-                        break;
-                    }
+                    TokEvent::Finish { reason } => { finish = reason; break; }
                 }
             }
+            drop(rx);
+            if finish.starts_with("error") {
+                eprintln!("[req] completions stream ended in an engine error after {ntok} tokens: {finish}");
+                yield Ok::<_, std::convert::Infallible>(Event::default().data(sse_error_event(&finish)));
+            }
+            let fr = if finish == "length" { "length" } else { "stop" };
+            let mut chunk = serde_json::json!({
+                "id": cid, "object": "text_completion.chunk", "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "text": "", "finish_reason": fr}],
+            });
+            if let Some(r) = stop_reason_of(&finish) {
+                chunk["choices"][0]["stop_reason"] = serde_json::json!(r); // WP08
+            }
+            yield Ok::<_, std::convert::Infallible>(Event::default().data(chunk.to_string()));
+            yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
+            let dt = t0.elapsed().as_secs_f32();
+            eprintln!("[req] done   completions tok={} ({:.1} tok/s wall) finish={}", ntok, if dt>1e-6 {ntok as f32/dt} else {0.0}, fr);
         };
         return Sse::new(stream).into_response();
     }
     // non-streaming: collect everything, detokenize once, single response.
     let mut toks: Vec<u32> = Vec::with_capacity(req_max);
-    let mut finish = "stop".to_string();
+    // WP02: an engine error (or a channel closed without a Finish) is an HTTP error, not 200 "stop"
+    let mut finish = "error: engine stopped".to_string();
+    let mut stop_reason: Option<String> = None;
     while let Some(ev) = rx.recv().await {
         match ev {
             TokEvent::Tok(t) => toks.push(t),
-            TokEvent::Finish { reason } => { finish = if reason == "length" { "length".into() } else { "stop".into() }; break; }
+            TokEvent::Finish { reason } => {
+                stop_reason = stop_reason_of(&reason); // WP08
+                finish = reason;
+                break;
+            }
         }
     }
+    drop(rx);
+    if finish.starts_with("error") {
+        return (engine_error_status(&finish), Json(serde_json::json!({"error": {
+            "message": finish, "type": "server_error", "completion_tokens": toks.len(),
+        }}))).into_response();
+    }
+    let finish = if finish == "length" { "length".to_string() } else { "stop".to_string() };
     let text = state.tokenizer.decode(&toks, true).unwrap_or_default();
     dump_tokens(&cid, &toks);
-    let json = serde_json::json!({
+    let mut json = serde_json::json!({
         "id": cid, "object": "text_completion", "created": created, "model": model_name,
         "choices": [{"index": 0, "text": text, "finish_reason": finish, "logprobs": null}],
         "usage": {"prompt_tokens": prompt_len, "completion_tokens": toks.len(),
                   "total_tokens": prompt_len + toks.len()},
     });
+    if let Some(r) = stop_reason {
+        json["choices"][0]["stop_reason"] = serde_json::json!(r); // WP08
+    }
     (StatusCode::OK, axum::Json(json)).into_response()
 }
 
@@ -1560,4 +1857,127 @@ pub fn create_router(state: AppState) -> Router {
         // so images that other engines accept also arrive here.
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod context_budget_tests {
+    // PR #4's context-budget contract. The PR's two further tests
+    // (streaming_state_follows_the_rendered_prompt_not_the_model_family,
+    // reasoning_effort_high_stays_a_thinking_level) test `prompt_ends_inside_think` /
+    // `normalize_reasoning_effort`, which this leg deliberately does NOT port — dev's
+    // reasoning semantics (P13 thinking toggle + the 35b4b15 effort-derived start) are kept.
+    use super::{esc, generation_room};
+
+    #[test]
+    fn mtp_headroom_is_reserved_before_clamping() {
+        assert_eq!(generation_room(4096, 1314, 16), Some(2766));
+        assert_eq!(generation_room(4096, 1324, 16), Some(2756));
+    }
+
+    #[test]
+    fn prompt_that_leaves_only_headroom_has_no_generation_room() {
+        assert_eq!(generation_room(4096, 4080, 16), None);
+        assert_eq!(generation_room(4096, usize::MAX, 16), None);
+    }
+
+    #[test]
+    fn sse_json_escape_preserves_indented_go_code() {
+        let text = concat!(
+            "// New crée un cache.\n",
+            "func New(capacity int) *CacheLRU {\n",
+            "\treturn &CacheLRU{\r\n",
+            "\t\tcapacity: capacity,\n",
+            "\t\titems: make(map[interface{}]*list.Element),\n",
+            "\t}\n",
+            "}\n",
+        );
+        let payload = format!(r#"{{"delta":{{"content":"{}"}}}}"#, esc(text));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("SSE data must contain valid JSON");
+
+        assert_eq!(parsed["delta"]["content"], text);
+        assert!(!payload.contains('\t'), "JSON payload must not contain literal tabs");
+        assert!(!payload.contains('\r'), "JSON payload must not contain literal CRs");
+    }
+}
+
+#[cfg(test)]
+mod wp08_validation_tests {
+    use super::{spec_finish_reason, stop_reason_of, validate_penalties};
+    use crate::exl3_forward::PenParams;
+
+    #[test]
+    fn penalty_validation_contract() {
+        assert!(validate_penalties(None, None, None, None).is_ok());
+        assert!(validate_penalties(Some(1.05), Some(1.5), Some(0.3), Some(0.05)).is_ok());
+        // rep < 1 is accepted (owner decision 2026-09-26); <= 0 / non-finite are 400s
+        assert!(validate_penalties(Some(0.05), None, None, None).is_ok());
+        assert!(validate_penalties(Some(0.0), None, None, None).is_err());
+        assert!(validate_penalties(Some(-1.0), None, None, None).is_err());
+        assert!(validate_penalties(Some(f32::NAN), None, None, None).is_err());
+        assert!(validate_penalties(Some(f32::INFINITY), None, None, None).is_err());
+        assert!(validate_penalties(None, Some(2.0), Some(-2.0), None).is_ok());
+        assert!(validate_penalties(None, Some(2.01), None, None).is_err());
+        assert!(validate_penalties(None, None, Some(-2.5), None).is_err());
+        assert!(validate_penalties(None, None, None, Some(0.0)).is_ok());
+        assert!(validate_penalties(None, None, None, Some(1.0)).is_ok());
+        assert!(validate_penalties(None, None, None, Some(1.5)).is_err());
+        assert!(validate_penalties(None, None, None, Some(-0.1)).is_err());
+    }
+
+    #[test]
+    fn loop_detected_is_a_stop_with_a_reason() {
+        assert_eq!(spec_finish_reason("loop_detected"), "stop");
+        assert_eq!(stop_reason_of("loop_detected").as_deref(), Some("loop_detected"));
+        assert_eq!(stop_reason_of("stop"), None);
+        assert_eq!(spec_finish_reason("length"), "length");
+    }
+
+    #[test]
+    fn inactive_penalties_stage_nothing() {
+        // the rival's alt() NoOp rule: defaults never launch a penalty kernel
+        assert_eq!(PenParams::new(1.0, 0.0, 0.0, 1024, 1024), None);
+        assert_eq!(PenParams::new(1.1, 0.0, 0.0, 0, 0), None);
+        assert!(PenParams::new(1.1, 0.0, 0.0, 1024, 1024).is_some());
+        assert!(PenParams::new(1.0, 0.0, 0.3, 1024, 1024).is_some());
+        assert!(PenParams::new(0.9, 0.0, 0.0, 1024, 1024).is_some());
+        assert!(PenParams::new(1.0, -0.5, 0.0, 16, 0).is_some());
+    }
+}
+
+#[cfg(test)]
+mod grow_find_tests {
+    // WP02: the incremental streaming search must return exactly what the O(n) `str::find` did.
+    use super::GrowFind;
+
+    #[test]
+    fn grow_find_matches_str_find_on_growing_buffers() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5eed);
+        let alphabet = ["<", "tool", "_call", "</think>", "<think>", "a", "é", "日本", "\n", "<tool_call>", "</thi", "nk>", "int ", "main"];
+        let needles = ["<tool_call", "</think>", "<think>", "int main", "日本", "é", ""];
+        for _ in 0..400 {
+            let mut acc = String::new();
+            let mut finders: Vec<GrowFind> = needles.iter().map(|_| GrowFind::default()).collect();
+            let mut base = 0usize;
+            for _ in 0..60 {
+                acc.push_str(alphabet[rng.gen_range(0..alphabet.len())]);
+                // a monotone base on a char boundary, as the stream cursors are
+                if rng.gen_bool(0.2) {
+                    let mut b = rng.gen_range(base..=acc.len());
+                    while !acc.is_char_boundary(b) { b -= 1; }
+                    base = b.max(base);
+                }
+                // hay = a prefix of acc (the reasoning branch searches acc[..safe]), never below base
+                let mut cut = acc.len() - rng.gen_range(0..=acc.len().min(4));
+                while !acc.is_char_boundary(cut) { cut -= 1; }
+                let cut = cut.max(base);
+                for (f, n) in finders.iter_mut().zip(needles.iter()) {
+                    let hay = &acc[..cut];
+                    let want = hay[base..].find(n).map(|i| base + i);
+                    assert_eq!(f.find(hay, base, n), want, "hay={hay:?} base={base} needle={n:?}");
+                }
+            }
+        }
+    }
 }

@@ -99,10 +99,11 @@ BATCH=${BATCH:-1}
 PREFIX=${PREFIX:-off}
 KVC=${KVC:-q4}
 MTP=${MTP:-off}
-# Fold explicitly OFF (belt + suspenders: the flag also makes an OLD pre-E13 binary safe).
-export GB10_MOE_NO_FOLD=1
+# Fold explicitly OFF (belt + suspenders).
+FOLD="--moe-no-fold"
 # Graphs ON by default; GRAPHS=eager overrides to the non-graph path.
-[ "${GRAPHS:-on}" = "eager" ] && export GB10_NO_DECODE_GRAPHS=1 GB10_NO_VERIFY_GRAPH=1
+GRAPH_FLAGS=""
+[ "${GRAPHS:-on}" = "eager" ] && GRAPH_FLAGS="--no-decode-graphs --no-verify-graph"
 
 set -euo pipefail
 SDIR="$(cd "$(dirname "$0")" && pwd)"
@@ -117,8 +118,12 @@ exec "$BIN" --server \
   --model-dir "$MODEL_DIR" --tp --nodes "$NODE" --port "$PORT" \
   --max-seq-len "$SEQ" --max-batch "$BATCH" --max-tokens 65536 \
   --default-presence-penalty 1.5 --prefix-cache "$PREFIX" --mtp="$MTP" \
-  --kv-cache "$KVC" --mxfp4=on
+  --kv-cache "$KVC" --mxfp4=on ${FOLD} ${GRAPH_FLAGS}
 ```
+> **Note (v0.7.0):** the engine no longer reads environment variables. Every option is a
+> command-line flag; exporting one of the old `GB10_*` variables now refuses startup and names the
+> replacement flag. The two lines above used to be `export GB10_MOE_NO_FOLD=1` and
+> `export GB10_NO_DECODE_GRAPHS=1 GB10_NO_VERIFY_GRAPH=1`.
 
 This is the configuration that was verified running at **~25 tok/s** on TP=2.
 
@@ -131,7 +136,7 @@ The key options for Hy3:
 | `--mxfp4=on` | on | Run the fp4 decode/verify GEMMs on the sm_121a OMMA path |
 | `--mtp off` | off | Hy3 MTP currently works but is left off here |
 | `--prefix-cache off` | off | Every request prefills its whole prompt (see the note below) |
-| `GB10_MOE_NO_FOLD=1` | exported | MoE fold explicitly off |
+| `--moe-no-fold` | on | MoE fold explicitly off |
 | `GRAPHS=eager` (optional) | — | Override to the non-graph path |
 
 ### Memory: plan for a large footprint

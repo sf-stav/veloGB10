@@ -17,6 +17,8 @@ pub struct NetCtx {
 }
 
 extern "C" {
+    /// CLI-1: the transport's options (the shim reads no env) — call before every net_init.
+    fn net_set_opts(spin_us: u64, tail_drill: c_int, oneshot: c_int, tp_diag: c_int);
     fn net_init(rank: c_int, world: c_int, peer_ips: *const *const c_char, n_peers: c_int,
                 tcp_port: c_int, dev_name: *const c_char,
                 gid_idx: c_int, fp32_capacity_bytes: c_int, payload_bytes: c_int) -> *mut NetCtx;
@@ -25,6 +27,7 @@ extern "C" {
     fn net_set_recv_mode(c: *mut NetCtx, gpu: c_int) -> c_int;
     fn net_rx_done(c: *mut NetCtx) -> u64;
     fn net_ctx_dptr(c: *mut NetCtx) -> *mut c_void;
+    fn net_peer_ip(c: *mut NetCtx) -> *const c_char;
     fn net_flags_dptr(c: *mut NetCtx) -> *mut c_void;
     fn net_send_dptr(c: *mut NetCtx) -> *mut c_void;
     fn net_recv_dptr(c: *mut NetCtx) -> *mut c_void;
@@ -32,9 +35,11 @@ extern "C" {
     fn net_recv_hptr(c: *mut NetCtx) -> *mut c_void;
     fn net_device_epoch(c: *mut NetCtx) -> u64;
     fn net_gate_waits(c: *mut NetCtx) -> u64;
+    fn net_wait_sleeps() -> u64;
     fn net_bench_cq_hold(c: *mut NetCtx, hold: u32, hold_us: u32) -> c_int;
     fn net_gpu_ready(c: *mut NetCtx) -> u64;
     fn net_tail_fires(c: *mut NetCtx) -> u64;
+    fn net_gpu_rx_skips(c: *mut NetCtx) -> u64;
     fn net_abort_status(c: *mut NetCtx) -> u64;
     fn net_exchange(c: *mut NetCtx, nbytes: c_int) -> c_int;
     fn net_flush(c: *mut NetCtx) -> c_int;
@@ -54,7 +59,7 @@ extern "C" {
     fn net_rank(c: *mut NetCtx) -> c_int;
     fn net_abort(c: *mut NetCtx);
     fn net_shutdown(c: *mut NetCtx);
-    // R9 DIAGNOSTIC (world>2, GB10_TP_DIAG=1) — per-epoch payload checksum rings.
+    // R9 DIAGNOSTIC (world>2, --tp-diag=1) — per-epoch payload checksum rings.
     fn net_diag_send_xor(c: *mut NetCtx) -> u64;
     fn net_diag_recv_xor(c: *mut NetCtx) -> u64;
     fn net_diag_send_hptr(c: *mut NetCtx) -> *mut c_void;
@@ -88,6 +93,10 @@ pub const GTS_K1_IN: usize = 0;
 pub const GTS_K1_OUT: usize = 1;
 pub const GTS_K2_IN: usize = 2;
 pub const GTS_K2_GO: usize = 3;
+
+/// TP-E: 1 ms sleeps taken so far by the host rendezvous waits (net_agree / net_exchange / the proxy's
+/// placement waits), process-wide. Mid-request this should stay 0 under the TP-E spin budget.
+pub fn wait_sleeps() -> u64 { unsafe { net_wait_sleeps() } }
 
 /// Pin the CALLING thread to `core` and VERIFY the affinity read back (GB10 is big.LITTLE; a launch or
 /// poll thread parked on a little A725 balloons latency and drains the GPU stream mid-token). Returns
@@ -172,7 +181,7 @@ pub fn agree_ext(step: u64, accept_count: u8, k_verify: u8, hash: u32) -> Option
     const AGREE_NBYTES: usize = 32;
     const STATUS_OK: u64 = 0;
     const STATUS_MISMATCH: u64 = 1;
-    let diag = std::env::var("GB10_TP_DIAG").is_ok();
+    let diag = crate::opts::var(crate::opt!("tp-diag")).is_ok();
     let rank = unsafe { net_rank(ctx) };
     let epoch = unsafe { net_device_epoch(ctx) };
     let send = unsafe { net_ctrl_send_hptr(ctx) as *mut u64 };
@@ -355,6 +364,9 @@ pub fn traced_rx_done() -> u64 {
 /// The link's cooperative abort status word (0 = healthy) for the CURRENT registered ctx, or 0 when
 /// no TP link is attached. Mirrors `traced_rx_done` — used by the acceptance gates so an aborted
 /// run FAILS LOUDLY instead of reporting a number computed on no-op'd kernels (I9).
+/// TP-F: an auxiliary link's cooperative abort status (the dual-rail prefill transport's second rail).
+pub fn ctx_abort_status(ctx_addr: usize) -> u64 { unsafe { net_abort_status(ctx_addr as *mut NetCtx) } }
+
 pub fn traced_abort_status() -> u64 {
     let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
     if c == 0 { 0 } else { unsafe { net_abort_status(c as *mut NetCtx) } }
@@ -362,9 +374,45 @@ pub fn traced_abort_status() -> u64 {
 
 /// The link's tail-epoch guard fire count (MUST stay 0; a fire means RC/PCIe placement ordering
 /// failed). Same traced pattern as `traced_abort_status`.
+/// TP-I: wait until the proxy has posted AND retired (send CQE) every hot-path epoch the device has
+/// published — after a device synchronize, this means no doorbell payload of ours is still being read
+/// out of the send ring and none of the peer's (consumed by our K2s) is still landing in the recv ring.
+/// The host exchanges stage in send slot 0 and receive in recv slot g&7 of the SAME rings, so a host
+/// exchange must not overlap an in-flight epoch. Bounded (the proxy retires in microseconds); Err past
+/// `timeout`. No-op without a registered link.
+pub fn drain_sends(timeout: std::time::Duration) -> anyhow::Result<()> {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { return Ok(()); }
+    let c = c as *mut NetCtx;
+    let t0 = std::time::Instant::now();
+    loop {
+        let e = unsafe { net_device_epoch(c) };
+        let (mut p, mut r) = (0u64, 0u64);
+        unsafe { net_counters(c, &mut p, &mut r, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if p >= e && r >= e { return Ok(()); }
+        if t0.elapsed() > timeout {
+            anyhow::bail!("TP drain: the proxy has not retired the device's epochs (device {e}, posted {p}, retired {r}) within {:?}", timeout);
+        }
+        std::hint::spin_loop();
+    }
+}
+
+/// TP-I (C7): the I3 reuse-gate bind counter of the registered link's device ctx (cumulative; the
+/// folded decode K1 now counts on whichever block runs the gate).
+pub fn traced_gate_waits() -> u64 {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { 0 } else { unsafe { net_gate_waits(c as *mut NetCtx) } }
+}
+
 pub fn traced_tail_fires() -> u64 {
     let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
     if c == 0 { 0 } else { unsafe { net_tail_fires(c as *mut NetCtx) } }
+}
+
+/// TP-G: epochs the proxy did NOT validate because the GPU decode K2 proved them first (RX_DONE).
+pub fn traced_gpu_rx_skips() -> u64 {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { 0 } else { unsafe { net_gpu_rx_skips(c as *mut NetCtx) } }
 }
 
 
@@ -381,22 +429,45 @@ pub fn spawn_proxy(ctx_addr: usize, core: i32) -> std::thread::JoinHandle<()> {
     })
 }
 
+/// TP-F: spawn the proxy of an AUXILIARY link (the dual-rail prefill transport's second rail).
+/// Unlike `spawn_proxy` it does NOT register the ctx as the process's agree/trace link.
+pub fn spawn_proxy_aux(ctx_addr: usize, core: i32) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let ctx = ctx_addr as *mut NetCtx;
+        unsafe { net_proxy_loop(ctx, core as c_int); }
+    })
+}
+
 /// A 2-node tensor-parallel link (one RC QP, RoCEv2). `rank` 0 = head (listens), 1 = node (connects).
 pub struct TpLink {
     ctx: *mut NetCtx,
     slot_bytes: usize,
 }
 
+/// CLI-1: hand the registry's transport options to the C shim (the old getenv reads, same meanings:
+/// --tp-spin-us N>=1 overrides the 20 ms spin budget; --tp-tail-drill / --tp-diag presence;
+/// --tp-oneshot any value not starting with '0'). Called before every net_init.
+fn push_net_opts() {
+    use crate::{opt, opts};
+    let spin: u64 = opts::var(opt!("tp-spin-us")).ok()
+        .and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+    let tail = opts::var(opt!("tp-tail-drill")).is_ok() as c_int;
+    let oneshot = opts::var(opt!("tp-oneshot")).map_or(false, |v| !v.starts_with('0')) as c_int;
+    let diag = opts::var(opt!("tp-diag")).is_ok() as c_int;
+    unsafe { net_set_opts(spin, tail, oneshot, diag) }
+}
+
 impl TpLink {
     /// `slot_bytes` is the ring-slot CAPACITY — size it for the FP32 payload (and the startup prompt
     /// frame) so switching precision later never re-addresses the rings, which would invalidate a
     /// captured graph. The active hot-path payload is set separately by `set_payload`.
-    /// P3-1: does this transport ctx run the one-shot all-peers push? (GB10_TP_ONESHOT + world==4,
+    /// P3-1: does this transport ctx run the one-shot all-peers push? (--tp-oneshot + world==4,
     /// resolved at net_init — the same field the proxy and K1 read. Single source of truth.)
     pub fn oneshot_on(&self) -> bool { unsafe { net_oneshot_on(self.ctx) != 0 } }
 
     pub fn connect(rank: i32, peer_ip: &str, tcp_port: u16, dev: &str, gid_idx: i32,
                    slot_bytes: usize) -> anyhow::Result<Self> {
+        push_net_opts();
         // world==2 legacy call: a synthetic 2-entry peer-IP list indexed by rank (peer_ips[1-rank]
         // is the peer — identical to the old single peer_ip). net_init dispatches to the unchanged
         // single-QP path. (rank 0 may pass "" — it listens and never dials.)
@@ -420,6 +491,7 @@ impl TpLink {
     pub fn connect_nway(rank: i32, world: i32, peer_ips: &[IpAddr], tcp_port: u16, dev: &str,
                         gid_idx: i32, slot_bytes: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(world >= 2, "connect_nway: world must be >= 2");
+        push_net_opts();
         anyhow::ensure!(peer_ips.len() >= world as usize, "connect_nway: peer_ips too short");
         let dev_c = CString::new(dev)?;
         let cstrs: Vec<CString> = peer_ips
@@ -475,6 +547,10 @@ impl TpLink {
     pub fn send_device_ptr(&self) -> u64 { unsafe { net_send_dptr(self.ctx) as u64 } }
     pub fn recv_device_ptr(&self) -> u64 { unsafe { net_recv_dptr(self.ctx) as u64 } }
     pub fn ctx_addr(&self) -> usize { self.ctx as usize }
+    /// The peer's IP as this link's TCP handshake saw it (rank 0: learned from accept(); rank 1: dialed).
+    pub fn peer_ip(&self) -> String {
+        unsafe { std::ffi::CStr::from_ptr(net_peer_ip(self.ctx)).to_string_lossy().into_owned() }
+    }
 
     /// Device-side barrier counter (source of truth) and the published watermark. Equal at quiesce —
     /// assert that at graph instantiation (I8/Q4 tripwire).

@@ -79,7 +79,7 @@ impl KVCache {
 // ONLY on the `_e` attention lane (`gqa_attn_verify_e_k8v8`), and that lane's contract is
 // `batch <= MAX_VERIFY (16)` with `chain_ok` (gpu.rs:9261). A multi-lane serve whose packed
 // verify/step width leaves that envelope hits
-//     assert!(use_e, "k8v8 requires the _e attention lane (batch<=8, gqa<=48, no GB10_NO_ATTN_E)")
+//     assert!(use_e, "k8v8 requires the _e attention lane (batch<=8, gqa<=48, no --no-attn-e)")
 // — a runtime panic AFTER a full model load, with no hint of the remedy.
 //
 // The check below is the host-side predicate, evaluated BEFORE the model load and BEFORE any node
@@ -101,7 +101,7 @@ pub enum KvLaneVerdict {
 /// row-group grid covers, and the dispatch panics instead of degrading (deliberately — a silent
 /// bf16 read of an int8 buffer is the mojibake hazard). Every other mode is unconstrained.
 pub fn kv_lane_check(kv_cache: Option<&str>, max_batch: usize, tp: usize) -> KvLaneVerdict {
-    let k8v8 = matches!(kv_cache, Some("k8v8")) || std::env::var("GB10_KV_K8V8").ok().as_deref() == Some("1");
+    let k8v8 = matches!(kv_cache, Some("k8v8")) || crate::opts::var(crate::opt!("kv-k8v8")).ok().as_deref() == Some("1");
     if k8v8 && max_batch > 1 {
         return KvLaneVerdict::Reject(format!(
             "k8v8 KV does not support multi-lane serving (max-batch {max_batch} > 1, tp {tp}): the \

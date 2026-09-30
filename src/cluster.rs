@@ -89,7 +89,7 @@ fn recv_msg(r: &mut impl Read) -> Result<Msg> { recv_json(r) }
 // ---------------------------------------------------------------------------------------------------
 
 fn cache_root() -> PathBuf {
-    std::env::var("GB10_TP_CACHE").map(PathBuf::from).unwrap_or_else(|_| {
+    crate::opts::var(crate::opt!("tp-cache")).map(PathBuf::from).unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         PathBuf::from(home).join(".cache/gb10_tp")
     })
@@ -202,6 +202,303 @@ pub fn build_manifest(model_dir: &Path, world: u32) -> Result<(String, Vec<Vec<A
     let model_id = model_dir.file_name().map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "model".into());
     Ok((model_id, per_rank))
+}
+
+// ---------------------------------------------------------------------------------------------------
+// EXL3 pack manifest (TP-A D-T0-6; PACK-FIX 2026-09-30: the files the engine READS, nothing else)
+// ---------------------------------------------------------------------------------------------------
+
+/// PACK-FIX: the small (non-tensor) files the EXL3 TP path reads from the pack dir — the loader,
+/// the tokenizer and the serve boot. Code evidence (PLAN/notes_2026-09-28/PACK-FIX.md):
+///   config.json                  exl3.rs Exl3Pack::open (qwen::Config), exl3_serve.rs cfg_eos,
+///                                tokenizer.rs stop_token_ids, exl3_tune.rs config_sha256
+///   quantization_config.json     exl3.rs is_exl3_dir + Exl3Pack::open (quant_method/codebook),
+///                                exl3_serve.rs is_exl3_pack, exl3_tune.rs quant_sha256
+///   model.safetensors.index.json exl3.rs Exl3Pack::open (weight_map -> the shard set),
+///                                exl3_forward.rs PLE ngram loader, exl3_serve.rs is_exl3_pack
+///   tokenizer.json               tokenizer.rs QwenTokenizer::from_file (+ special_ids)
+///   tokenizer_config.json        tokenizer.rs stop_token_ids (eos_token) + load_chat_env fallback
+///   generation_config.json       tokenizer.rs stop_token_ids (eos_token_id int|list)
+///   chat_template.jinja          tokenizer.rs load_chat_env (the served chat template)
+/// The three optional ones (tokenizer_config / generation_config / chat_template) are hashed when
+/// present; presence itself is part of the manifest (one side having a template the other lacks
+/// changes served bytes, so it is a mismatch). Everything else in the dir — README*, LICENSE,
+/// *.md, qbench_prompts.*, pack_scan.json, *.native, vocab.json/merges.txt (the tokenizer reads
+/// tokenizer.json only), preprocessor configs (the EXL3 serve path has no vision tower), dot-files,
+/// unknown files — is NOT read by the engine and is ignored.
+pub const PACK_READ_FILES: [&str; 7] = [
+    "config.json", "quantization_config.json", "model.safetensors.index.json", "tokenizer.json",
+    "tokenizer_config.json", "generation_config.json", "chat_template.jinja",
+];
+/// The sidecars `Exl3Pack::open` opens BY NAME (header read) whether or not the index lists them
+/// (exl3.rs step 7). On the Flash-Next pack the index lists both as well.
+pub const PACK_SIDECARS: [&str; 2] =
+    ["ngram_embedding.safetensors", "mtp_hyper_connection_mixer_patch.safetensors"];
+
+/// One hashed pack file: (path relative to the pack dir, sha256 hex, size in bytes). A file the
+/// index references that does not exist is recorded as ("…", "MISSING", 0) so a node's diff names it.
+pub type PackFile = (String, String, u64);
+
+/// The EXL3 pack manifest: the per-file list (sorted by path), the manifest hash over it, the
+/// hashed byte total, the top-level entries NOT hashed (for the boot log), and how many bytes were
+/// actually hashed this call (0 on a warm hash cache).
+pub struct PackManifest {
+    pub hash: String,
+    pub files: Vec<PackFile>,
+    pub bytes: u64,
+    pub ignored: Vec<String>,
+    pub hashed_now: u64,
+}
+
+const PACK_MISSING: &str = "MISSING";
+
+/// The loader-read file set of an EXL3 pack (relative names, sorted, deduplicated): every
+/// safetensors file the index's weight_map references (= `Exl3Pack::shards`, whose headers and
+/// tensors `FwdModel::load` reads) + the by-name sidecars that exist + the `PACK_READ_FILES` that
+/// exist, and the sorted top-level names NOT in that set. The index is mandatory — the loader cannot
+/// run without it.
+fn pack_file_set(dir: &Path) -> Result<(Vec<String>, Vec<String>)> {
+    let idx_path = dir.join("model.safetensors.index.json");
+    let raw = std::fs::read_to_string(&idx_path)
+        .with_context(|| format!("pack manifest: {} missing (not an EXL3 pack?)", idx_path.display()))?;
+    let idx: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("pack manifest: {} unparsable", idx_path.display()))?;
+    let wmap = idx["weight_map"].as_object()
+        .with_context(|| format!("pack manifest: {} has no weight_map", idx_path.display()))?;
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for v in wmap.values() {
+        if let Some(s) = v.as_str() { set.insert(s.to_string()); }
+    }
+    for f in PACK_SIDECARS.iter().chain(PACK_READ_FILES.iter()) {
+        if dir.join(f).is_file() { set.insert((*f).to_string()); }
+    }
+    // top-level components of the hashed set (an index may reference a shard in a subdir)
+    let tops: std::collections::BTreeSet<&str> = set.iter().filter_map(|s| s.split('/').next()).collect();
+    let mut ignored = Vec::new();
+    for e in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let name = e?.file_name().to_string_lossy().to_string();
+        if !tops.contains(name.as_str()) { ignored.push(name); }
+    }
+    ignored.sort();
+    Ok((set.into_iter().collect(), ignored))
+}
+
+/// PACK-FIX hash-cache key: the CANONICAL (symlink-resolved) path + mtime + size. A symlinked view
+/// of a pack (HF snapshot links, test views) therefore reuses the real files' cached hashes. As
+/// sound as the path-as-given key: the bytes are a function of the real file, and its mtime/size
+/// are what the key already trusted. (build_manifest / draft_manifest keep `cached_key`.)
+fn canonical_key(path: &Path) -> Result<String> {
+    let real = std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
+    cached_key(&real)
+}
+
+/// Hash `jobs` (path, size) with up to `threads` workers, largest file first (the largest file
+/// bounds the wall time). Each file's sha256 is independent, so the result is bitwise the
+/// sequential one. Returns the hashes in `jobs` order.
+fn sha256_files_parallel(jobs: &[(PathBuf, u64)], threads: usize) -> Result<Vec<String>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut order: Vec<usize> = (0..jobs.len()).collect();
+    order.sort_by(|&a, &b| jobs[b].1.cmp(&jobs[a].1));
+    let next = AtomicUsize::new(0);
+    let out: std::sync::Mutex<Vec<Option<Result<String>>>> =
+        std::sync::Mutex::new((0..jobs.len()).map(|_| None).collect());
+    std::thread::scope(|sc| {
+        for _ in 0..threads.max(1).min(jobs.len().max(1)) {
+            sc.spawn(|| loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= order.len() { break; }
+                let i = order[k];
+                let r = sha256_file(&jobs[i].0).map(|(h, _)| h);
+                out.lock().unwrap()[i] = Some(r);
+            });
+        }
+    });
+    out.into_inner().unwrap().into_iter()
+        .map(|r| r.unwrap_or_else(|| Err(anyhow::anyhow!("hash worker did not run"))))
+        .collect()
+}
+
+/// TP-A (EXL3 TP, D-T0-6) + PACK-FIX: the pack manifest — sha256 over the sorted
+/// `relative-path \0 sha256 \0 size \n` lines of the files the engine READS (`pack_file_set`: the
+/// index-referenced safetensors + by-name sidecars + `PACK_READ_FILES`), content-hashed through the
+/// per-file (canonical path, mtime, size) hash cache; uncached files are hashed in parallel. The head
+/// ships the hash AND the per-file list in TpConfig; the node recomputes over ITS local copy and, on
+/// a mismatch, refuses naming each differing file. Files the engine never reads (README.md, LICENSE,
+/// ...) are not part of it: a republished model card must not block a TP boot (owner 2026-09-30).
+pub fn pack_manifest(dir: &Path) -> Result<PackManifest> {
+    let (names, ignored) = pack_file_set(dir)?;
+    let mut cache = hash_cache_load();
+    let mut entries: Vec<(String, Option<String>, u64)> = Vec::with_capacity(names.len());
+    let mut todo: Vec<(PathBuf, u64)> = Vec::new();
+    let mut todo_idx: Vec<(usize, String)> = Vec::new();
+    for rel in &names {
+        let path = dir.join(rel);
+        match std::fs::metadata(&path) {
+            Ok(md) if md.is_file() => {
+                let size = md.len();
+                let key = canonical_key(&path)?;
+                match cache.get(&key) {
+                    Some(h) => entries.push((rel.clone(), Some(h.clone()), size)),
+                    None => {
+                        todo_idx.push((entries.len(), key));
+                        todo.push((path, size));
+                        entries.push((rel.clone(), None, size));
+                    }
+                }
+            }
+            // index-referenced but absent: recorded, never silently skipped (the node names it)
+            _ => entries.push((rel.clone(), Some(PACK_MISSING.to_string()), 0)),
+        }
+    }
+    let hashed_now: u64 = todo.iter().map(|(_, s)| *s).sum();
+    if !todo.is_empty() {
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+        let hashes = sha256_files_parallel(&todo, threads)?;
+        for ((i, key), h) in todo_idx.into_iter().zip(hashes) {
+            cache.insert(key, h.clone());
+            entries[i].1 = Some(h);
+        }
+        hash_cache_save(&cache);
+    }
+    let files: Vec<PackFile> = entries.into_iter().map(|(r, h, s)| (r, h.unwrap(), s)).collect();
+    let bytes = files.iter().map(|f| f.2).sum();
+    let mut lines: Vec<String> = files.iter().map(|(r, h, s)| format!("{r}\0{h}\0{s}\n")).collect();
+    lines.sort();
+    let mut h = Sha256::new();
+    for l in &lines { h.update(l.as_bytes()); }
+    Ok(PackManifest { hash: hex(&h.finalize()), files, bytes, ignored, hashed_now })
+}
+
+/// PACK-FIX: human-readable per-file differences between the head's manifest list and a node's
+/// (one line per differing file; empty = the lists agree).
+pub fn pack_manifest_diff(head: &[PackFile], node: &[PackFile]) -> Vec<String> {
+    let hm: HashMap<&str, (&str, u64)> = head.iter().map(|(r, h, s)| (r.as_str(), (h.as_str(), *s))).collect();
+    let nm: HashMap<&str, (&str, u64)> = node.iter().map(|(r, h, s)| (r.as_str(), (h.as_str(), *s))).collect();
+    let mut names: Vec<&str> = hm.keys().chain(nm.keys()).copied().collect();
+    names.sort();
+    names.dedup();
+    let mut out = Vec::new();
+    for n in names {
+        match (hm.get(n), nm.get(n)) {
+            (Some(a), Some(b)) if a == b => {}
+            (Some((ha, sa)), Some((hb, sb))) =>
+                out.push(format!("  {n}: head sha256 {ha} ({sa} B)  !=  node sha256 {hb} ({sb} B)")),
+            (Some((ha, sa)), None) => out.push(format!("  {n}: on the head (sha256 {ha}, {sa} B), ABSENT on the node")),
+            (None, Some((hb, sb))) => out.push(format!("  {n}: ABSENT on the head, on the node (sha256 {hb}, {sb} B)")),
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------------
+// PACK-FIX: node refusal -> the head fails loudly (never block in the RDMA bring-up for a node
+// that already quit)
+// ---------------------------------------------------------------------------------------------------
+
+/// Cap on a reported node failure (the head peeks a whole frame; a per-file diff is ~200 B/file).
+const NODE_FAIL_MAX: usize = 32 * 1024;
+
+/// Node side: report a failure during the session BOOT (pack mismatch, option install, program
+/// parse, its RDMA link bring-up; on the served path also its load / attach / boot agree) to the head
+/// over the retained control stream as one `Msg::Error` frame, so the head — blocked in its link
+/// bring-up or loading its own shard — prints the reason and exits instead of hanging. Best effort:
+/// a dead socket is not an error here (the node is about to exit, which closes the stream; the head's
+/// watch reports that too).
+pub fn node_report_failure(s: &mut TcpStream, reason: &str) {
+    let mut msg = format!("node {}: {reason}", hostname());
+    if msg.len() > NODE_FAIL_MAX {
+        let mut cut = NODE_FAIL_MAX;
+        while !msg.is_char_boundary(cut) { cut -= 1; }
+        msg.truncate(cut);
+        msg.push_str(" …(truncated)");
+    }
+    let _ = send_msg(s, &Msg::Error { msg });
+    let _ = s.flush();
+}
+
+enum PeekFrame { Incomplete, Error(String), Other }
+
+fn peek_frame(b: &[u8]) -> PeekFrame {
+    if b.len() < 4 { return PeekFrame::Incomplete; }
+    let n = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    if n > NODE_FAIL_MAX + 1024 { return PeekFrame::Other; }
+    if b.len() < 4 + n { return PeekFrame::Incomplete; }
+    match serde_json::from_slice::<Msg>(&b[4..4 + n]) {
+        Ok(Msg::Error { msg }) => PeekFrame::Error(msg),
+        _ => PeekFrame::Other,
+    }
+}
+
+/// Head side: while the head is blocked in the RDMA data-plane bring-up (the world==2 QP handshake
+/// is a plain accept() with no deadline, before any liveness probe exists) and — on the served path —
+/// while it loads its own shard, watch every node's retained control stream WITHOUT consuming it
+/// (MSG_PEEK). A node that reports a failure (`node_report_failure`) or closes the stream (its session
+/// process exited) has abandoned the session: print the node's reason and exit the head non-zero
+/// within ~0.1 s. Legitimate traffic (the node's `Ready`) ends the watch for that stream, untouched.
+/// `disarm` stops the watch and restores the streams' blocking reads BEFORE the head reads them.
+pub struct NodeWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+pub fn watch_nodes_during_bring_up(streams: &[TcpStream]) -> Result<NodeWatch> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let mut watched: Vec<(usize, String, TcpStream)> = Vec::with_capacity(streams.len());
+    for (i, s) in streams.iter().enumerate() {
+        let c = s.try_clone().context("node watch: clone control stream")?;
+        c.set_read_timeout(Some(Duration::from_millis(100))).context("node watch: read timeout")?;
+        let addr = c.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+        watched.push((i + 1, addr, c));
+    }
+    eprintln!("[head] watching {} node control stream(s) through the RDMA bring-up + boot (a node failure is reported here, never hung on)",
+              watched.len());
+    let stop2 = stop.clone();
+    let handle = std::thread::Builder::new().name("tp-node-watch".into()).spawn(move || {
+        let mut buf = vec![0u8; NODE_FAIL_MAX + 2048];
+        let mut live = vec![true; watched.len()];
+        while !stop2.load(Ordering::Acquire) && live.iter().any(|&l| l) {
+            let mut partial = false;
+            for (k, (rank, addr, c)) in watched.iter().enumerate() {
+                if !live[k] || stop2.load(Ordering::Acquire) { continue; }
+                match c.peek(&mut buf) {
+                    Ok(0) => node_watch_fatal(*rank, addr, None),
+                    Ok(n) => match peek_frame(&buf[..n]) {
+                        PeekFrame::Error(msg) => node_watch_fatal(*rank, addr, Some(msg)),
+                        PeekFrame::Incomplete => partial = true,
+                        PeekFrame::Other => live[k] = false,
+                    },
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(e) => node_watch_fatal(*rank, addr, Some(format!("control connection error: {e}"))),
+                }
+            }
+            if partial { std::thread::sleep(Duration::from_millis(20)); }
+        }
+    }).context("spawn node watch")?;
+    Ok(NodeWatch { stop, handle: Some(handle) })
+}
+
+impl NodeWatch {
+    /// Stop watching and restore blocking reads on `streams` (the socket's read timeout is shared
+    /// with the watch's clones).
+    pub fn disarm(mut self, streams: &[TcpStream]) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(h) = self.handle.take() { let _ = h.join(); }
+        for s in streams { let _ = s.set_read_timeout(None); }
+    }
+}
+
+fn node_watch_fatal(rank: usize, addr: &str, reason: Option<String>) -> ! {
+    match reason {
+        Some(r) => eprintln!("[head] FATAL: NODE FAILED — rank {rank} ({addr}) abandoned the session during its boot:\n{r}"),
+        None => eprintln!("[head] FATAL: NODE FAILED — rank {rank} ({addr}) closed the control connection during the session \
+                           boot (its session process exited; the reason is in the node's log)"),
+    }
+    eprintln!("[head] exiting (code 1): the head does not wait in the RDMA bring-up / boot for a node that already quit");
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(1)
 }
 
 /// Whether a logical path (relative to the model dir) belongs in node rank `r`'s manifest. When
@@ -330,8 +627,8 @@ struct Roce { ib: String, netdev: String, ip: Ipv4Addr, bcast: Ipv4Addr, mask: u
 fn roce_interfaces() -> Vec<Roce> {
     // Default = the fixed GB10 rail names (identical across DGX Spark + every OEM clone: same SoC,
     // hard-wired PCIe topology, systemd predictable naming). Manual fallback for any platform that
-    // breaks that: GB10_RDMA_DEV=dev1[,dev2] (rail order), set via --rdma-dev.
-    let devs: Vec<(String, u8)> = match std::env::var("GB10_RDMA_DEV") {
+    // breaks that: --rdma-dev=dev1[,dev2] (rail order), set via --rdma-dev.
+    let devs: Vec<(String, u8)> = match crate::opts::var(crate::opt!("rdma-dev")) {
         Ok(s) if !s.trim().is_empty() =>
             s.split(',').enumerate().map(|(i, d)| (d.trim().to_string(), (i + 1) as u8)).collect(),
         _ => vec![("rocep1s0f1".into(), 1), ("roceP2p1s0f1".into(), 2)],
@@ -343,7 +640,7 @@ fn roce_interfaces() -> Vec<Roce> {
             .and_then(|mut d| d.next()).and_then(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string());
         let Some(netdev) = netdev else {
-            eprintln!("  [discover] RoCE device '{ib}' not found — override with --rdma-dev / GB10_RDMA_DEV, \
+            eprintln!("  [discover] RoCE device '{ib}' not found — override with --rdma-dev / --rdma-dev, \
                        or use --nodes <ip> to skip discovery");
             continue;
         };
@@ -355,11 +652,8 @@ fn roce_interfaces() -> Vec<Roce> {
     out
 }
 
-/// Parse `ip -o -4 addr show dev <netdev>` → (addr, prefix_len, broadcast).
-fn ipv4_of(netdev: &str) -> Option<(Ipv4Addr, u8, Ipv4Addr)> {
-    let out = std::process::Command::new("ip")
-        .args(["-o", "-4", "addr", "show", "dev", netdev]).output().ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
+/// Parse `ip -o -4 addr show dev <netdev>` output → (addr, prefix_len, broadcast).
+fn ipv4_of_str(s: &str) -> Option<(Ipv4Addr, u8, Ipv4Addr)> {
     let toks: Vec<&str> = s.split_whitespace().collect();
     let (mut ip, mut prefix, mut brd) = (None, None, None);
     let mut i = 0;
@@ -373,7 +667,69 @@ fn ipv4_of(netdev: &str) -> Option<(Ipv4Addr, u8, Ipv4Addr)> {
         }
         i += 1;
     }
-    Some((ip?, prefix?, brd?))
+    // Ported from sf-stav/veloGB10 PR#5 (Morxi): `brd` is absent for point-to-point prefixes
+    // (/31, /30, ...) on some kernels: the runtime only needs the address itself, while the
+    // bcast/mask serve discovery broadcast + rail ranking. So do NOT hard-require `brd`;
+    // synthesize it from ip | ~mask when the kernel omits it.
+    let ip = ip?;
+    let prefix = prefix?;
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let bcast = brd.unwrap_or_else(|| Ipv4Addr::from(u32::from(ip) | !mask));
+    Some((ip, prefix, bcast))
+}
+
+/// Run `ip -o -4 addr show dev <netdev>` and parse it (the pure parser above is unit-tested).
+fn ipv4_of(netdev: &str) -> Option<(Ipv4Addr, u8, Ipv4Addr)> {
+    let out = std::process::Command::new("ip")
+        .args(["-o", "-4", "addr", "show", "dev", netdev]).output().ok()?;
+    ipv4_of_str(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(test)]
+mod ipv4_tests {
+    use super::*;
+
+    #[test]
+    fn slash24_with_brd_uses_kernel_value() {
+        let s = "2: eth0    inet 192.168.177.13/24 brd 192.168.177.255 scope global eth0";
+        let (ip, prefix, bcast) = ipv4_of_str(s).expect("parse");
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 177, 13));
+        assert_eq!(prefix, 24);
+        assert_eq!(bcast, Ipv4Addr::new(192, 168, 177, 255));
+    }
+
+    #[test]
+    fn slash31_no_brd_synthesizes() {
+        // Peer link /31: kernel prints no `brd`; ip|~mask gives the link's other address.
+        let s = "3: p2p    inet 10.0.0.0/31 scope link p2p";
+        let (ip, prefix, bcast) = ipv4_of_str(s).expect("parse");
+        assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 0));
+        assert_eq!(prefix, 31);
+        assert_eq!(bcast, Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn slash30_no_brd_synthesizes() {
+        let s = "4: p2p    inet 10.0.0.2/30 scope link p2p";
+        let (ip, prefix, bcast) = ipv4_of_str(s).expect("parse");
+        assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(prefix, 30);
+        assert_eq!(bcast, Ipv4Addr::new(10, 0, 0, 3));
+    }
+
+    #[test]
+    fn prefix_zero_no_panic_bcast_is_all_ones() {
+        let s = "5: p2p    inet 10.0.0.7/0 scope link p2p";
+        let (ip, prefix, bcast) = ipv4_of_str(s).expect("parse");
+        assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(prefix, 0);
+        assert_eq!(bcast, Ipv4Addr::new(255, 255, 255, 255));
+    }
+
+    #[test]
+    fn missing_addr_is_none() {
+        assert!(ipv4_of_str("2: eth0    <BROADCAST,MULTICAST,UP> mtu 1500").is_none());
+    }
 }
 
 /// Rank a reply's source IP: on RoCE rail 1 (3) > rail 2 (2) > any other link (1).
@@ -650,6 +1006,9 @@ fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &s
             let mut node_cfg = cfg.clone();
             node_cfg.node_rank = node_rank;
             node_cfg.topology = topology.to_vec();
+            // CLI-1: the head's resolved option registry rides the config (v23), taken at ship time
+            // so every option the head resolved before its sync reaches the node.
+            node_cfg.opts = crate::opts::snapshot();
             send_msg(&mut s, &Msg::Config(node_cfg.clone()))?;
             eprintln!("[head] shipped config to {} (rank {node_rank}/{})", node.hostname, node_cfg.world);
 
@@ -709,11 +1068,30 @@ pub fn run_head(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, discover_wa
                 cfg: &crate::tp::TpConfig)
     -> Result<Vec<NodeInfo>>
 {
+    run_head_retain(model_dir, explicit, discover_wait, cfg).map(|(n, _)| n)
+}
+
+/// TP-D: `run_head` that RETAINS the per-node control streams (rank-indexed: `streams[i]` goes to
+/// rank i + 1) — the EXL3 TP serve runs its Step / HeadFlag / Ready / Shutdown control plane over
+/// them (EXL3 ships no artifacts, so `run_head_session`'s manifest/drafter path does not apply).
+pub fn run_head_retain(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, discover_wait: Duration,
+                       cfg: &crate::tp::TpConfig)
+    -> Result<(Vec<NodeInfo>, Vec<TcpStream>)>
+{
     let world = cfg.world.max(1);
     eprintln!("[head] {} — building manifest for {} (world {world}) ...", hostname(), model_dir.display());
-    let (model_id, per_rank) = build_manifest(model_dir, world)?;
+    // TP-A (EXL3, D-T0-6): nothing ships — every node loads its OWN local pack copy, proven
+    // identical by `cfg.exl3_manifest` (checked node-side before any load). The node still runs
+    // the unchanged Hello/Manifest/Ready/Config handshake, with an empty artifact list.
+    let (model_id, per_rank) = if cfg.exl3 {
+        (model_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "exl3".into()),
+         vec![Vec::new(); world as usize])
+    } else {
+        build_manifest(model_dir, world)?
+    };
     let total: u64 = per_rank.iter().flatten().map(|a| a.size).sum();
-    eprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB", total_artifacts(&per_rank), total as f64/1e9);
+    eprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB{}", total_artifacts(&per_rank), total as f64/1e9,
+              if cfg.exl3 { " (EXL3: nodes load their local pack, manifest-verified)" } else { "" });
 
     let ifaces = roce_interfaces();
     let mut nodes: Vec<NodeInfo> = match explicit {
@@ -735,14 +1113,15 @@ pub fn run_head(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, discover_wa
     assign_ranks(&mut nodes, &ifaces);
     let topology = build_topology(&nodes, &ifaces, world)?;
     crate::tp::set_topology(topology.clone());
+    let mut streams = Vec::with_capacity(nodes.len());
     for (i, node) in nodes.iter().enumerate() {
         let rank = (i + 1) as i32;
         // Bench sessions ship no drafter (bench nodes never load a round; the bench wire adds
         // only the empty-DraftManifest round to the pre-v5 behavior).
-        head_sync_one(node, rank, model_dir, &model_id, &per_rank[rank as usize], &topology, cfg, None)?;
+        streams.push(head_sync_one(node, rank, model_dir, &model_id, &per_rank[rank as usize], &topology, cfg, None)?);
     }
     eprintln!("[head] all {} node(s) synced.", nodes.len());
-    Ok(nodes)
+    Ok((nodes, streams))
 }
 
 fn total_artifacts(per_rank: &[Vec<Artifact>]) -> usize {
@@ -1148,5 +1527,133 @@ mod tests {
         // Replicate-if-not-divisible: a rank with no dir gets the whole model.
         let all: Vec<&str> = logicals.iter().copied().filter(|rel| include_for_rank(rel, 2, false)).collect();
         assert_eq!(all.len(), logicals.len());
+    }
+}
+
+#[cfg(test)]
+mod pack_manifest_tests {
+    use super::*;
+
+    /// A synthetic EXL3-shaped pack: an index referencing two shards + a sidecar, the loader-read
+    /// small files, and files the engine never reads (README, LICENSE, pack_scan.json, *.native).
+    fn make_pack(root: &Path, name: &str, readme: &str, shard_b: &[u8], gen_cfg: Option<&str>) -> PathBuf {
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        let idx = serde_json::json!({"metadata": {}, "weight_map": {
+            "w.a.trellis": "model-00001-of-00002.safetensors",
+            "w.b.trellis": "model-00002-of-00002.safetensors",
+            "mtp.x": "mtp_hyper_connection_mixer_patch.safetensors"}});
+        std::fs::write(d.join("model.safetensors.index.json"), idx.to_string()).unwrap();
+        std::fs::write(d.join("model-00001-of-00002.safetensors"), b"shard-a").unwrap();
+        std::fs::write(d.join("model-00002-of-00002.safetensors"), shard_b).unwrap();
+        std::fs::write(d.join("mtp_hyper_connection_mixer_patch.safetensors"), b"patch").unwrap();
+        std::fs::write(d.join("ngram_embedding.safetensors"), b"ngram").unwrap();   // sidecar, not in the index
+        std::fs::write(d.join("config.json"), b"{\"model_type\":\"qwen4_exp\"}").unwrap();
+        std::fs::write(d.join("quantization_config.json"), b"{\"quant_method\":\"exl3\"}").unwrap();
+        std::fs::write(d.join("tokenizer.json"), b"{}").unwrap();
+        if let Some(g) = gen_cfg { std::fs::write(d.join("generation_config.json"), g).unwrap(); }
+        std::fs::write(d.join("README.md"), readme).unwrap();
+        std::fs::write(d.join("LICENSE"), b"license").unwrap();
+        std::fs::write(d.join("pack_scan.json"), b"{}").unwrap();
+        std::fs::write(d.join("config.json.native"), b"{}").unwrap();
+        std::fs::write(d.join("qbench_prompts.md"), b"x").unwrap();
+        d
+    }
+
+    #[test]
+    fn manifest_is_the_loader_read_set_and_ignores_readme() {
+        let root = std::env::temp_dir().join(format!("packfix_ut_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // private hash cache for the test process (never the user's ~/.cache/gb10_tp)
+        crate::opts::set(crate::opt!("tp-cache"), root.join("cache").to_string_lossy());
+        let a = make_pack(&root, "a", "upstream card", b"shard-b", Some("{\"eos_token_id\": 1}"));
+        let b = make_pack(&root, "b", "the owner's model card, different length", b"shard-b", Some("{\"eos_token_id\": 1}"));
+        let ma = pack_manifest(&a).unwrap();
+        let mb = pack_manifest(&b).unwrap();
+        let names: Vec<&str> = ma.files.iter().map(|f| f.0.as_str()).collect();
+        assert_eq!(names, vec!["config.json", "generation_config.json", "model-00001-of-00002.safetensors",
+                               "model-00002-of-00002.safetensors", "model.safetensors.index.json",
+                               "mtp_hyper_connection_mixer_patch.safetensors", "ngram_embedding.safetensors",
+                               "quantization_config.json", "tokenizer.json"]);
+        for ig in ["LICENSE", "README.md", "config.json.native", "pack_scan.json", "qbench_prompts.md"] {
+            assert!(ma.ignored.iter().any(|x| x == ig), "{ig} must be ignored: {:?}", ma.ignored);
+        }
+        assert_eq!(ma.hash, mb.hash, "a README difference must not change the manifest");
+        assert!(pack_manifest_diff(&ma.files, &mb.files).is_empty());
+        // warm cache: nothing re-hashed
+        assert_eq!(pack_manifest(&a).unwrap().hashed_now, 0);
+
+        // one flipped byte in a weight shard (same size) -> mismatch naming exactly that file
+        let c = make_pack(&root, "c", "upstream card", b"shard-B", Some("{\"eos_token_id\": 1}"));
+        let mc = pack_manifest(&c).unwrap();
+        assert_ne!(ma.hash, mc.hash);
+        let d = pack_manifest_diff(&ma.files, &mc.files);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("model-00002-of-00002.safetensors") && d[0].contains("!="), "{d:?}");
+
+        // a whitespace change in a loader-read JSON -> mismatch naming it
+        let e = make_pack(&root, "e", "upstream card", b"shard-b", Some("{\"eos_token_id\":  1}"));
+        let me = pack_manifest(&e).unwrap();
+        assert_ne!(ma.hash, me.hash);
+        let d = pack_manifest_diff(&ma.files, &me.files);
+        assert!(d.len() == 1 && d[0].contains("generation_config.json"), "{d:?}");
+
+        // an optional read file present on one side only -> mismatch naming it
+        let f = make_pack(&root, "f", "upstream card", b"shard-b", None);
+        let mf = pack_manifest(&f).unwrap();
+        let d = pack_manifest_diff(&ma.files, &mf.files);
+        assert!(d.len() == 1 && d[0].contains("generation_config.json") && d[0].contains("ABSENT on the node"), "{d:?}");
+
+        // an index-referenced shard missing on the node -> recorded, named
+        let g = make_pack(&root, "g", "upstream card", b"shard-b", Some("{\"eos_token_id\": 1}"));
+        std::fs::remove_file(g.join("model-00001-of-00002.safetensors")).unwrap();
+        let mg = pack_manifest(&g).unwrap();
+        let d = pack_manifest_diff(&ma.files, &mg.files);
+        assert!(d.len() == 1 && d[0].contains("model-00001-of-00002.safetensors") && d[0].contains(PACK_MISSING), "{d:?}");
+
+        // a symlinked view of a pack hashes identically and reuses the cache (canonical key)
+        let v = root.join("view");
+        std::fs::create_dir_all(&v).unwrap();
+        for ent in std::fs::read_dir(&a).unwrap() {
+            let ent = ent.unwrap();
+            std::os::unix::fs::symlink(ent.path(), v.join(ent.file_name())).unwrap();
+        }
+        let mv = pack_manifest(&v).unwrap();
+        assert_eq!(mv.hash, ma.hash);
+        assert_eq!(mv.hashed_now, 0, "a symlink view must hit the real files' cached hashes");
+
+        // the parallel hasher is bitwise the sequential one
+        let jobs: Vec<(PathBuf, u64)> = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors", "LICENSE"]
+            .iter().map(|n| (a.join(n), std::fs::metadata(a.join(n)).unwrap().len())).collect();
+        let par = sha256_files_parallel(&jobs, 3).unwrap();
+        let seq: Vec<String> = jobs.iter().map(|(p, _)| sha256_file(p).unwrap().0).collect();
+        assert_eq!(par, seq);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn peeked_frames_classify() {
+        let mut err = Vec::new();
+        send_msg(&mut err, &Msg::Error { msg: "PACK MANIFEST MISMATCH: x".into() }).unwrap();
+        assert!(matches!(peek_frame(&err), PeekFrame::Error(m) if m.contains("MISMATCH")));
+        assert!(matches!(peek_frame(&err[..err.len() - 1]), PeekFrame::Incomplete));
+        assert!(matches!(peek_frame(&err[..3]), PeekFrame::Incomplete));
+        // the node's legitimate first frame on the served path (its mirror Ready) is not a failure
+        let mut ready = Vec::new();
+        send_json(&mut ready, &crate::tp_serve::ServingMsg::Ready).unwrap();
+        assert!(matches!(peek_frame(&ready), PeekFrame::Other));
+    }
+
+    #[test]
+    fn node_watch_disarm_restores_blocking_reads() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let _peer = TcpStream::connect(addr).unwrap();
+        let (s, _) = l.accept().unwrap();
+        let streams = vec![s];
+        let w = watch_nodes_during_bring_up(&streams).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        w.disarm(&streams);
+        assert_eq!(streams[0].read_timeout().unwrap(), None);
     }
 }

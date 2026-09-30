@@ -16,7 +16,7 @@
 //! Percentiles, never means: the failure mode we are hunting (scheduler/IRQ jitter) is a tail.
 
 use crate::net::{self, TpLink};
-use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, DevicePtr, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 
 pub struct BenchArgs {
@@ -65,7 +65,7 @@ fn report(name: &str, samples: &mut Vec<u64>) {
              pct(samples, 1.0) as f64 / 1000.0);
 }
 
-/// Dump the per-barrier histograms collected during a MODEL run (GB10_TP_TRACE=1), in the same shape
+/// Dump the per-barrier histograms collected during a MODEL run (--tp-trace=1), in the same shape
 /// the microbench reports so the two are directly comparable. The rings hold the last GTS_EPOCHS
 /// barriers, which is what we summarise.
 /// Per-layer-TYPE cost split, from the barrier trace. The barriers tile the forward pass, so the gap
@@ -213,7 +213,7 @@ pub fn run(a: BenchArgs) -> anyhow::Result<()> {
     };
     let mut link = link;
     link.set_payload(a.payload_bytes, false)?;
-    // P3-1: when the transport ctx selected the one-shot push (GB10_TP_ONESHOT, world==4), K2 MUST
+    // P3-1: when the transport ctx selected the one-shot push (--tp-oneshot, world==4), K2 MUST
     // be tp_wait_add_4way (sender-indexed rings) — the v1 tp_wait_add would wait on round-keyed
     // slots the proxy never wrote. The ctx is the single source of truth; read it AFTER connect.
     let k2 = if link.oneshot_on() {
@@ -371,3 +371,272 @@ pub fn run(a: BenchArgs) -> anyhow::Result<()> {
 }
 
 fn mono_ns() -> u64 { net::now_ns() }
+
+// ---------------------------------------------------------------------------------------------
+// TP-F: `--tp-reduce-bench` — the prefill-sized fp32 all-reduce on the REAL transport (no model):
+// times the serial (TP-B..E) and pipelined (TP-F) schedules of crate::tp_xport — the exact code the
+// EXL3 engine launches — and validates EVERY reduce bitwise against the CPU's lower + upper fp32 sum.
+// ---------------------------------------------------------------------------------------------
+
+pub struct ReduceArgs {
+    pub rank: i32,
+    pub peer: String,
+    pub port: u16,
+    pub dev: String,
+    pub gid: i32,
+    /// second rail (TP-F dual rail): RoCE device for rail 1 ("" = single rail)
+    pub dev2: String,
+    pub floats: usize,
+    pub reduces: usize,
+    /// "serial" | "pipe"
+    pub mode: String,
+    pub lookahead: usize,
+    pub blocks: u32,
+    /// decode-sized serial reduces interleaved after every big one (mixed-sequence coverage)
+    pub mix: usize,
+    /// "f32" (in place) | "f16" (f16 partial in, f16 sum out, in place) | "f32to16" (fp32 in, f16 out)
+    pub io: String,
+    pub proxy_core: i32,
+    pub proxy_core2: i32,
+    pub main_core: i32,
+}
+
+fn fill_val(r: i32, i: usize, it: usize) -> f32 {
+    let h = (i as u64).wrapping_mul(2654435761).wrapping_add((it as u64) * 40503 + (r as u64) * 7919) % 2_000_003;
+    let v = (h as f32 - 1_000_001.0) * 1.37e-4;
+    if (i + it) % 97 == 0 { v * 1e-6 } else { v }
+}
+
+pub fn run_reduce(a: ReduceArgs) -> anyhow::Result<()> {
+    println!("=== --tp-reduce-bench rank {} mode {} floats {} ({:.1} MiB) reduces {} lookahead {} blocks {} mix {} rails {} ===",
+             a.rank, a.mode, a.floats, a.floats as f64 * 4.0 / 1048576.0, a.reduces, a.lookahead, a.blocks, a.mix,
+             if a.dev2.is_empty() { 1 } else { 2 });
+    let dev = CudaDevice::new(0)?;
+    let kern = crate::tp_xport::Kernels::load(&dev, "tprb")?;
+    if a.main_core >= 0 && !net::pin_thread(a.main_core) {
+        anyhow::bail!("could not pin the bench thread to core {}", a.main_core);
+    }
+    let mut link = TpLink::connect(a.rank, &a.peer, a.port, &a.dev, a.gid, crate::tp::TP_SLOT_BYTES)?;
+    link.set_payload(2560 * 4, true)?;
+    let ctx = link.ctx_device_ptr();
+    let link = std::mem::ManuallyDrop::new(link);
+    net::spawn_proxy(link.ctx_addr(), a.proxy_core);
+    let mut rails = vec![ctx];
+    let mut link2: Option<std::mem::ManuallyDrop<TpLink>> = None;
+    if !a.dev2.is_empty() {
+        let mut l2 = TpLink::connect(a.rank, &a.peer, a.port + 10, &a.dev2, a.gid, crate::tp::TP_SLOT_BYTES)?;
+        l2.set_payload(2560 * 4, true)?;
+        rails.push(l2.ctx_device_ptr());
+        let l2 = std::mem::ManuallyDrop::new(l2);
+        net::spawn_proxy_aux(l2.ctx_addr(), a.proxy_core2);
+        link2 = Some(l2);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    if a.mode.starts_with("dec") {
+        return run_reduce_dec(&a, &dev, &kern, ctx, &link);
+    }
+    let pipe = crate::tp_xport::Pipe::new(&dev, rails, 2, a.lookahead, a.blocks)?;
+    let stream = crate::gpu::fork_blocking_stream(&dev);   // AGENTS §2.1: blocking compute stream
+    let n = a.floats;
+    let mut buf = dev.alloc_zeros::<f32>(n)?;
+    let dn = 16 * 2560;
+    let mut small = dev.alloc_zeros::<f32>(dn)?;
+    let mut host = vec![0f32; n];
+    let mut hs = vec![0f32; dn];
+    let (mut times, mut bad) = (Vec::with_capacity(a.reduces), 0usize);
+    let blocking = &stream;
+    let mut h16 = dev.alloc_zeros::<u16>(n)?;
+    let mut hh = vec![0u16; n];
+    let f16of = |v: f32| half::f16::from_f32(v);
+    for it in 0..a.reduces {
+        let t0;
+        let got: Vec<f32>;
+        let want = |i: usize| -> f32 {
+            match a.io.as_str() {
+                "f16" | "f16w" => f16of(f16of(fill_val(0, i, it)).to_f32() + f16of(fill_val(1, i, it)).to_f32()).to_f32(),
+                "f32to16" => f16of(fill_val(0, i, it) + fill_val(1, i, it)).to_f32(),
+                _ => fill_val(0, i, it) + fill_val(1, i, it),
+            }
+        };
+        match a.io.as_str() {
+            "f16" | "f16w" => {
+                for (i, v) in hh.iter_mut().enumerate() { *v = f16of(fill_val(a.rank, i, it)).to_bits(); }
+                dev.htod_sync_copy_into(&hh, &mut h16)?;
+                dev.synchronize()?;
+                let p16 = *h16.device_ptr() as u64;
+                t0 = std::time::Instant::now();
+                crate::tp_xport::reduce_pipe(&kern, blocking, &pipe, crate::tp_xport::Io { src: p16, src_f16: true, out: p16, out_f16: true, wire_f16: a.io == "f16w" }, n)?;
+                dev.synchronize()?;
+                times.push(t0.elapsed().as_nanos() as u64);
+                got = dev.dtoh_sync_copy(&h16)?.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
+            }
+            "f32to16" => {
+                for (i, v) in host.iter_mut().enumerate() { *v = fill_val(a.rank, i, it); }
+                dev.htod_sync_copy_into(&host, &mut buf)?;
+                dev.synchronize()?;
+                let (p, p16) = (*buf.device_ptr() as u64, *h16.device_ptr() as u64);
+                t0 = std::time::Instant::now();
+                crate::tp_xport::reduce_pipe(&kern, blocking, &pipe, crate::tp_xport::Io { src: p, src_f16: false, out: p16, out_f16: true, wire_f16: false }, n)?;
+                dev.synchronize()?;
+                times.push(t0.elapsed().as_nanos() as u64);
+                got = dev.dtoh_sync_copy(&h16)?.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
+            }
+            _ => {
+                for (i, v) in host.iter_mut().enumerate() { *v = fill_val(a.rank, i, it); }
+                dev.htod_sync_copy_into(&host, &mut buf)?;
+                dev.synchronize()?;
+                let p = *buf.device_ptr() as u64;
+                t0 = std::time::Instant::now();
+                if a.mode == "pipe" && crate::tp_xport::pipe_ok(n) {
+                    crate::tp_xport::reduce_pipe(&kern, blocking, &pipe, crate::tp_xport::Io::f32_inplace(p), n)?;
+                } else {
+                    crate::tp_xport::reduce_serial(&kern, blocking, ctx, p, n)?;
+                }
+                dev.synchronize()?;
+                times.push(t0.elapsed().as_nanos() as u64);
+                got = dev.dtoh_sync_copy(&buf)?;
+            }
+        }
+        for i in 0..n {
+            let w = want(i);
+            if got[i].to_bits() != w.to_bits() {
+                if bad < 5 { println!("  MISMATCH reduce {it} elem {i}: got {:e} want {:e}", got[i], w); }
+                bad += 1;
+            }
+        }
+        for m in 0..a.mix {
+            let w = 2560 * (1 + (it + m) % 16);
+            for (i, v) in hs[..w].iter_mut().enumerate() { *v = fill_val(a.rank, i, it * 31 + m); }
+            dev.htod_sync_copy_into(&hs, &mut small)?;
+            dev.synchronize()?;
+            crate::tp_xport::reduce_serial(&kern, blocking, ctx, *small.device_ptr() as u64, w)?;
+            dev.synchronize()?;
+            let g = dev.dtoh_sync_copy(&small)?;
+            for i in 0..w {
+                let want = fill_val(0, i, it * 31 + m) + fill_val(1, i, it * 31 + m);
+                if g[i].to_bits() != want.to_bits() { bad += 1; }
+            }
+        }
+        if link.abort_status() != 0 { anyhow::bail!("transport ABORT status {} at reduce {it}", link.abort_status()); }
+        if let Some(l2) = &link2 { if l2.abort_status() != 0 { anyhow::bail!("rail-2 ABORT status {} at reduce {it}", l2.abort_status()); } }
+    }
+    let mut s = times.clone();
+    s.sort_unstable();
+    let p50 = pct(&s, 0.5) as f64 / 1e3;
+    println!("  reduce {:.1} MiB: p10 {:.0} p50 {:.0} p90 {:.0} max {:.0} us  => {:.2} GB/s per direction (p50), {:.1} ms per 96-reduce chunk",
+             n as f64 * 4.0 / 1048576.0, pct(&s, 0.1) as f64 / 1e3, p50, pct(&s, 0.9) as f64 / 1e3, pct(&s, 1.0) as f64 / 1e3,
+             n as f64 * 4.0 / (p50 * 1e3), p50 * 96.0 / 1e3);
+    println!("  tail fires {}  gate binds {}  abort {}  device epoch {} gpu_ready {}",
+             link.tail_fires(), link.gate_waits(), link.abort_status(), link.device_epoch(), link.gpu_ready());
+    if let Some(l2) = &link2 {
+        println!("  rail2: tail fires {}  abort {}  device epoch {} gpu_ready {}", l2.tail_fires(), l2.abort_status(), l2.device_epoch(), l2.gpu_ready());
+    }
+    println!("  VALIDATION: {} mismatching elements over {} reduces (+{} mixed small) => {}", bad, a.reduces, a.reduces * a.mix,
+             if bad == 0 { "BITWISE_OK" } else { "FAIL" });
+    if bad != 0 { anyhow::bail!("reduce bench validation FAILED"); }
+    Ok(())
+}
+
+// TP-G: decode-sized all-reduces, 96 back-to-back per timed batch (one verify's barrier count), each
+// with its own buffers; every result checked bitwise against f16(lower + upper).
+//   mode "decold"  : xq_ks_combine_f32 (KS 1) -> serial K1/K2 (tp_xport::reduce_serial) -> xq_cvt_f32_f16
+//                    (the TP-B..F decode sequence)
+//   mode "decl"    : xq_ks_combine_f32_k1l (K1 folded into the last block) -> xq_tp_wait_add_dec -> f16
+//   mode "declg"   : the same with the GPU-side receive (io bit 3)
+//   "decmix1" old producer + old K1 + new K2; "decmix2" folded K1 + old K2 + cvt; "decmix3" old producer
+//   + multi-block K1m + new K2 (the attribution ladder, TP-G.md §2)
+fn run_reduce_dec(a: &ReduceArgs, dev: &std::sync::Arc<CudaDevice>, kern: &crate::tp_xport::Kernels, ctx: u64,
+                  link: &TpLink) -> anyhow::Result<()> {
+    const NB: usize = 96;
+    let names = ["xq_ks_combine_f32", "xq_ks_combine_f32_k1l", "xq_tp_wait_add_dec", "xq_cvt_f32_f16"];
+    let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/exl3_bench.ptx")?);
+    dev.load_ptx(ptx, "tpgx", &names)?;
+    let f = |n: &str| dev.get_func("tpgx", n).ok_or_else(|| anyhow::anyhow!("{n} missing"));
+    let (kc, kcl, k2d, kcv) = (f(names[0])?, f(names[1])?, f(names[2])?, f(names[3])?);
+    let k1m = f_k1m(dev)?;
+    let stream = crate::gpu::fork_blocking_stream(dev);
+    let n = a.floats;
+    anyhow::ensure!(n % 4 == 0 && n * 4 <= 256 * 1024, "decode bench: floats must be a multiple of 4 and <= 64K");
+    let mut src = dev.alloc_zeros::<f32>(NB * n)?;
+    let part = dev.alloc_zeros::<f32>(NB * n)?;
+    let out = dev.alloc_zeros::<u16>(NB * n)?;
+    let mut arrive = dev.alloc_zeros::<u32>(1)?;
+    dev.memset_zeros(&mut arrive)?;
+    dev.synchronize()?;
+    let arr = *arrive.device_ptr() as u64;
+    let (ps, pp, po) = (*src.device_ptr() as u64, *part.device_ptr() as u64, *out.device_ptr() as u64);
+    let io: i32 = 2 | if a.mode == "declg" { 8 } else { 0 };
+    let g = ((n as u32).div_ceil(256), 1, 1);
+    let mut host = vec![0f32; NB * n];
+    let (mut times, mut bad) = (Vec::new(), 0usize);
+    let reps = a.reduces.max(1);
+    for it in 0..reps {
+        for j in 0..NB { for i in 0..n { host[j * n + i] = fill_val(a.rank, i, it * NB + j); } }
+        dev.htod_sync_copy_into(&host, &mut src)?;
+        dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for j in 0..NB {
+            let (s, p, o) = (ps + (j * n * 4) as u64, pp + (j * n * 4) as u64, po + (j * n * 2) as u64);
+            let c = LaunchConfig { grid_dim: g, block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                if a.mode == "decold" {
+                    kc.clone().launch_on_stream(&stream, c, (s, p, 1i32, n as i32, 1i32))?;
+                    crate::tp_xport::reduce_serial(kern, &stream, ctx, p, n)?;
+                    kcv.clone().launch_on_stream(&stream, c, (o, p, n as i64))?;
+                } else if a.mode == "decmix1" {
+                    // old producer + old single-block K1, new K2 (isolates the K2 side)
+                    kc.clone().launch_on_stream(&stream, c, (s, p, 1i32, n as i32, 1i32))?;
+                    crate::tp_xport::k1_serial(kern, &stream, ctx, p, n)?;
+                    let c2 = LaunchConfig { grid_dim: (a.blocks, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                    k2d.clone().launch_on_stream(&stream, c2, (ctx, o, p, n as i32, io))?;
+                } else if a.mode == "decmix3" {
+                    // old producer + multi-block K1m (a.blocks), new K2
+                    kc.clone().launch_on_stream(&stream, c, (s, p, 1i32, n as i32, 1i32))?;
+                    let c2 = LaunchConfig { grid_dim: (a.blocks, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 };
+                    k1m.clone().launch_on_stream(&stream, c2, (ctx, p, (n * 4) as u32, arr, 0i32))?;
+                    let c3 = LaunchConfig { grid_dim: (a.blocks, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                    k2d.clone().launch_on_stream(&stream, c3, (ctx, o, p, n as i32, io))?;
+                } else if a.mode == "decl" || a.mode == "declg" {
+                    // v2 fold: producer + last-block K1, new K2
+                    kcl.clone().launch_on_stream(&stream, c, (ctx, s, p, 1i32, n as i32, 1i32, arr))?;
+                    let c2 = LaunchConfig { grid_dim: (a.blocks, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                    k2d.clone().launch_on_stream(&stream, c2, (ctx, o, p, n as i32, io))?;
+                } else if a.mode == "decmix2" {
+                    // folded producer+K1 (last block), old single-block K2 + cvt (isolates the K1 side)
+                    kcl.clone().launch_on_stream(&stream, c, (ctx, s, p, 1i32, n as i32, 1i32, arr))?;
+                    crate::tp_xport::k2_serial(kern, &stream, ctx, p, n)?;
+                    kcv.clone().launch_on_stream(&stream, c, (o, p, n as i64))?;
+                } else {
+                    anyhow::bail!("decode bench mode {} unknown (decold | decl | declg | decmix1 | decmix2 | decmix3)", a.mode);
+                }
+            }
+        }
+        dev.synchronize()?;
+        times.push(t0.elapsed().as_nanos() as u64 / NB as u64);
+        let got = dev.dtoh_sync_copy(&out)?;
+        for j in 0..NB {
+            for i in 0..n {
+                let w = half::f16::from_f32(fill_val(0, i, it * NB + j) + fill_val(1, i, it * NB + j)).to_bits();
+                if got[j * n + i] != w {
+                    if bad < 5 { println!("  MISMATCH rep {it} reduce {j} elem {i}: got {:04x} want {:04x}", got[j * n + i], w); }
+                    bad += 1;
+                }
+            }
+        }
+        if link.abort_status() != 0 { anyhow::bail!("transport ABORT status {} at rep {it}", link.abort_status()); }
+    }
+    let mut s = times.clone();
+    s.sort_unstable();
+    println!("  decode reduce {} floats ({:.0} KiB) mode {}: per reduce p10 {:.2} p50 {:.2} p90 {:.2} us  => {:.2} ms per 96-barrier verify (p50)",
+             n, n as f64 * 4.0 / 1024.0, a.mode, pct(&s, 0.1) as f64 / 1e3, pct(&s, 0.5) as f64 / 1e3, pct(&s, 0.9) as f64 / 1e3,
+             pct(&s, 0.5) as f64 * 96.0 / 1e6);
+    println!("  tail fires {}  gpu_rx_skips {}  abort {}  device epoch {} gpu_ready {}", link.tail_fires(),
+             crate::net::traced_gpu_rx_skips(), link.abort_status(), link.device_epoch(), link.gpu_ready());
+    println!("  VALIDATION: {} mismatching elements over {} x {} reduces => {}", bad, reps, NB, if bad == 0 { "BITWISE_OK" } else { "FAIL" });
+    if bad != 0 { anyhow::bail!("decode reduce bench validation FAILED"); }
+    Ok(())
+}
+
+fn f_k1m(dev: &std::sync::Arc<CudaDevice>) -> anyhow::Result<cudarc::driver::CudaFunction> {
+    dev.get_func("tprb", "tp_gate_copy_signal_mb").ok_or_else(|| anyhow::anyhow!("tp_gate_copy_signal_mb missing"))
+}

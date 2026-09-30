@@ -83,7 +83,7 @@ pub struct Dsv4GpuModel {
     /// verify are valid for committed positions; only compressor/indexer state and the
     /// committed ring rows need re-application). Lazily allocated on first verify.
     pub x_cap: Option<Vec<B>>,
-    /// CUDA-graph decode (R3A.1/E2, `GB10_GRAPH=1`): per-fire-variant whole-forward graphs,
+    /// CUDA-graph decode (R3A.1/E2, `--graph=1`): per-fire-variant whole-forward graphs,
     /// lazily captured on the first decode token of each variant. None = eager (default).
     pub graphs: Option<crate::dsv4_graph::DecodeGraphs>,
 }
@@ -476,10 +476,10 @@ impl Dsv4GpuModel {
         assert!(nbytes <= crate::tp::TP_SLOT_BYTES,
             "FATAL: DSV4 TP all-reduce payload {nbytes} B > TP_SLOT_BYTES ({}) B", crate::tp::TP_SLOT_BYTES);
         link.set_payload(nbytes, false).expect("net_set_payload");
-        if std::env::var("GB10_TP_TRACE").is_ok()
+        if crate::opts::var(crate::opt!("tp-trace")).is_ok()
             || crate::tp::tp_config().map(|c| c.trace).unwrap_or(false) {
             crate::net::trace_enable(&mut link);
-            eprintln!("[dsv4-tp] per-barrier tracing ON (GB10_TP_TRACE)");
+            eprintln!("[dsv4-tp] per-barrier tracing ON (--tp-trace)");
         }
         self.tp_rank = rank;
         self.rt.tp_ctx_dptr = link.ctx_device_ptr();
@@ -532,7 +532,7 @@ impl Dsv4GpuModel {
         anyhow::ensure!(chunk % 128 == 0 && chunk > 0, "prefill chunk {chunk} not a multiple of 128 (§12.B.5)");
         let s = ids.len();
         anyhow::ensure!(s > 0, "forward_prefill_chunked: empty prompt");
-        let trace = crate::env_knob("GB10_PREFILL_TRACE", "DSV4_PREFILL_TRACE").is_some();
+        let trace = crate::opts::var(crate::opt!("prefill-trace")).ok().is_some();
         let t0 = if trace { Some(std::time::Instant::now()) } else { None };
         let mut tail: Option<(B, usize)> = None;
         let mut c0 = 0usize;
@@ -565,7 +565,7 @@ impl Dsv4GpuModel {
     /// what makes >4K prompts (200K, 1M) fit chunk-sized prefill scratch.
     pub fn forward(&mut self, ids: &[i32], start_pos: usize) -> Result<S> {
         let s = ids.len();
-        let trace = crate::env_knob("GB10_PREFILL_TRACE", "DSV4_PREFILL_TRACE").is_some();
+        let trace = crate::opts::var(crate::opt!("prefill-trace")).ok().is_some();
         let t0 = if trace { Some(std::time::Instant::now()) } else { None };
         if start_pos == 0 && s > PREFILL_CHUNK {
             let (x_tail, tail_len) = self.forward_prefill_chunked(ids, PREFILL_CHUNK)?;
@@ -577,12 +577,12 @@ impl Dsv4GpuModel {
             }
             return Ok(logits);
         }
-        // CUDA-graph decode (R3A.1/E2, opt-in GB10_GRAPH=1): single-token decode replays a
+        // CUDA-graph decode (R3A.1/E2, opt-in --graph=1): single-token decode replays a
         // per-fire-variant whole-forward graph instead of ~1600 eager launches. Bitwise by
         // construction (same kernels/args; only the launch vehicle changes) — verified by the
         // classifier's baked-value checks at capture + the replay≡eager gate in the tests.
         // Eager fallback: any capture/classify error poisons that variant (loud, once).
-        if s == 1 && start_pos > 0 && crate::dsv4_gpu::env_flag_once("GB10_GRAPH") {
+        if s == 1 && start_pos > 0 && crate::dsv4_gpu::env_flag_once(crate::opt!("graph")) {
             // Classifier disambiguation floor (gather CSA-vs-HCA baked values diverge) and
             // the hierarchical-topk regime limit (>16384 blocks ⇒ kernel sequence changes).
             if start_pos >= 130 && (start_pos + 1) / 4 <= 16384 {
@@ -602,7 +602,7 @@ impl Dsv4GpuModel {
         Ok(logits)
     }
 
-    /// CUDA-graph decode step (the `GB10_GRAPH=1` arm of [`forward`](Self::forward)).
+    /// CUDA-graph decode step (the `--graph=1` arm of [`forward`](Self::forward)).
     /// Lazy per-variant capture: the capture run RECORDS (does not execute), so the token's
     /// output is produced by the replay that immediately follows — state advances exactly
     /// once, identical to an eager step. Capture/classify errors poison the variant

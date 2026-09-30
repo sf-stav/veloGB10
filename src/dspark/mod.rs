@@ -76,7 +76,7 @@ pub const N_PARAMS: u64 = 1_359_284_737;
 pub const REAL_SHA256: &str = "9d26d5e637551c244d543c67c790bd0947f360e005c569e5851a185ffe692786";
 
 /// Default synthetic-artifact output directory — CWD-relative (never a hardcoded box path;
-/// owner rule 2026-08-23), overridable via DSPARK_SYNTH_DIR or the CLI value.
+/// owner rule 2026-08-23), overridable via --dspark-synth-dir or the CLI value.
 pub const DEFAULT_SYNTH_DIR: &str = "dspark-synth-qwen38";
 
 /// The fixed generator seed for the synthetic artifact. Deterministic by construction — no system

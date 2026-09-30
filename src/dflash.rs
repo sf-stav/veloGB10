@@ -669,8 +669,8 @@ impl DflashDrafter {
         let mut k_ctx = pool.get_bf16(nkv * hd * ctx_len);
         let mut v_ctx = pool.get_bf16(nkv * hd * ctx_len);
 
-        // GB10_DFLASH_DEBUG: dump intermediates as f32 for the golden comparison.
-        let dbg = std::env::var("GB10_DFLASH_DEBUG").is_ok();
+        // --dflash-debug: dump intermediates as f32 for the golden comparison.
+        let dbg = crate::opts::var(crate::opt!("dflash-debug")).is_ok();
         let dump = |tag: &str, b: &CudaSlice<bf16>, n: usize| {
             if dbg {
                 let v = self.dev.dtoh_sync_copy(b).unwrap();
@@ -761,11 +761,11 @@ impl DflashDrafter {
             // P14: the TILED kernel (row-tiled, K/V streamed through smem, online softmax) is the
             // default — it reads each KV byte from DRAM ~once per (row-tile, kv-head) instead of
             // 3x per (row, q_head) (see the kernel's header comment: ~14.4 GB -> ~0.46 GB per round
-            // at 7.2 K). `GB10_DFLASH_ATTN_EAGER=1` restores the reference-shaped eager kernel
+            // at 7.2 K). `--dflash-attn-eager=1` restores the reference-shaped eager kernel
             // (first-line repro + the A/B that proves the two agree).
             let dper = hd / 32;                    // dims per lane
             let g_heads = nh / nkv;                // q heads per kv head
-            let tiled = std::env::var("GB10_DFLASH_ATTN_EAGER").is_err()
+            let tiled = crate::opts::var(crate::opt!("dflash-attn-eager")).is_err()
                 && hd % 32 == 0
                 && matches!((dper, g_heads), (1, 1) | (1, 2) | (1, 4)
                             | (2, 1) | (2, 2) | (2, 4) | (2, 8) | (2, 16)

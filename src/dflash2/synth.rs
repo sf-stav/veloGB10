@@ -266,7 +266,7 @@ pub fn generate(dir: &str, seed: u64) -> Result<GenSummary, anyhow::Error> {
 
 /// Convenience: the default generation target (gitignored `tool_probe/`).
 pub fn default_dir() -> String {
-    std::env::var("DFLASH2_SYNTH_DIR")
+    crate::opts::var(crate::opt!("dflash2-synth-dir"))
         .unwrap_or_else(|_| crate::dflash2::DEFAULT_SYNTH_DIR.to_string())
 }
 

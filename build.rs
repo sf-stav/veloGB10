@@ -61,6 +61,14 @@ fn main() {
         ("mxfp4_bench.cu", "mxfp4_bench.ptx", "sm_121a"),
         ("gpu_mxfp4.cu", "gpu_mxfp4.ptx", "sm_121a"),
         ("gpu_mxfp4_moe.cu", "gpu_mxfp4_moe.ptx", "sm_121a"),
+        // PR veloGB10#4: NVFP4 W4A4 prefill kernels. Self-contained module (own helpers,
+        // own kernel_build_id), sm_121a like the other mxf4nvf4 OMMA users.
+        ("gpu_w4a4.cu", "gpu_w4a4.ptx", "sm_121a"),
+        // S-A3-c: EXL3 weight-path GEMM (trellis decode fused into fp16 HMMA).
+        // Probe/bench-only module — loaded lazily by --probe-exl3-kernel / --probe-exl3-binv /
+        // --bench-exl3-gemm (mxfp4_bench precedent); NOT in the serving manifest.
+        // sm_121: fp16 mma.m16n8k16 + dp4a are baseline CC 12.1.
+        ("exl3_bench.cu", "exl3_bench.ptx", "sm_121"),
     ];
 
     for (src_name, _, _) in &kernels {
@@ -93,6 +101,60 @@ fn main() {
         .hash(&mut hasher);
     let build_id = format!("{:016x}", hasher.finish());
     println!("cargo:rustc-env=KERNEL_BUILD_ID={build_id}");
+
+    // ---- TUNE T0 (PLAN/AUTOTUNE_DESIGN.md §7.2): TUNE_BUILD_ID, the autotune table's build stamp ----
+    // Narrower than SOURCE_BUILD_ID (every src/*.rs, so a server.rs edit would needlessly invalidate
+    // a tuned table): a content hash over exactly the files that decide kernel code and decode-graph
+    // composition. FNV-1a 64 over (name, len, bytes) — a stable algorithm, NOT std's DefaultHasher,
+    // so a toolchain upgrade can never alias or silently change it. Missing files hash as absent.
+    {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |b: &[u8]| {
+            for &x in b {
+                h ^= x as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        // T2 (review): + the files that decide which graphs are captured and how (the WP27 capture
+        // DAG, the DHEAD draft tail, the served posture / precapture in exl3_serve, MODULE_FNS and
+        // smem opt-ins in exl3_bench).
+        for f in ["kernels/exl3_bench.cu", "kernels/gpu_batch.cu", "native/tp_doorbell.h",
+                  "src/exl3_forward.rs", "src/exl3_tune.rs", "src/exl3.rs", "src/exl3_wp27.rs",
+                  "src/exl3_forward/dhead.rs", "src/exl3_serve.rs", "src/exl3_bench.rs",
+                  // T0c (p5e): the W4 packages' host sides (dispatch, grids, registry entries)
+                  "src/exl3_forward/dense.rs", "src/exl3_forward/w4s.rs"] {
+            println!("cargo:rerun-if-changed={f}");
+            let bytes = std::fs::read(f).unwrap_or_default();
+            feed(f.as_bytes());
+            feed(&(bytes.len() as u64).to_le_bytes());
+            feed(&bytes);
+        }
+        println!("cargo:rustc-env=TUNE_BUILD_ID={h:016x}");
+        // Provenance only (receipts / table provenance.commit): the HEAD commit and dirty flag AS OF
+        // THIS build-script run (cargo reruns it on any tracked source change, not on a bare commit).
+        let git = |a: &[&str]| Command::new("git").args(a).output().ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        // T2 (review): rerun on a bare commit / checkout too, so the stamp never cites a stale commit
+        // (only paths that exist: a missing rerun-if-changed path would rerun on every build).
+        let mut watch: Vec<String> = Vec::new();
+        if let Some(p) = git(&["rev-parse", "--git-path", "HEAD"]) { watch.push(p); }
+        if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
+            if let Some(p) = git(&["rev-parse", "--git-path", &r]) { watch.push(p); }
+        }
+        if let Some(p) = git(&["rev-parse", "--git-path", "packed-refs"]) { watch.push(p); }
+        for p in watch {
+            if std::path::Path::new(&p).exists() { println!("cargo:rerun-if-changed={p}"); }
+        }
+        let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+        let dirty = match git(&["status", "--porcelain", "--untracked-files=no"]) {
+            Some(s) if s.is_empty() => "0",
+            Some(_) => "1",
+            None => "unknown",
+        };
+        println!("cargo:rustc-env=TUNE_GIT_COMMIT={commit}");
+        println!("cargo:rustc-env=TUNE_GIT_DIRTY={dirty}");
+    }
 
     // Rust-side sources change wire/compute behavior (weight sharders, the cluster protocol, the
     // scheduler) WITHOUT touching the kernels — so the KERNEL_BUILD_ID handshake can't see them.

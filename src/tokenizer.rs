@@ -29,6 +29,27 @@ pub struct QwenTokenizer {
     /// reference renders verbatim inside `<function=…>` (RENDER_AUDIT.md 2.2). Templates without
     /// the branch still need the parsed-object form (they iterate `arguments | items`).
     pub raw_tool_args_history: bool,
+    /// WP01: vocab-derived tables built ONCE at load (think markers, eos, vocab size, the stream
+    /// decoder's id->bytes/special tables). `None` only under `--wp01-off=1`, which restores the
+    /// legacy per-call rebuilds (a 248K-entry `get_vocab(true)` HashMap per call + a 12.8 MB
+    /// tokenizer.json re-parse per stream) for A/B and bisect.
+    cache: Option<TokCache>,
+}
+
+/// WP01 load-time cache. Every field is the value the legacy per-call expression computes; the
+/// tokenizer is immutable after `from_file`, so computing it once is exact.
+struct TokCache {
+    /// `get_vocab(true).contains_key("</think:opensource>")` (hy_v3 markers).
+    think_hy: bool,
+    /// `get_vocab(true).get("<|endoftext|>")`, 151643 fallback.
+    eos_id: u32,
+    /// `get_vocab_size(true)` (= `get_vocab(true).len()` in tokenizers 0.19).
+    vocab_size: usize,
+    stream: std::sync::Arc<StreamTables>,
+}
+
+fn wp01_env(o: crate::opts::OptId) -> bool {
+    crate::opts::var(o).map_or(false, |v| !v.is_empty() && v != "0")
 }
 
 /// The server-wide `--thinking` policy (W1, Phase 13): may the ENGINE override the model
@@ -107,10 +128,53 @@ impl QwenTokenizer {
             None => (None, None, false),
         };
         let model_dir = Path::new(path).parent().map(|p| p.to_path_buf());
-        Ok(Self {
+        let cache = if wp01_env(crate::opt!("wp01-off")) {
+            eprintln!("[tokenizer] --wp01-off=1: legacy per-request vocab/special-table rebuilds");
+            None
+        } else {
+            Some(TokCache::build(&tokenizer, &stream_json_path(model_dir.as_deref())))
+        };
+        let me = Self {
             tokenizer, chat_env, model_dir, tool_call_format: None, auto_disable_think_tools: false,
-            template_meta, raw_tool_args_history,
-        })
+            template_meta, raw_tool_args_history, cache,
+        };
+        if me.cache.is_some() && wp01_env(crate::opt!("wp01-xcheck")) { me.wp01_xcheck(); }
+        Ok(me)
+    }
+
+    /// --wp01-xcheck=1 (diagnostic): exhaustive load-time diff of every cached table against
+    /// the legacy per-call expressions — think/eos/vocab_size, and for EVERY id (plus a margin past
+    /// the table) the special flag and the piece bytes the legacy decoder would append. Prints
+    /// `[wp01-xcheck] ... mismatches=0` on success, the first mismatches otherwise. Per-request
+    /// decoders additionally shadow-run the legacy decoder and compare every emitted string.
+    fn wp01_xcheck(&self) {
+        let Some(c) = &self.cache else { return };
+        let t0 = std::time::Instant::now();
+        let vocab = self.tokenizer.get_vocab(true);
+        let legacy_think = vocab.contains_key("</think:opensource>");
+        let legacy_eos = vocab.get("<|endoftext|>").copied().unwrap_or(151643) as u32;
+        let legacy_vsz = self.tokenizer.get_vocab_size(true);
+        let mut bad = 0usize;
+        if legacy_think != c.think_hy || legacy_eos != c.eos_id || legacy_vsz != c.vocab_size {
+            bad += 1;
+            eprintln!("[wp01-xcheck] MISMATCH scalars: think {}/{} eos {}/{} vocab_size {}/{} (new/old)",
+                      c.think_hy, legacy_think, c.eos_id, legacy_eos, c.vocab_size, legacy_vsz);
+        }
+        let legacy = LegacyStreamDecoder::new(&self.tokenizer, &stream_json_path(self.model_dir.as_deref()));
+        let n = c.stream.kind.len() as u32;
+        for id in 0..n.saturating_add(64) {
+            let old: Option<Vec<u8>> = if legacy.specials.contains(&id) { None }
+                else { legacy.vocab.get(&id).map(|p| piece_bytes(p, &legacy.inv)) };
+            let new: Option<&[u8]> = c.stream.piece(id);
+            if old.as_deref() != new {
+                bad += 1;
+                if bad <= 8 {
+                    eprintln!("[wp01-xcheck] MISMATCH id={id}: new={new:?} old={old:?}");
+                }
+            }
+        }
+        eprintln!("[wp01-xcheck] load tables: ids={} specials={} dup_ids={} mismatches={bad} ({:.1} ms)",
+                  n, legacy.specials.len(), c.stream.dup_ids, t0.elapsed().as_secs_f64() * 1e3);
     }
 
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
@@ -129,19 +193,28 @@ impl QwenTokenizer {
     /// models). See `StreamByteDecoder` — the per-token `decode(&[t])` path it replaces
     /// mangles every multi-byte char split across tokens (all emoji) into "�".
     pub fn stream_decoder(&self) -> StreamByteDecoder {
-        let path = self.model_dir.as_deref()
-            .map(|d| d.join("tokenizer.json").to_string_lossy().into_owned())
-            .unwrap_or_default();
-        StreamByteDecoder::new(&self.tokenizer, &path)
+        let path = stream_json_path(self.model_dir.as_deref());
+        // WP01: the id->bytes/special tables were built once at load; a request only allocates
+        // its ≤3-byte pending buffer. --wp01-off=1 = the legacy per-request rebuild.
+        match &self.cache {
+            Some(c) => {
+                let shadow = wp01_env(crate::opt!("wp01-xcheck"))
+                    .then(|| Box::new(LegacyStreamDecoder::new(&self.tokenizer, &path)));
+                StreamByteDecoder::from_tables(std::sync::Arc::clone(&c.stream), shadow)
+            }
+            None => StreamByteDecoder::new(&self.tokenizer, &path),
+        }
     }
 
     pub fn eos_token_id(&self) -> u32 {
+        if let Some(c) = &self.cache { return c.eos_id; }
         self.tokenizer.get_vocab(true).get("<|endoftext|>").copied().unwrap_or(151643) as u32
     }
 
     /// Vocab size INCLUDING added tokens — the exclusive upper bound of a valid token id.
     /// Used by the /v1/tokenize endpoint to reject id-list prompts that carry garbage ids.
     pub fn vocab_size(&self) -> usize {
+        if let Some(c) = &self.cache { return c.vocab_size; }
         self.tokenizer.get_vocab_size(true)
     }
 
@@ -151,7 +224,12 @@ impl QwenTokenizer {
     /// prompt (the empty block is already closed), so generation starts as CONTENT; its markers are
     /// the `:opensource`-suffixed forms. Resolved from the vocab, never hardcoded per family.
     pub fn think_tags(&self) -> (&'static str, &'static str, bool) {
-        if self.tokenizer.get_vocab(true).contains_key("</think:opensource>") {
+        // WP01: resolved once at load (was a 248K-entry HashMap build per call, 3x per request).
+        let hy = match &self.cache {
+            Some(c) => c.think_hy,
+            None => self.tokenizer.get_vocab(true).contains_key("</think:opensource>"),
+        };
+        if hy {
             ("<think:opensource>", "</think:opensource>", false)
         } else {
             ("<think>", "</think>", true)
@@ -954,6 +1032,82 @@ mod tests {
         assert!(err.is_err(), "a request must not be able to clobber the engine's `messages` key");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// WP01 gate: the load-time tables are byte-identical to the legacy per-request rebuilds.
+    ///   (a) cached think/eos/vocab_size == the legacy per-call expressions;
+    ///   (b) EVERY id (plus 64 past the table), each from a fresh state: push + finish identical;
+    ///   (c) 10K random id sequences (byte-alphabet ids to split/garble UTF-8, uniform ids,
+    ///       specials, out-of-range ids), every push and the final finish identical;
+    ///   (d) emoji / CJK / mixed-script texts stream-decode identically AND round-trip.
+    /// Skips when no model tokenizer is present (GB10_TEST_TOKENIZER overrides the fixture).
+    #[test]
+    fn wp01_stream_tables_match_legacy() {
+        let Some((tok, path)) = fixture_tokenizer() else {
+            eprintln!("skip: no model tokenizer fixture"); return;
+        };
+        let c = tok.cache.as_ref().expect("WP01 cache must be built at load");
+        // (a)
+        let vocab = tok.tokenizer.get_vocab(true);
+        assert_eq!(c.think_hy, vocab.contains_key("</think:opensource>"));
+        assert_eq!(c.eos_id, vocab.get("<|endoftext|>").copied().unwrap_or(151643) as u32);
+        assert_eq!(c.vocab_size, tok.tokenizer.get_vocab_size(true));
+        assert_eq!(c.stream.dup_ids, 0,
+                   "{path}: ids with two vocab strings make the LEGACY inversion random; not comparable");
+        let json = stream_json_path(tok.model_dir.as_deref());
+        let tables = std::sync::Arc::clone(&c.stream);
+        let mut new = StreamByteDecoder::from_tables(std::sync::Arc::clone(&tables), None);
+        let mut old = LegacyStreamDecoder::new(&tok.tokenizer, &json);
+        assert!(!old.specials.is_empty(), "{json}: special set should not be empty");
+        // (b)
+        let n = tables.kind.len() as u32;
+        let (mut n_piece, mut n_special) = (0usize, 0usize);
+        for id in 0..n + 64 {
+            match tables.kind.get(id as usize).copied() {
+                Some(K_PIECE) => n_piece += 1,
+                Some(K_SPECIAL) => n_special += 1,
+                _ => {}
+            }
+            assert_eq!(new.push(id), old.push(id), "push id={id}");
+            assert_eq!(new.finish(), old.finish(), "finish after id={id}");
+        }
+        assert!(n_piece > 1000 && n_special > 0, "table looks empty: piece={n_piece} special={n_special}");
+        // (c)
+        let specials: Vec<u32> = (0..n).filter(|&i| tables.kind[i as usize] == K_SPECIAL).collect();
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let mut pushes = 0usize;
+        for seq in 0..10_000 {
+            let len = 1 + (rnd() % 48) as usize;
+            for k in 0..len {
+                let r = rnd();
+                let id = match r % 10 {
+                    0..=3 => (r >> 8) as u32 % 256,
+                    4..=7 => (r >> 8) as u32 % n,
+                    8 => specials[(r >> 8) as usize % specials.len()],
+                    _ => n.saturating_sub(8) + (r >> 8) as u32 % 72,
+                };
+                assert_eq!(new.push(id), old.push(id), "seq {seq} pos {k} id={id}");
+                pushes += 1;
+            }
+            assert_eq!(new.finish(), old.finish(), "finish seq {seq}");
+        }
+        // (d)
+        for text in ["Hello \u{1F600} world! \u{1F680}\u{1F4A5}",
+                     "你好，世界！这是一个中文测试。日本語のテキストも。한국어 문장.",
+                     "e\u{301}\u{302} \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} flags \u{1F1EC}\u{1F1E7} \u{10348}",
+                     "mixed: ascii + Ελληνικά + русский + العربية + हिन्दी + ∑∫√ + 𝔘𝔫𝔦𝔠𝔬𝔡𝔢"] {
+            let ids = tok.encode(text, false).expect("encode");
+            let (mut a, mut b) = (String::new(), String::new());
+            for &id in &ids { a.push_str(&new.push(id)); b.push_str(&old.push(id)); pushes += 1; }
+            a.push_str(&new.finish()); b.push_str(&old.finish());
+            assert_eq!(a, b, "emoji/CJK stream differs: {text:?}");
+            // Round-trip vs the whole-list decode (the tokenizer's normalizer NFC-composes
+            // e+U+0301 at encode, so the reference is decode(encode(text)), not `text`).
+            assert_eq!(a, tok.decode(&ids, false).expect("decode"), "stream decode must round-trip");
+            assert!(!a.contains('\u{FFFD}'), "no replacement chars: {a:?}");
+        }
+        eprintln!("wp01: {path}: ids={n} piece={n_piece} special={n_special} random+text pushes={pushes} — identical");
+    }
 }
 
 /// Load a tokenizer.json, transparently upgrading the pair-array merges form (`[["a","b"], ...]`)
@@ -1255,20 +1409,207 @@ fn special_ids(tokenizer_path: &str) -> std::collections::HashSet<u32> {
     set
 }
 
+/// The tokenizer.json the stream decoder reads its special set from: `<model_dir>/tokenizer.json`
+/// (the legacy `stream_decoder()` expression, unchanged).
+fn stream_json_path(model_dir: Option<&Path>) -> String {
+    model_dir.map(|d| d.join("tokenizer.json").to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+impl TokCache {
+    /// Everything the request path used to rebuild per call, computed once from ONE
+    /// `get_vocab(true)` build + ONE tokenizer.json parse (the same `special_ids` function).
+    fn build(tokenizer: &Tokenizer, json_path: &str) -> Self {
+        let t0 = std::time::Instant::now();
+        let vocab = tokenizer.get_vocab(true);
+        let think_hy = vocab.contains_key("</think:opensource>");
+        let eos_id = vocab.get("<|endoftext|>").copied().unwrap_or(151643) as u32;
+        // The crate's own call (not vocab.len()), so the cached value is the legacy value by
+        // construction whatever the crate version computes it as.
+        let vocab_size = tokenizer.get_vocab_size(true);
+        let stream = StreamTables::build(tokenizer, &vocab, &special_ids(json_path));
+        eprintln!("[tokenizer] WP01 tables cached at load: vocab={} ids={} specials={} dup_ids={} \
+                   think_hy={} eos={} ({:.1} ms)",
+                  vocab.len(), stream.kind.len(), stream.n_special, stream.dup_ids, think_hy, eos_id,
+                  t0.elapsed().as_secs_f64() * 1e3);
+        Self { think_hy, eos_id, vocab_size, stream: std::sync::Arc::new(stream) }
+    }
+}
+
+/// WP01: the stream decoder's per-id tables, built once at load and shared (`Arc`) by every
+/// request's `StreamByteDecoder`. Id `i` is:
+///   - `K_SPECIAL`: in the tokenizer.json `added_tokens` special set -> push returns "" (legacy
+///     checked `specials` first, before the vocab lookup — same order here);
+///   - `K_PIECE`:  its raw bytes are `bytes[off[i]..off[i+1]]` = `piece_bytes(piece, inv)`, the
+///     exact function the legacy decoder applied per push;
+///   - `K_NONE`:   not in the vocab -> push returns "" without touching `pending` (legacy
+///     `vocab.get(&id) == None`). Ids past the table behave the same.
+/// The id->piece map is the inversion of `get_vocab(true)` (string->id), as the legacy decoder
+/// built it. If two strings share an id (`dup_ids > 0`) the legacy HashMap inversion kept
+/// whichever it iterated last — per-process random; here the tie resolves deterministically to
+/// the crate's `id_to_token` (what `decode()` uses). The served Qwen vocab has dup_ids = 0.
+struct StreamTables {
+    bytes: Vec<u8>,
+    off: Vec<u32>,
+    kind: Vec<u8>,
+    n_special: usize,
+    dup_ids: usize,
+}
+
+const K_NONE: u8 = 0;
+const K_PIECE: u8 = 1;
+const K_SPECIAL: u8 = 2;
+
+impl StreamTables {
+    fn build(tokenizer: &Tokenizer, vocab: &std::collections::HashMap<String, u32>,
+             specials: &std::collections::HashSet<u32>) -> Self {
+        let inv = bytes_to_unicode_inverse();
+        let n = vocab.values().max().map_or(0, |&m| m as usize + 1);
+        let mut by_id: Vec<Option<&str>> = vec![None; n];
+        let mut dup_ids = 0usize;
+        for (s, &id) in vocab {
+            let slot = &mut by_id[id as usize];
+            if slot.is_some() {
+                dup_ids += 1;
+                if tokenizer.id_to_token(id).as_deref() != Some(s.as_str()) { continue; }
+            }
+            *slot = Some(s.as_str());
+        }
+        let mut bytes: Vec<u8> = Vec::with_capacity(n * 8);
+        let mut off: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut kind: Vec<u8> = Vec::with_capacity(n);
+        let mut n_special = 0usize;
+        off.push(0);
+        for (id, piece) in by_id.iter().enumerate() {
+            if specials.contains(&(id as u32)) {
+                kind.push(K_SPECIAL);
+                n_special += 1;
+            } else if let Some(p) = piece {
+                kind.push(K_PIECE);
+                bytes.extend(piece_bytes(p, &inv));
+            } else {
+                kind.push(K_NONE);
+            }
+            off.push(bytes.len() as u32);
+        }
+        Self { bytes, off, kind, n_special, dup_ids }
+    }
+
+    /// The raw bytes a push of `id` appends, or `None` when the push is a no-op returning ""
+    /// (special, or not in the vocab).
+    #[inline]
+    fn piece(&self, id: u32) -> Option<&[u8]> {
+        let i = id as usize;
+        if self.kind.get(i).copied() != Some(K_PIECE) { return None; }
+        Some(&self.bytes[self.off[i] as usize..self.off[i + 1] as usize])
+    }
+}
+
 /// Incremental byte-level stream decoder: reassembles multi-byte UTF-8 chars split across
 /// tokens by accumulating RAW bytes and emitting only complete UTF-8 sequences, holding back
 /// the ≤3-byte tail. Replaces the lossy per-token `decode(&[t], true)` in the SSE streaming
 /// path (server.rs) — without it, "That's wonderful to hear! 😀" arrives as "�" per byte.
 /// Applies to ALL qwen byte-level BPE models via the shared server path.
+///
+/// WP01: backed by the load-time `StreamTables` (a request allocates only `pending`); the
+/// legacy per-request-rebuild decoder stays reachable (`--wp01-off=1`) and, under
+/// `--wp01-xcheck=1`, runs in lock-step as a shadow with every push/finish compared.
 pub struct StreamByteDecoder {
+    imp: StreamImpl,
+    shadow: Option<Box<LegacyStreamDecoder>>,
+    pushes: u64,
+    xmis: u64,
+}
+
+enum StreamImpl {
+    Cached { tables: std::sync::Arc<StreamTables>, pending: Vec<u8> },
+    Legacy(LegacyStreamDecoder),
+}
+
+impl StreamByteDecoder {
+    /// The legacy constructor: rebuilds the id->piece map and re-parses tokenizer.json.
+    pub fn new(tokenizer: &Tokenizer, tokenizer_path: &str) -> Self {
+        Self { imp: StreamImpl::Legacy(LegacyStreamDecoder::new(tokenizer, tokenizer_path)),
+               shadow: None, pushes: 0, xmis: 0 }
+    }
+
+    fn from_tables(tables: std::sync::Arc<StreamTables>, shadow: Option<Box<LegacyStreamDecoder>>) -> Self {
+        Self { imp: StreamImpl::Cached { tables, pending: Vec::with_capacity(16) },
+               shadow, pushes: 0, xmis: 0 }
+    }
+
+    /// Feed one generated token id; returns the decodable text (an incomplete trailing
+    /// UTF-8 char is held back for the next token). Special tokens are skipped, matching
+    /// `decode(ids, true)`.
+    pub fn push(&mut self, id: u32) -> String {
+        let out = match &mut self.imp {
+            StreamImpl::Legacy(d) => d.push(id),
+            StreamImpl::Cached { tables, pending } => {
+                let Some(piece) = tables.piece(id) else { return self.shadow_check(id, String::new()) };
+                pending.extend_from_slice(piece);
+                // Emit the longest complete UTF-8 prefix; keep the trailing ≤3 bytes that could
+                // be a truncated char. (Verbatim the legacy loop.)
+                let mut out = String::new();
+                for cut in 0..=3.min(pending.len()) {
+                    let end = pending.len() - cut;
+                    if let Ok(s) = std::str::from_utf8(&pending[..end]) {
+                        out = s.to_string();
+                        pending.drain(..end);
+                        break;
+                    }
+                }
+                out
+            }
+        };
+        self.shadow_check(id, out)
+    }
+
+    #[inline]
+    fn shadow_check(&mut self, id: u32, out: String) -> String {
+        if let Some(sh) = self.shadow.as_mut() {
+            self.pushes += 1;
+            let old = sh.push(id);
+            if old != out {
+                self.xmis += 1;
+                if self.xmis <= 8 {
+                    eprintln!("[wp01-xcheck] MISMATCH push#{} id={id}: new={out:?} old={old:?}", self.pushes);
+                }
+            }
+        }
+        out
+    }
+
+    /// Flush the held-back tail at stream end; invalid bytes become U+FFFD (the crate's
+    /// lossy semantics for a genuinely truncated sequence).
+    pub fn finish(&mut self) -> String {
+        let out = match &mut self.imp {
+            StreamImpl::Legacy(d) => d.finish(),
+            StreamImpl::Cached { pending, .. } => {
+                let out = String::from_utf8_lossy(pending).to_string();
+                pending.clear();
+                out
+            }
+        };
+        if let Some(sh) = self.shadow.as_mut() {
+            let old = sh.finish();
+            if old != out { self.xmis += 1; }
+            eprintln!("[wp01-xcheck] stream decoder: pushes={} mismatches={}{}", self.pushes, self.xmis,
+                      if old != out { format!(" (finish: new={out:?} old={old:?})") } else { String::new() });
+        }
+        out
+    }
+}
+
+/// The pre-WP01 decoder, kept verbatim: per-request `get_vocab(true)` inversion + tokenizer.json
+/// re-parse. Active under `--wp01-off=1`; the shadow reference under `--wp01-xcheck=1`.
+struct LegacyStreamDecoder {
     inv: std::collections::HashMap<char, u8>,
     vocab: std::collections::HashMap<u32, String>,
     specials: std::collections::HashSet<u32>,
     pending: Vec<u8>,
 }
 
-impl StreamByteDecoder {
-    pub fn new(tokenizer: &Tokenizer, tokenizer_path: &str) -> Self {
+impl LegacyStreamDecoder {
+    fn new(tokenizer: &Tokenizer, tokenizer_path: &str) -> Self {
         let vocab = tokenizer.get_vocab(true).into_iter()
             .map(|(s, id)| (id as u32, s)).collect();
         Self {

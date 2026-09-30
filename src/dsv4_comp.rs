@@ -450,7 +450,7 @@ impl GpuCompressor {
             // unmodified; the in-place sim then runs the IDENTICAL body on the IDENTICAL
             // inputs ⇒ dequant(packed) == the bf16 cache rows, bitwise — the R5a-1 gate
             // asserts exactly that).
-            if crate::dsv4_gpu::env_flag_once("GB10_PACKED_CACHE") {
+            if crate::dsv4_gpu::env_flag_once(crate::opt!("packed-cache")) {
                 if let (Some(pc), Some(ps)) = (&self.packed_codes, &self.packed_scales) {
                 let codes_dst = crate::dsv4_gpu::DevPtr {
                     dptr: *pc.device_ptr() + (cache_row0 * (d / 2)) as u64,
@@ -475,7 +475,7 @@ impl GpuCompressor {
             // R5b: FP8-packed cache rows FIRST (codes variant, const input — the in-place
             // sim then runs the identical body on identical inputs; dequant == bf16 rows'
             // nope span bitwise, the R5b-1 gate).
-            if crate::dsv4_gpu::env_flag_once("GB10_PACKED_CACHE") {
+            if crate::dsv4_gpu::env_flag_once(crate::opt!("packed-cache")) {
                 if let (Some(pc), Some(ps)) = (&self.packed_codes, &self.packed_scales) {
                 let nope_u = d - spec.rope_dim;
                 let codes_dst = crate::dsv4_gpu::DevPtr {
@@ -1174,10 +1174,10 @@ impl GpuIndexer {
         // grid.y > 1 parallelizes the block axis — the single-CTA scorer dominated 1M
         // decode at ~33 ms/250K blocks; tiling across CTAs fills the GPU's SMs.
         let score_grid_y = ((nblocks + 1023) / 1024).max(1) as u32;
-        // R5a-2 (env-hatched, GB10_PACKED_CACHE=1): read the FP4-packed cache (¼ bytes, same
+        // R5a-2 (env-hatched, --packed-cache=1): read the FP4-packed cache (¼ bytes, same
         // values bit-for-bit — the dsv4_comp_index_score_fp4_b chains are unchanged).
         // Requires the packed buffers to exist (rotate compressor) — else the bf16 reader.
-        let use_fp4 = crate::dsv4_gpu::env_flag_once("GB10_PACKED_CACHE")
+        let use_fp4 = crate::dsv4_gpu::env_flag_once(crate::opt!("packed-cache"))
             && self.comp.packed_codes.is_some() && self.comp.packed_scales.is_some();
         if use_fp4 {
             let pc = self.comp.packed_codes.as_ref().unwrap();

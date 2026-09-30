@@ -280,15 +280,15 @@ pub fn iota_positions<I: Dsv4Buf<i32>>(
     Ok(out)
 }
 
-/// One-time env flag check (cached): true iff `name` is set to a non-empty, non-"0" value.
-/// Used for debug/A-B arms (e.g. GB10_VERIFY_SEQ forces the sequential verify path).
-pub fn env_flag_once(name: &'static str) -> bool {
+/// One-time option check (cached): true iff the option is set to a non-empty, non-"0" value.
+/// Used for debug/A-B arms (e.g. --verify-seq forces the sequential verify path).
+pub fn env_flag_once(o: crate::opts::OptId) -> bool {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, bool>>> = OnceLock::new();
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<crate::opts::OptId, bool>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut cache = cache.lock().unwrap();
-    *cache.entry(name).or_insert_with(|| {
-        std::env::var(name).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+    *cache.entry(o).or_insert_with(|| {
+        crate::opts::var(o).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
     })
 }
 

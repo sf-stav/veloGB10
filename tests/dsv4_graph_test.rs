@@ -1,6 +1,6 @@
 //! CUDA-graph decode gate (R3A.1/E2): the graphed decode step must reproduce the EAGER
 //! decode step BITWISE — same kernels, same args, same state machine; only the launch
-//! vehicle changes. Drives both paths component-level (GB10_GRAPH=1 set for BOTH so the
+//! vehicle changes. Drives both paths component-level (--graph set for BOTH so the
 //! SEQ-arm capacity allocs are identical — the capacity arm is size-only, value-neutral):
 //!   eager   = forward_streams + forward_head per token (the raw eager path);
 //!   graphed = Dsv4GpuModel::forward_decode_graphed per token (lazy V0/V4/V128 captures).
@@ -31,8 +31,8 @@ fn argmax(x: &[f32]) -> usize {
 fn graph_decode_matches_eager_bitwise() {
     let _g = gate();
     // BOTH arms see the flag: the SEQ-arm idxs capacity allocs must match (size-only).
-    // SAFETY: single test thread in this binary touches the env before any GPU work.
-    unsafe { std::env::set_var("GB10_GRAPH", "1") };
+    // CLI-1: the options registry (no env); set before any GPU work.
+    gb10_inference::opts::test_set(gb10_inference::opt!("graph"), Some("1"));
     let bundle = Path::new(BUNDLE);
     let cfg = dsv4_load::load_config(bundle).unwrap();
     let dev = Arc::new(CudaDevice::new(0).unwrap());

@@ -33,7 +33,7 @@ pub fn rb_clone(x: &[f32]) -> Vec<f32> {
 /// CPU courtesy: the mirror's parallelism cap (default 8 of 20 cores; env-overridable,
 /// diagnostics-only knob — the mirror is probe-only code).
 pub fn mirror_threads() -> usize {
-    std::env::var("GB10_DF2_MIRROR_THREADS").ok()
+    crate::opts::var(crate::opt!("df2-mirror-threads")).ok()
         .and_then(|v| v.parse::<usize>().ok()).filter(|&n| (1..=16).contains(&n)).unwrap_or(8)
 }
 

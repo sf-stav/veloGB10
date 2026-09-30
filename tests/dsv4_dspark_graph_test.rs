@@ -1,4 +1,4 @@
-//! DSpark drafter-graph gate (Tier 1.1a, GB10_DSPARK_GRAPH=1): the graphed draft must
+//! DSpark drafter-graph gate (Tier 1.1a, --dspark-graph): the graphed draft must
 //! reproduce the EAGER draft BITWISE — same kernels, same args, same state machine; only
 //! the launch vehicle changes. One `Dsv4DSpark` instance runs BOTH arms interleaved at the
 //! same start_pos: the draft's only state mutation is the main_kv ring write at slot
@@ -37,8 +37,8 @@ fn synth_mh(rows: usize, three_d: usize, seed: u64) -> Vec<bf16> {
 #[test]
 fn dspark_graph_matches_eager_bitwise() {
     let _g = gate();
-    // SAFETY: single test thread in this binary touches the env before any GPU work.
-    unsafe { std::env::set_var("GB10_DSPARK_GRAPH", "1") };
+    // CLI-1: the options registry (no env); set before any GPU work.
+    gb10_inference::opts::test_set(gb10_inference::opt!("dspark-graph"), Some("1"));
     let bundle = Path::new(BUNDLE);
     let cfg = dsv4_load::load_config(bundle).unwrap();
     let dev = Arc::new(CudaDevice::new(0).unwrap());

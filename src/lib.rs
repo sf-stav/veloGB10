@@ -1,3 +1,5 @@
+/// CLI-1: the options registry (every engine option is a command-line flag; AGENTS §7).
+pub mod opts;
 pub mod memory;
 pub mod model;
 pub mod qwen;
@@ -8,6 +10,15 @@ pub mod vision_gpu;
 pub mod gpu;
 pub mod quant;
 pub mod mxfp4;
+pub mod exl3;
+pub mod exl3_bench;
+pub mod exl3_forward;
+// TUNE (PLAN/AUTOTUNE_DESIGN.md): tunable registry + frozen table (re-exported as exl3_forward::tune)
+pub mod exl3_tune;
+pub mod exl3_serve;
+pub mod exl3_wp27;
+pub mod loop_detect;
+pub mod wp24; // WP24: real-q speculative sampling (host replicas, dump, cross-check, gate)
 pub mod batch;
 pub mod tel;
 pub mod dispatch_assert;
@@ -20,11 +31,14 @@ pub mod tokenizer;
 pub mod server;
 pub mod otel;
 pub mod net;
+// HOST / RO-7: big-core detection + pinning of the serving engine's critical host threads.
+pub mod cpu_affinity;
 pub mod pp;
 pub mod cluster;
 pub mod tp;
 pub mod tp_serve;
 pub mod tp_bench;
+pub mod tp_xport;
 pub mod dsv4_load;
 pub mod dsv4_cpu;
 pub mod dsv4_moe;
@@ -40,6 +54,11 @@ pub mod dflash;
 pub mod dspark;
 pub mod dflash2;
 pub mod json_schema;
+// PR veloGB10#4 (qwen4_exp): new modules. gptq is DEFERRED — it needs the
+// gpu.rs GptqTap/GptqHess/IGS surface that only exists after the gpu.rs merge.
+pub mod ple;
+pub mod memwatch;
+pub mod w4a4;
 
 use serde::Serialize;
 
@@ -84,30 +103,8 @@ pub fn make_timings(
     }
 }
 
-/// The drafter-artifact directory as an ENV KNOB (diagnostics/harness plumbing; the user-facing
-/// surface is the CLI flag `--draft-dir`, resolved in `resolve_draft_dir`). Generic name
-/// `GB10_DRAFT_DIR`; P14's first spelling `GB10_DFLASH_DIR` survives as a deprecated alias that
-/// warns once (AGENTS §7).
+/// The drafter-artifact directory the binary resolved (`--draft-dir`, written into the internal
+/// [draft-dir] option by the paths that need it after `resolve_draft_dir`; CLI-1: no env alias).
 pub fn draft_dir_env() -> Option<String> {
-    env_knob("GB10_DRAFT_DIR", "GB10_DFLASH_DIR")
-}
-
-/// Resolve a generic (family-agnostic) env knob, honoring a deprecated family-prefixed alias.
-/// AGENTS.md §7: one generic name per knob (`GB10_*` / `RUST_INFER_*`), honored by all families;
-/// family-prefixed names (`DSV4_*`) survive only as documented back-compat aliases. The generic
-/// name wins when both are set; a set alias logs a one-time-per-process deprecation warning.
-pub fn env_knob(generic: &'static str, deprecated_alias: &'static str) -> Option<String> {
-    if let Ok(v) = std::env::var(generic) {
-        return Some(v);
-    }
-    if let Ok(v) = std::env::var(deprecated_alias) {
-        static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
-            std::sync::OnceLock::new();
-        let warned = WARNED.get_or_init(Default::default);
-        if warned.lock().unwrap().insert(deprecated_alias) {
-            eprintln!("[deprecated] env {deprecated_alias} is a back-compat alias — use {generic} (AGENTS.md §7)");
-        }
-        return Some(v);
-    }
-    None
+    crate::opts::var(crate::opt!("draft-dir")).ok()
 }

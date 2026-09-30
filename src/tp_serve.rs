@@ -41,6 +41,10 @@ pub struct WireRequest {
     pub min_new: usize,
     #[serde(default)]
     pub ignore_eos: bool,
+    /// TP-D (EXL3 serve): the request's min-p (the EXL3 sampler honours it; the NVFP4 mirror's
+    /// `into_request` keeps 0.0 — that sampler has none). Older peers: absent = 0.
+    #[serde(default)]
+    pub min_p: f32,
 }
 
 /// One scheduler-visible event within a step. Ordering inside a step: all Admits (in admit order),
@@ -84,6 +88,11 @@ pub enum ServingMsg {
     Step(StepEvents),
     /// Head's request channel closed (server shutdown) and all lanes drained: end the session.
     Shutdown,
+    /// TP-D (EXL3 serve): a head-authoritative boolean decided INSIDE a step (today: "the client
+    /// left — cancel this prefill at this chunk boundary"). The node blocks on it at the same
+    /// program point and adopts the head's value, so both ranks stop (or continue) the SPMD
+    /// prefill at the same chunk.
+    HeadFlag { v: bool },
 }
 
 impl From<&BatchRequest> for WireRequest {
@@ -102,6 +111,7 @@ impl From<&BatchRequest> for WireRequest {
             domain: r.domain,
             min_new: r.min_new,
             ignore_eos: r.ignore_eos,
+            min_p: r.min_p,
         }
     }
 }
@@ -120,6 +130,7 @@ impl WireRequest {
             rep_penalty: self.rep_penalty,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
+            min_p: 0.0, // the NVFP4 sampler has no min-p (WP08)
             tx,
             seed: self.seed,
             ckpt_at: self.ckpt_at,

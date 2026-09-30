@@ -5,12 +5,18 @@ decoding on veloGB10, in three deployment shapes: **single node**, **TP=2**, and
 the required files on each machine, the exact launch commands, and the log lines you should expect.
 
 - **Target model:** `doth4580/Qwen3.8-27B-NVFP4-FULL` — https://huggingface.co/doth4580/Qwen3.8-27B-NVFP4-FULL
-- **Drafter (requires download):** `doth4580/Qwen3.8-27B-DFlash2` — https://huggingface.co/doth4580/Qwen3.8-27B-DFlash2
+- **Drafter (requires download):** `doth4580/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED` —
+  https://huggingface.co/doth4580/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED — an NVFP4 drafter that is
+  slightly faster than the bf16 one.
 - **Full context:** launch with `--max-seq-len 262144` (the model's full 256K).
 
-> **Use only our quantized models.** Our NVFP4 artifacts are built and tuned specifically for the
-> veloGB10 engine. An alternative is to run `--quantize all` on the original Qwen bf16 model and use
-> that output — the result is identical to our NVFP4 artifact.
+> **Use only our quantized models.** Both the target model and the drafter are published from this
+> account, and both are built and tuned specifically for the veloGB10 engine. An alternative for the
+> target is to run `--quantize all` on the original Qwen bf16 model — the result is identical to our
+> NVFP4 artifact.
+
+> **The older bf16 drafter still works.** `doth4580/Qwen3.8-27B-DFlash2` remains valid — point
+> `--draft-dir` at it instead. The examples below use the newer NVFP4 drafter.
 
 ---
 
@@ -20,7 +26,8 @@ the required files on each machine, the exact launch commands, and the log lines
 
 The engine is **the binary + a `src/ptx/` directory of kernel artifacts**. The binary loads the PTX
 relative to its **current working directory**, so run it from a directory that contains both. The
-binary is ~16 MB; the PTX files total ~12 MB. Do not mismatch a binary with foreign PTX.
+binary is ~27 MB; the PTX files total ~37 MB. Do not mismatch a binary with foreign PTX — the
+engine refuses to start on a build-id mismatch.
 
 On every machine (nodes included), the directory must look like this:
 
@@ -29,17 +36,21 @@ On every machine (nodes included), the directory must look like this:
 ├── gb10_inference
 └── src
     └── ptx
+        ├── exl3_bench.ptx
         ├── fused_decode.ptx
         ├── gemm_nvfp4.ptx
         ├── gpu_batch.ptx
         ├── gpu_batch_b3.ptx
         ├── gpu_dflash.ptx
+        ├── gpu_dspark.ptx
         ├── gpu_dsv4.ptx
         ├── gpu_dsv4_attn.ptx
         ├── gpu_dsv4_comp.ptx
         ├── gpu_kernels.ptx
         ├── gpu_mxfp4.ptx
         ├── gpu_mxfp4_moe.ptx
+        ├── gpu_vision.ptx
+        ├── gpu_w4a4.ptx
         ├── mxfp4_bench.ptx
         ├── rms_norm.ptx
         └── silu_gate.ptx
@@ -51,8 +62,12 @@ On every machine (nodes included), the directory must look like this:
 
 The DFlash 2 drafter checkpoint must be present locally:
 
-- `Qwen3.8-27B-DFlash2/` — `config.json`, `model.safetensors`, `README.md`, `dl.log` (the full
-  directory as downloaded from `doth4580/Qwen3.8-27B-DFlash2`).
+- `Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED/` — `config.json`, `model.safetensors`,
+  `nvfp4.safetensors`, `README.md`, `LICENSE` (the full directory as downloaded from
+  `doth4580/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED`). This is the NVFP4 drafter the examples use.
+- The older bf16 drafter still works: `Qwen3.8-27B-DFlash2/` — `config.json`, `model.safetensors`,
+  `README.md`, `dl.log` (as downloaded from `doth4580/Qwen3.8-27B-DFlash2`). Point `--draft-dir` at
+  it instead; nothing else changes.
 
 ### The target model (head only)
 
@@ -110,23 +125,22 @@ directory. For this example, copy the models next to the binary, each in its own
 │   ├── tokenizer.json
 │   ├── tokenizer_config.json
 │   └── vocab.json
-├── Qwen3.8-27B-DFlash2
+├── Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
 │   ├── LICENSE
 │   ├── README.md
-│   ├── assets
-│   │   └── dflash2-figure.png
 │   ├── config.json
-│   ├── dl.log
-│   └── model.safetensors
+│   ├── model.safetensors
+│   └── nvfp4.safetensors
 ├── gb10_inference
 └── src
     └── ptx
         └── ... (as in §1)
 ```
 
-`3.8-27b-nvfp4-full-all` is the main model directory; `Qwen3.8-27B-DFlash2` is the DFlash 2 drafter
-directory. In a single-node or TP deployment, verify the full directory tree from §1 and these two
-model directories before launching.
+`3.8-27b-nvfp4-full-all` is the main model directory;
+`Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED` is the DFlash 2 drafter directory (the older bf16
+`Qwen3.8-27B-DFlash2` directory works equally well here). In a single-node or TP deployment, verify
+the full directory tree from §1 and these two model directories before launching.
 
 ### TP=4 (three nodes + head)
 
@@ -136,14 +150,19 @@ model directories before launching.
   --tp 4 \
   --nodes 192.168.177.12:29500,192.168.177.13:29500,192.168.177.14:29500 \
   --port 9000 \
+  --kv-cache k8v8 \
   --max-seq-len 262144 \
   --max-batch 1 \
   --max-tokens 65536 \
   --prefix-cache on \
-  --default-presence-penalty 1.5 \
+  --default-presence-penalty 0.0 \
   --mtp=auto \
-  --spec-source dflash2-auto \
-  --draft-dir ~/veloGB10/Qwen3.8-27B-DFlash2
+  --fp8-prefill on \
+  --reasoning-effort low \
+  --df2-block 16 \
+  --df2-round-shard on \
+  --spec-source dflash2 \
+  --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
 ```
 
 ### TP=2 (one node + head)
@@ -154,14 +173,19 @@ model directories before launching.
   --tp 2 \
   --nodes 192.168.177.12:29500 \
   --port 9000 \
+  --kv-cache k8v8 \
   --max-seq-len 262144 \
   --max-batch 1 \
   --max-tokens 65536 \
   --prefix-cache on \
-  --default-presence-penalty 1.5 \
+  --default-presence-penalty 0.0 \
   --mtp=auto \
-  --spec-source dflash2-auto \
-  --draft-dir ~/veloGB10/Qwen3.8-27B-DFlash2
+  --fp8-prefill on \
+  --reasoning-effort low \
+  --df2-block 16 \
+  --df2-round-shard on \
+  --spec-source dflash2 \
+  --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
 ```
 
 ### Single node
@@ -170,14 +194,19 @@ model directories before launching.
 ./gb10_inference --server \
   --model-dir ~/veloGB10/3.8-27b-nvfp4-full-all \
   --port 9000 \
+  --kv-cache k8v8 \
   --max-seq-len 262144 \
   --max-batch 1 \
   --max-tokens 65536 \
   --prefix-cache on \
-  --default-presence-penalty 1.5 \
+  --default-presence-penalty 0.0 \
   --mtp=auto \
-  --spec-source dflash2-auto \
-  --draft-dir ~/veloGB10/Qwen3.8-27B-DFlash2
+  --fp8-prefill on \
+  --reasoning-effort low \
+  --df2-block 16 \
+  --df2-round-shard on \
+  --spec-source dflash2 \
+  --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
 ```
 
 ### Enabling concurrency with `--max-batch`
@@ -196,11 +225,19 @@ simultaneous requests you want to handle, e.g.:
   --max-batch 4 \
   --max-tokens 65536 \
   --prefix-cache on \
-  --default-presence-penalty 1.5 \
+  --default-presence-penalty 0.0 \
   --mtp=auto \
-  --spec-source dflash2-auto \
-  --draft-dir ~/veloGB10/Qwen3.8-27B-DFlash2
+  --fp8-prefill on \
+  --reasoning-effort low \
+  --df2-block 16 \
+  --df2-round-shard on \
+  --spec-source dflash2 \
+  --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
 ```
+
+> The concurrency example deliberately leaves `--kv-cache` at its default: `k8v8` (used in the
+> single-request examples) is a **single-lane** format and the engine refuses it when
+> `--max-batch` is greater than 1.
 
 - `--max-batch N` is the max concurrent sequences (lanes) the server will run. With `N > 1` the
   scheduler batches the concurrent greedy lanes into a single verify forward, so you trade a little

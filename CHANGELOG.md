@@ -3,6 +3,71 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.7.0 — EXL3 packs (Qwen3.8-Flash-Next), TP=2 serving, CLI-only options
+
+A large release: a second quantization format with its own model family, two-node serving as a
+shipped mode, and one breaking change to how the engine is configured.
+
+### New: EXL3 packs are served directly
+
+`--model-dir` now accepts an **EXL3 (ExLlamaV3 trellis)** pack alongside the NVFP4/FP8 families.
+The model shipped on this path is **Qwen3.8-Flash-Next**: a 125B MoE with ~6B active parameters,
+a Gated DeltaNet + Qwen Sparse Attention hybrid, 512 experts (top-10), a 51B n-gram embedding
+table, an MTP draft head, and a 262,144-token context.
+
+- The weights are published as
+  **[doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw)**
+  — EXL3 3.05 bpw, about 85 GB including the 32.6 GB n-gram table.
+- Native MTP speculative decoding is built in: greedy output is bitwise identical to
+  non-speculative decoding, and sampled output is distribution-exact.
+- **TP=1 and TP=2 only.** Any other world size exits with `--tp 2 only`.
+- **Text only — no vision on the EXL3 path** (image requests are rejected). Vision remains on the
+  NVFP4 / Qwen3.8 27B path added in v0.6.0.
+- q8 KV by default, prefix cache with prefill checkpoints, penalties, streaming, loop detection.
+
+### TP=2
+
+TP=2 ships as a served mode: sequence-parallel prefill, a vocab-parallel LM head, and prefill
+communication overlap — each on by default with an `off` value. Measured on two GB10 (DGX Spark)
+over ConnectX-7, one request at a time, on the same engine code as this release but not on the
+release binary itself; decode includes MTP speculation:
+
+| | TP=2 | vs TP=1 |
+|---|---|---|
+| Decode, greedy (C code / Python / prose) | ~192 / ~160 / ~110 tok/s | ×1.38–1.42 |
+| Decode, thinking-on, sampled | ~95 tok/s | ×1.36 |
+| Prefill (2K / 32K / 128K / 256K) | 2,485 / 2,376 / 2,279 / 2,138 tok/s | ×1.56–1.69 |
+
+### CLI-1: every option is a command-line flag (breaking)
+
+- **The engine reads no environment variables.** Leaving a `GB10_*` variable set now refuses
+  startup and names the replacement flag — for example `GB10_TP_GRAPH` suggests `--tp-graph`.
+- `--print-config` prints every option's resolved value for a given command line; `--help-diag`
+  lists the diagnostics and test drills.
+- Migration table for every removed variable: **[docs/ENV_TO_FLAGS.md](docs/ENV_TO_FLAGS.md)**.
+- Under TP every option is set on the head; the head ships its resolved options to the node, and a
+  node's own command line carries only the per-box options.
+
+### Speed
+
+Prefill and decode levers on both paths, all bitwise: a pipelined expert kernel, a tensor-core GDN
+chunk scan, hyper-connection fusion, router coalescing, sparse-attention selection, MoE gate/up
+folding, and shared-expert overlap. On the EXL3 path, prefill TTFT is down roughly 27–30% against
+the previous release. Autotune tables are now stamped with a build id and validated at load, so a
+stale table cannot be applied to a changed build. NVFP4 W4A4 prefill kernels were contributed via
+community PR #4.
+
+### Reliability
+
+- **A node that fails during boot now fails the head loudly** instead of leaving it hanging
+  (PACK-FIX). The EXL3 TP pack-manifest check was removed by owner decision — each box loads its
+  own pack at the path the head names.
+- Autotune's preflight no longer requires specific machine addresses; it checks only that the GPU
+  is idle (no other engine, no resident compute applications).
+- Streaming loop detection, and CPU-affinity pinning by default.
+
+Plus minor bug fixes and optimizations.
+
 ## v0.6.1 — `response_format` served again (quality-regression hotfix)
 
 - **`response_format` requests are served, not rejected.** v0.6.0's P13 W2 change turned any

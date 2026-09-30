@@ -194,25 +194,52 @@ pub struct VisualTower {
     pub merger_fc2_b: Vec<f32>,  // [out_hidden]
 }
 
-struct Map<'a> {
-    m: HashMap<String, (&'a str, &'a [u8])>,
+struct Map {
+    m: HashMap<String, (String, Vec<u8>)>,
 }
 
-impl<'a> Map<'a> {
-    fn build(all_raw: &'a [Vec<u8>]) -> Result<Self> {
+impl Map {
+    /// B13 fix (S-B14): SLICED read. The old path `std::fs::read` every whole shard into
+    /// `all_raw` — 105.7 GB of anonymous host RAM on this artifact to extract a ~0.5 GB
+    /// tower — which was the serve-prep memory sink that killed every `--server` boot at
+    /// TP=1 and TP=2 (memwatch floor-hit between "binding HTTP" and listen; the 1 Hz
+    /// trace showed a monotonic ~1 GB/s drain exactly here). Now: parse each shard's
+    /// safetensors HEADER only (8-byte LE length + JSON), then seek+read just the
+    /// `model.visual.*` byte ranges. dtype strings match the safetensors spellings the
+    /// getters already switch on ("BF16"/"F16"/"F32"; packed tensors are consumed raw).
+    fn build_sliced(shards: &[String]) -> Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
         let mut m = HashMap::new();
-        for raw in all_raw {
-            let st = SafeTensors::deserialize(raw)?;
-            use safetensors::Dtype;
-            for (name, view) in st.tensors() {
-                let dt = match view.dtype() {
-                    Dtype::BF16 => "BF16",
-                    Dtype::F16 => "F16",
-                    Dtype::F32 => "F32",
-                    _ => "OTHER",
-                };
-                m.insert(name.to_string(), (dt, view.data()));
+        for s in shards {
+            let mut f = std::fs::File::open(s)
+                .map_err(|e| anyhow!("{}: {e}", s))?;
+            let mut u64buf = [0u8; 8];
+            f.read_exact(&mut u64buf)?;
+            let hlen = u64::from_le_bytes(u64buf) as usize;
+            let mut hjson = vec![0u8; hlen];
+            f.read_exact(&mut hjson)?;
+            let hdr: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(&hjson)?;
+            for (name, meta) in hdr {
+                if name == "__metadata__" || !name.starts_with("model.visual.") {
+                    continue;
+                }
+                let dt = meta.get("dtype").and_then(|x| x.as_str())
+                    .ok_or_else(|| anyhow!("{}: header has no dtype", name))?.to_string();
+                let offs = meta.get("data_offsets").and_then(|x| x.as_array())
+                    .ok_or_else(|| anyhow!("{}: header has no data_offsets", name))?;
+                let start = offs.first().and_then(|x| x.as_u64())
+                    .ok_or_else(|| anyhow!("{}: bad data_offsets start", name))? as usize;
+                let end = offs.get(1).and_then(|x| x.as_u64())
+                    .ok_or_else(|| anyhow!("{}: bad data_offsets end", name))? as usize;
+                let mut data = vec![0u8; end - start];
+                f.seek(SeekFrom::Start((8 + hlen + start) as u64))?;
+                f.read_exact(&mut data)?;
+                m.insert(name, (dt, data));
             }
+        }
+        if m.is_empty() {
+            return Err(anyhow!("no model.visual.* tensors in any shard"));
         }
         Ok(Map { m })
     }
@@ -222,7 +249,7 @@ impl<'a> Map<'a> {
             .m
             .get(name)
             .ok_or_else(|| anyhow!("missing tensor: {}", name))?;
-        let v = match *dt {
+        let v = match dt.as_str() {
             "BF16" | "F16" => {
                 let m = data.len() / 2;
                 let mut out = Vec::with_capacity(m);
@@ -350,11 +377,9 @@ impl VisualTower {
         if shards.is_empty() {
             return Err(anyhow!("no safetensors found in {}", model_dir));
         }
-        let mut all_raw: Vec<Vec<u8>> = Vec::new();
-        for s in &shards {
-            all_raw.push(std::fs::read(s)?);
-        }
-        let map = Map::build(&all_raw)?;
+        // B13 fix: sliced read — headers only, then just the model.visual.* ranges
+        // (the old all_raw path pulled every whole shard into host RAM: 105.7 GB).
+        let map = Map::build_sliced(&shards)?;
 
         // Load all visual tensors strictly, geometry-driven.
         let mut block_names: Vec<String> = Vec::new();

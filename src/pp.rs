@@ -34,7 +34,7 @@ const HDR_WORDS: usize = 8;
 const MAGIC: u32 = 0x5050_0001;
 
 fn rdma_dev() -> String {
-    std::env::var("GB10_RDMA_DEV").ok().filter(|s| !s.is_empty())
+    crate::opts::var(crate::opt!("rdma-dev")).ok().filter(|s| !s.is_empty())
         .unwrap_or_else(|| "rocep1s0f1".to_string())
 }
 
@@ -50,7 +50,7 @@ pub fn pp_node(model_dir: &str) -> anyhow::Result<()> {
     // spend their ~100 s model load AFTER the QP handshake — no start-order sensitivity.
     // Retry the dial: the head's listener comes up a few seconds after ITS launch (process
     // start + CUDA context for the pinned staging buffer) — the node may win that race.
-    let peer_ip = std::env::var("PP_HEAD_IP").unwrap_or_default();
+    let peer_ip = crate::opts::var(crate::opt!("pp-head-ip")).unwrap_or_default();
     let mut link = None;
     for attempt in 1..=90 {
         match link_up(1, &peer_ip) {

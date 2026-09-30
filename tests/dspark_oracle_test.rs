@@ -225,8 +225,9 @@ fn markov_chain_latents_distinct_when_logits_distinct() {
     for k in 0..7 {
         logits0[k * vocab + k] = 100.0;
     }
-    let h = vec![0.0f32; 7 * o.cfg.hidden];
-    let mo = o.markov_chain(&logits0, &h);
+    // S10 semantics: the chain seeds `prev` from the ANCHOR TOKEN (argmax of row 0 = 0 here);
+    // the latents W1[d[k-1]] stay anchor-independent for this hand-crafted logits0.
+    let mo = o.markov_chain(&logits0, 0);
     let rank = o.cfg.markov_rank;
     for k1 in 0..6 {
         for k2 in (k1 + 1)..6 {
@@ -264,7 +265,8 @@ fn piecewise_composition_equals_run_round() {
     }
     let h = o.block_forward(&emb, &kv, 8);
     let logits0 = o.lm_head(&h, 7);
-    let mo = o.markov_chain(&logits0, &h);
+    // S10 semantics: anchor = the input id at query offset 0 (reference chain).
+    let mo = o.markov_chain(&logits0, blk[0]);
     let co = o.confidence(&h, &mo.latents, 0.5);
 
     assert_eq!(h, a.h);

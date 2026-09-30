@@ -51,7 +51,7 @@ pub struct Dsv4DSpark {
     markov_w1_host: Vec<bf16>,
     block: usize,
     noise_id: i32,
-    // ---- CUDA-graph draft (GB10_DSPARK_GRAPH=1): persistent inputs + the draft graph ----
+    // ---- CUDA-graph draft (--dspark-graph=1): persistent inputs + the draft graph ----
     /// Persistent zeros [block] for the MoE router's unused ids arg (tid2eid is None here).
     g_zeros: Option<CudaSlice<i32>>,
     /// Persistent main_hidden [1, 3*dim] (d2d from the trunk's per-step capture).
@@ -65,10 +65,10 @@ pub struct Dsv4DSpark {
     /// the confidence head consumes it on the host).
     g_collapse_out: Option<B>,
     dgraphs: Option<DecodeGraphs>,
-    /// GB10_DSPARK_PHASE_MS accumulators: GPU-synced chain time vs host Markov-tail time.
+    /// --dspark-phase-ms accumulators: GPU-synced chain time vs host Markov-tail time.
     pub t_chain: f64,
     pub t_markov: f64,
-    /// GB10_DSPARK_FP8_LOGITS: fp8_bsb copies of the draft LM head + Markov W2 (halve the
+    /// --dspark-fp8-logits: fp8_bsb copies of the draft LM head + Markov W2 (halve the
     /// draft's head reads — the vLLM stack's FP8 DeepGEMM copies, memo §2). Draft-side only:
     /// near-tie argmax flips cost acceptance, never correctness (the trunk verify governs).
     head_fp8: Option<Fp8Weight>,
@@ -91,7 +91,7 @@ pub struct DraftOut {
 }
 
 /// The graphed draft chain's logits, pre-readout: fp32 (bf16 head path) or bf16 (the
-/// GB10_DSPARK_FP8_LOGITS fp8_bsb path — the fp8 GEMM's native output).
+/// --dspark-fp8-logits fp8_bsb path — the fp8 GEMM's native output).
 pub enum DraftLogitsDev {
     F32(GS),
     BF16(GB),
@@ -352,19 +352,19 @@ impl Dsv4DSpark {
         Ok(me)
     }
 
-    /// --dspark-fp8-head / GB10_DSPARK_FP8_LOGITS: build fp8_bsb copies of the draft LM head
+    /// --dspark-fp8-head / --dspark-fp8-logits: build fp8_bsb copies of the draft LM head
     /// [vocab, dim] and Markov W2 [vocab, rank] (halve the draft head reads — the vLLM stack's
     /// FP8 DeepGEMM copies, memo §2). Draft-side only: the trunk verify governs correctness;
     /// near-tie argmax flips cost acceptance, never correctness. The head's flag rides TpConfig
     /// (SPMD: both ranks build the same arms); the env var remains as the back-compat alias.
     fn maybe_make_fp8_heads(&mut self) -> Result<()> {
         let cfg_flag = crate::tp::tp_config().map(|c| c.dspark_fp8_head).unwrap_or(false);
-        if !cfg_flag && !env_flag_once("GB10_DSPARK_FP8_LOGITS") {
+        if !cfg_flag && !env_flag_once(crate::opt!("dspark-fp8-logits")) {
             return Ok(());
         }
         self.use_fp8_logits = true;
         let (vocab, dim, rank) = (self.cfg.vocab_size, self.cfg.dim, self.cfg.dspark_markov_rank);
-        eprintln!("[dspark] fp8 draft head ON (--dspark-fp8-head / GB10_DSPARK_FP8_LOGITS): quantizing lm_head [{vocab},{dim}] + markov_w2 [{vocab},{rank}] → fp8_bsb ...");
+        eprintln!("[dspark] fp8 draft head ON (--dspark-fp8-head / --dspark-fp8-logits): quantizing lm_head [{vocab},{dim}] + markov_w2 [{vocab},{rank}] → fp8_bsb ...");
         let t0 = std::time::Instant::now();
         let head_host: Vec<bf16> = self.dev.dtoh_sync_copy(&self.head)?;
         let (wt, sb) = quant::quantize_fp8_bsb(&head_host, vocab, dim);
@@ -442,7 +442,7 @@ impl Dsv4DSpark {
         anyhow::ensure!(n >= 1 && n <= self.block, "draft_n width {n} out of range 1..={}", self.block);
         let (dim, vocab) = (self.cfg.dim, self.cfg.vocab_size);
         let eps = self.cfg.norm_eps;
-        let phase = env_flag_once("GB10_DSPARK_PHASE_MS");
+        let phase = env_flag_once(crate::opt!("dspark-phase-ms"));
         let _tc = std::time::Instant::now();
 
         // 1. main_x = main_norm(main_proj(main_hidden)) [1, dim].
@@ -471,7 +471,7 @@ impl Dsv4DSpark {
             self.t_chain += _tc.elapsed().as_secs_f64();
         }
         let _tm = std::time::Instant::now();
-        // fp8 draft head (GB10_DSPARK_FP8_LOGITS): halves the 1.06 GB head read per draft.
+        // fp8 draft head (--dspark-fp8-logits): halves the 1.06 GB head read per draft.
         let logits_host: Vec<f32> = if self.use_fp8_logits && self.head_fp8.is_some() {
             let h8 = self.head_fp8.as_ref().unwrap();
             let (cc, csa) = self.rt.quant_g128::<B, CudaSlice<u8>>(&yn, n, dim)?;
@@ -505,7 +505,7 @@ impl Dsv4DSpark {
             let id = output_ids[i] as usize;
             let e_host = &self.markov_w1_host[id * rank..(id + 1) * rank];
             let e_dev: B = self.dev.htod_sync_copy(e_host)?;
-            // fp8 Markov W2 (GB10_DSPARK_FP8_LOGITS): halves the 66 MB w2 read per step.
+            // fp8 Markov W2 (--dspark-fp8-logits): halves the 66 MB w2 read per step.
             let bias_host: Vec<f32> = if self.use_fp8_logits && self.markov_w2_fp8.is_some() {
                 let m8 = self.markov_w2_fp8.as_ref().unwrap();
                 let (cc, csa) = self.rt.quant_g128::<B, CudaSlice<u8>>(&e_dev, 1, rank)?;
@@ -544,7 +544,7 @@ impl Dsv4DSpark {
         Ok(DraftOut { drafts: output_ids[1..=n].to_vec(), confidence })
     }
 
-    /// CUDA-graph draft (GB10_DSPARK_GRAPH=1): the device chain (main_x → embed → 3 stages →
+    /// CUDA-graph draft (--dspark-graph=1): the device chain (main_x → embed → 3 stages →
     /// hc_head → norm → LM head) replays a captured whole-chain graph instead of ~170 eager
     /// launches + per-call htod/iota uploads; the Markov tail stays eager (host-serial by
     /// design). Bitwise by construction (same kernels/args/order — the classifier verifies
@@ -557,7 +557,7 @@ impl Dsv4DSpark {
 
     /// [`draft_graphed`](Self::draft_graphed) + the [block, vocab] fp32 logits (the gate).
     pub fn draft_graphed_full(&mut self, main_hidden: &B, real_token: i32, start_pos: usize) -> Result<(DraftOut, Vec<f32>)> {
-        if !env_flag_once("GB10_DSPARK_GRAPH") {
+        if !env_flag_once(crate::opt!("dspark-graph")) {
             return self.draft_full(main_hidden, real_token, start_pos);
         }
         self.ensure_graph_inputs()?;
@@ -738,7 +738,7 @@ impl Dsv4DSpark {
             ));
         }
         g.apply_updates_and_launch(&self.rt.stream, start_pos)?;
-        let phase = env_flag_once("GB10_DSPARK_PHASE_MS");
+        let phase = env_flag_once(crate::opt!("dspark-phase-ms"));
         let _tm = std::time::Instant::now();
         let logits_host: Vec<f32> = if self.use_fp8_logits {
             let lg: Vec<bf16> = self.dev.dtoh_sync_copy(self.g_logits_bf16.as_ref().unwrap())?;

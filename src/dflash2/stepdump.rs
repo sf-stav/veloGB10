@@ -1,5 +1,5 @@
 //! S5F3 — the draft-parity step dump (dump-only, default OFF; `--df2-step-dump <dir>` /
-//! `GB10_DF2_STEP_DUMP=<dir>`).
+//! `--df2-step-dump=<dir>`).
 //!
 //! During a `--bench-df2-matrix --parity` run (or any `BatchScheduler` speculation run), one
 //! JSONL record per verify step:
