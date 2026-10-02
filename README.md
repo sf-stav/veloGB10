@@ -527,9 +527,11 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
   attributes), off by default. `request.id` is the conversation key so a reply's turns join one
   continuous session; `generation.id` stays per-POST. Companion flags: `--otel-batch-size`,
   `--otel-batch-interval-ms`, `--otel-include-tokens`, `--otel-model-id`, `--otel-topology`.
-- **Vision** — image input on a GPU vision tower across the Qwen3.5/3.8 VL family
-  (`--vision-cpu` for the CPU reference path); PNG/JPEG/WebP/GIF. The tower bootstraps
+- **Vision** — image input on a GPU vision tower across the Qwen3.5/3.8 VL family **and the
+  EXL3 / Qwen3.8-Flash-Next path** (`--vision-cpu` for the CPU reference path); PNG/JPEG/WebP/GIF,
+  with images resized to `--image-max-edge` on the EXL3 path. The tower bootstraps
   opportunistically: a non-vision or incompatible model serves text-only, never a startup crash.
+  **Video and audio parts are not served yet** — they return `400`.
 - **MTP speculative decoding** — native multi-token prediction heads with an auto-depth policy
   that measures its own cost/acceptance trade-off live and re-picks depth (or disables itself)
   per workload. No configuration required.
@@ -874,7 +876,7 @@ This project does not link extensively against any other project (other than the
 Areas that are in flight or planned. These are tracked openly — progress and timelines are as honest as I can make them, and this list changes as work lands.
 
 - **Fix Tencent Hy3 support.** Hy3 regressed over the last few weeks as the engine evolved; restoring it to a fully working, gated state is a priority.
-- **Broaden vision coverage.** Vision is supported; work remains to bring it to the full set of Qwen models and harden it further.
+- **Video input.** Image input is supported on every topology, including the EXL3 / Qwen3.8-Flash-Next path. Video (and audio) parts are not served yet — they return `400` — and that is the remaining vision work, along with widening coverage across the rest of the Qwen family.
 - **Qwen3.5 397B MoE (incl. Ornith 1.5).** Large-model port; the engine already serves this architecture at 122B, so the work is the TP=2/TP=4 capacity bring-up (large weight footprint) plus the correctness gates at that size.
 - **DeepSeek V4 Flash DSpark.** Work has started but it's far from complete or optimized. The goal is to beat all competition on decode speed across 2× and 4× GB10.
 - **Other Qwen 3.8 variants.** If a 122B or other Qwen 3.8-size model fits on 1×, 2×, or 4× Spark, it's likely to be picked up next.
