@@ -33,7 +33,8 @@ fn df2_block_default() -> usize { crate::dflash2::BLOCK }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TpConfig {
-    pub config_version: u32,          // = 24 (v24: + exl3_pack_files, PACK-FIX's per-file pack manifest;
+    pub config_version: u32,          // = 25 (v25: + ship_shards / sync_only, B32 per-rank shard shipping;
+                                      //      v24: + exl3_pack_files, PACK-FIX's per-file pack manifest;
                                       //      v23: exl3_env -> opts, the CLI-1 option registry;
                                       //      v22: + exl3_seq_parallel, TP-SP1's --tp-seq-parallel;
                                       //      v21: + exl3_vp_sampled, TP-H2's --tp-vp-sampled;
@@ -273,9 +274,10 @@ pub struct TpConfig {
     /// The session runs the EXL3 engine (FwdModel) — the node routes to the EXL3 TP path.
     #[serde(default)]
     pub exl3: bool,
-    /// The head's EXL3 pack dir. Zero-config: the node loads ITS OWN local copy at the same path
-    /// (D-T0-6: every compute box holds the pack; shipping ~80 GB per boot is pointless) and must
-    /// prove it identical to the head's via `exl3_manifest` before it loads a byte.
+    /// The head's EXL3 pack dir. Legacy (D-T0-6): the node loads ITS OWN local copy at the same path. Nothing
+    /// checks that copy against the head's — the manifest check was removed by the owner in 074c669
+    /// (2026-09-30); `exl3_manifest` / `exl3_pack_files` below are no longer filled. With B32 `ship_shards`
+    /// the node replaces this with the shard dir the head shipped it through the blob cache.
     #[serde(default)]
     pub exl3_pack_dir: String,
     /// sha256 over the pack's (relative path, sha256, size) list (cluster::pack_manifest) — PACK-FIX:
@@ -301,6 +303,14 @@ pub struct TpConfig {
     /// The EXL3 TP program: "xtp" (the rung-3 cross-TP probe). Unknown = refuse.
     #[serde(default)]
     pub exl3_mode: String,
+    /// v25 (B32): the head shipped this node ONLY its rank's shard dir through the blob cache (shard_plan) —
+    /// always, for every model the shard plan covers (no switch, owner 2026-10-02); the node loads the assembled
+    /// cache dir, never the head's path. false = a model the plan does not cover (its own existing path).
+    #[serde(default)]
+    pub ship_shards: bool,
+    /// v25 (B32, `--tp-sync-only`): sync, report, exit (head and nodes) — no model load.
+    #[serde(default)]
+    pub sync_only: bool,
     // ---- v19 (TP-I2): CLI-flag knobs of the EXL3 TP engine (owner rule 2026-09-29: new options are
     // CLI flags riding TpConfig, never env vars).
     /// The head's resolved `--tp-prefill-overlap` code (rows per hook | dual << 31 | fold << 30 (v20); 0 = off). The node
@@ -325,7 +335,7 @@ impl TpConfig {
     pub fn from_opts() -> Self {
         eprintln!("[from_opts] [kv-k8v8]={:?}", crate::opts::var(crate::opt!("kv-k8v8")).ok());
         TpConfig {
-            config_version: 24,
+            config_version: 25,
             // TP rank count. The --tp CLI flag is the single authority for a TP run (bare --tp = 2,
             // --tp N = N); `from_opts` only snapshots the bench `--head` path, which is always TP=2.
             // GB10_TP_WORLD is deliberately NOT read here — one source of truth, zero ambiguity.
@@ -427,6 +437,8 @@ impl TpConfig {
             exl3_vp_sampled: None,
             exl3_seq_parallel: None,
             exl3_mode: String::new(),
+            ship_shards: false, // set by the head per node when it ships shards (cluster::head_sync_one)
+            sync_only: crate::opts::var(crate::opt!("tp-sync-only")).is_ok(),
         }
     }
 }
@@ -483,7 +495,7 @@ pub fn topology() -> Option<&'static Vec<String>> { TP_TOPOLOGY.get() }
 /// Resolve the N-way peer-IP list (indexed by rank) for `world > 2`. Precedence: the process-global
 /// `TP_TOPOLOGY` (head), then the shipped `TpConfig::topology` (node), then fail loudly. A fabricated
 /// placeholder is NOT acceptable here — it silently corrupts the doubling-partner map.
-fn resolve_topology(world: i32) -> Result<Vec<IpAddr>> {
+pub fn resolve_topology(world: i32) -> Result<Vec<IpAddr>> {
     let list: &Vec<String> = TP_TOPOLOGY
         .get()
         .or_else(|| tp_config().map(|c| &c.topology))
@@ -502,7 +514,7 @@ fn resolve_topology(world: i32) -> Result<Vec<IpAddr>> {
     Ok(ips)
 }
 
-fn rdma_dev() -> String {
+pub fn rdma_dev() -> String {
     crate::opts::var(crate::opt!("rdma-dev")).ok()
         .and_then(|s| s.split(',').next().map(|x| x.trim().to_string()))
         .filter(|s| !s.is_empty())

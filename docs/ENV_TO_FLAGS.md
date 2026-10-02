@@ -455,3 +455,7 @@ node's own command line carries only the per-box options (scope `local`).
 
 Also new: `--tp-prefill-overlap`, `--tp-vp-sampled`, `--tp-seq-parallel`, `--ep-deal` (existing flags)
 are registry options now (shown by `--print-config`); `--ep-deal` gains `freq`.
+
+TP-4X1: `--prefill-absorb-tail` (flag, off, spmd; no env twin): EXL3 prefill folds a ragged (< `recon-min` = 17 rows)
+chunk into its neighbour when the fold loses no checkpoint beyond `recon-min - 1` rows (the C1 message-boundary tail
+checkpoint is always kept). `--prefill-chunk 4095` is now accepted under TP (C1 merge cap = min(2C-1, 4095)).

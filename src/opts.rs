@@ -441,6 +441,7 @@ pub fn print_resolved() -> String {
                   show(xtp::parse_seq_parallel(get(crate::opt!("tp-seq-parallel")).as_deref()), &|c| xtp::seq_parallel_desc(c).to_string()));
     s += &format!("ep-deal -> {}\n", xtp::ep_deal_kind());
     s += &format!("tp-dds-prior (TP=2 WP23 cost-guard prior, ms/draft) -> {}\n", crate::exl3_serve::dds_prior_tp());
+    s += &format!("tp-dds-prior (TP=4 WP23 cost-guard prior, ms/draft) -> {}\n", crate::exl3_serve::dds_prior_tp4());
     s += "# EXL3 tunables (id = default | override flag -> value; unset = the tuned table / the default)\n";
     for t in crate::exl3_tune::REGISTRY {
         let ov = (t.env_parse)();

@@ -133,7 +133,7 @@ pub fn band_smem(window: usize, ntot: usize) -> usize {
 /// their scores smem by ABSOLUTE ctx (`(HEAD_DIM + ntot + 32) * 4`, no opt-in => the 48 KiB
 /// default cap) — bisect `/tmp/s10/ctx_bisect/results.txt`: seq 12120 PASSED (49,152 B),
 /// seq 12121 FAILED (49,156 B, CUDA_ERROR_INVALID_VALUE at round.rs:1094); a 256K capture
-/// would have needed ~1.049 MB/block — physically impossible (the rivals' dissected cubins
+/// would have needed ~1.049 MB/block — physically impossible (other implementations' dissected cubins
 /// prove nobody stages O(ctx) scores: `PLAN/B8_S10R_DISSECTION.md` §2.2).
 /// Above THIS bound the round's RoPE tables would exceed the model's trained positions —
 /// the auto-fallback to MTP (main.rs `load_df2_round_dir`) remains the standing directive.

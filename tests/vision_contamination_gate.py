@@ -1,6 +1,7 @@
 import json, base64, sys, urllib.request, os, hashlib, re
 
-PORT = int(os.environ.get("PORT","8099"))
+# AGENTS §7 (owner rule): a CLI flag, never an env var — `vision_contamination_gate.py [--port N]`
+PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 8099
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
 RED="/tmp/vision_repro/solid_red.png"
 BLUE="/tmp/vision_repro/solid_blue.png"
@@ -11,7 +12,9 @@ def imgs(p):
     return [{"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64(p)}"}},
             {"type":"text","text":"What color is this image? Answer with just the color name in one word."}]
 def chat(messages, max_tokens=64, temp=0.0):
-    body={"model":"x","messages":messages,"max_tokens":max_tokens,"temperature":temp,"stream":False}
+    # thinking off: the gate reads the answer, and a thinking preamble can exhaust max_tokens first
+    body={"model":"x","messages":messages,"max_tokens":max_tokens,"temperature":temp,"stream":False,
+          "chat_template_kwargs":{"enable_thinking":False}}
     req=urllib.request.Request(URL,data=json.dumps(body).encode(),headers={"Content-Type":"application/json"})
     with urllib.request.urlopen(req,timeout=300) as r:
         d=json.loads(r.read().decode())

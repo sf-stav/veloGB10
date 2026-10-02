@@ -34,7 +34,16 @@ pub const WP16_STRIDE: usize = 8192;
 /// checkpoint position? `e % 8192 == 0`, or `e` bounds one of the run's last 2 chunks. `e` must
 /// be a C multiple (a partial final chunk's end is not a grid point of any longer prompt).
 pub fn wp16_due(e: usize, n: usize, c: usize) -> bool {
-    c > 0 && e > 0 && e <= n && e % c == 0 && (e % WP16_STRIDE == 0 || e + 2 * c >= n)
+    c > 0 && e > 0 && e <= n && e % c == 0 && (stride_hit(e, c) || e + 2 * c >= n)
+}
+
+/// Does the stride checkpoint rule pick chunk end `e` (a C multiple, e >= c)? c <= 2048: `e % 8192
+/// == 0`, exactly today's rule. c > 2048 (TP-4X1, `--prefill-chunk 4095`): C multiples almost never
+/// hit a multiple of 8192, so the rule is "the chunk [e-c, e) crosses one" - a checkpoint about
+/// every 8192 rows, the same density and memory as C=2048 (identical to `e % 8192 == 0` whenever C
+/// divides 8192, e.g. 4096).
+fn stride_hit(e: usize, c: usize) -> bool {
+    if c > 2048 { e / WP16_STRIDE > (e - c) / WP16_STRIDE } else { e % WP16_STRIDE == 0 }
 }
 
 fn env_flag(o: crate::opts::OptId) -> bool {
@@ -95,7 +104,12 @@ pub const TAIL_BACKOFF: usize = 8;
 pub fn tail_point(boundary: Option<usize>, from: usize, n: usize, c: usize, extra_chunk: bool) -> Option<usize> {
     let t = boundary?.checked_sub(TAIL_BACKOFF)?;
     if c == 0 || t <= from || t >= n { return None; }
-    let s = from.max(t / c * c);
+    // TP-4X1: tail grain = min(C, 2048). At C <= 2048 this is C (unchanged); at C > 2048 (steady
+    // 4,095-row chunks) it keeps today's tail-checkpoint availability (a 2-4K-row prompt still gets
+    // its message-boundary checkpoint, at the price of the one small tail chunk it costs today)
+    // instead of silently dropping it.
+    let g = c.min(2048);
+    let s = from.max(t / g * g);
     if s == from && !extra_chunk { return None; }
     // v2: when no C boundary lies between the run start and t, merge_grid cannot absorb the split
     // and the run pays one extra chunk (~120-190 ms of fixed weight streaming, v1 A/B): only worth
@@ -113,7 +127,20 @@ pub const TAIL_MIN_GAIN_SPLIT: usize = 1024;
 /// (2) a realigned lead chunk [from, next C multiple) merges with the chunk after it likewise.
 /// Required boundaries (t, n) never move. Knob off never calls this.
 pub fn merge_grid(from: usize, ends: Vec<usize>, tail: Option<usize>, c: usize) -> Vec<usize> {
+    merge_grid_cap(from, ends, tail, c, 2 * c.max(1) - 1)
+}
+
+/// TP-4X1: the scratch / all-reduce partial buffer holds at most `TP_MAX_ROWS` = 4,096 rows
+/// (`SP_MAX_ROWS` = 4,095 for a sequence-parallel chunk), so under TP a merged chunk is capped at
+/// min(2C - 1, 4,095). Identical to 2C - 1 for every C <= 2,048 (every config legal before this
+/// change); C in 2,049..=4,095 was refused at boot under TP while C1 tail checkpoints were on.
+pub fn merge_cap(c: usize, tp: bool) -> usize {
     let cap = 2 * c.max(1) - 1;
+    if tp { cap.min(super::xtp::TP_MAX_ROWS - 1) } else { cap }
+}
+
+/// merge_grid with an explicit row cap (see merge_cap); `merge_grid` is `cap = 2C - 1`.
+pub fn merge_grid_cap(from: usize, ends: Vec<usize>, tail: Option<usize>, c: usize, cap: usize) -> Vec<usize> {
     let mut e = ends;
     let start = |e: &Vec<usize>, i: usize| if i == 0 { from } else { e[i - 1] };
     if let Some(t) = tail {
@@ -126,6 +153,57 @@ pub fn merge_grid(from: usize, ends: Vec<usize>, tail: Option<usize>, c: usize) 
         e.remove(0);
     }
     e
+}
+
+/// TP-4X1 ragged-tail folding: ALWAYS on since v0.7.1 (owner 2026-10-02, D-TP4-6; no off switch).
+/// `--prefill-absorb-tail` is still accepted so older command lines keep working.
+pub fn absorb_on() -> bool { true }
+
+/// The ragged-chunk threshold when absorb is on: chunks below `recon_min_rows()` (17) are the replicated
+/// eager small-M class, each streaming every weight for a handful of rows.
+pub fn absorb_rmin() -> Option<usize> { absorb_on().then(super::recon_min_rows) }
+
+/// TP-4X1: fold ragged chunks. A chunk of fewer than `rmin` rows is merged into its neighbour (dropping
+/// the boundary that separates them) when (a) the merged chunk fits `cap` rows, and (b) the dropped
+/// boundary is not required: never the tail checkpoint `tail`, never `n`, and - in a checkpointing run
+/// (`ckpts`) - never a boundary the WP16 rule checkpoints (`wp16_due`) UNLESS the tail checkpoint sits
+/// fewer than `rmin` rows before it (that checkpoint dominates it: a resume loses < `rmin` rows).
+/// Forward merge (drop the chunk's end) is tried first, then backward (drop its start). Cache
+/// granularity cost: zero checkpoints beyond `rmin - 1` rows are lost, and `tail` / `n` never move.
+pub fn absorb_grid(from: usize, ends: Vec<usize>, tail: Option<usize>, n: usize, c: usize, cap: usize,
+                   ckpts: bool, rmin: usize) -> Vec<usize> {
+    let mut e = ends;
+    let droppable = |b: usize| -> bool {
+        if b >= n || Some(b) == tail { return false; }
+        if !ckpts || !wp16_due(b, n, c) { return true; }
+        tail.is_some_and(|t| t < b && b - t < rmin)
+    };
+    let mut i = 0;
+    while i < e.len() {
+        let s = if i == 0 { from } else { e[i - 1] };
+        if e[i] - s < rmin {
+            if i + 1 < e.len() && droppable(e[i]) && e[i + 1] - s <= cap { e.remove(i); continue; }
+            if i >= 1 && droppable(e[i - 1]) {
+                let s2 = if i >= 2 { e[i - 2] } else { from };
+                if e[i] - s2 <= cap { e.remove(i - 1); i -= 1; continue; }
+            }
+        }
+        i += 1;
+    }
+    e
+}
+
+/// TP-4X1: the served chunk grid of a run over [from, n): `realign` = a tracked (C1) run - run_grid with
+/// the tail split, merged to `cap` rows; else today's plain grid. `absorb` = Some(rmin) applies
+/// absorb_grid. `absorb = None` is exactly the pre-TP-4X1 grid (merge_grid_cap with the old cap).
+pub fn plan_grid(from: usize, n: usize, c: usize, realign: bool, tail: Option<usize>, cap: usize,
+                 absorb: Option<usize>, ckpts: bool) -> Vec<usize> {
+    let g = if realign {
+        merge_grid_cap(from, run_grid(from, n, c, true, tail), tail, c, cap)
+    } else {
+        run_grid(from, n, c, false, None)
+    };
+    match absorb { Some(rmin) => absorb_grid(from, g, tail, n, c, cap, ckpts, rmin), None => g }
 }
 
 /// C1: chunk ends of a run over [from, n) at width c. `realign`: the first chunk ends at the next
@@ -791,6 +869,245 @@ mod tests {
         assert_eq!(tail_point(Some(6590), 0, 6581, c, true), None);    // not inside the run
         assert_eq!(tail_point(Some(4), 0, 6581, c, true), None);
         assert_eq!(tail_point(None, 0, 6581, c, true), None);
+    }
+
+    /// The pre-TP-4X1 rules, verbatim: the flags-off reference every new function must equal.
+    mod old {
+        pub const WP16_STRIDE: usize = 8192;
+        pub fn wp16_due(e: usize, n: usize, c: usize) -> bool {
+            c > 0 && e > 0 && e <= n && e % c == 0 && (e % WP16_STRIDE == 0 || e + 2 * c >= n)
+        }
+        pub fn merge_grid(from: usize, ends: Vec<usize>, tail: Option<usize>, c: usize) -> Vec<usize> {
+            let cap = 2 * c.max(1) - 1;
+            let mut e = ends;
+            let start = |e: &Vec<usize>, i: usize| if i == 0 { from } else { e[i - 1] };
+            if let Some(t) = tail {
+                if let Some(i) = e.iter().position(|&x| x == t) {
+                    if i >= 1 && Some(e[i - 1]) != tail && t - start(&e, i - 1) <= cap { e.remove(i - 1); }
+                }
+            }
+            if from % c.max(1) != 0 && e.len() >= 2 && Some(e[0]) != tail && e[1] - from <= cap {
+                e.remove(0);
+            }
+            e
+        }
+    }
+
+    /// TP-4X1 flags-off identity: for every C <= 2,048 (every config legal before) the new
+    /// due rule, merge cap and merged grid equal the old ones, over a sweep of runs and tails.
+    #[test]
+    fn tp4x1_flags_off_equals_old_grid() {
+        for &c in &[64usize, 256, 512, 1000, 1024, 1500, 2047, 2048] {
+            // the cap is the old 2C - 1 under TP and not
+            assert_eq!(merge_cap(c, true), 2 * c - 1);
+            assert_eq!(merge_cap(c, false), 2 * c - 1);
+            for &n in &[1usize, 100, 1519, 2048, 3000, 4096, 6581, 8195, 8300, 20_000, 32_000, 131_772] {
+                for e in (0..=n + 3).step_by(1).filter(|e| e % c == 0 || e % 7 == 0) {
+                    assert_eq!(wp16_due(e, n, c), old::wp16_due(e, n, c), "due e={e} n={n} c={c}");
+                }
+                for &from in &[0usize, 7, c, c + 13, 2 * c + 1, 5000, 6573] {
+                    if from >= n { continue; }
+                    for &tp in &[false, true] {
+                        let mut tails = vec![None];
+                        for d in [14usize, 12, 9, 200, 1000] { if n > d && n - d > from { tails.push(Some(n - d)); } }
+                        for tail in tails {
+                            let g = run_grid(from, n, c, true, tail);
+                            assert_eq!(merge_grid_cap(from, g.clone(), tail, c, merge_cap(c, tp)),
+                                       old::merge_grid(from, g.clone(), tail, c), "from={from} n={n} c={c} tail={tail:?}");
+                            assert_eq!(merge_grid(from, g.clone(), tail, c), old::merge_grid(from, g, tail, c));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// TP-4X1: C = 4,095 under TP caps merged chunks at 4,095 rows (the all-reduce partial buffer
+    /// holds 4,096); non-TP keeps 2C - 1. Boundaries at 4,095 multiples, tail split kept.
+    #[test]
+    fn tp4x1_steady_4095_grid() {
+        let c = 4095;
+        assert_eq!(merge_cap(c, true), 4095);
+        assert_eq!(merge_cap(c, false), 8189);
+        assert_eq!(merge_cap(4096, true), 4095);
+        assert_eq!(merge_cap(2048, true), 4095);
+        let cap = merge_cap(c, true);
+        // the served 8K request (n = 8195, message boundary - 8 = 8181): 4 chunks (4095, 4086, 9, 5)
+        let g = merge_grid_cap(0, run_grid(0, 8195, c, true, Some(8181)), Some(8181), c, cap);
+        assert_eq!(g, vec![4095, 8181, 8190, 8195]);
+        // no merged chunk exceeds the cap, whatever the run
+        for &n in &[1519usize, 3000, 4095, 4096, 8195, 12_286, 32_000, 128_000, 250_000] {
+            for tail in [None, Some(n.saturating_sub(14).max(1))] {
+                let tail = tail.filter(|&t| t < n);
+                let g = merge_grid_cap(0, run_grid(0, n, c, true, tail), tail, c, cap);
+                let mut s = 0;
+                for &e in &g { assert!(e - s <= cap && e > s, "n={n} chunk [{s},{e})"); s = e; }
+                assert_eq!(s, n);
+                assert!(tail.map_or(true, |t| g.contains(&t)));
+            }
+        }
+    }
+
+    /// TP-4X1: stride checkpoints at C > 2,048 follow the crossing rule (a chunk crossing a
+    /// multiple of 8,192): the same density as C = 2,048; and = `e % 8192 == 0` for C = 4,096.
+    #[test]
+    fn tp4x1_stride_rule_at_wide_chunks() {
+        let n = 131_072 + 700;
+        let due = |c: usize| -> Vec<usize> {
+            let ends = run_grid(0, n, c, false, None);
+            ends.into_iter().filter(|&e| wp16_due(e, n, c)).collect()
+        };
+        // C = 4,095: ends 12285, 20475, ... one per crossed multiple of 8,192 (16), plus the last 2
+        let d = due(4095);
+        assert!(d.starts_with(&[12_285, 20_475]), "{d:?}");
+        let stride_only: Vec<usize> = d.iter().copied().filter(|&e| e + 2 * 4095 < n).collect();
+        // 8192*k crossed for k = 1..=14 before the last 2 chunks (k = 15, 16 land in them)
+        assert_eq!(stride_only.len(), 14, "{stride_only:?}");
+        for w in stride_only.windows(2) { assert!((8190..=12_285).contains(&(w[1] - w[0])), "{w:?}"); }
+        // the last 2 chunk boundaries are still checkpoints
+        assert!(d.contains(&(n / 4095 * 4095)) && d.contains(&(n / 4095 * 4095 - 4095)));
+        // C = 4,096 divides 8,192: the crossing rule IS the stride rule
+        for e in (4096..=n).step_by(4096) { assert_eq!(stride_hit(e, 4096), e % 8192 == 0); }
+        // C = 2,048 unchanged (crossing == stride for a divisor of 8,192)
+        for e in (2048..=n).step_by(2048) { assert_eq!(stride_hit(e, 2048), e % 8192 == 0); }
+    }
+
+    const RMIN: usize = 17; // recon_min_rows() default: chunks below it are the replicated eager small-M class
+
+    /// TP-4X1 absorb off == the pre-TP-4X1 grid for every run (tracked: merge_grid; plain: run_grid).
+    #[test]
+    fn tp4x1_absorb_off_equals_old_grid() {
+        for &c in &[256usize, 1024, 2048] {
+            for &n in &[1usize, 17, 100, 1519, 2048, 3000, 8195, 8300, 32_000, 128_000] {
+                for &from in &[0usize, 13, c, 5000, 8181] {
+                    if from >= n { continue; }
+                    let mut tails = vec![None];
+                    for d in [14usize, 12, 9, 200, 1000] { if n > d && n - d > from { tails.push(Some(n - d)); } }
+                    for tail in tails {
+                        let cap = merge_cap(c, true);
+                        let new = plan_grid(from, n, c, true, tail, cap, None, true);
+                        assert_eq!(new, old::merge_grid(from, run_grid(from, n, c, true, tail), tail, c));
+                        assert_eq!(plan_grid(from, n, c, false, None, cap, None, false), run_grid(from, n, c, false, None));
+                    }
+                }
+            }
+        }
+    }
+
+    /// TP-4X1 absorb: the served 8K request (n = 8195, tail 8181) loses the 11-row replicated chunk;
+    /// the tail checkpoint and n never move; the 8192 checkpoint is dropped only because the tail
+    /// checkpoint sits 11 < 17 rows before it.
+    #[test]
+    fn tp4x1_absorb_served_8k() {
+        let (n, t) = (8195, 8181);
+        let cap = merge_cap(2048, true);
+        let old = plan_grid(0, n, 2048, true, Some(t), cap, None, true);
+        assert_eq!(old, vec![2048, 4096, 8181, 8192, 8195]); // 2048, 2048, 4085, 11, 3
+        assert_eq!(plan_grid(0, n, 2048, true, Some(t), cap, Some(RMIN), true), vec![2048, 4096, 8181, 8195]);
+        // steady 4095 chunks
+        let cap = merge_cap(4095, true);
+        assert_eq!(plan_grid(0, n, 4095, true, Some(t), cap, None, true), vec![4095, 8181, 8190, 8195]);
+        assert_eq!(plan_grid(0, n, 4095, true, Some(t), cap, Some(RMIN), true), vec![4095, 8181, 8195]);
+        // a middle ragged chunk followed by a real one: 8181 | 8192 | 8300
+        assert_eq!(plan_grid(0, 8300, 2048, true, Some(8181), merge_cap(2048, true), Some(RMIN), true),
+                   vec![2048, 4096, 8181, 8300]);
+        // no tail checkpoint: the stride checkpoint 8192 is NOT dominated -> kept (cache granularity wins);
+        // an untracked run has no checkpoints, so its 3-row remainder folds into [6144, 8195)
+        let cap = merge_cap(2048, true);
+        assert_eq!(plan_grid(0, n, 2048, true, None, cap, Some(RMIN), true), vec![2048, 4096, 6144, 8192, 8195]);
+        assert_eq!(plan_grid(0, n, 2048, false, None, cap, Some(RMIN), false), vec![2048, 4096, 6144, 8195]);
+        // the inherent final chunk after the tail checkpoint (n - t = 14 rows) stays: tail never moves
+        assert_eq!(plan_grid(0, 3000, 2048, true, Some(2986), cap, Some(RMIN), true), vec![2986, 3000]);
+        assert_eq!(plan_grid(0, 1519, 2048, true, None, cap, Some(RMIN), true), vec![1519]);
+        // a lone tiny prompt is never merged away
+        assert_eq!(plan_grid(0, 10, 2048, true, None, cap, Some(RMIN), true), vec![10]);
+        // the cap holds: a ragged chunk does not fold into a full chunk
+        assert_eq!(plan_grid(0, 4099, 4095, false, None, merge_cap(4095, true), Some(RMIN), false), vec![4095, 4099]);
+    }
+
+    /// TP-4X1: tail-checkpoint availability at C = 4,095 equals today's C = 2,048 for every prompt and
+    /// run start (grain min(C, 2048)); 2-4K-row prompts keep their message-boundary checkpoint.
+    #[test]
+    fn tp4x1_tail_grain_keeps_availability() {
+        for n in (1..=60usize).map(|k| k * 211 + 3).chain([8195, 32_000, 128_000, 250_000]) {
+            for &from in &[0usize, 9, 2048, 4095, 8181] {
+                for extra in [false, true] {
+                    for d in [6usize, 40] {
+                        let b = n.saturating_sub(d);
+                        let a = tail_point(Some(b), from, n, 2048, extra);
+                        let w = tail_point(Some(b), from, n, 4095, extra);
+                        assert_eq!(a, w, "n={n} from={from} extra={extra} d={d}");
+                    }
+                }
+            }
+        }
+        // 3,000-row prompt: boundary tail kept at C = 4,095 (grid [2986, 3000], today's cost), not dropped
+        assert_eq!(tail_point(Some(2994), 0, 3000, 4095, false), Some(2986));
+    }
+
+    /// TP-4X1 invariants over a sweep: ends strictly increase to n, tail and n survive, every chunk <= cap,
+    /// never more chunks than without absorb, and a lost checkpoint is always within RMIN - 1 rows after the
+    /// tail checkpoint (so a resume loses < RMIN rows).
+    #[test]
+    fn tp4x1_absorb_invariants() {
+        for &c in &[1024usize, 2048, 4095] {
+            let cap = merge_cap(c, true);
+            for n in (1..=40).chain((1..=120).map(|k| k * 311 + 7)).chain([8195, 8300, 32_000, 128_000, 250_000]) {
+                for &from in &[0usize, 9, c, c + 5, 8181] {
+                    if from >= n { continue; }
+                    let mut tails = vec![None];
+                    for d in [14usize, 12, 9, 5, 200] { if n > d && n - d > from { tails.push(Some(n - d)); } }
+                    for tail in tails {
+                        for &ck in &[true, false] {
+                            let realign = ck;
+                            let base = plan_grid(from, n, c, realign, tail.filter(|_| realign), cap, None, ck);
+                            let tl = tail.filter(|_| realign);
+                            let g = plan_grid(from, n, c, realign, tl, cap, Some(RMIN), ck);
+                            let mut s = from;
+                            for &e in &g {
+                                assert!(e > s && e <= n, "{g:?}");
+                                assert!(e - s <= cap.max(c).max(base.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0)).max(base[0] - from), "cap {g:?}");
+                                s = e;
+                            }
+                            assert_eq!(s, n);
+                            assert!(g.len() <= base.len());
+                            if let Some(t) = tl { if base.contains(&t) { assert!(g.contains(&t), "tail lost {g:?}"); } }
+                            if ck {
+                                for &b in base.iter().filter(|&&b| b < n && !g.contains(&b)) {
+                                    if wp16_due(b, n, c) {
+                                        let t = tl.expect("a due checkpoint was dropped without a tail");
+                                        assert!(t < b && b - t < RMIN, "lost due ckpt {b} (tail {t})");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prints the TP-4X1 grid tables (cargo test --release --lib tp4x1_print_tables -- --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn tp4x1_print_tables() {
+        let tail_of = |n: usize, c: usize| tail_point(Some(n - 6), 0, n, c, false); // served: message boundary - 8 = n - 14
+        for &n in &[1519usize, 3000, 8195, 32_000, 128_000, 250_000] {
+            for (name, c, absorb) in [("A today C=2048", 2048usize, None), ("B C=4095", 4095, None),
+                                      ("C C=2048+absorb", 2048, Some(RMIN)), ("D C=4095+absorb", 4095, Some(RMIN))] {
+                let tail = tail_of(n, c);
+                let cap = merge_cap(c, true);
+                let g = plan_grid(0, n, c, true, tail, cap, absorb, true);
+                let mut rows = Vec::new();
+                let mut s = 0;
+                for &e in &g { rows.push(e - s); s = e; }
+                let ragged = rows.iter().filter(|&&r| r < RMIN).count();
+                let ck: Vec<usize> = g.iter().copied().filter(|&e| wp16_due(e, n, c) || tail == Some(e)).collect();
+                let shown = if rows.len() > 10 { format!("{:?} .. {:?}", &rows[..3], &rows[rows.len() - 4..]) } else { format!("{rows:?}") };
+                let cks = if ck.len() > 6 { format!("{} (last {:?})", ck.len(), &ck[ck.len() - 4..]) } else { format!("{ck:?}") };
+                println!("TABLE n={n:>7} {name:<16} tail={tail:?} chunks={:>3} ragged={ragged} rows={shown} | ckpts {cks}", rows.len());
+            }
+        }
     }
 
     fn take(st: &mut CkptStore<u32>, slot: usize, pos: usize, next: &mut u32) -> bool {

@@ -309,11 +309,13 @@ impl DHead {
         Ok(DHead { bits, hbits, k, n, nblk, s, r, tmax, delta, dq, mse, codes, bsig, ws, xc_id, xc_conf, p, rq, xc_list, shard: None })
     }
 
-    /// TP-H #3: arm the sharded screen for rank `rank` of `world` (2). Boot-time, outside any capture;
+    /// TP-H #3: arm the sharded screen for rank `rank` of `world` (2; TP-4C: or 4 — each rank screens
+    /// nblk / world blocks and the multi-round K2 reassembles the array, bitwise: one non-zero contributor
+    /// per entry). Boot-time, outside any capture;
     /// every condition is a structural property of the model and the shipped env, so both ranks reach the
     /// same verdict (an Err fails the boot on both — never a one-sided degrade).
     pub(super) fn enable_shard(&mut self, dev: &Arc<CudaDevice>, rank: usize, world: usize) -> Result<()> {
-        anyhow::ensure!(world == 2 && rank < world, "the sharded screen is world 2 only (rank {rank}/{world})");
+        anyhow::ensure!((world == 2 || world == 4) && rank < world, "the sharded screen is world 2 or 4 only (rank {rank}/{world})");
         anyhow::ensure!(self.nblk % world == 0 && (self.nblk / world) >= 1, "nblk {} not divisible by world {world}", self.nblk);
         anyhow::ensure!(matches!(self.bits, 1 | 2 | 4), "screen width {} has no sharded screen kernel", self.bits);
         anyhow::ensure!((self.nblk * 4) % 16 == 0, "nblk {} floats are not a whole number of 16-byte vectors", self.nblk);

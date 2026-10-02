@@ -3,6 +3,48 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.7.1 — TP=4 on the EXL3 path, image input, automatic shard shipping
+
+A fast follow to v0.7.0: the EXL3 path gains a fourth node and images, the node sync becomes
+shard-level, and two defaults change that alter long-context output bytes.
+
+### TP=4 on the EXL3 path
+
+`--tp 4` now serves Qwen3.8-Flash-Next from EXL3 packs across three peer nodes plus the head:
+attention, GDN and the KV cache split by head, the routed experts dealt across the ranks, the
+vocab-parallel LM head, sharded MTP-head screening, a per-step lockstep agreement check and a
+watchdog. Measured on pure code: **~218 tok/s decode** (min/max 138/231, p50/p90/p99 218/228/231) and
+**~3.2K tok/s prefill** — TTFT 0.64 s at ~2.1K input tokens, 10.9 s at ~34.9K. Against a single GB10
+that is **×1.6 decode and ×2.0–2.2 prefill**.
+
+### Image input, on every topology
+
+Images are served end to end on the EXL3 path at TP=1, TP=2 and TP=4: the pack's **original bf16
+vision tower** is loaded (`vision_tower_bf16.safetensors`), each image is resized so its longer side
+is at most `--image-max-edge` (default 1024, aspect preserved), 3-axis mrope is applied at all six
+main-attention RoPE sites **and** the QSA indexer — so images work past the 2,051-token dense window —
+and image rows ship to the TP nodes as a digest-checked binary payload. Parts are returned in client
+order. **Video and audio parts return `400`** for now; video is planned.
+
+### Automatic shard shipping
+
+A multi-node run no longer needs the model copied to the peer machines. The head plans each rank's
+shard and ships only that, through the TP blob cache: **~57.5 GiB per node at TP=2** and **~46.8 GiB
+at TP=4** for the EXL3 pack, and 66.0 GiB for NVFP4 (was 98.5 replicated). TP=2 output is
+token-identical to the previous path for both formats, and the live TP=4 bank is identical.
+`--tp-sync-only` runs a node that syncs and exits.
+
+### Default changes (output-changing on long context)
+
+- **`--prefill-chunk 4095`**, up from 2048 — a large part of the TP=4 prefill gain. Ragged-tail
+  folding is always on; `--prefill-chunk 2048` restores the previous grid.
+- **`--qsa-key-rope full`** — the EXL3 indexer had left rotary dims 32..63 of every pooled key at
+  zero since the sparse-attention work, while the reference fills them. `half` keeps the old bytes
+  for A/B comparison only.
+
+Plus minor bug fixes and optimizations, including a clear error instead of a panic when `--model-dir`
+does not exist.
+
 ## v0.7.0 — EXL3 packs (Qwen3.8-Flash-Next), TP=2 serving, CLI-only options
 
 A large release: a second quantization format with its own model family, two-node serving as a

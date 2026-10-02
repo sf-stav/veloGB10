@@ -524,6 +524,44 @@ fn parse_content_text(v: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// VIS-5: the content parts in their ORIGINAL order — Some(text) for a text part, None for an image —
+/// so the template renders images where the client put them (not all images before all text).
+fn parse_content_layout(v: &serde_json::Value) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    if let serde_json::Value::Array(parts) = v {
+        for part in parts {
+            match part {
+                serde_json::Value::String(s) => out.push(Some(s.clone())),
+                serde_json::Value::Object(o) => match o.get("type").and_then(|t| t.as_str()) {
+                    Some("image_url") | Some("image") | Some("input_image") => out.push(None),
+                    Some("text") | None => {
+                        if let Some(t) = o.get("text").and_then(|t| t.as_str()) { out.push(Some(t.to_string())); }
+                    }
+                    Some(_) => {}
+                },
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// VID-0 (VIS-5): content part types this server does not take (video, audio, files, ...). A
+/// request carrying one is refused with a 400 naming the type, never silently dropped.
+fn parse_content_unsupported(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let serde_json::Value::Array(parts) = v {
+        for part in parts {
+            if let serde_json::Value::Object(o) = part {
+                if let Some(t) = o.get("type").and_then(|t| t.as_str()) {
+                    if !matches!(t, "text" | "image_url" | "image" | "input_image") { out.push(t.to_string()); }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Extract image parts from a `content` array into `Vec<ImageInput>`.
 fn parse_content_images(v: &serde_json::Value) -> Vec<ImageInput> {
     let mut imgs = Vec::new();
@@ -578,6 +616,12 @@ pub struct ChatMessage {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// VIS-5: the content parts in client order (Some(text) / None = image); empty = string content.
+    #[serde(skip)]
+    pub layout: Vec<Option<String>>,
+    /// VID-0: content part types the server does not take (the handler answers 400).
+    #[serde(skip)]
+    pub unsupported_parts: Vec<String>,
 }
 
 impl<'de> serde::Deserialize<'de> for ChatMessage {
@@ -603,10 +647,14 @@ impl<'de> serde::Deserialize<'de> for ChatMessage {
         let content_owned = raw.content.clone();
         let content = content_owned.as_ref().and_then(|v| parse_content_text(v));
         let images = content_owned.as_ref().map(parse_content_images).unwrap_or_default();
+        let layout = content_owned.as_ref().map(parse_content_layout).unwrap_or_default();
+        let unsupported_parts = content_owned.as_ref().map(parse_content_unsupported).unwrap_or_default();
         Ok(ChatMessage {
             role: raw.role,
             content,
             images,
+            layout,
+            unsupported_parts,
             tool_calls: raw.tool_calls,
             tool_call_id: raw.tool_call_id,
             name: raw.name,
@@ -617,7 +665,7 @@ impl<'de> serde::Deserialize<'de> for ChatMessage {
 
 impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: Some(content.into()), images: vec![],
+        Self { role: "user".into(), content: Some(content.into()), images: vec![], layout: vec![], unsupported_parts: vec![],
                tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }
     }
 
@@ -637,12 +685,23 @@ impl ChatMessage {
         if !self.images.is_empty() {
             // Vision: render as a content ARRAY of parts so the model's Jinja template turns each
             // image into `<|vision_start|><|image_pad|><|vision_end|>` and keeps the text.
+            // VIS-5: in the client's order (the layout); a message built without one (internal
+            // constructors) keeps the old images-then-text shape.
             let mut parts = Vec::new();
-            for _ in &self.images {
-                parts.push(serde_json::json!({"type": "image"}));
-            }
-            if !content.is_empty() {
-                parts.push(serde_json::json!({"type": "text", "text": content}));
+            if self.layout.iter().filter(|p| p.is_none()).count() == self.images.len() {
+                for p in &self.layout {
+                    match p {
+                        None => parts.push(serde_json::json!({"type": "image"})),
+                        Some(t) => parts.push(serde_json::json!({"type": "text", "text": t})),
+                    }
+                }
+            } else {
+                for _ in &self.images {
+                    parts.push(serde_json::json!({"type": "image"}));
+                }
+                if !content.is_empty() {
+                    parts.push(serde_json::json!({"type": "text", "text": content}));
+                }
             }
             m.insert("content".into(), serde_json::Value::Array(parts));
         } else {
@@ -688,6 +747,25 @@ impl ChatMessage {
 
 #[cfg(test)]
 mod tests {
+
+    /// VIS-5: image and text parts render in the client's order; VID-0: unknown part types are captured.
+    #[test]
+    fn vis5_interleave_order_and_unsupported_parts() {
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"text","text":"q1"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,BBBB"}},{"type":"text","text":"q2"}]}"#).unwrap();
+        let j = m.to_template_json(false);
+        let kinds: Vec<String> = j["content"].as_array().unwrap().iter()
+            .map(|p| p["type"].as_str().unwrap().to_string() + p.get("text").and_then(|t| t.as_str()).unwrap_or("")).collect();
+        assert_eq!(kinds, vec!["image", "textq1", "image", "textq2"]);
+        assert!(m.unsupported_parts.is_empty());
+        let v: ChatMessage = serde_json::from_str(r#"{"role":"user","content":[{"type":"video_url","video_url":{"url":"x"}},{"type":"text","text":"hi"}]}"#).unwrap();
+        assert_eq!(v.unsupported_parts, vec!["video_url".to_string()]);
+        // text-only string content is untouched
+        let t: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"plain"}"#).unwrap();
+        assert_eq!(t.to_template_json(false)["content"], serde_json::json!("plain"));
+    }
+
     use super::*;
 
     /// Regression: a prior assistant tool_call whose arguments are NON-STRING (numbers,
@@ -709,7 +787,7 @@ mod tests {
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
-                images: vec![],
+                images: vec![], layout: vec![], unsupported_parts: vec![],
                 tool_calls: Some(vec![ToolCall {
                     id: "call_0".into(),
                     kind: "function".into(),
@@ -723,7 +801,7 @@ mod tests {
             ChatMessage {
                 role: "tool".into(),
                 content: Some("line one\nline two".into()),
-                images: vec![], tool_calls: None, tool_call_id: Some("call_0".into()), name: Some("read".into()),
+                images: vec![], layout: vec![], unsupported_parts: vec![], tool_calls: None, tool_call_id: Some("call_0".into()), name: Some("read".into()),
                 reasoning_content: None,
             },
         ];
@@ -839,7 +917,7 @@ mod tests {
                 role: "assistant".into(),
                 // Simulate what round-trips from a client: reasoning + answer.
                 content: Some("<think>\nI should keep it short.\n</think>\n\nThe beacon awoke, and so did something else.\n".into()),
-                images: vec![], tool_calls: None, tool_call_id: None, name: None, reasoning_content: None,
+                images: vec![], layout: vec![], unsupported_parts: vec![], tool_calls: None, tool_call_id: None, name: None, reasoning_content: None,
             },
             ChatMessage::user("Continue it for another 1000 words."),
         ];

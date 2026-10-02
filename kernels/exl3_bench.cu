@@ -57,7 +57,7 @@ __device__ __forceinline__ uint16_t exl3_dq_from(const uint32_t* __restrict__ ri
     const unsigned hi = ring[i0m];
     const unsigned idx = __funnelshift_r(lo, hi, (unsigned)sf) & 0xFFFFu;
     // UNSIGNED dp4a overload: value = 1024 + unsigned byte-sum s (must match Rust LUT).
-    // S-A3-n (SASS diff vs the rival's exl3_moe_coop_a: ZERO I2F there, one
+    // S-A3-n (SASS diff vs the reference implementation's exl3_moe_coop_a: ZERO I2F there, one
     // I2F.F16.U32 per weight here — a reduced-rate conversion on the decode's
     // critical path): accumulate 0x6400 instead of 1024. 0x6400 is the fp16 bit
     // pattern of 1024.0 and s <= 4*255 = 1020 < 1024, so 0x6400 + s IS the fp16
@@ -124,7 +124,7 @@ __device__ __forceinline__ unsigned long long xq_tune_gtimer() {
 
 // L2 conditioning (§5.4): stream `n16` 16-byte words through L2 with ld.global.cg (L2, not L1) —
 // a read-only replay of the unit's real predecessor's last reads that leaves no dirty lines (unlike
-// the rival's memset thrash). The loads are asm volatile (never elided or sunk under `write`);
+// the reference implementation's memset thrash). The loads are asm volatile (never elided or sunk under `write`);
 // `sink` is written only when `write` != 0. Block 0 / thread 0 then waits until `min_ns` have
 // passed since it started, so the host has submitted the timed unit before the stream reaches it
 // (§5.5: the event pair then measures device time only). Grid-stride, 4 independent 16-B loads in
@@ -680,7 +680,7 @@ extern "C" __global__ void exl3_hmma_gemm(const uint16_t* __restrict__ trellis,
 // re-stages the A tile every k16 step behind two block barriers and reads each warp's
 // 160-B trellis window with 16 dependent scalar L1 loads per lane — one 160-B window in
 // flight per warp, ~7.7 KB/SM: 79% of the 238 GB/s floor at m=6 (2.10 ms; ledger).
-// This kernel (the rival's exl3_gemm_kernel<5,..,16,16,512,4,3> byte schedule, minus its
+// This kernel (the reference implementation's exl3_gemm_kernel<5,..,16,16,512,4,3> byte schedule, minus its
 // stream-K split, which would change the K-reduction order):
 //   * grid = #SMs CTAs (1/SM, 8 warps). Tile = 128 columns = one col16 trellis block per
 //     warp over the FULL K. Tiles interleave (t = blockIdx.x + i*gridDim.x) so the
@@ -1496,6 +1496,88 @@ extern "C" __global__ void xq_gemm_f16_rows(__half* __restrict__ out,
     else              xq_gemm_f16_rows_body<16>(out, w, x, M, N, K);
 }
 
+// ---- TP-4T1: BIT-EXACT small-M twin of xq_gemm_f16 for the prefill TAIL chunks (c < recon_min_rows, M <= 16:
+// hc down/up, a_w/b_w, the PLE projections). xq_gemm_f16 is ONE THREAD PER COLUMN with 2-byte loads at a
+// lane stride of K*2 bytes (20 KB for hc down): every warp load touches 32 L1 lines, ~665 us for hc down
+// at ANY M (L1 wavefront bound, 20x its FMA-chain floor); xq_gemm_f16_rows is thread-per-column too (10 warps
+// at N=320 -> 2.2 ms at M=11). Here the weight tile [32 cols][XQ_TG_KC k] and the x tile [XQ_TG_RB rows][KC]
+// are staged through shared memory with coalesced 16-B cp.async (XQ_TG_ST-stage pipeline, one __syncthreads per
+// tile), the weight tile is read back with conflict-free LDS.128 (16-B row pad), and warp r / lane c of the
+// block computes output (row m0 + r, column n0 + c). EXACTNESS: per output the arithmetic is xq_gemm_f16's
+// verbatim — acc = 0.0f, ascending k, the same `acc += xq_h2f(w) * xq_h2f(x)` expression (same contracted FFMA),
+// the same final __float2half_rn; no split-K, no shuffle tree, no atomics, no tensor core => every output is
+// BITWISE equal to xq_gemm_f16 (probe: --probe-exl3-tailgemm). grid (ceil(N/32), ceil(M/4)), block 128.
+// K % 8 == 0 (16-B cp.async; the served K are 10240/320/2560), any M (rows beyond M are clamped on load, skipped
+// on store). Weight rows >= N clamp to row N-1 on load (the a/b N = 48 second tile is half empty).
+#define XQ_TG_RB 4
+#define XQ_TG_KC 128
+#define XQ_TG_ST 4
+__device__ __forceinline__ void xq_tg_cp16(void* smem_dst, const void* gsrc) {
+    unsigned d = (unsigned)__cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(d), "l"(gsrc) : "memory");
+}
+extern "C" __global__ void __launch_bounds__(128)
+xq_gemm_f16_tail(__half* __restrict__ out, const __half* __restrict__ w, const __half* __restrict__ x,
+                 int M, int N, int K) {
+    XQ_PDL_ENTRY();
+    constexpr int KC = XQ_TG_KC, ST = XQ_TG_ST, RB = XQ_TG_RB;
+    constexpr int PITCH = KC + 8;              // halves; 16-B pad => conflict-free LDS.128 across a quarter-warp
+    constexpr int CH = KC / 8;                 // 16-B chunks per row per stage
+    __shared__ __align__(16) __half wS[ST][32][PITCH];
+    __shared__ __align__(16) __half xS[ST][RB][KC];
+    const int tid = threadIdx.x, lane = tid & 31, r = tid >> 5;
+    const int n0 = blockIdx.x * 32, m0 = blockIdx.y * RB;
+    const int nt = (K + KC - 1) / KC;
+    auto load_tile = [&](int tile, int buf) {
+        const int k0 = tile * KC;
+        const int kc = min(KC, K - k0);
+        #pragma unroll
+        for (int i = 0; i < (32 * CH) / 128; i++) {
+            const int idx = tid + i * 128, row = idx / CH, ch = idx % CH;
+            if (ch * 8 < kc) {
+                const int nn = min(n0 + row, N - 1);
+                xq_tg_cp16(&wS[buf][row][ch * 8], w + (size_t)nn * K + k0 + ch * 8);
+            }
+        }
+        if (tid < RB * CH) {
+            const int row = tid / CH, ch = tid % CH;
+            if (ch * 8 < kc) {
+                const int mm = min(m0 + row, M - 1);
+                xq_tg_cp16(&xS[buf][row][ch * 8], x + (size_t)mm * K + k0 + ch * 8);
+            }
+        }
+    };
+    #pragma unroll
+    for (int s = 0; s < ST - 1; s++) {
+        if (s < nt) load_tile(s, s);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+    float acc = 0.0f;
+    const bool live = (m0 + r) < M;
+    for (int t = 0; t < nt; t++) {
+        asm volatile("cp.async.wait_group %0;" :: "n"(ST - 2) : "memory");
+        __syncthreads();
+        if (t + ST - 1 < nt) load_tile(t + ST - 1, (t + ST - 1) % ST);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        if (live) {
+            const int buf = t % ST;
+            const int kc = min(KC, K - t * KC);
+            const uint4* wp = (const uint4*)&wS[buf][lane][0];
+            const uint4* xp = (const uint4*)&xS[buf][r][0];
+            for (int j = 0; j < kc / 8; j++) {
+                const uint4 wv = wp[j], xv = xp[j];
+                const __half* wh = (const __half*)&wv;
+                const __half* xh = (const __half*)&xv;
+                #pragma unroll
+                for (int q = 0; q < 8; q++) acc += xq_h2f(wh[q]) * xq_h2f(xh[q]);
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    const int n = n0 + lane, m = m0 + r;
+    if (live && n < N) out[(size_t)m * N + n] = xq_f2h(acc);
+}
+
 // ---- WP09: K-MAJOR twin of xq_gemm_f16_rows (the PLE key/value projections, verify + decode).
 // The weights are relayouted ONCE at load to [K/16][N][16] f16: element (n, k) lives at
 // ((k>>4)*N + n)*16 + (k&15). Thread n's 16-k step s is then ONE 32-B load at (s*N + n)*32 B,
@@ -1684,6 +1766,140 @@ xq_gemm_f16_f32_rows32(float* __restrict__ out, const __half* __restrict__ w,
         for (int r = 0; r < 32; ++r)
             if (r < rows) out[(long long)(m0 + r) * N + n] = acc[r];
     }
+}
+
+// TP-4R1: REGISTER-TILED order-preserving prefill router GEMM, out[m][n] = sum_k w[n][k] * x[m][k] in fp32.
+// WHY: rows32 gives each thread ONE column x 32 rows, so every FFMA needs one smem word (x broadcast): 256 FFMA : 64
+// LDS.128 per 8 k = LSU/smem-operand bound at ~25% of the FFMA peak (7.4 TFLOP/s measured in-trace). Here a thread
+// owns an (8 x 8 | 8 x 4) tile built from groups of 4 (LDS.128 fragments, interleaved group offsets so a quarter-warp
+// reads 8 consecutive 16-B chunks = conflict-free): operand words per FFMA (TM+TN)/(TM*TN) = 0.25 | 0.375.
+// ORDER: every output (m, n) is still ONE register chain acc = 0.0f; acc += w[n][k] * x[m][k], k = 0..K-1 ascending,
+// fp16 -> fp32 exact conversions (an fp16*fp16 product is exact in fp32, so FFMA contraction cannot change a bit).
+// No split-K, no tensor cores, no shuffles, no atomics: bitwise == xq_gemm_f16_f32 == rows32 == rows8.
+// Staging: BK = 16 k per tile; each work item = (row-group of 4 rows, k-quad): 4 x LDG.64 (one 32-B sector per row per
+// 4 lanes) -> 4x4 register transpose -> 4 x STS.128 into fp32 k-major tiles As[k][m] / Bs[k][n]; tile i+1 is loaded
+// into registers while tile i is computed, smem is double-buffered, ONE __syncthreads per tile.
+// Contract: N % BN == 0, K % 16 == 0, M >= 1 (x rows past M are clamped to row M-1, their outputs are never stored).
+template <int BM, int BN, int GM, int GN>
+__device__ __forceinline__ void xq_rtile_body(float* __restrict__ out, const __half* __restrict__ w,
+                                              const __half* __restrict__ x, int M, int N, int K) {
+    constexpr int BK = 16;
+    constexpr int TM = 4 * GM, TN = 4 * GN;
+    constexpr int TY = BM / TM, TX = BN / TN, T = TX * TY;
+    constexpr int ROWS = BM + BN;
+    constexpr int NQ = BK / 4;                        // k-quads per row per tile
+    constexpr int RGN = ROWS / 4;                     // row groups (x first, then w)
+    static_assert(ROWS % 4 == 0 && RGN % 8 == 0, "row groups multiple of 8");
+    constexpr int ITEMS = RGN * NQ;
+    constexpr int IPT = (ITEMS + T - 1) / T;          // staging items per thread
+    __shared__ __align__(16) float As[2][BK][BM];
+    __shared__ __align__(16) float Bs[2][BK][BN];
+    const int t = threadIdx.x;
+    const int tx = t % TX, ty = t / TX;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const __half* base[IPT];
+    int kq4[IPT], rgl[IPT]; bool isx[IPT], act[IPT];
+    #pragma unroll
+    for (int j = 0; j < IPT; ++j) {
+        const int i = t + j * T;
+        act[j] = i < ITEMS;
+        const int rg = (i / (8 * NQ)) * 8 + (i % 8);
+        kq4[j] = ((i / 8) % NQ) * 4;
+        isx[j] = (4 * rg) < BM;
+        rgl[j] = isx[j] ? rg : rg - BM / 4;
+        const int r0 = isx[j] ? (m0 + 4 * rgl[j]) : (n0 + 4 * rgl[j]);
+        base[j] = (isx[j] ? x : w) + (long long)(act[j] ? r0 : 0) * K + kq4[j];
+    }
+    const int lim = M - 1;
+    uint2 pre[IPT][4];
+    auto gload = [&](int k0) {
+        #pragma unroll
+        for (int j = 0; j < IPT; ++j)
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                long long roff = (long long)r * K;
+                if (isx[j]) { int m = m0 + 4 * rgl[j] + r; m = m < lim ? m : lim; roff = (long long)(m - (m0 + 4 * rgl[j])) * K; }
+                pre[j][r] = __ldg(reinterpret_cast<const uint2*>(base[j] + roff + k0));
+            }
+    };
+    auto sstore = [&](int buf) {
+        #pragma unroll
+        for (int j = 0; j < IPT; ++j) {
+            if (!act[j]) continue;
+            float f[4][4];
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const __half2* h2 = reinterpret_cast<const __half2*>(&pre[j][r]);
+                const float2 a = __half22float2(h2[0]);
+                const float2 b = __half22float2(h2[1]);
+                f[r][0] = a.x; f[r][1] = a.y; f[r][2] = b.x; f[r][3] = b.y;
+            }
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                float* dst = isx[j] ? &As[buf][kq4[j] + e][4 * rgl[j]] : &Bs[buf][kq4[j] + e][4 * rgl[j]];
+                *reinterpret_cast<float4*>(dst) = make_float4(f[0][e], f[1][e], f[2][e], f[3][e]);
+            }
+        }
+    };
+    float acc[TM][TN];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i)
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+    gload(0);
+    sstore(0);
+    __syncthreads();
+    const int nt = K / BK;
+    for (int it = 0; it < nt; ++it) {
+        const int cur = it & 1;
+        if (it + 1 < nt) gload((it + 1) * BK);
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float a[TM], b[TN];
+            #pragma unroll
+            for (int g = 0; g < GM; ++g) {
+                const float4 v = *reinterpret_cast<const float4*>(&As[cur][k][g * (BM / GM) + ty * 4]);
+                a[4 * g] = v.x; a[4 * g + 1] = v.y; a[4 * g + 2] = v.z; a[4 * g + 3] = v.w;
+            }
+            #pragma unroll
+            for (int g = 0; g < GN; ++g) {
+                const float4 v = *reinterpret_cast<const float4*>(&Bs[cur][k][g * (BN / GN) + tx * 4]);
+                b[4 * g] = v.x; b[4 * g + 1] = v.y; b[4 * g + 2] = v.z; b[4 * g + 3] = v.w;
+            }
+            #pragma unroll
+            for (int i = 0; i < TM; ++i)
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] += b[j] * a[i];
+        }
+        if (it + 1 < nt) { sstore(cur ^ 1); __syncthreads(); }
+    }
+    #pragma unroll
+    for (int gm = 0; gm < GM; ++gm)
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int m = m0 + gm * (BM / GM) + ty * 4 + i;
+            if (m < M)
+                #pragma unroll
+                for (int gn = 0; gn < GN; ++gn) {
+                    const int n = n0 + gn * (BN / GN) + tx * 4;
+                    *reinterpret_cast<float4*>(out + (long long)m * N + n) =
+                        make_float4(acc[4 * gm + i][4 * gn], acc[4 * gm + i][4 * gn + 1], acc[4 * gm + i][4 * gn + 2], acc[4 * gm + i][4 * gn + 3]);
+                }
+        }
+}
+// 128 x 64 outputs per CTA, 8 x 8 per thread (grid (N/64, ceil(M/128)), block 128): chunks of >= ~1280 rows.
+extern "C" __global__ void __launch_bounds__(128)
+xq_gemm_f16_f32_tile128(float* __restrict__ out, const __half* __restrict__ w, const __half* __restrict__ x,
+                        int M, int N, int K) {
+    XQ_PDL_ENTRY();
+    xq_rtile_body<128, 64, 2, 2>(out, w, x, M, N, K);
+}
+// 64 x 64 outputs per CTA, 8 x 4 per thread (grid (N/64, ceil(M/64)), block 128): mid chunks (more CTAs per SM wave).
+extern "C" __global__ void __launch_bounds__(128)
+xq_gemm_f16_f32_tile64(float* __restrict__ out, const __half* __restrict__ w, const __half* __restrict__ x,
+                       int M, int N, int K) {
+    XQ_PDL_ENTRY();
+    xq_rtile_body<64, 64, 2, 1>(out, w, x, M, N, K);
 }
 
 // PFX1 (d): the prefill router for SMALL chunks — a BIT-EXACT twin of xq_gemm_f16_f32 /
@@ -1938,7 +2154,7 @@ extern "C" __global__ void xq_hc_mix4(__half* __restrict__ x, float* __restrict_
 // 1024 (m SMs busy at decode/verify): each block did its row's elementwise x AND the hc inject
 // trees behind serial strided-load chains (~14 us per call at m=6 against ~1 us of bytes).
 // Here grid (ninj + nxb, B), block 1024 (MUST stay 1024: the tree leaves are the 1024 per-thread
-// partials of the old kernels), no cross-block state (the rival hc_mix.cu shape: independent
+// partials of the old kernels), no cross-block state (the reference implementation's hc_mix.cu shape: independent
 // blocks, each re-deriving what it needs):
 //   blockIdx.x <  ninj : stream s = blockIdx.x's inject tree, ALONE in its block. Same per-thread
 //                        partial (c = tid + j*1024, ascending j, part += w*hn — one fma chain),
@@ -2405,7 +2621,7 @@ extern "C" __global__ void xq_argmax_rows(int* __restrict__ out_ids, int lane0,
 }
 
 // ---- API-parity DDS: max logit of one fp16 row -> out[ooff] (f32). The draft head's argmax
-// LOGIT is the rival's dynamic-draft confidence score (exllamav3 DraftConfidenceCalibrator).
+// LOGIT is the reference implementation's dynamic-draft confidence score (exllamav3 DraftConfidenceCalibrator).
 extern "C" __global__ void xq_rowmax_f16(float* __restrict__ out, long long ooff,
                                          const __half* __restrict__ x, long long start, int V) {
     XQ_PDL_ENTRY();
@@ -2937,7 +3153,7 @@ extern "C" __global__ void __launch_bounds__(256, 3) xq_dh_rescore(
 // fixed (warp-chunk, index) order with a counter-hashed uniform — a pure function of
 // (logits, params), so a fixed seed reproduces. Used for plain steps AND MTP verify rows:
 // with a deterministic (argmax) draft, "sample the target at each verify row, accept while
-// sample == draft" is distribution-exact (the rival's EXL3_BATCH_VERIFY rule).
+// sample == draft" is distribution-exact (the reference implementation's EXL3_BATCH_VERIFY rule).
 __device__ __forceinline__ unsigned int xq_skey(unsigned short b) {
     return (b & 0x8000u) ? ((~(unsigned int)b) & 0xFFFFu) : ((unsigned int)b | 0x8000u);
 }
@@ -3170,20 +3386,20 @@ extern "C" __global__ void __launch_bounds__(1024) xq_sample_rows(
     }
 }
 
-// ---- WP15: repetition / presence / frequency penalties with the RIVAL's semantics
+// ---- WP15: repetition / presence / frequency penalties with the REFERENCE implementation's semantics
 // (exllamav3 ComboSampler: SS_RepP then SS_PresFreqP, exllamav3_ext/generator/rep_pen.cu), applied
 // in place to fp16 logit rows BEFORE xq_argmax / xq_sample_rows, at every decode row and every
 // verify row. Per-row params pen[row*8 + {0 flag (bit0 rep, bit1 pres/freq; 0 = the row is
 // untouched), 1 rep_p (f32), 2 pres_p (f32), 3 freq_p (f32), 4 sustain, 5 decay, 6-7 0}].
-// Window: past positions i with past_len - i < sustain + decay (the rival's `i > past_len - S - D`),
+// Window: past positions i with past_len - i < sustain + decay (the reference implementation's `i > past_len - S - D`),
 // factor(dist) = 1 for dist <= S, else 1 - (dist - S) / D (clamped); the rep factor and the presence
 // factor are the MAX over a token's occurrences (its most recent), the frequency term the SUM.
 //   rep:  w = v > 0 ? v / rep_p : v * rep_p;  fr = f + 1e-30;  v = v * ((1 - fr) + 1e-30) + w * fr
 //   pres/freq: v -= freq_p * sum(factor);  v -= f * pres_p
-// Factors are exact integers in 1/D units (the rival's float factor is k/D, exact for D = 1024),
-// accumulated with integer atomics: deterministic, unlike the rival's float atomicAdd; the frequency
-// sum can differ from the rival's by float rounding only. Only tokens seen in the window are
-// rewritten — for every other token the rival's formula returns v bit-exactly — so a penalized row
+// Factors are exact integers in 1/D units (the reference implementation's float factor is k/D, exact for D = 1024),
+// accumulated with integer atomics: deterministic, unlike the reference implementation's float atomicAdd; the frequency
+// sum can differ from the reference implementation's by float rounding only. Only tokens seen in the window are
+// rewritten — for every other token the reference implementation's formula returns v bit-exactly — so a penalized row
 // costs O(window) work per 4096-id span, and an unpenalized row (flag 0) exits at once.
 // Past tokens: a per-slot device ring `hist` of R = 1 << rlog2 ids indexed by position & (R-1)
 // (positions < base: committed history) plus the in-flight row tokens (positions >= base).
@@ -3201,7 +3417,7 @@ __device__ __forceinline__ unsigned short xq_pen_tok(float v, unsigned int fm, c
                                                      float freq, float scale) {
     const float f = (float)fm / scale;
     if (flag & 1u) {
-        // literally the rival's expression (rep_pen.cu apply_rep_pens_kernel)
+        // literally the reference implementation's expression (rep_pen.cu apply_rep_pens_kernel)
         const float w = v > 0.0f ? v / rep : v * rep;
         const float fr = f + 1e-30f;
         const float f1 = (1.0f - fr) + 1e-30f;
@@ -4507,6 +4723,50 @@ extern "C" __global__ void xq_cos_gather(const float* __restrict__ tab, float* _
     dst[i] = tab[(long long)pos[b] * stride + (int)(i - (long long)b * stride)];
 }
 
+// ---- VIS-2: RoPE row gather through a per-slot mrope map (every main-attention gather site).
+// Row b is KV position p = pos[b] of slot s (slot_src ? slot_src[b * slot_stride] : slot_const).
+// Inside the slot's mapped prompt (p < rplen[s]) the source row is rmap[s * max_pos + p]; past it,
+// p + rdelta[s] (text after the last image runs rdelta <= 0 below its KV index, HF get_rope_index).
+// Source rows >= max_pos live in the per-slot image-row table mtab (rows max_pos + s * R + j).
+// A slot with rplen = rdelta = 0 — every text-only request — reads tab[p]: bit-identical to
+// xq_cos_gather. An out-of-range slot (a stale id) also falls back to tab[p].
+extern "C" __global__ void xq_cos_gather_v(const float* __restrict__ tab, const float* __restrict__ mtab,
+                                           float* __restrict__ dst, const int* __restrict__ pos,
+                                           const int* __restrict__ slot_src, int slot_stride, int slot_const,
+                                           const int* __restrict__ rmap, const int* __restrict__ rplen,
+                                           const int* __restrict__ rdelta, int nslots, int max_pos,
+                                           int stride, int M) {
+    XQ_PDL_ENTRY();
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)M * stride;
+    if (i >= total) return;
+    int b = (int)(i / stride);
+    int p = pos[b];
+    int s = slot_src ? slot_src[(long long)b * slot_stride] : slot_const;
+    long long idx = p;
+    if (s >= 0 && s < nslots) {
+        idx = p < rplen[s] ? (long long)rmap[(long long)s * max_pos + p] : (long long)p + rdelta[s];
+    }
+    const float* src = idx < max_pos ? tab + idx * stride : mtab + (idx - max_pos) * stride;
+    dst[i] = src[(int)(i - (long long)b * stride)];
+}
+
+// ---- VIS-2: image-embedding splice into the embedded residual of a prefill chunk.
+// resid [c][hc][h] f32 (xq_embed_resid's layout); src_row[b] >= 0 = the row of img [n][h] for chunk
+// row b (written into every hyper-connection stream: the reference splices BEFORE the hc repeat);
+// src_row[b] < 0 leaves the token embedding.
+extern "C" __global__ void xq_splice_rows(float* __restrict__ resid, const float* __restrict__ img,
+                                          const int* __restrict__ src_row, int h, int hc, int B) {
+    XQ_PDL_ENTRY();
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long rw = (long long)h * hc;
+    if (i >= rw * B) return;
+    int b = (int)(i / rw);
+    int s = src_row[b];
+    if (s < 0) return;
+    resid[i] = img[(long long)s * h + (int)((i % rw) % h)];
+}
+
 // ---- per-expert input Hadamard: xh[e,m,:] = H(x[m,:] * suh_all[idxmap[e],:]).
 // grid E*M*(K/128), block 32; suh PRE-butterfly (their convention, S-A3-c).
 // exl3_had128 normalizes internally — no extra scale here.
@@ -5430,7 +5690,7 @@ xq_gemm_grouped_a1b3(const uint16_t* __restrict__ base,
 
 // ===========================================================================
 // A5 WP20 (PLAN/SURPASS_PLAN_2026-09-26.md): expert WORD DIET + MoE glue as
-// LAST-ARRIVAL EPILOGUES (the rival's exl3_moe_coop structure on our a1b3 body).
+// LAST-ARRIVAL EPILOGUES (the reference implementation's exl3_moe_coop structure on our a1b3 body).
 // Target: plain sm_121 — nothing here needs an f/a feature (fp16 mma.m16n8k16, dp4a,
 // 64-bit funnel shifts, device-scope atomics/fences are baseline CC 12.1).
 //
@@ -6671,12 +6931,12 @@ MPK_DN_ENTRY(10, 8)
 
 // ---------------------------------------------------------------------------
 // S-A3-h item 3, rung 1: COOPERATIVE MoE expert-stream GEMM — a schedule port
-// of the rival's exl3_moe_coop_a/b<3,2,true> (R-M3 §4), MATH UNCHANGED.
+// of the reference implementation's exl3_moe_coop_a/b<3,2,true> (R-M3 §4), MATH UNCHANGED.
 //
 // Old schedule (xq_gemm_grouped_xh)            New schedule (this kernel)
 // ─ 256 threads, m16 x N128 CTA tile           ─ 512 threads, one block per
 // ─ grid (expert x N/128 tiles)                  (expert-run, 32-COL GROUP) —
-// ─ 8 warps compute 8 x 16-col stripes           the rival's A/B work map (A =
+// ─ 8 warps compute 8 x 16-col stripes           the reference implementation's A/B work map (A =
 // ─ trellis words read as scalar 4B              gate/up call site, B = down;
 //   global loads inside the decode; A tile       N granularity 32 cols so tail
 //   staged by direct LDG->SMEM                   groups never idle a 128 tile)
@@ -6818,7 +7078,7 @@ __device__ __forceinline__ void xq_moe_coop_body(const uint16_t* __restrict__ ba
     TrView s_tr = (TrView)s_tr_raw;
     SaView s_a  = (SaView)s_a_raw;
     // Work map: one block per (expert, 32-col group); projection is the call
-    // site (A = gate/up, B = down — the rival's A/B split).
+    // site (A = gate/up, B = down — the reference implementation's A/B split).
     const int groups = N >> 5;
     const int expert = blockIdx.x / groups;
     const int group  = blockIdx.x - expert * groups;
@@ -7039,20 +7299,20 @@ __device__ __forceinline__ void xq_k_norm_rope(float* kbuf, float* red, const __
 #define XQ_KV_F32 0
 #define XQ_KV_F16 1
 #define XQ_KV_FP8 2
-// WP25/K3 q8 = the rival's "-cq 8" cache (exllamav3 cache/q_cache_kernels.cuh quant_block_x4 +
+// WP25/K3 q8 = the reference implementation's "-cq 8" cache (exllamav3 cache/q_cache_kernels.cuh quant_block_x4 +
 // triton_paged._qc_load_kt/_qc_load_v, fork 523ecd3), per 32-dim group of a K/V row:
 //   v = H32(x) * (1/sqrt 32)          unnormalized butterfly, strides 1,2,4,8,16 (their H4 x H8 order)
 //   s = max|v| + 1e-10                stored as ONE f16 per group (__float2half_rn)
 //   q = clamp(floor(fma(v * (1/s), 128, 128)), 0, 255)          linear midpoint grid, 8-bit code
 //   read: (q - 127.5) * (f16(s) / 128)                            stays in the ROTATED basis
-// The rotation is folded out of attention exactly as the rival does it (orthonormal and block-
+// The rotation is folded out of attention exactly as the reference implementation does it (orthonormal and block-
 // diagonal per head): q is rotated once where it is staged (q.k == H q . H k), the output is
 // rotated back once (xq_h32r) before the gate, so every in-loop read is unpack x scale.
 #define XQ_KV_Q8 3
 // Probe-only positive control (WP25 rung 1: "a deliberately broken 4-bit arm, which must fail"):
-// the q8 layout and readers with the rival's 4-bit midpoint grid (code q4*16+8). Never served.
+// the q8 layout and readers with the reference implementation's 4-bit midpoint grid (code q4*16+8). Never served.
 #define XQ_KV_Q4X 4
-#define XQ_R32 0.17677669529663688110f   // 1/sqrt(32), the rival's r32
+#define XQ_R32 0.17677669529663688110f   // 1/sqrt(32), the reference implementation's r32
 struct XqKv { char* k; char* v; long long rb; int fmt; int hd; };
 __device__ __forceinline__ int xq_kv_fmt(int mpf) { return (int)(((unsigned)mpf) >> 28); }
 __device__ __forceinline__ long long xq_kv_rowb(int fmt, int hd) {
@@ -7071,7 +7331,7 @@ __device__ __forceinline__ XqKv xq_kv_make(const void* kcvc, int mpf, int hd, in
     return r;
 }
 // q8 H32 butterfly across a warp: lane j holds element j of one 32-group. Stage o pairs lanes
-// j, j^o: low lane a+b, high lane a-b (= the rival's sign-flip-and-add, bitwise). Unnormalized.
+// j, j^o: low lane a+b, high lane a-b (= the reference implementation's sign-flip-and-add, bitwise). Unnormalized.
 __device__ __forceinline__ float xq_h32(float v, int lane) {
     #pragma unroll
     for (int o = 1; o < 32; o <<= 1) {
@@ -7082,7 +7342,7 @@ __device__ __forceinline__ float xq_h32(float v, int lane) {
 }
 // Orthonormal H32/sqrt(32) (involutory): q into the cache basis, attention output back out.
 __device__ __forceinline__ float xq_h32r(float v, int lane) { return __fmul_rn(xq_h32(v, lane), XQ_R32); }
-// q8 code byte k of a word -> (code - 127.5) * sm, rounded ONCE (== the rival's f32 expression):
+// q8 code byte k of a word -> (code - 127.5) * sm, rounded ONCE (== the reference implementation's f32 expression):
 // the byte is spliced under 2^23 (PRMT, no I2F), t = code - 128 exactly, fma(t, sm, sm/2).
 __device__ __forceinline__ float xq_q8v(unsigned w, int k, float sm, float hs) {
     const float f = __uint_as_float(__byte_perm(w, 0x4B000000u, 0x7540 | k));
@@ -9082,6 +9342,79 @@ extern "C" __global__ void xq_had_suh_rows(const __half* __restrict__ x, const _
     for (int r = 0; r < 4; r++) xh[base + r] = xq_f2h(v[r]);
 }
 
+// TP-4M1 (PLAN/TP-4M1_REPORT.md): xq_had_suh_rows_live_u{1,2,4} (U = items in flight per warp; served = u2) = xq_had_suh_rows with the EP dead rows skipped, vector
+// loads/stores, and a persistent grid-stride loop. PER-ELEMENT ARITHMETIC IS THE SAME CODE: v = h2f(x) * h2f(suh)
+// (f32 product, exact), exl3_had128 (the same butterfly, 4 elements per lane, 32 lanes = one 128-block), ONE f16
+// RN store. Only memory behaviour differs: x / suh are read as one 8-byte uint2 per lane (4 halves), the result is
+// stored as one uint2, a warp walks (row, block) items in the old blockIdx order with U items in flight.
+// DEAD ROWS: under EP the compact row list holds live_end = offs_row[n_local] real rows; rows [live_end, R) were
+// given a valid dummy mapping by xq_moe_pf_ep_fill purely so this kernel would not read an uninitialised index, and
+// their output is never read (every consumer reads xh through the tile lists: M = cnt[e], rows >= cnt are
+// zero-filled by the cp.async staging, and every tile lies below offs_row[n_local]). The live-row kernel therefore
+// does not write them. live_end == nullptr processes all R rows (the old kernel's coverage).
+// Requires K % 128 == 0, 8-byte aligned x / suh_all / xh bases (cudaMalloc'd slices).
+template <int XQ_HSL_U>
+__device__ __forceinline__ void xq_had_suh_rows_live_body(
+        const __half* __restrict__ x, const __half* __restrict__ suh_all,
+        const int* __restrict__ idxmap, const int* __restrict__ row_tok, const int* __restrict__ row_eidx,
+        __half* __restrict__ xh, const int* __restrict__ live_end, int R, int K) {
+    const int nblk = K >> 7;
+    int lim = R;
+    if (live_end != nullptr) { const int le = *live_end; lim = le < R ? le : R; if (lim < 0) lim = 0; }
+    const long long nitem = (long long)lim * nblk;
+    const int lane = threadIdx.x & 31;
+    const long long gw = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    const long long stride = (long long)gridDim.x * 8;
+    for (long long it0 = gw; it0 < nitem; it0 += stride * XQ_HSL_U) {
+        uint2 xv[XQ_HSL_U], sv[XQ_HSL_U];
+        long long ob[XQ_HSL_U];
+        #pragma unroll
+        for (int u = 0; u < XQ_HSL_U; ++u) {
+            const long long it = it0 + (long long)u * stride;
+            ob[u] = -1;
+            if (it < nitem) {
+                const int i = (int)it / nblk;            // nitem = R * (K/128) < 2^31 (R <= ~100M rows of K = 2560)
+                const int blk = (int)it - i * nblk;
+                const int m = row_tok[i];
+                const long long col = (long long)blk * 128 + lane * 4;
+                const int e = idxmap[row_eidx[i]];
+                xv[u] = *reinterpret_cast<const uint2*>(x + (long long)m * K + col);
+                sv[u] = *reinterpret_cast<const uint2*>(suh_all + (long long)e * K + col);
+                ob[u] = (long long)i * K + col;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < XQ_HSL_U; ++u) {
+            if (ob[u] >= 0) {
+                const float2 xa = __half22float2(*reinterpret_cast<const __half2*>(&xv[u].x));
+                const float2 xb = __half22float2(*reinterpret_cast<const __half2*>(&xv[u].y));
+                const float2 sa = __half22float2(*reinterpret_cast<const __half2*>(&sv[u].x));
+                const float2 sb = __half22float2(*reinterpret_cast<const __half2*>(&sv[u].y));
+                float v[4];
+                v[0] = xa.x * sa.x; v[1] = xa.y * sa.y; v[2] = xb.x * sb.x; v[3] = xb.y * sb.y;
+                exl3_had128(v, lane);
+                const __half2 o01 = __floats2half2_rn(v[0], v[1]);
+                const __half2 o23 = __floats2half2_rn(v[2], v[3]);
+                uint2 ov;
+                ov.x = *reinterpret_cast<const unsigned*>(&o01);
+                ov.y = *reinterpret_cast<const unsigned*>(&o23);
+                *reinterpret_cast<uint2*>(xh + ob[u]) = ov;
+            }
+        }
+    }
+}
+#define XQ_HSL_ENTRY(U) \
+extern "C" __global__ void __launch_bounds__(256) xq_had_suh_rows_live_u##U( \
+        const __half* __restrict__ x, const __half* __restrict__ suh_all, \
+        const int* __restrict__ idxmap, const int* __restrict__ row_tok, const int* __restrict__ row_eidx, \
+        __half* __restrict__ xh, const int* __restrict__ live_end, int R, int K) { \
+    XQ_PDL_ENTRY(); \
+    xq_had_suh_rows_live_body<U>(x, suh_all, idxmap, row_tok, row_eidx, xh, live_end, R, K); \
+}
+XQ_HSL_ENTRY(1)
+XQ_HSL_ENTRY(2)
+XQ_HSL_ENTRY(4)
+
 extern "C" __global__ void xq_had_svh_rows(const __half* __restrict__ yraw, const __half* __restrict__ svh_all,
                                            const int* __restrict__ idxmap, const int* __restrict__ row_eidx,
                                            __half* __restrict__ y, int R, int N) {
@@ -10184,7 +10517,7 @@ xq_hc_fuse(__half* __restrict__ dd, __half* __restrict__ uu,
     }
 }
 
-// ---- S-A3-p: int8-weight twin of xq_hc_fuse (opt-in, --hc-int8). The rival's EXL3_GR_INT8
+// ---- S-A3-p: int8-weight twin of xq_hc_fuse (opt-in, --hc-int8). The reference implementation's EXL3_GR_INT8
 // recipe transcribed onto our mixer layout: symmetric int8, one fp32 scale per OUTPUT row along
 // the contracted dim (down: [lr][rw] -> down_s[lr]; up: [rw][lr] -> up_s[rw]). The scale is
 // constant over k, so it factors out: dd[n] = s[n] * sum_k q[n,k] * hn[k]. Same grid, barrier,
@@ -10253,7 +10586,7 @@ xq_hc_fuse_i8(__half* __restrict__ dd, __half* __restrict__ uu,
 // Here a warp (phase A) / thread (phase B) loads each weight vector ONCE and runs every row's
 // dot product with THAT ROW'S EXACT accumulation sequence (same per-lane ascending dot8 adds,
 // same butterfly, same scale-then-round) — so each row is bit-identical to xq_hc_fuse_i8 and to
-// the m=1 path (batch invariance by construction). The rival's row-batched gr_mix changed the
+// the m=1 path (batch invariance by construction). The reference implementation's row-batched gr_mix changed the
 // reduction order and was rejected for moving greedy output; this one does not.
 template <int M>
 __device__ __forceinline__ void xq_hc_fuse_i8_rb_body(__half* __restrict__ dd, __half* __restrict__ uu,
@@ -10674,7 +11007,7 @@ xq_hc_fuse_i8_rbk(__half* __restrict__ dd, __half* __restrict__ uu,
 //            BEFORE the barrier on the CTAs that have no phase-A unit (all CTAs when G <= #units),
 //            i.e. under the phase-A weight stream. A 256-thread CTA computes mix_rg's 1024 leaves
 //            (leaf l = tid + 256q: the same c = l + 1024j ascending fma chain, same guards) and runs
-//            the SAME pairing (smem 512..32, warp-0 shfl_down 16..1). The rival hc_mix.cu shape: a
+//            the SAME pairing (smem 512..32, warp-0 shfl_down 16..1). The reference implementation's hc_mix.cu shape: a
 //            tiny L2-resident reduction redone in its own block instead of a separate launch.
 //   barrier  the unchanged xq_grid_barrier.
 //   phase B  up GEMV + mix, compute-bound after the barrier, so balanced: EVERY CTA owns hidden
@@ -12358,7 +12691,7 @@ DKS_ENTRY(3, 6)
 
 // =============================================================================
 // S-A3-f-d — MTP k-chain VERIFY (width m = k+1 rows of ONE slot, positions
-// p..p+m-1). Transcribed structure from the rival recipe's device-resident
+// p..p+m-1). Transcribed structure from the reference implementation recipe's device-resident
 // draft-chain patch (0003) + pruned draft head (0002); every stateful op is a
 // CHAIN variant of the decode kernel: the group's rows are processed
 // SEQUENTIALLY so each row sees the previous rows' committed state, with the
@@ -12603,7 +12936,8 @@ extern "C" __global__ void xq_attn_decode_group_ref(__half* __restrict__ attn,
 #define XQ_DV3_TS  2304                      // score-plane row stride (positions): 9 x 256
 #define XQ_DV3_CH  64                        // dots chunk: 8 warps x 8 positions
 #define XQ_DV3_NCH (XQ_DV3_TS / XQ_DV3_CH)   // 36 chunk-max slots per (row, head)
-#define XQ_DV3_G   12                        // q heads per kv head the bodies are built for
+#define XQ_DV3_G   12                        // q heads per kv head: the W<=2 / TP=1 instantiation
+#define XQ_DV3_G6  6                         // TP-4G: the W=4 / TP=4 instantiation (6 heads per kv head)
 #define XQ_DV3_T   64                        // accumulate tile (positions)
 
 // The softmax scale exactly as v2 gets it: rsqrt.approx of the RUNTIME head dim (MUFU.RSQ
@@ -12677,13 +13011,20 @@ extern "C" __global__ void xq_attn_dense_prep(float* __restrict__ qstage, float*
 // ch*64 + w*8 + [0,8): their K rows (E=8 dims per lane: lane + 32j) sit in registers and
 // feed all 12 heads. Per group of 4 heads the 8x4 = 32 lane-partials go through the
 // warp's [32][33] transpose tile and lane L finishes dot L = (position L>>2, head L&3).
-extern "C" __global__ void __launch_bounds__(256, 2)
-xq_attn_dense_dots(float* __restrict__ sc, float* __restrict__ pmx, const float* __restrict__ qstage,
-                   const float* __restrict__ kcvc, const int* __restrict__ slotpos,
-                   int nh_packed, int hd_packed, int max_pos) {
-    XQ_PDL_ENTRY();
+// TP-4G: the body is templated on G (q heads per kv head; 12 = W<=2 / TP=1, 6 = W=4 / TP=4).
+// Heads are processed in groups of 4 (NHG = ceil(G/4)); at G=6 the second group holds 2 valid
+// heads and its lanes for the other 2 are computed on stale tile rows and discarded (never
+// stored, never in the max). Every head's dot is the same in-register + cross-lane halving
+// tree at any G, so a head's bits do not depend on G. At G=12 (PARTIAL = false) every guard
+// below is compiled out (SASS identical to the pre-TP-4G kernel up to register naming).
+template <int G>
+__device__ __forceinline__ void xq_dv3_dots_body(float* __restrict__ sc, float* __restrict__ pmx,
+                                                 const float* __restrict__ qstage,
+                                                 const float* __restrict__ kcvc, const int* __restrict__ slotpos,
+                                                 int nh_packed, int hd_packed, int max_pos) {
     constexpr int E = 8;                         // hd 256 (host-gated)
-    constexpr int G = XQ_DV3_G;
+    constexpr int NHG = (G + 3) / 4;
+    constexpr bool PARTIAL = (G % 4) != 0;       // the last 4-head group is short (G=6); false at G=12
     const int nh = nh_packed & 0xFFFF;
     const int nkv = (nh_packed >> 16) & 0xFFFF;
     const int hd = hd_packed & 0xFFFF;
@@ -12724,9 +13065,10 @@ xq_attn_dense_dots(float* __restrict__ sc, float* __restrict__ pmx, const float*
             }
         }
         #pragma unroll
-        for (int hg = 0; hg < G / 4; hg++) {
+        for (int hg = 0; hg < NHG; hg++) {
             #pragma unroll
             for (int hh = 0; hh < 4; hh++) {
+                if (PARTIAL && hg * 4 + hh >= G) continue;   // skipped rows are never stored / maxed
                 const float* qh = qs + (hg * 4 + hh) * (32 * E);
                 float qv[E];
                 #pragma unroll
@@ -12757,14 +13099,14 @@ xq_attn_dense_dots(float* __restrict__ sc, float* __restrict__ pmx, const float*
             const int t = t0 + (lane >> 2);
             const int h = hg * 4 + (lane & 3);
             float mv = -INFINITY;
-            if (t < npos) {
+            if (t < npos && (!PARTIAL || h < G)) {
                 srow[(long long)h * XQ_DV3_TS + t] = a[0];
                 mv = __fmul_rn(a[0], scale);
             }
             mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, 4));
             mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, 8));
             mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, 16));
-            if (lane < 4) wmx[warp][hg * 4 + lane] = mv;
+            if (lane < 4 && (!PARTIAL || hg * 4 + lane < G)) wmx[warp][hg * 4 + lane] = mv;
             __syncwarp();                         // tb is rewritten by the next head group
         }
         __syncthreads();
@@ -12776,6 +13118,21 @@ xq_attn_dense_dots(float* __restrict__ sc, float* __restrict__ pmx, const float*
         }
         __syncthreads();                          // wmx reuse by the next chunk
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2)
+xq_attn_dense_dots(float* __restrict__ sc, float* __restrict__ pmx, const float* __restrict__ qstage,
+                   const float* __restrict__ kcvc, const int* __restrict__ slotpos,
+                   int nh_packed, int hd_packed, int max_pos) {
+    XQ_PDL_ENTRY();
+    xq_dv3_dots_body<XQ_DV3_G>(sc, pmx, qstage, kcvc, slotpos, nh_packed, hd_packed, max_pos);
+}
+extern "C" __global__ void __launch_bounds__(256, 2)
+xq_attn_dense_dots_g6(float* __restrict__ sc, float* __restrict__ pmx, const float* __restrict__ qstage,
+                      const float* __restrict__ kcvc, const int* __restrict__ slotpos,
+                      int nh_packed, int hd_packed, int max_pos) {
+    XQ_PDL_ENTRY();
+    xq_dv3_dots_body<XQ_DV3_G6>(sc, pmx, qstage, kcvc, slotpos, nh_packed, hd_packed, max_pos);
 }
 
 // Stage V rows [t0, t0+T) of this CTA's dim slice (raw cache bytes, SD*eb per row; fp8 also
@@ -12854,12 +13211,12 @@ __device__ __forceinline__ void xq_dv3_ldv_q8(float* v, const char* vbt, const f
 
 // ---- 3. accumulate: grid (hd/SD, nkv, m), block 192 = 12 heads x 16 dim-groups of DPT dims.
 // Thread (h = tid>>4, dgl = tid&15) owns dims d0..d0+DPT-1 of head kvh*12+h.
-template <int FMT, int DPT>
+template <int G, int FMT, int DPT>
 __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const float* __restrict__ sc,
                                                 const float* __restrict__ pmx, const XqKv& kc,
                                                 const __half* __restrict__ qg, int nh, int hd,
                                                 int kvh, int row, int npos, char* vb, float* vsc, float* wb) {
-    constexpr int G = XQ_DV3_G, T = XQ_DV3_T, SD = 16 * DPT, WST = XQ_DV3_T + 4;
+    constexpr int T = XQ_DV3_T, SD = 16 * DPT, WST = XQ_DV3_T + 4;
     constexpr int EB = FMT == XQ_KV_F32 ? 4 : (FMT == XQ_KV_F16 ? 2 : 1);
     constexpr int N16 = SD * EB / 16;
     // q8 (WP25): codes packed SD bytes per smem row (so the DPT=2 body fits acc1's buffer);
@@ -12987,7 +13344,7 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
     }
 }
 
-template <int DPT>
+template <int G, int DPT>
 __device__ __forceinline__ void xq_dv3_acc_entry(__half* __restrict__ attn, const float* __restrict__ sc,
                                                  const float* __restrict__ pmx, const float* __restrict__ kcvc,
                                                  const __half* __restrict__ qg, const int* __restrict__ slotpos,
@@ -12996,28 +13353,28 @@ __device__ __forceinline__ void xq_dv3_acc_entry(__half* __restrict__ attn, cons
     const int nh = nh_packed & 0xFFFF;
     const int nkv = (nh_packed >> 16) & 0xFFFF;
     const int hd = hd_packed & 0xFFFF;
-    if (hd != 256 || nh != XQ_DV3_G * nkv) return;   // host-gated
+    if (hd != 256 || nh != G * nkv) return;   // host-gated
     const int kvh = blockIdx.y;
     const int row = blockIdx.z;
     const int slot = slotpos[row * 2 + 0];
     const int npos = slotpos[row * 2 + 1] + 1;
     __shared__ __align__(16) char vb[2 * XQ_DV3_T * SD * 4];
     __shared__ __align__(16) float vsc[2 * XQ_DV3_T * 4];
-    __shared__ __align__(16) float wb[XQ_DV3_G * (XQ_DV3_T + 4)];
+    __shared__ __align__(16) float wb[G * (XQ_DV3_T + 4)];
     if (npos > XQ_DV3_TS) {
         // host bug tripwire: the score plane cannot hold this row — loud, never truncated
         const int h = threadIdx.x >> 4, dgl = threadIdx.x & 15;
         #pragma unroll
         for (int e = 0; e < DPT; e++)
-            attn[(long long)row * nh * hd + (long long)(kvh * XQ_DV3_G + h) * hd + blockIdx.x * SD + dgl * DPT + e] =
+            attn[(long long)row * nh * hd + (long long)(kvh * G + h) * hd + blockIdx.x * SD + dgl * DPT + e] =
                 __float2half(__int_as_float(0x7fc00000));
         return;
     }
     const XqKv kc = xq_kv_make(kcvc, max_pos, hd, nkv, slot, kvh);
     switch (kc.fmt) {
-        case XQ_KV_F32: xq_dv3_acc_body<XQ_KV_F32, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
-        case XQ_KV_F16: xq_dv3_acc_body<XQ_KV_F16, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
-        case XQ_KV_FP8: xq_dv3_acc_body<XQ_KV_FP8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
+        case XQ_KV_F32: xq_dv3_acc_body<G, XQ_KV_F32, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
+        case XQ_KV_F16: xq_dv3_acc_body<G, XQ_KV_F16, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
+        case XQ_KV_FP8: xq_dv3_acc_body<G, XQ_KV_FP8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
         default:
             // q8 / probe-only q4x (same layout + reader). The output un-rotation needs a whole
             // 32-group per thread-16 slice, so the single-row acc1 (DPT=1, 16-dim slices) runs
@@ -13025,10 +13382,10 @@ __device__ __forceinline__ void xq_dv3_acc_entry(__half* __restrict__ attn, cons
             // grid (and so every captured graph) is unchanged. RS = SD bytes keeps the DPT=2
             // body inside acc1's static vb buffer (2*64*32 B <= 2*64*16*4 B).
             if constexpr (DPT >= 2) {
-                xq_dv3_acc_body<XQ_KV_Q8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+                xq_dv3_acc_body<G, XQ_KV_Q8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
             } else {
                 if ((int)blockIdx.x < hd / 32)   // block-uniform
-                    xq_dv3_acc_body<XQ_KV_Q8, 2>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+                    xq_dv3_acc_body<G, XQ_KV_Q8, 2>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
             }
             break;
     }
@@ -13041,14 +13398,30 @@ xq_attn_dense_acc4(__half* __restrict__ attn, const float* __restrict__ sc, cons
                    const float* __restrict__ kcvc, const __half* __restrict__ qg,
                    const int* __restrict__ slotpos, int nh_packed, int hd_packed, int max_pos) {
     XQ_PDL_ENTRY();
-    xq_dv3_acc_entry<4>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
+    xq_dv3_acc_entry<XQ_DV3_G, 4>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
 }
 extern "C" __global__ void __launch_bounds__(192)
 xq_attn_dense_acc1(__half* __restrict__ attn, const float* __restrict__ sc, const float* __restrict__ pmx,
                    const float* __restrict__ kcvc, const __half* __restrict__ qg,
                    const int* __restrict__ slotpos, int nh_packed, int hd_packed, int max_pos) {
     XQ_PDL_ENTRY();
-    xq_dv3_acc_entry<1>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
+    xq_dv3_acc_entry<XQ_DV3_G, 1>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
+}
+// TP-4G: G=6 twins (block 16*6 = 96). Same body, same per-thread chains; only the head count of
+// the CTA differs, so each (head, dim) thread runs the identical ascending-t fma chain.
+extern "C" __global__ void __launch_bounds__(96)
+xq_attn_dense_acc4_g6(__half* __restrict__ attn, const float* __restrict__ sc, const float* __restrict__ pmx,
+                      const float* __restrict__ kcvc, const __half* __restrict__ qg,
+                      const int* __restrict__ slotpos, int nh_packed, int hd_packed, int max_pos) {
+    XQ_PDL_ENTRY();
+    xq_dv3_acc_entry<XQ_DV3_G6, 4>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
+}
+extern "C" __global__ void __launch_bounds__(96)
+xq_attn_dense_acc1_g6(__half* __restrict__ attn, const float* __restrict__ sc, const float* __restrict__ pmx,
+                      const float* __restrict__ kcvc, const __half* __restrict__ qg,
+                      const int* __restrict__ slotpos, int nh_packed, int hd_packed, int max_pos) {
+    XQ_PDL_ENTRY();
+    xq_dv3_acc_entry<XQ_DV3_G6, 1>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
 }
 
 // WP13 XCHECK (GB10_EXL3_DENSE_XCHECK=1): bitwise diff of the v3 output vs the old kernel's
@@ -13443,7 +13816,7 @@ extern "C" __global__ void xq_copy_u16(unsigned short* __restrict__ dst,
     if (i < n) dst[doff + i] = src[soff + i];
 }
 
-// Pruned draft lm_head (rival patch 0002, EXL3_MTP_HEAD_N): keep the first
+// Pruned draft lm_head (reference patch 0002, EXL3_MTP_HEAD_N): keep the first
 // nb_keep 16-column trellis blocks of every k-block. bw = words per (kb, nb)
 // block = 16*BITS. One thread per word.
 extern "C" __global__ void xq_slice_trellis_u16(unsigned short* __restrict__ dst,
@@ -13570,6 +13943,7 @@ struct QsaParamsX {
     int topk;               // block budget = indexer_budget / ratio (512)
     int sel_max;            // indexer_budget + ratio - 1 (2051): row pitch of the selection lists
     int pad;
+    const void* mr;         // VIS-3: QsaParams.mr (per-slot indexer mrope; read only by gpu_batch.cu)
 };
 
 #define XQ_QSA_MAX_VERIFY 16   // mirrors gpu_batch.cu MAX_VERIFY (path table row stride)
@@ -15464,7 +15838,7 @@ extern "C" __global__ void xq_attn_dense_splitk4(float* __restrict__ pm, float* 
 // (pm > -INFINITY), s ASCENDING; then the per-head gate at qg's +hd offset
 // and attn = f16((acc/l_g) * sig(g)) — exactly xq_attn_decode's closing lines.
 // WP25: bits 28..31 of `rows` carry the KV format (q8: the split-K partials accumulate in the
-// cache's rotated basis; the output rotates back here, once, before the gate — the rival's merge).
+// cache's rotated basis; the output rotates back here, once, before the gate — the reference implementation's merge).
 extern "C" __global__ void xq_attn_sel_combine(__half* __restrict__ attn, const float* __restrict__ pm,
                                                const float* __restrict__ pl, const float* __restrict__ pacc,
                                                const __half* __restrict__ qg, int nh_packed,
@@ -15932,12 +16306,12 @@ __device__ __forceinline__ void xq_w4a_stage_v(char* vbt, float* vsct, const XqK
         }
     }
 }
-template <int FMT, int DPT>
+template <int G, int FMT, int DPT>
 __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const float* __restrict__ sc,
                                             const float* __restrict__ pmx, const XqKv& kc,
                                             const __half* __restrict__ qg, int nh, int hd,
                                             int kvh, int row, int npos, char* vb, float* vsc, float* wb) {
-    constexpr int G = XQ_DV3_G, T = XQ_W4A_T, NST = XQ_W4A_NST, SD = 16 * DPT, WST = XQ_W4A_T + 4;
+    constexpr int T = XQ_W4A_T, NST = XQ_W4A_NST, SD = 16 * DPT, WST = XQ_W4A_T + 4;
     constexpr int EB = FMT == XQ_KV_F32 ? 4 : (FMT == XQ_KV_F16 ? 2 : 1);
     constexpr int N16 = SD * EB / 16;
     constexpr bool Q8 = FMT >= XQ_KV_Q8;
@@ -16059,7 +16433,7 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
     }
     }
 }
-template <int DPT>
+template <int G, int DPT>
 __device__ __forceinline__ void xq_w4a_entry(__half* __restrict__ attn, const float* __restrict__ sc,
                                              const float* __restrict__ pmx, const float* __restrict__ kcvc,
                                              const __half* __restrict__ qg, const int* __restrict__ slotpos,
@@ -16068,36 +16442,36 @@ __device__ __forceinline__ void xq_w4a_entry(__half* __restrict__ attn, const fl
     const int nh = nh_packed & 0xFFFF;
     const int nkv = (nh_packed >> 16) & 0xFFFF;
     const int hd = hd_packed & 0xFFFF;
-    if (hd != 256 || nh != XQ_DV3_G * nkv) return;   // host-gated
+    if (hd != 256 || nh != G * nkv) return;   // host-gated
     const int kvh = blockIdx.y;
     const int row = blockIdx.z;
     const int slot = slotpos[row * 2 + 0];
     const int npos = slotpos[row * 2 + 1] + 1;
     __shared__ __align__(16) char vb[XQ_W4A_NST * XQ_W4A_T * SD * 4];
     __shared__ __align__(16) float vsc[XQ_W4A_NST * XQ_W4A_T * 4];
-    __shared__ __align__(16) float wb[XQ_DV3_G * (XQ_W4A_T + 4)];
+    __shared__ __align__(16) float wb[G * (XQ_W4A_T + 4)];
     if (npos > XQ_DV3_TS) {
         // host bug tripwire: the score plane cannot hold this row — loud, never truncated
         const int h = threadIdx.x >> 4, dgl = threadIdx.x & 15;
         #pragma unroll
         for (int e = 0; e < DPT; e++)
-            attn[(long long)row * nh * hd + (long long)(kvh * XQ_DV3_G + h) * hd + blockIdx.x * SD + dgl * DPT + e] =
+            attn[(long long)row * nh * hd + (long long)(kvh * G + h) * hd + blockIdx.x * SD + dgl * DPT + e] =
                 __float2half(__int_as_float(0x7fc00000));
         return;
     }
     const XqKv kc = xq_kv_make(kcvc, max_pos, hd, nkv, slot, kvh);
     switch (kc.fmt) {
-        case XQ_KV_F32: xq_w4a_body<XQ_KV_F32, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
-        case XQ_KV_F16: xq_w4a_body<XQ_KV_F16, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
-        case XQ_KV_FP8: xq_w4a_body<XQ_KV_FP8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
+        case XQ_KV_F32: xq_w4a_body<G, XQ_KV_F32, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
+        case XQ_KV_F16: xq_w4a_body<G, XQ_KV_F16, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
+        case XQ_KV_FP8: xq_w4a_body<G, XQ_KV_FP8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
         default:
             // q8 / probe-only q4x: xq_dv3_acc_entry's rule (the single-row acc1 runs the DPT=2 body on
             // its first hd/32 CTAs; RS = SD bytes keeps it inside acc1's vb)
             if constexpr (DPT >= 2) {
-                xq_w4a_body<XQ_KV_Q8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+                xq_w4a_body<G, XQ_KV_Q8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
             } else {
                 if ((int)blockIdx.x < hd / 32)   // block-uniform
-                    xq_w4a_body<XQ_KV_Q8, 2>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+                    xq_w4a_body<G, XQ_KV_Q8, 2>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
             }
             break;
     }
@@ -16107,14 +16481,29 @@ xq_attn_dense_acc4_w4(__half* __restrict__ attn, const float* __restrict__ sc, c
                       const float* __restrict__ kcvc, const __half* __restrict__ qg,
                       const int* __restrict__ slotpos, int nh_packed, int hd_packed, int max_pos) {
     XQ_PDL_ENTRY();
-    xq_w4a_entry<4>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
+    xq_w4a_entry<XQ_DV3_G, 4>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
 }
 extern "C" __global__ void __launch_bounds__(192)
 xq_attn_dense_acc1_w4(__half* __restrict__ attn, const float* __restrict__ sc, const float* __restrict__ pmx,
                       const float* __restrict__ kcvc, const __half* __restrict__ qg,
                       const int* __restrict__ slotpos, int nh_packed, int hd_packed, int max_pos) {
     XQ_PDL_ENTRY();
-    xq_w4a_entry<1>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
+    xq_w4a_entry<XQ_DV3_G, 1>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
+}
+// TP-4G: G=6 twins of the 5-stage-ring kernels (block 96).
+extern "C" __global__ void __launch_bounds__(96, 2)
+xq_attn_dense_acc4_w4_g6(__half* __restrict__ attn, const float* __restrict__ sc, const float* __restrict__ pmx,
+                         const float* __restrict__ kcvc, const __half* __restrict__ qg,
+                         const int* __restrict__ slotpos, int nh_packed, int hd_packed, int max_pos) {
+    XQ_PDL_ENTRY();
+    xq_w4a_entry<XQ_DV3_G6, 4>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
+}
+extern "C" __global__ void __launch_bounds__(96)
+xq_attn_dense_acc1_w4_g6(__half* __restrict__ attn, const float* __restrict__ sc, const float* __restrict__ pmx,
+                         const float* __restrict__ kcvc, const __half* __restrict__ qg,
+                         const int* __restrict__ slotpos, int nh_packed, int hd_packed, int max_pos) {
+    XQ_PDL_ENTRY();
+    xq_w4a_entry<XQ_DV3_G6, 1>(attn, sc, pmx, kcvc, qg, slotpos, nh_packed, hd_packed, max_pos);
 }
 
 // ---- (8) DRAFT-PASS ATTENTION (m = 1 MTP head). Three latency-bound launches per pass
@@ -16658,6 +17047,120 @@ extern "C" __global__ void xq_moe_combine_rows_ep(float* __restrict__ out, const
     }
 }
 
+// TP-4M1: xq_moe_combine_rows_ep2<KM> = xq_moe_combine_rows_ep with every memory access vectorised and all the
+// row's gathers issued up front. Per output element the arithmetic is the old kernel's:
+//   acc = add_shared ? __fmul_rn(sgv, h2f(ysh)) : 0;  for j ascending, cand >= 0: acc = __fmaf_rn(wts_j, h2f(yd_j), acc)
+// and sgv = xq_sig(tree) where tree is the old kernel's 1024-lane halving tree over the per-lane partials
+//   part_v = ((0 + sg[v]*x[v]) + sg[v+1024]*x[v+1024]) + sg[v+2048]*x[v+2048]   (ascending, c < h only).
+// The tree is reproduced EXACTLY (same pairs, same levels) but evaluated in one warp: lane l loads the 32 values
+// sm[l + 32 j] and runs the levels s2 = 512 .. 32 in registers (pair (j, j + s2/32) per level), then s2 = 16 .. 1
+// by shuffles — each add has the same two operands the old smem tree gave it, so sm[0] is bit-identical.
+// One block = one row, h/8 threads, each owns 8 consecutive output columns (16-B yd / ysh loads, 2 x float4 store).
+// Requires h == 2560 (320 threads), k <= KM, 16-B aligned yd / ysh / out / x / sg bases.
+__device__ __forceinline__ void xq_u4_f8(const uint4& u, float* f) {
+    const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+    const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+    const float2 c = __half22float2(*reinterpret_cast<const __half2*>(&u.z));
+    const float2 d = __half22float2(*reinterpret_cast<const __half2*>(&u.w));
+    f[0] = a.x; f[1] = a.y; f[2] = b.x; f[3] = b.y; f[4] = c.x; f[5] = c.y; f[6] = d.x; f[7] = d.y;
+}
+template <int KM>
+__device__ __forceinline__ void xq_moe_combine_ep2_body(float* __restrict__ out, const __half* __restrict__ yd,
+        const __half* __restrict__ ysh, const int* __restrict__ cand, const float* __restrict__ wts,
+        const __half* __restrict__ sg, const __half* __restrict__ x, int k, int h, int M, int add_shared) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    __shared__ float sm[1024];
+    __shared__ float sgv_s;
+    const int tid = threadIdx.x;
+    int cr[KM];
+    float wv[KM];
+    #pragma unroll
+    for (int j = 0; j < KM; ++j) {
+        cr[j] = -1; wv[j] = 0.0f;
+        if (j < k) { cr[j] = cand[(long long)m * k + j]; wv[j] = wts[(long long)m * k + j]; }
+    }
+    uint4 yv[KM];
+    #pragma unroll
+    for (int j = 0; j < KM; ++j)
+        if (cr[j] >= 0) yv[j] = *reinterpret_cast<const uint4*>(yd + (long long)cr[j] * h + tid * 8);
+    uint4 sv = make_uint4(0, 0, 0, 0);
+    if (add_shared) sv = *reinterpret_cast<const uint4*>(ysh + (long long)m * h + tid * 8);
+    float sgv = 0.0f;
+    if (add_shared) {
+        if (tid < 128) {
+            float part[8];
+            #pragma unroll
+            for (int u = 0; u < 8; ++u) part[u] = 0.0f;
+            for (int c0 = tid * 8; c0 < h; c0 += 1024) {
+                float xf[8], gf[8];
+                xq_u4_f8(*reinterpret_cast<const uint4*>(x + (long long)m * h + c0), xf);
+                xq_u4_f8(*reinterpret_cast<const uint4*>(sg + c0), gf);
+                #pragma unroll
+                for (int u = 0; u < 8; ++u) part[u] += gf[u] * xf[u];
+            }
+            #pragma unroll
+            for (int u = 0; u < 8; ++u) sm[tid * 8 + u] = part[u];
+        }
+        __syncthreads();
+        if (tid < 32) {
+            float a[32];
+            #pragma unroll
+            for (int j = 0; j < 32; ++j) a[j] = sm[tid + 32 * j];
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) a[j] = a[j] + a[j + 16];   // s2 = 512
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) a[j] = a[j] + a[j + 8];     // s2 = 256
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) a[j] = a[j] + a[j + 4];     // s2 = 128
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) a[j] = a[j] + a[j + 2];     // s2 = 64
+            float val = a[0] + a[1];                                // s2 = 32
+            #pragma unroll
+            for (int s2 = 16; s2 > 0; s2 >>= 1) val = val + __shfl_down_sync(0xFFFFFFFFu, val, s2);
+            if (tid == 0) sgv_s = xq_sig(val);
+        }
+        __syncthreads();
+        sgv = sgv_s;
+    }
+    float acc[8];
+    if (add_shared) {
+        float sf[8];
+        xq_u4_f8(sv, sf);
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) acc[u] = __fmul_rn(sgv, sf[u]);
+    } else {
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) acc[u] = 0.0f;
+    }
+    #pragma unroll
+    for (int j = 0; j < KM; ++j) {
+        if (cr[j] >= 0) {
+            float yf[8];
+            xq_u4_f8(yv[j], yf);
+            #pragma unroll
+            for (int u = 0; u < 8; ++u) acc[u] = __fmaf_rn(wv[j], yf[u], acc[u]);
+        }
+    }
+    float4* o = reinterpret_cast<float4*>(out + (long long)m * h + tid * 8);
+    o[0] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    o[1] = make_float4(acc[4], acc[5], acc[6], acc[7]);
+}
+extern "C" __global__ void __launch_bounds__(320) xq_moe_combine_rows_ep2_k10(float* __restrict__ out,
+        const __half* __restrict__ yd, const __half* __restrict__ ysh, const int* __restrict__ cand,
+        const float* __restrict__ wts, const __half* __restrict__ sg, const __half* __restrict__ x,
+        int k, int h, int M, int add_shared) {
+    XQ_PDL_ENTRY();
+    xq_moe_combine_ep2_body<10>(out, yd, ysh, cand, wts, sg, x, k, h, M, add_shared);
+}
+extern "C" __global__ void __launch_bounds__(320) xq_moe_combine_rows_ep2_k16(float* __restrict__ out,
+        const __half* __restrict__ yd, const __half* __restrict__ ysh, const int* __restrict__ cand,
+        const float* __restrict__ wts, const __half* __restrict__ sg, const __half* __restrict__ x,
+        int k, int h, int M, int add_shared) {
+    XQ_PDL_ENTRY();
+    xq_moe_combine_ep2_body<16>(out, yd, ysh, cand, wts, sg, x, k, h, M, add_shared);
+}
+
 // =============================================================================
 // TP-G (T2 lever #2, PLAN/notes_2026-09-28/TP-G.md): the DECODE all-reduce (<= 16 rows) with K1
 // FOLDED into the producing kernel's epilogue and a multi-block K2 with an optional GPU-side
@@ -16714,9 +17217,51 @@ __device__ __forceinline__ const unsigned char* xtp_recv_slot(tp_dev_ctx* c, uns
     return c->recv_ring + (size_t)(e & (TP_RING_SLOTS - 1)) * c->slot_stride;
 }
 
+// TP-4F2 (--tp-reduce single): the I3 reuse gate of the uniform one-shot ctx. Every epoch of that ctx is pushed
+// to ALL THREE peers, so the send slot's previous owner (epoch e-R) is free only when EVERY peer QP retired it:
+// warp 0, lane l < 3 polls tx_retired[rank ^ (l+1)] >= e-R (three independent host-memory loads in flight at
+// once, not three serial round trips on the critical path), the warp votes, same bounded deadline / abort
+// word / status 11 as the tree gate. Reached only when c->oneshot (the dedicated ctx; rails 1 and 2 have 0).
+// World 4 only (the host refuses the flag elsewhere). All threads call; returns 1 = aborted.
+__device__ __forceinline__ int xtp_k1_gate_os(tp_dev_ctx* c, unsigned long long e) {
+    __shared__ int s_ab_os;
+    if (threadIdx.x < 32) {
+        const int lane = (int)threadIdx.x;
+        if (lane == 0) s_ab_os = 0;
+        if (e > TP_RING_SLOTS) {
+            const unsigned long long tgt = e - TP_RING_SLOTS;
+            const unsigned long long* ret = (lane < 3) ? xtp_nway(c, (int)c->rank ^ (lane + 1), TP_NWAY_TX_OFF) : nullptr;
+            const unsigned long long* ab = xtp_flag(c, TP_F_ABORT);
+            auto retired = [&]() -> bool { return ret == nullptr || xtp_ld(ret) >= tgt; };
+            bool ok = __all_sync(0xffffffffu, retired());
+            if (!ok) {
+                if (lane == 0) c->gate_waits += 1;
+                const unsigned long long deadline = xtp_now() + K1_GATE_WAIT_NS;
+                unsigned ns = 64, cap = 2048u;
+                for (;;) {
+                    if (__all_sync(0xffffffffu, retired())) break;
+                    int stop = 0;
+                    if (lane == 0) {
+                        if (xtp_ld(ab)) stop = 1;
+                        else if (xtp_now() >= deadline) { xtp_st_rel(xtp_flag(c, TP_F_ABORT), 11); stop = 1; }
+                    }
+                    stop = __shfl_sync(0xffffffffu, stop, 0);
+                    if (stop) { if (lane == 0) s_ab_os = 1; break; }
+                    __nanosleep(ns);
+                    if (ns < cap) ns <<= 1;
+                }
+            }
+            xtp_fence_acq();                        // every lane (no lane reads lane 0's shared flag mid-warp)
+        }
+    }
+    __syncthreads();
+    return s_ab_os;
+}
+
 // The I3 reuse gate (tp_gate_copy_signal_mb's, verbatim): thread 0 waits tx_retired >= e-R, bounded
 // (K1_GATE_WAIT_NS -> device status 11, I9). All threads call; returns 1 = aborted (store nothing).
 __device__ __forceinline__ int xtp_k1_gate(tp_dev_ctx* c, unsigned long long e) {
+    if (c->oneshot) return xtp_k1_gate_os(c, e);        // TP-4F2: the uniform one-shot ctx only (rails 1/2: 0)
     __shared__ int s_ab;
     if (threadIdx.x == 0) {
         s_ab = 0;
@@ -16773,7 +17318,16 @@ __device__ __forceinline__ void xtp_k1_last(tp_dev_ctx* c, unsigned* arrive, con
     if (!ab) {
         uint4* dst = (uint4*)xtp_send_slot(c, e);
         const uint4* s4 = (const uint4*)part;
-        for (unsigned i = threadIdx.x; i < (nbytes >> 4); i += blockDim.x) dst[i] = __ldcg(s4 + i);
+        // TP-4Z16a: the copy is latency-bound (ONE block, one load + one store per thread per trip): four loads in flight per
+        // trip halve it (80 KiB: 4.0 -> 2.0 us, 160 KiB: 7.5 -> 3.3 us, kernel-only microbenchmark). Same bytes, same slot.
+        const unsigned n16 = nbytes >> 4;
+        unsigned i = threadIdx.x;
+        for (; i + 3u * blockDim.x < n16; i += 4u * blockDim.x) {
+            const uint4 v0 = __ldcg(s4 + i), v1 = __ldcg(s4 + i + blockDim.x),
+                        v2 = __ldcg(s4 + i + 2u * blockDim.x), v3 = __ldcg(s4 + i + 3u * blockDim.x);
+            dst[i] = v0; dst[i + blockDim.x] = v1; dst[i + 2u * blockDim.x] = v2; dst[i + 3u * blockDim.x] = v3;
+        }
+        for (; i < n16; i += blockDim.x) dst[i] = __ldcg(s4 + i);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -16847,11 +17401,30 @@ extern "C" __global__ void xq_cvt_f16_f32_k1l(tp_dev_ctx* c, float* __restrict__
     xtp_k1_last(c, arrive, out, (unsigned)n * 4u);
 }
 
+// TP-4Z2: L2 run-ahead of the NEXT kernel's weights from the otherwise idle threads of a K2 block. A K2 spends tens of
+// microseconds waiting for the peer's payload with the DRAM bus idle, and the kernel behind it (the hc mixer, 6.5 MB of int8
+// weights) is weight-bound and streams cold from DRAM. The weights never depend on this reduce's output, so they can be
+// pulled into L2 now. Pure prefetch: no data path, no output byte, and a 0 byte count (the default) is a no-op. The threads
+// below `skip` (the spinners) never take part, so the wait is not delayed; the rest of the grid stripes the two ranges by
+// 128-byte line.
+__device__ __forceinline__ void xq_l2_prefetch2(unsigned long long p0, unsigned n0, unsigned long long p1, unsigned n1,
+                                                unsigned skip) {
+    if (n0 == 0u && n1 == 0u) return;
+    if (threadIdx.x < skip) return;
+    const unsigned per = blockDim.x - skip;
+    const unsigned t = blockIdx.x * per + (threadIdx.x - skip);
+    const unsigned nt = gridDim.x * per;
+    for (unsigned off = t * 128u; off < n0; off += nt * 128u) asm volatile("prefetch.global.L2 [%0];" :: "l"(p0 + off));
+    for (unsigned off = t * 128u; off < n1; off += nt * 128u) asm volatile("prefetch.global.L2 [%0];" :: "l"(p1 + off));
+}
+
 // K2 (decode): gate per block (see the section header), then out = lower + upper (fp32, the canonical
 // order), f16 (__float2half_rn) when io bit 1. io bit 0: `local` is f16 (widened exactly); bit 3: the
 // GPU-side receive. n % 4 == 0 (host). out may alias local (same-thread read-then-write).
-extern "C" __global__ void xq_tp_wait_add_dec(tp_dev_ctx* c, void* out, const void* local, int n, int io) {
+extern "C" __global__ void xq_tp_wait_add_dec(tp_dev_ctx* c, void* out, const void* local, int n, int io,
+                                              unsigned long long pf0, unsigned pfn0, unsigned long long pf1, unsigned pfn1) {
     XQ_PDL_ENTRY();                                     // the producer+K1 wrote c->epoch: wait for it
+    xq_l2_prefetch2(pf0, pfn0, pf1, pfn1, 1u);          // TP-4Z2: thread 0 spins; every other thread run-ahead-prefetches
     const unsigned long long e = c->epoch;
     const unsigned char* slot = xtp_recv_slot(c, e);
     __shared__ int s_ab;
@@ -16908,6 +17481,76 @@ extern "C" __global__ void xq_tp_wait_add_dec(tp_dev_ctx* c, void* out, const vo
         } else {
             ((float4*)out)[i] = r;
         }
+    }
+}
+
+// TP-4F2 K2 (--tp-reduce single): the ONE-STAGE world-4 decode/verify reduce. The dedicated uniform one-shot
+// ctx carries ONE epoch per logical reduce (the producer's folded K1 published this rank's fp32 partial to all
+// three peers); here every block gates on all three peers (warp 0, lane l < 3 = peer rank ^ (l+1): the proxy's
+// validated release cpu_done[p] >= e AND the sender-indexed slot's generation-tagged tail == e, R9 — the same two
+// conditions the rd K2 gates on, per peer), then forms
+//     out = f16( (p0 + p2) + (p1 + p3) )          p_r = rank r's fp32 partial (own = `local`)
+// which is EXACTLY the rd two-stage association (stage 0 pairs {0,2},{1,3} — epoch parity, PLAN/TP-4F2_REPORT.md
+// section 1 — stage 1 adds the pair sums; fp32 add is commutative so the grouping is rank-independent), rounded
+// ONCE with __floats2half2_rn like the rd last stage. n % 4 == 0; out must not alias local (the host passes
+// y_raw / moe_out vs the fp32 `part`).
+extern "C" __global__ void xq_tp_wait_add_dec_single(tp_dev_ctx* c, __half* out, const float* local, int n,
+                                                     unsigned long long pf0, unsigned pfn0, unsigned long long pf1, unsigned pfn1) {
+    XQ_PDL_ENTRY();                                     // the producer+K1 wrote c->epoch: wait for it
+    xq_l2_prefetch2(pf0, pfn0, pf1, pfn1, 32u);         // TP-4Z2: warp 0 spins; the other warps run-ahead-prefetch
+    const unsigned long long e = c->epoch;
+    const unsigned wire = ((unsigned)n * 4u + 7u) & ~7u;
+    const int rank = (int)c->rank;
+    const size_t ring_e = (size_t)(e & (TP_RING_SLOTS - 1));
+    __shared__ int s_ab;
+    if (threadIdx.x < 32) {
+        const int lane = (int)threadIdx.x;
+        if (lane == 0) s_ab = 0;
+        const int peer = (lane < 3) ? (rank ^ (lane + 1)) : -1;
+        const unsigned long long* done = nullptr;
+        const unsigned long long* tail = nullptr;
+        if (peer >= 0) {
+            done = xtp_nway(c, peer, TP_NWAY_CPU_OFF);
+            tail = (const unsigned long long*)(c->oneshot_recv
+                   + ((size_t)peer * TP_RING_SLOTS + ring_e) * (size_t)c->slot_stride + wire);
+        }
+        const unsigned long long* ab = xtp_flag(c, TP_F_ABORT);
+        const unsigned long long tight = xtp_now() + 2000ull;
+        unsigned ns = 64;
+        for (;;) {
+            const bool mine = (peer < 0) || (xtp_ld(done) >= e && xtp_ld(tail) == e);
+            if (__all_sync(0xffffffffu, mine)) break;
+            int stop = (lane == 0) ? (int)(xtp_ld(ab) != 0) : 0;   // the proxy's guards abort a lost payload
+            stop = __shfl_sync(0xffffffffu, stop, 0);
+            if (stop) { if (lane == 0) s_ab = 1; break; }
+            if (xtp_now() < tight) continue;
+            __nanosleep(ns);
+            if (ns < 512u) ns <<= 1;
+        }
+        xtp_fence_acq();                                // every lane, then the block barrier publishes it
+    }
+    __syncthreads();
+    if (s_ab) return;
+    const float4* pr[4];
+    #pragma unroll
+    for (int q = 0; q < 4; ++q)
+        pr[q] = (const float4*)(c->oneshot_recv + ((size_t)q * TP_RING_SLOTS + ring_e) * (size_t)c->slot_stride);
+    const float4* lo = (const float4*)local;
+    const int n4 = n >> 2;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) {
+        float4 v[4];
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) v[q] = (q == rank) ? lo[i] : pr[q][i];
+        float4 r;
+        r.x = (v[0].x + v[2].x) + (v[1].x + v[3].x);
+        r.y = (v[0].y + v[2].y) + (v[1].y + v[3].y);
+        r.z = (v[0].z + v[2].z) + (v[1].z + v[3].z);
+        r.w = (v[0].w + v[2].w) + (v[1].w + v[3].w);
+        __half2 h01 = __floats2half2_rn(r.x, r.y), h23 = __floats2half2_rn(r.z, r.w);
+        uint2 u;
+        u.x = *reinterpret_cast<unsigned*>(&h01);
+        u.y = *reinterpret_cast<unsigned*>(&h23);
+        ((uint2*)out)[i] = u;
     }
 }
 
@@ -17324,6 +17967,171 @@ extern "C" __global__ void __launch_bounds__(256) xq_vp_gather_k2(
         const int r = i / rq;
         const int j = i - r * rq;
         dlg[(long long)r * lq + j] = src[i];
+    }
+}
+
+// =============================================================================
+// TP-4H2: WORLD-4 vocab-parallel row all-gather (--tp-vp-sampled at world 4). ADDITIVE: nothing above
+// (xq_vp_gather_k1/k2, xtp_k1_gate_mb, xtp_k2_gate_mb — the world-2 path) is touched; the host takes
+// these kernels at world 4 only (`vp_gather_rows_w4`, src/exl3_forward/xtp.rs). The schedule, launch
+// tables and the index math below are mirrored in src/tp_vpgather.rs and pinned by its CPU tests.
+//
+// Recursive doubling over the decode doorbell, TWO epochs per group of nr <= 4 rows (partner(e) = rank ^
+// (1 << (e % rounds)), rounds = 2; shard s = logits columns [s * n_sh, (s + 1) * n_sh)):
+//   stage 0 (epoch e)   : payload = the OWN shard rows [nr][n_sh] f16 (from the shard GEMM output); K1 also
+//                         copies them into this rank's columns of the logits rows. K2 writes the partner's
+//                         shard (partner = rank ^ m0, m0 = 1 << (e % rounds)) into ITS columns.
+//   stage 1 (epoch e+1) : payload = TWO shards, [blk 0 = shard rank][blk 1 = shard rank ^ m0] (m0 = the
+//                         PREVIOUS epoch's mask: 1 << ((e + rounds - 1) % rounds)), each [nr][n_sh], read
+//                         from the logits rows stage 0 assembled. K2 writes partner p's two shards
+//                         (p, p ^ m0) — exactly the two this rank lacks. Not a contiguous column block
+//                         when m0 = 2 (the odd-first-epoch phase): shards are indexed, never assumed adjacent.
+// Payload unit i (uint4 = 8 f16) -> (blk, row, j): i = (blk * nr + row) * rq + j, rq = n_sh / 8. Payload
+// bytes = nr * n_sh * 2 * (stage + 1) (<= 993,280 at nr = 4, stage 1), the 8 B generation tail at align8.
+// The host launches per group K1(0) K2(0) K1(1) K2(1), every K2 with lag 0 (stage 1's K1 reads columns
+// stage 0's K2 wrote; serial lookahead 1 = the proven recv-slot rule). No arithmetic anywhere: bit copies.
+// All offsets are 16 B aligned (n_sh % 8 == 0, V % 8 == 0: host-checked). World 4 only (host-checked).
+// =============================================================================
+// The I3 reuse gate, multi-block, world > 2: every block waits partner(e - R)'s per-QP tx_retired (the
+// same peer as partner(e): R is even). xtp_k1_gate's body with xtp_k1_gate_mb's per-block shape.
+__device__ __forceinline__ int xtp_k1_gate_mb_nw(tp_dev_ctx* c, unsigned long long e) {
+    __shared__ int s_ab;
+    if (threadIdx.x == 0) {
+        s_ab = 0;
+        if (e > TP_RING_SLOTS) {
+            const unsigned long long tgt = e - TP_RING_SLOTS;
+            const unsigned long long* ret = xtp_nway(c, xtp_partner(c, tgt), TP_NWAY_TX_OFF);
+            const unsigned long long* ab = xtp_flag(c, TP_F_ABORT);
+            if (blockIdx.x == 0 && xtp_ld(ret) < tgt) c->gate_waits += 1;
+            const unsigned long long deadline = xtp_now() + K1_GATE_WAIT_NS;
+            unsigned ns = 64, cap = 2048u;
+            while (xtp_ld(ret) < tgt) {
+                if (xtp_ld(ab)) { s_ab = 1; break; }
+                if (xtp_now() >= deadline) { xtp_st_rel(xtp_flag(c, TP_F_ABORT), 11); s_ab = 1; break; }
+                __nanosleep(ns);
+                if (ns < cap) ns <<= 1;
+            }
+            if (!s_ab) xtp_fence_acq();
+        }
+    }
+    __syncthreads();
+    return s_ab;
+}
+
+extern "C" __global__ void __launch_bounds__(256) xq_vp_gather4_k1(
+        tp_dev_ctx* c, const __half* __restrict__ shard, __half* __restrict__ logits, long long ldl,
+        int n_sh, int r0, int nr, int stage, unsigned* __restrict__ arrive) {
+    XQ_PDL_ENTRY();
+    // every block reads the PRE-kernel counter (the last block stores it only after all arrived)
+    const unsigned long long e = c->epoch + 1;
+    const int ab = xtp_k1_gate_mb_nw(c, e);
+    unsigned char* slot = xtp_send_slot(c, e);
+    const int rq = n_sh >> 3;                                       // uint4 per shard row
+    const int per = nr * rq;                                        // uint4 per shard block
+    const int tot = per * (stage + 1);
+    const unsigned nbytes = (unsigned)tot * 16u;
+    if (!ab) {
+        const int rank = (int)c->rank;
+        const long long lq = ldl >> 3;                              // uint4 per logits row
+        uint4* dsl = reinterpret_cast<uint4*>(slot);
+        uint4* lg = reinterpret_cast<uint4*>(logits) + (long long)r0 * lq;
+        if (stage == 0) {
+            const uint4* src = reinterpret_cast<const uint4*>(shard) + (long long)r0 * rq;
+            uint4* own = lg + (long long)rank * rq;                 // this rank's columns
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tot; i += gridDim.x * blockDim.x) {
+                const int r = i / rq;
+                const int j = i - r * rq;
+                const uint4 v = __ldcg(src + i);
+                dsl[i] = v;
+                own[(long long)r * lq + j] = v;
+            }
+        } else {
+            // the two shards held after stage 0: own + the stage-0 partner's (mask of the previous epoch)
+            const int m0 = 1 << (int)((e + (unsigned long long)c->rounds - 1ull) % (unsigned long long)c->rounds);
+            const int s1 = rank ^ m0;
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tot; i += gridDim.x * blockDim.x) {
+                const int blk = i / per;
+                const int rem = i - blk * per;
+                const int r = rem / rq;
+                const int j = rem - r * rq;
+                const int s = blk ? s1 : rank;
+                dsl[i] = __ldcg(lg + (long long)r * lq + (long long)s * rq + j);
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();                         // this block's slot stores, system scope
+        const unsigned prev = atomicAdd(arrive, 1u);    // device-memory counter (GPU-only line, I6-safe)
+        if (prev == gridDim.x - 1) {
+            __threadfence_system();                     // acquire side of the last-block pattern
+            *arrive = 0u;                               // re-armed for the next launch / replay
+            c->epoch = e;                               // advances even on abort (I9 no-op), like K1m
+            if (c->qp_mask) c->qp_mask[e & (TP_QPMASK_SLOTS - 1)] = 1u << xtp_partner(c, e);
+            if (!ab && !xtp_ld(xtp_flag(c, TP_F_ABORT))) {
+                const unsigned wire = (nbytes + 7u) & ~7u;
+                *(unsigned long long*)(slot + wire) = e; // tail epoch, written LAST
+                c->len_local[e & (TP_LEN_EPOCHS - 1)] = TP_LEN_TAG(e, wire);
+                xtp_st_rel(xtp_flag(c, TP_F_GPU_READY), e);
+            }
+        }
+    }
+}
+
+// K2 gate, multi-block, world > 2: xtp_k2_gate1's conditions (partner(e)'s per-peer cpu_done AND the R9
+// tail equality; with io bit 3 the commit hint + the tail; abort) per block, RX_DONE by block 0 only.
+__device__ __forceinline__ int xtp_k2_gate_mb_nw(tp_dev_ctx* c, unsigned long long e, const unsigned long long* tail, int io) {
+    __shared__ int s_ab;
+    if (threadIdx.x == 0) {
+        s_ab = 0;
+        const bool g = (io & 8) != 0;
+        const unsigned long long* done = xtp_nway(c, xtp_partner(c, e), TP_NWAY_CPU_OFF);
+        const unsigned long long* hint = xtp_nway(c, xtp_partner(c, e), TP_NWAY_PEER_OFF);
+        const unsigned long long* ab = xtp_flag(c, TP_F_ABORT);
+        const unsigned long long tight = xtp_now() + 2000ull;
+        unsigned ns = 64;
+        for (;;) {
+            if (xtp_ld(done) >= e && xtp_ld(tail) == e) break;
+            if (g && xtp_ld(hint) >= e && xtp_ld(tail) == e) break;
+            if (xtp_ld(ab)) { s_ab = 1; break; }
+            if (xtp_now() < tight) continue;
+            __nanosleep(ns);
+            if (ns < 512u) ns <<= 1;
+        }
+        if (!s_ab) {
+            xtp_fence_acq();
+            if (g && blockIdx.x == 0) xtp_st_rel(xtp_flag(c, TP_F_RX_DONE), e);
+        }
+    }
+    __syncthreads();
+    return s_ab;
+}
+
+extern "C" __global__ void __launch_bounds__(256) xq_vp_gather4_k2(
+        tp_dev_ctx* c, __half* __restrict__ logits, long long ldl, int n_sh,
+        int r0, int nr, int stage, unsigned lag, int io) {
+    XQ_PDL_ENTRY();                                     // the K1s wrote c->epoch: wait for them
+    const unsigned long long e = c->epoch - (unsigned long long)lag;
+    const unsigned char* slot = xtp_recv_slot(c, e);
+    const int rq = n_sh >> 3;
+    const int per = nr * rq;
+    const int tot = per * (stage + 1);
+    const unsigned nbytes = (unsigned)tot * 16u;
+    const unsigned long long* tail = (const unsigned long long*)(slot + ((nbytes + 7u) & ~7u));
+    if (xtp_k2_gate_mb_nw(c, e, tail, io)) return;
+    // the partner's payload: stage 0 = its own shard; stage 1 = {partner, partner ^ (the previous epoch's mask)}
+    const int p0 = (int)c->rank ^ (1 << (int)(e % (unsigned long long)c->rounds));
+    const int p1 = p0 ^ (1 << (int)((e + (unsigned long long)c->rounds - 1ull) % (unsigned long long)c->rounds));
+    const uint4* src = reinterpret_cast<const uint4*>(slot);
+    const long long lq = ldl >> 3;
+    uint4* lg = reinterpret_cast<uint4*>(logits) + (long long)r0 * lq;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tot; i += gridDim.x * blockDim.x) {
+        const int blk = i / per;
+        const int rem = i - blk * per;
+        const int r = rem / rq;
+        const int j = rem - r * rq;
+        const int s = blk ? p1 : p0;
+        lg[(long long)r * lq + (long long)s * rq + j] = src[i];
     }
 }
 

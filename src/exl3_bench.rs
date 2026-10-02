@@ -26,7 +26,7 @@ use cudarc::nvrtc::Ptx;
 use half::f16;
 
 const MODULE: &str = "exl3_bench";
-const MODULE_FNS: &[&str] = &[
+pub(crate) const MODULE_FNS: &[&str] = &[
     "exl3_decode_dump",
     // S-A3-u G: coalesced reconstruct (same values; nb % 8 == 0)
     "exl3_decode_dump8",
@@ -46,6 +46,8 @@ const MODULE_FNS: &[&str] = &[
     "xq_gemm_f16",
     // S-A3-m: row-batched bit-exact twin (PLE projections)
     "xq_gemm_f16_rows",
+    // TP-4T1: bit-exact small-M twin for the prefill tail chunks (hc down/up, a/b, PLE)
+    "xq_gemm_f16_tail",
     "xq_gemm_f16_f32",
     "xq_hc_norm",
     "xq_silu_div",
@@ -67,6 +69,8 @@ const MODULE_FNS: &[&str] = &[
     "xq_memset_u16",
     // S-A3-f Item 1: per-step RoPE gather from the precomputed host-exact table
     "xq_cos_gather",
+    "xq_cos_gather_v",
+    "xq_splice_rows",
     // S-A3-f Item 2: device-side MoE routing (route kernel + padded consumer grids)
     "xq_moe_route",
     // TP-A (EXL3 TP=2 rung 3): expert-parallel route filter + FP32 partial combine + the
@@ -82,6 +86,8 @@ const MODULE_FNS: &[&str] = &[
     "xq_moe_combine_ep_k1l",
     "xq_cvt_f16_f32_k1l",
     "xq_tp_wait_add_dec",
+    // TP-4F2: single-stage 4-way decode reduce K2 (`--tp-reduce single`; sums the three peers + own, one f16 rounding)
+    "xq_tp_wait_add_dec_single",
     // TP-I3 (c1): K2m folded into the prefill consumers (--tp-prefill-overlap fold)
     "xq_pf_hc_inj_norm_k2",
     "exl3_had_svh_k2",
@@ -132,6 +138,12 @@ const MODULE_FNS: &[&str] = &[
     "xq_attn_prefill_flash128c",
     "xq_ple_conv_chunk",
     "xq_had_suh_rows",
+    // TP-4M1: live-row vectorised twin (EP prefill up-input rotation) + the vectorised EP combine
+    "xq_had_suh_rows_live_u1",
+    "xq_had_suh_rows_live_u2",
+    "xq_had_suh_rows_live_u4",
+    "xq_moe_combine_rows_ep2_k10",
+    "xq_moe_combine_rows_ep2_k16",
     "xq_had_svh_rows",
     "xq_gemm_grouped_rows",
     "xq_moe_combine_rows",
@@ -169,6 +181,8 @@ const MODULE_FNS: &[&str] = &[
     "xq_gemm_f16_f32_rows32",
     // PFX1 (d): 64-col x 8-row bit-exact router twin for short prefill chunks
     "xq_gemm_f16_f32_rows8",
+    // TP-4R1: register-tiled order-preserving prefill router (128x64 / 64x64 CTA tiles)
+    "xq_gemm_f16_f32_tile128", "xq_gemm_f16_f32_tile64",
     // S-A3-p: int8-weight hc mixer twin (--hc-int8, opt-in)
     "xq_hc_fuse_i8",
     "xq_gemm_f16_v",
@@ -206,6 +220,10 @@ const MODULE_FNS: &[&str] = &[
     "xq_attn_dense_dots",
     "xq_attn_dense_acc4",
     "xq_attn_dense_acc1",
+    // TP-4G: G=6 (W=4 / TP=4) instantiations
+    "xq_attn_dense_dots_g6",
+    "xq_attn_dense_acc4_g6",
+    "xq_attn_dense_acc1_g6",
     "xq_dv3_xcheck",
     "xq_gdn_commit",
     // S-A3-o G1: rank-1 ring commit
@@ -270,7 +288,7 @@ const MODULE_FNS: &[&str] = &[
     "xq_slice_trellis_u16",
     "xq_slice_trellis_u16_off",
     // S-A3-h item 3 rung 1: cooperative MoE expert-stream GEMM pair (schedule
-    // port of the rival's exl3_moe_coop_a/b; math identical to
+    // port of the reference implementation's exl3_moe_coop_a/b; math identical to
     // xq_gemm_grouped_xh — see kernels/exl3_bench.cu). A = gate/up, B = down;
     // launched from fn moe() behind --moe-coop.
     "xq_moe_coop_a",
@@ -312,6 +330,8 @@ const MODULE_FNS: &[&str] = &[
     "xq_gdn_commit_all_w4",
     "xq_attn_dense_acc4_w4",
     "xq_attn_dense_acc1_w4",
+    "xq_attn_dense_acc4_w4_g6",
+    "xq_attn_dense_acc1_w4_g6",
     "xq_attn_dense_splitk4_w4",
     "xq_attn_sel_combine_w4",
     // W4/QSA: row-shared union gather for multi-row verifies (bit-identical partials to the above)
@@ -3379,9 +3399,24 @@ fn probe_argmax_rows(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
 // 0..=2051). (a)/(b) stay fatal for f32 (their original contract) and are reported for
 // f16/fp8/q8. Then a small v2-vs-v3 timing table (synthetic, f32 and q8).
 // ---------------------------------------------------------------------------
+// TP-4G: the same gate over four shapes — 24/2 (TP=1, G=12; the full original cell set + draft
+// chain), 12/1 (TP=2, G=12, one kv head), 12/2 and 6/1 (G=6: the W=4 / TP=4 shape, the new
+// `_g6` kernels; 12/2 also exercises kvh > 0 at G=6). Every v3 variant must equal v2 bitwise
+// at every shape; the kernels are picked by the HOST's plan (`dv3_plan` / `dv3_w4_twin`).
 fn probe_attn(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
-    const NH: usize = 24;
-    const NKV: usize = 2;
+    probe_attn_shape::<24, 2>(dev, true)?;
+    probe_attn_shape::<12, 1>(dev, false)?;
+    probe_attn_shape::<12, 2>(dev, false)?;
+    probe_attn_shape::<6, 1>(dev, false)?;
+    Ok(())
+}
+
+fn probe_attn_shape<const NH: usize, const NKV: usize>(dev: &std::sync::Arc<CudaDevice>, full: bool) -> Result<()> {
+    use crate::exl3_forward::{dv3_plan, dv3_w4_twin};
+    let grp = crate::exl3_forward::dv3_group(NH, NKV)
+        .ok_or_else(|| anyhow::anyhow!("EXL3-ATTN: {NH}/{NKV} is not a dense-v3 group"))?;
+    let shape_tag = if full { String::new() } else { format!("[{NH}/{NKV}]") };
+    let acc_block = dv3_plan(grp, 1).3;
     const HD: usize = 256;
     const RDIM: usize = 64;
     const MAXP: usize = 2304;   // holds the whole dense regime (positions 0..=2051)
@@ -3392,9 +3427,11 @@ fn probe_attn(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
     let f_ref = dev.get_func(MODULE, "xq_attn_decode_group_ref").context("xq_attn_decode_group_ref")?;
     let f_dec = dev.get_func(MODULE, "xq_attn_decode").context("xq_attn_decode")?;
     let f_prep = dev.get_func(MODULE, "xq_attn_dense_prep").context("xq_attn_dense_prep")?;
-    let f_dots = dev.get_func(MODULE, "xq_attn_dense_dots").context("xq_attn_dense_dots")?;
-    let f_acc4 = dev.get_func(MODULE, "xq_attn_dense_acc4").context("xq_attn_dense_acc4")?;
-    let f_acc1 = dev.get_func(MODULE, "xq_attn_dense_acc1").context("xq_attn_dense_acc1")?;
+    let (n_dots, n_acc1, _, _) = dv3_plan(grp, 1);
+    let (_, n_acc4, _, _) = dv3_plan(grp, 2);
+    let f_dots = dev.get_func(MODULE, n_dots).context(n_dots)?;
+    let f_acc4 = dev.get_func(MODULE, n_acc4).context(n_acc4)?;
+    let f_acc1 = dev.get_func(MODULE, n_acc1).context(n_acc1)?;
     let mut rng = 0x5eed_1234u32;
     let mut rnd = move |amp: f32| -> f32 {
         rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -3409,8 +3446,9 @@ fn probe_attn(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
     let (pqs, ps, ppm) = (*d_qs.device_ptr() as u64, *d_s.device_ptr() as u64, *d_pm.device_ptr() as u64);
     // the host's launch sequence (FwdModel::dense_attn_v3); acc4 = true -> 64-dim slices
     // W4/SMALL: the 5-stage-ring accumulate twins (bitwise to acc4 / acc1) + the draft-pass chain
-    let f_acc4w = dev.get_func(MODULE, "xq_attn_dense_acc4_w4").context("xq_attn_dense_acc4_w4")?;
-    let f_acc1w = dev.get_func(MODULE, "xq_attn_dense_acc1_w4").context("xq_attn_dense_acc1_w4")?;
+    let (n_acc4w, n_acc1w) = (dv3_w4_twin(n_acc4), dv3_w4_twin(n_acc1));
+    let f_acc4w = dev.get_func(MODULE, n_acc4w).context(n_acc4w)?;
+    let f_acc1w = dev.get_func(MODULE, n_acc1w).context(n_acc1w)?;
     let f_aprep = dev.get_func(MODULE, "xq_attn_prep").context("xq_attn_prep")?;
     let f_sk4 = dev.get_func(MODULE, "xq_attn_dense_splitk4").context("xq_attn_dense_splitk4")?;
     let f_comb = dev.get_func(MODULE, "xq_attn_sel_combine").context("xq_attn_sel_combine")?;
@@ -3456,7 +3494,7 @@ fn probe_attn(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
                 (pqs, pc, pq, pk, pv, pn, pcs, psp, nh_p, hd_p, mpf, 1e-6f32))?;
             f_dots.clone().launch(lc((nchg, NKV as u32, m as u32), 256),
                 (ps, ppm, pqs, pc, psp, nh_p, hd_p, mpf))?;
-            fa.clone().launch(lc(((HD / sd) as u32, NKV as u32, m as u32), 192),
+            fa.clone().launch(lc(((HD / sd) as u32, NKV as u32, m as u32), acc_block),
                 (pa, ps, ppm, pc, pq, psp, nh_p, hd_p, mpf))?;
         }
         Ok(())
@@ -3468,7 +3506,8 @@ fn probe_attn(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
         let rb = match fmt { 0 => 4 * HD, 1 => 2 * HD, _ => HD + 16 };
         let mpf = (MAXP as i32) | ((fmt as i32) << 28);
         let cache_bytes = 2 * NKV * MAXP * rb;
-        for &p0 in &[0usize, 5, 63, 300, 1100, 2036] {
+        let p0s: &[usize] = if full { &[0, 5, 63, 300, 1100, 2036] } else { &[0, 63, 1100, 2036] };
+        for &p0 in p0s {
             // one prefix cache shared by every width at this p0 (positions < p0)
             let mut cache0 = vec![0u8; cache_bytes];
             for kv in 0..2 {
@@ -3528,7 +3567,7 @@ fn probe_attn(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
                 let d_cs = dev.htod_sync_copy(&cs)?;
                 let d_sp = dev.htod_sync_copy(&sp)?;
                 let mut outs: Vec<(Vec<u16>, Vec<u8>)> = Vec::new();
-                for which in 0..9 {
+                for which in 0..(if full { 9 } else { 7 }) {
                     let d_cache = dev.htod_sync_copy(&cache0)?;
                     let d_attn = dev.htod_sync_copy(&vec![0u16; m * NH * HD])?;
                     let pa = *d_attn.device_ptr() as u64;
@@ -3597,7 +3636,7 @@ fn probe_attn(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
                 }
                 // W4/SMALL draft chain: new (8) vs old (7) — attn rows + KV cache (its own class: the
                 // split-K online softmax is not v2's two-pass scan, so it is gated against itself)
-                {
+                if full {
                     let nzd = outs[7].0.iter().filter(|b| { let v = f16::from_bits(**b).to_f32(); v != 0.0 && v.is_finite() }).count();
                     if nzd < m * NH * HD / 2 {
                         bail!("EXL3-ATTN FAIL: implausible draft-chain output at fmt={fname} m={m} p0={p0} ({nzd} finite nonzero)");
@@ -3612,12 +3651,12 @@ fn probe_attn(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
                 }
                 checked += 1;
             }
-            println!("    attn {fname} p0={p0}: widths {{1..8,12,16}} v2 == v3 (acc4 + acc1) == W4S acc4_w4/acc1_w4{} \
+            println!("    attn{shape_tag} {fname} p0={p0}: widths {{1..8,12,16}} v2 == v3 (acc4 + acc1) == W4S acc4_w4/acc1_w4{} \
                       (attn rows + KV cache); W4S draft chain == old draft chain",
                      if fmt == 0 { " == ref-loop == seq-decode" } else { "" });
         }
     }
-    println!("EXL3-ATTN: PASS ({checked} cells: v2 warp-tree scan bitwise vs xq_attn_softmax class; \
+    println!("EXL3-ATTN{shape_tag}: PASS ({checked} cells: v2 warp-tree scan bitwise vs xq_attn_softmax class; \
               WP13 dense v3 bitwise vs v2 in f32/f16/fp8/q8; W4S dense acc4_w4/acc1_w4 bitwise vs v2; \
               W4S draft chain bitwise vs the old draft chain in {draft_checked} cells)");
 
@@ -3666,7 +3705,7 @@ fn probe_attn(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
                 if pass == 1 { match which { 0 => t_old = us, 1 => t_new = us, _ => t_w4 = us } }
             }
         }
-        println!("    EXL3-ATTN-V3 timing {} m={m} p0={p0}: old {} {t_old:.1} us, v3 {t_new:.1} us, W4S v3+acc_w4 {t_w4:.1} us \
+        println!("    EXL3-ATTN-V3{shape_tag} timing {} m={m} p0={p0}: old {} {t_old:.1} us, v3 {t_new:.1} us, W4S v3+acc_w4 {t_w4:.1} us \
                   per layer call ({:.1}x / {:.1}x; synthetic, launch-inclusive, harness-only)",
                  ["f32", "f16", "fp8", "q8"][fmt], if m == 1 { "xq_attn_decode" } else { "xq_attn_decode_group" },
                  t_old / t_new.max(1e-9), t_old / t_w4.max(1e-9));
@@ -5193,6 +5232,417 @@ pub(crate) fn load_module_pub(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
     load_module(dev)
 }
 
+/// TP-4T1 (`--probe-exl3-tailgemm`): the prefill TAIL-chunk small-M plain fp16 GEMM `xq_gemm_f16_tail`
+/// against the production reference `xq_gemm_f16` (per-row launch, one thread per column) at the served
+/// tail shapes (hc down/up, GDN a/b, PLE key/value) plus ragged N/K, M in {1,2,3,5,8,11,16}. PASS requires
+/// the outputs to be BITWISE equal (outputs pre-poisoned, reference non-trivially nonzero), then prints the
+/// per-call time table (weights rotated through >= 128 MB of copies so the read is DRAM-cold, launches
+/// back-to-back). Synthetic, no model. Flag only; no env.
+pub fn probe_tailgemm() -> Result<()> {
+    let dev = dev0()?;
+    load_module(&dev)?;
+    let f_old = dev.get_func(MODULE, "xq_gemm_f16").context("xq_gemm_f16")?;
+    let f_new = dev.get_func(MODULE, "xq_gemm_f16_tail").context("xq_gemm_f16_tail")?;
+    // (label, N, K)
+    let shapes: [(&str, usize, usize); 7] = [
+        ("hc_down", 320, 10240), ("hc_up", 10240, 320), ("a_or_b", 48, 2560),
+        ("ple_key", 10240, 2560), ("ple_val", 2560, 2560),
+        ("ragged_N300_K1040", 300, 1040), ("ragged_N33_K136", 33, 136),
+    ];
+    let ms = [1usize, 2, 3, 5, 8, 11, 16];
+    let mut compared = 0usize;
+    let mut table: Vec<String> = Vec::new();
+    for &(label, n, k) in &shapes {
+        let w = synth_x(n, k, 0xF16 ^ (n as u32));
+        let d_w = dev.htod_sync_copy(&w)?;
+        // cold-rotation copies of the weight (same bytes)
+        let wbytes = n * k * 2;
+        let ncopy = ((128usize << 20) / wbytes.max(1)).clamp(2, 64);
+        let mut copies = Vec::with_capacity(ncopy);
+        for _ in 0..ncopy { copies.push(dev.htod_sync_copy(&w)?); }
+        for &m in &ms {
+            let d_x = dev.htod_sync_copy(&synth_x(m, k, 0xA11 ^ (m as u32)))?;
+            let mut o_old = dev.htod_sync_copy(&vec![0x7e01u16; m * n])?;
+            let mut o_new = dev.htod_sync_copy(&vec![0x7e01u16; m * n])?;
+            let g_old = LaunchConfig { grid_dim: (((n + 127) / 128) as u32, m as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            let g_new = LaunchConfig { grid_dim: (((n + 31) / 32) as u32, ((m + 3) / 4) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                f_old.clone().launch(g_old, (&mut o_old, &d_w, &d_x, m as i32, n as i32, k as i32))?;
+                f_new.clone().launch(g_new, (&mut o_new, &d_w, &d_x, m as i32, n as i32, k as i32))?;
+            }
+            dev.synchronize()?;
+            let a = dev.dtoh_sync_copy(&o_old)?;
+            let b = dev.dtoh_sync_copy(&o_new)?;
+            if a.iter().filter(|v| **v != 0 && **v != 0x7e01).count() < m * n / 2 {
+                bail!("EXL3-TAILGEMM FAIL: implausible reference output ({label} m={m} N={n} K={k})");
+            }
+            let mism = a.iter().zip(b.iter()).filter(|(p, q)| p != q).count();
+            if mism > 0 { bail!("EXL3-TAILGEMM FAIL: {label} m={m} N={n} K={k}: {mism}/{} bytes differ", m * n); }
+            compared += m * n;
+            // timing (cold rotation; back-to-back launches, per-call mean)
+            let iters = (ncopy * 3).max(24);
+            let mut times = [0f64; 2];
+            for (slot, f, cfg) in [(0usize, &f_old, g_old), (1usize, &f_new, g_new)] {
+                for c in copies.iter().take(2) {
+                    unsafe { f.clone().launch(cfg, (&mut o_old, c, &d_x, m as i32, n as i32, k as i32))?; }
+                }
+                dev.synchronize()?;
+                let t0 = std::time::Instant::now();
+                for i in 0..iters {
+                    unsafe { f.clone().launch(cfg, (&mut o_old, &copies[i % ncopy], &d_x, m as i32, n as i32, k as i32))?; }
+                }
+                dev.synchronize()?;
+                times[slot] = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            }
+            table.push(format!("  {label:<18} M={m:<2} old {:>8.1} us   tail {:>7.1} us   x{:.1}", times[0], times[1], times[0] / times[1]));
+        }
+    }
+    println!("EXL3-TAILGEMM timing (per call, DRAM-cold rotation, back-to-back launches, includes ~launch gap):");
+    for l in &table { println!("{l}"); }
+    println!("EXL3-TAILGEMM: PASS (xq_gemm_f16_tail bitwise == xq_gemm_f16; {} shapes x {} M values, {} output elements compared)",
+             shapes.len(), ms.len(), compared);
+    Ok(())
+}
+
+/// TP-4R1 (`--probe-exl3-routergemm`): the register-tiled prefill router GEMMs `xq_gemm_f16_f32_tile128` / `_tile64`
+/// (the pair `exl3_forward::router_tile_kernel` dispatches) against the production reference `xq_gemm_f16_f32`
+/// (thread per (n, m), single ascending-k chain) and the kernel they replace, `xq_gemm_f16_f32_rows32`, at the served
+/// router shape (ne = 512, K = 2560) over the served chunk widths plus a second (ne, K) shape. PASS requires the fp32
+/// outputs BITWISE equal (new outputs pre-poisoned with a NaN pattern, reference non-trivially nonzero) and, for the
+/// widest batches, `xq_router_topk` (top-10 ids + weights) identical on both logit sets. Then a per-call time table
+/// (CUDA events around 10 back-to-back launches, median of 25 reps, L2-warm — a RANKING, not an in-round price,
+/// AGENTS §4). Synthetic, no model. Flag only; no env.
+pub fn probe_routergemm() -> Result<()> {
+    use cudarc::driver::sys;
+    let dev = dev0()?;
+    load_module(&dev)?;
+    let g = |n: &str| dev.get_func(MODULE, n).with_context(|| n.to_string());
+    let (f_ref, f_r32, f_r8) = (g("xq_gemm_f16_f32")?, g("xq_gemm_f16_f32_rows32")?, g("xq_gemm_f16_f32_rows8")?);
+    let (f_t128, f_t64, f_topk) = (g("xq_gemm_f16_f32_tile128")?, g("xq_gemm_f16_f32_tile64")?, g("xq_router_topk")?);
+    let st = *dev.cu_stream();
+    let mut e: [sys::CUevent; 2] = [std::ptr::null_mut(); 2];
+    for ev in e.iter_mut() {
+        let r = unsafe { sys::cuEventCreate(ev, 0) };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuEventCreate {r:?}");
+    }
+    let cfg_ref = |n: usize, m: usize| LaunchConfig { grid_dim: (n.div_ceil(128) as u32, m as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let cfg_r32 = |n: usize, m: usize| LaunchConfig { grid_dim: (n.div_ceil(128) as u32, ((m + 31) / 32) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let cfg_r8 = |n: usize, m: usize| LaunchConfig { grid_dim: ((n / 64) as u32, m.div_ceil(8) as u32, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 };
+    let cfg_t = |n: usize, m: usize, bm: usize| LaunchConfig { grid_dim: ((n / 64) as u32, m.div_ceil(bm) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let poison = f32::from_bits(0x7fc0_dead);
+    let mut compared = 0usize;
+    let mut table: Vec<String> = Vec::new();
+    let mut sp: Vec<(usize, f64)> = Vec::new();
+    let timed_ms = [17usize, 72, 131, 299, 384, 512, 1021, 1536, 2048, 4085];
+    let cases: [(usize, usize, Vec<usize>); 2] = [
+        (512, 2560, vec![1, 2, 3, 17, 33, 72, 100, 131, 299, 384, 512, 1021, 1280, 1536, 2048, 4085]),
+        (192, 144, vec![1, 5, 17, 100, 200, 300]),
+    ];
+    for (n, k, ms) in &cases {
+        let (n, k) = (*n, *k);
+        let d_w = dev.htod_sync_copy(&synth_x(n, k, 0x5A3 ^ n as u32))?;
+        for &m in ms {
+            let d_x = dev.htod_sync_copy(&synth_x(m, k, 0x77 ^ m as u32))?;
+            let mut o_ref = dev.htod_sync_copy(&vec![0f32; m * n])?;
+            let mut o_r32 = dev.htod_sync_copy(&vec![poison; m * n])?;
+            let mut o_t128 = dev.htod_sync_copy(&vec![poison; m * n])?;
+            let mut o_t64 = dev.htod_sync_copy(&vec![poison; m * n])?;
+            unsafe {
+                f_ref.clone().launch(cfg_ref(n, m), (&mut o_ref, &d_w, &d_x, m as i32, n as i32, k as i32))?;
+                f_r32.clone().launch(cfg_r32(n, m), (&mut o_r32, &d_w, &d_x, m as i32, n as i32, k as i32))?;
+                f_t128.clone().launch(cfg_t(n, m, 128), (&mut o_t128, &d_w, &d_x, m as i32, n as i32, k as i32))?;
+                f_t64.clone().launch(cfg_t(n, m, 64), (&mut o_t64, &d_w, &d_x, m as i32, n as i32, k as i32))?;
+            }
+            dev.synchronize()?;
+            let a = dev.dtoh_sync_copy(&o_ref)?;
+            if a.iter().filter(|v| **v != 0.0 && v.is_finite()).count() < m * n * 95 / 100 {
+                bail!("EXL3-ROUTERGEMM FAIL: implausible reference output (m={m} ne={n} K={k})");
+            }
+            let outs: Vec<(&str, Vec<f32>)> = vec![("tile128", dev.dtoh_sync_copy(&o_t128)?), ("tile64", dev.dtoh_sync_copy(&o_t64)?),
+                                                   ("rows32", dev.dtoh_sync_copy(&o_r32)?)];
+            for (name, b) in &outs {
+                let mism = a.iter().zip(b.iter()).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+                if mism > 0 { bail!("EXL3-ROUTERGEMM FAIL: {name} m={m} ne={n} K={k}: {mism}/{} fp32 outputs differ from xq_gemm_f16_f32", m * n); }
+                compared += m * n;
+            }
+            // top-10 ids + weights on the reference logits vs the dispatch-picked kernel's logits (served ne = 512 shape)
+            if n == 512 && m >= 1021 {
+                let topk = 10usize;
+                let (kn, bm) = crate::exl3_forward::router_tile_kernel(m, n, k).context("router_tile_kernel None at the served shape")?;
+                let fp = g(kn)?;
+                let mut o_pick = dev.htod_sync_copy(&vec![poison; m * n])?;
+                unsafe { fp.clone().launch(cfg_t(n, m, bm), (&mut o_pick, &d_w, &d_x, m as i32, n as i32, k as i32))?; }
+                let smem = ((256 + n + 512) * 4) as u32;
+                let tcfg = LaunchConfig { grid_dim: (m as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem };
+                let mut ids_a = dev.htod_sync_copy(&vec![-1i32; m * topk])?;
+                let mut ids_b = dev.htod_sync_copy(&vec![-1i32; m * topk])?;
+                let mut w_a = dev.htod_sync_copy(&vec![poison; m * topk])?;
+                let mut w_b = dev.htod_sync_copy(&vec![poison; m * topk])?;
+                unsafe {
+                    f_topk.clone().launch(tcfg, (&mut ids_a, &mut w_a, &o_ref, n as i32, topk as i32, m as i32))?;
+                    f_topk.clone().launch(tcfg, (&mut ids_b, &mut w_b, &o_pick, n as i32, topk as i32, m as i32))?;
+                }
+                dev.synchronize()?;
+                let (ia, ib) = (dev.dtoh_sync_copy(&ids_a)?, dev.dtoh_sync_copy(&ids_b)?);
+                let (wa, wb) = (dev.dtoh_sync_copy(&w_a)?, dev.dtoh_sync_copy(&w_b)?);
+                if ia.iter().any(|&v| v < 0 || v as usize >= n) { bail!("EXL3-ROUTERGEMM FAIL: implausible top-k ids (m={m})"); }
+                if ia != ib || wa.iter().zip(wb.iter()).any(|(p, q)| p.to_bits() != q.to_bits()) {
+                    bail!("EXL3-ROUTERGEMM FAIL: top-{topk} ids/weights differ at m={m} ({kn})");
+                }
+                println!("EXL3-ROUTERGEMM: m={m:>4}: top-{topk} ids + weights identical on {m} rows ({kn})");
+            }
+            // timing (served shape only): events around 10 back-to-back launches, median of 25
+            if n == 512 && timed_ms.contains(&m) {
+                let mut tm = |kind: u8| -> Result<f64> {
+                    let mut o = dev.htod_sync_copy(&vec![0f32; m * n])?;
+                    let mut reps = Vec::with_capacity(25);
+                    for rep in 0..28 {
+                        let r0 = unsafe { sys::cuEventRecord(e[0], st) };
+                        anyhow::ensure!(r0 == sys::CUresult::CUDA_SUCCESS, "cuEventRecord {r0:?}");
+                        for _ in 0..10 {
+                            unsafe {
+                                match kind {
+                                    0 => f_r32.clone().launch(cfg_r32(n, m), (&mut o, &d_w, &d_x, m as i32, n as i32, k as i32))?,
+                                    1 => f_r8.clone().launch(cfg_r8(n, m), (&mut o, &d_w, &d_x, m as i32, n as i32, k as i32))?,
+                                    2 => f_t64.clone().launch(cfg_t(n, m, 64), (&mut o, &d_w, &d_x, m as i32, n as i32, k as i32))?,
+                                    _ => f_t128.clone().launch(cfg_t(n, m, 128), (&mut o, &d_w, &d_x, m as i32, n as i32, k as i32))?,
+                                }
+                            }
+                        }
+                        let r1 = unsafe { sys::cuEventRecord(e[1], st) };
+                        anyhow::ensure!(r1 == sys::CUresult::CUDA_SUCCESS, "cuEventRecord {r1:?}");
+                        dev.synchronize()?;
+                        let mut ms: f32 = 0.0;
+                        let r = unsafe { sys::cuEventElapsedTime(&mut ms, e[0], e[1]) };
+                        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuEventElapsedTime {r:?}");
+                        if rep >= 3 { reps.push(ms as f64 * 1000.0 / 10.0); }
+                    }
+                    reps.sort_by(|p, q| p.partial_cmp(q).unwrap());
+                    Ok(reps[reps.len() / 2])
+                };
+                let (t32, t8, t64, t128) = (tm(0)?, tm(1)?, tm(2)?, tm(3)?);
+                let (kn, _) = crate::exl3_forward::router_tile_kernel(m, n, k).unwrap();
+                let tp = if kn.ends_with("tile64") { t64 } else { t128 };
+                let r8_on = crate::exl3_forward::pfx1_router_rows8(m, n, k);
+                let old = if r8_on { t8 } else { t32 };
+                sp.push((m, old / tp));
+                table.push(format!("  m={m:<5} rows32 {t32:>8.1} us   rows8 {t8:>8.1} us   tile64 {t64:>8.1} us   tile128 {t128:>8.1} us   \
+                                    picked {} -> x{:.2} vs today's pick ({})", kn.trim_start_matches("xq_gemm_f16_f32_"), old / tp,
+                                   if r8_on { "rows8" } else { "rows32" }));
+            }
+        }
+    }
+    for ev in e { unsafe { sys::cuEventDestroy_v2(ev); } }
+    println!("EXL3-ROUTERGEMM timing (ne=512 K=2560, per call, CUDA events over 10 back-to-back launches, median of 25, L2-warm, standalone ranking):");
+    for l in &table { println!("{l}"); }
+    println!("EXL3-ROUTERGEMM: PASS (tile128/tile64 bitwise == xq_gemm_f16_f32 (+ rows32); {} fp32 outputs compared; top-10 identical on the wide batches)", compared);
+    Ok(())
+}
+
+/// TP-4M1 (`--probe-exl3-moeglue`): the two W=4 MoE prefill glue kernels at the served shapes (synthetic, no model).
+///  (1) `xq_had_suh_rows_live_u{1,2,4}` vs the old `xq_had_suh_rows` (32-thread blocks, all r rows): BITWISE on every row the
+///      old kernel writes (live_end = null, several grid sizes, three chunk widths) and, with live_end set, on rows
+///      [0, live) with the dead rows left UNTOUCHED (poison survives).
+///  (2) `xq_moe_combine_rows_ep2_k{10,16}` vs the old `xq_moe_combine_rows_ep` (1024-thread block per row): BITWISE on every
+///      fp32 output, add_shared 0/1, local-pick densities 0.25 / 1.0, plus a k = 16 case.
+/// An empty/degenerate compare (reference mostly zero or non-finite) is a FAILURE. Then per-call timing at the served
+/// chunk (c = 2043, k = 10, ne_l = 128): L2-warm (median of 25 over 10 back-to-back launches) and L2-cold (a 192 MB memset
+/// before each single launch, median of 25), with the byte floor (238 GB/s) next to it. Standalone numbers RANK a kernel,
+/// they do not price it in-round (AGENTS §4). Flag only; no env.
+pub fn probe_moeglue() -> Result<()> {
+    use cudarc::driver::sys;
+    let dev = dev0()?;
+    load_module(&dev)?;
+    let g = |n: &str| dev.get_func(MODULE, n).with_context(|| n.to_string());
+    let f_old_h = g("xq_had_suh_rows")?;
+    let f_new_h = [g("xq_had_suh_rows_live_u1")?, g("xq_had_suh_rows_live_u2")?, g("xq_had_suh_rows_live_u4")?];
+    let us_of = [1usize, 2, 4];
+    let f_old_c = g("xq_moe_combine_rows_ep")?;
+    let (f_c10, f_c16) = (g("xq_moe_combine_rows_ep2_k10")?, g("xq_moe_combine_rows_ep2_k16")?);
+    let st = *dev.cu_stream();
+    let mut e: [sys::CUevent; 2] = [std::ptr::null_mut(); 2];
+    for ev in e.iter_mut() {
+        let r = unsafe { sys::cuEventCreate(ev, 0) };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuEventCreate {r:?}");
+    }
+    let flush = dev.alloc_zeros::<u8>(192 << 20)?;
+    let flush_ptr = *flush.device_ptr();
+    // (warm us, cold us) per call
+    let time_it = |launch: &mut dyn FnMut() -> Result<()>| -> Result<(f64, f64)> {
+        let mut warm = Vec::new();
+        for rep in 0..28 {
+            unsafe { sys::cuEventRecord(e[0], st) };
+            for _ in 0..10 { launch()?; }
+            unsafe { sys::cuEventRecord(e[1], st) };
+            dev.synchronize()?;
+            let mut ms: f32 = 0.0;
+            let r = unsafe { sys::cuEventElapsedTime(&mut ms, e[0], e[1]) };
+            anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuEventElapsedTime {r:?}");
+            if rep >= 3 { warm.push(ms as f64 * 100.0); }
+        }
+        let mut cold = Vec::new();
+        for rep in 0..28 {
+            unsafe { sys::cuMemsetD8Async(flush_ptr, 0xA5, 192 << 20, st) };
+            unsafe { sys::cuEventRecord(e[0], st) };
+            launch()?;
+            unsafe { sys::cuEventRecord(e[1], st) };
+            dev.synchronize()?;
+            let mut ms: f32 = 0.0;
+            let r = unsafe { sys::cuEventElapsedTime(&mut ms, e[0], e[1]) };
+            anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuEventElapsedTime {r:?}");
+            if rep >= 3 { cold.push(ms as f64 * 1000.0); }
+        }
+        warm.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        cold.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        Ok((warm[warm.len() / 2], cold[cold.len() / 2]))
+    };
+    let mut lcg = 0x1234_5678u32;
+    let mut rnd = move || { lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223); lcg >> 8 };
+    let (k, ne_l, topk) = (2560usize, 128usize, 10usize);
+    let floor_us = |bytes: f64| bytes / 238e9 * 1e6;
+    let mut compared = 0usize;
+    let mut table: Vec<String> = Vec::new();
+
+    // ------------------------------------------------------------------ (1) had_suh
+    let d_suh = dev.htod_sync_copy(&synth_x(ne_l, k, 0x51))?;
+    let idxmap: Vec<i32> = (0..ne_l).map(|x| ((x * 37 + 5) % ne_l) as i32).collect();
+    let d_idx = dev.htod_sync_copy(&idxmap)?;
+    for &c in &[2043usize, 777, 33] {
+        let r = c * topk;
+        let d_x = dev.htod_sync_copy(&synth_x(c, k, 0x77 ^ c as u32))?;
+        let live = r / 4 + (c % 7);
+        let mut tok = vec![0i32; r];
+        let mut eidx = vec![0i32; r];
+        for i in 0..live { tok[i] = (rnd() as usize % c) as i32; eidx[i] = (i * ne_l / live) as i32; }
+        let d_tok = dev.htod_sync_copy(&tok)?;
+        let d_eidx = dev.htod_sync_copy(&eidx)?;
+        let d_live = dev.htod_sync_copy(&[live as i32])?;
+        let live_p = *d_live.device_ptr() as u64;
+        let mut xh_old = dev.htod_sync_copy(&vec![0xFFFFu16; r * k])?;
+        let mut xh_new = dev.htod_sync_copy(&vec![0xFFFFu16; r * k])?;
+        unsafe { f_old_h.clone().launch(LaunchConfig { grid_dim: ((r * 20) as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 },
+                                        (&d_x, &d_suh, &d_idx, &d_tok, &d_eidx, &mut xh_old, r as i32, k as i32))?; }
+        dev.synchronize()?;
+        let a = dev.dtoh_sync_copy(&xh_old)?;
+        if a.iter().filter(|v| **v != 0 && (**v & 0x7C00) != 0x7C00).count() < r * k * 95 / 100 {
+            bail!("EXL3-MOEGLUE FAIL: implausible had_suh reference (c={c})");
+        }
+        for (vi, f) in f_new_h.iter().enumerate() {
+            for &grid in &[5u32, 288, 4096] {
+                // full coverage (live_end = null)
+                dev.htod_sync_copy_into(&vec![0xFFFFu16; r * k], &mut xh_new)?;
+                unsafe { f.clone().launch(LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                                          (&d_x, &d_suh, &d_idx, &d_tok, &d_eidx, &mut xh_new, 0u64, r as i32, k as i32))?; }
+                dev.synchronize()?;
+                let b = dev.dtoh_sync_copy(&xh_new)?;
+                let mism = a.iter().zip(b.iter()).filter(|(p, q)| p != q).count();
+                if mism > 0 { bail!("EXL3-MOEGLUE FAIL: had_suh_live_u{} grid {grid} c={c} (full): {mism}/{} halves differ", us_of[vi], r * k); }
+                compared += r * k;
+                // live-only coverage: live rows bitwise, dead rows untouched
+                dev.htod_sync_copy_into(&vec![0xFFFFu16; r * k], &mut xh_new)?;
+                unsafe { f.clone().launch(LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                                          (&d_x, &d_suh, &d_idx, &d_tok, &d_eidx, &mut xh_new, live_p, r as i32, k as i32))?; }
+                dev.synchronize()?;
+                let b = dev.dtoh_sync_copy(&xh_new)?;
+                let mism = a[..live * k].iter().zip(b[..live * k].iter()).filter(|(p, q)| p != q).count();
+                if mism > 0 { bail!("EXL3-MOEGLUE FAIL: had_suh_live_u{} grid {grid} c={c} (live {live}): {mism} live halves differ", us_of[vi]); }
+                if b[live * k..].iter().any(|v| *v != 0xFFFF) { bail!("EXL3-MOEGLUE FAIL: had_suh_live_u{} wrote past live_end (c={c})", us_of[vi]); }
+                compared += live * k;
+            }
+        }
+        println!("EXL3-MOEGLUE: had_suh c={c:>4} r={r:>5} live={live:>5}: 3 variants x 3 grids bitwise == xq_had_suh_rows (full + live-only, dead rows untouched)");
+        // timing at the served chunk only
+        if c == 2043 {
+            let cfg_old = LaunchConfig { grid_dim: ((r * 20) as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+            let (ow, oc) = time_it(&mut || { unsafe { f_old_h.clone().launch(cfg_old, (&d_x, &d_suh, &d_idx, &d_tok, &d_eidx, &mut xh_old, r as i32, k as i32))?; } Ok(()) })?;
+            let fl_all = floor_us((r * k * 2 + c * k * 2) as f64);
+            let fl_live = floor_us((live * k * 2 + c.min(live) * k * 2) as f64);
+            table.push(format!("  had_suh OLD (all r={r} rows)       warm {ow:>7.1} us  cold {oc:>7.1} us   floor(all rows) {fl_all:>6.1} us  floor(live rows) {fl_live:>6.1} us"));
+            let mut best = (f64::MAX, 0usize, 0u32);
+            for (vi, f) in f_new_h.iter().enumerate() {
+                for &grid in &[96u32, 144, 192, 288, 384, 576] {
+                    let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                    let (nw, nc) = time_it(&mut || { unsafe { f.clone().launch(cfg, (&d_x, &d_suh, &d_idx, &d_tok, &d_eidx, &mut xh_new, live_p, r as i32, k as i32))?; } Ok(()) })?;
+                    table.push(format!("  had_suh LIVE u{} grid {grid:>3} (live={live})  warm {nw:>7.1} us  cold {nc:>7.1} us   x{:.2} cold / x{:.2} warm vs OLD   {:.0} GB/s live-floor-bytes (cold)",
+                                       us_of[vi], oc / nc, ow / nw, (live * k * 2 + c.min(live) * k * 2) as f64 / (nc * 1e-6) / 1e9));
+                    if nc < best.0 { best = (nc, us_of[vi], grid); }
+                }
+            }
+            table.push(format!("  had_suh BEST: u{} grid {} cold {:.1} us = x{:.2} vs OLD cold {:.1} us", best.1, best.2, best.0, oc / best.0, oc));
+            // live-fraction sweep with the best config
+            let f = &f_new_h[us_of.iter().position(|&u| u == best.1).unwrap()];
+            for &frac in &[0.10f64, 0.25, 0.40, 0.60, 1.0] {
+                let lv = ((r as f64 * frac) as usize).min(r) as i32;
+                let d_lv = dev.htod_sync_copy(&[lv])?;
+                let lp = *d_lv.device_ptr() as u64;
+                let cfg = LaunchConfig { grid_dim: (best.2, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                let (nw, nc) = time_it(&mut || { unsafe { f.clone().launch(cfg, (&d_x, &d_suh, &d_idx, &d_tok, &d_eidx, &mut xh_new, lp, r as i32, k as i32))?; } Ok(()) })?;
+                table.push(format!("  had_suh LIVE best, live fraction {frac:.2} ({lv} rows)  warm {nw:>7.1} us  cold {nc:>7.1} us"));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ (2) combine
+    let h = 2560usize;
+    for &(c, k2, p, name) in &[(2043usize, 10usize, 0.25f64, "k10"), (777, 10, 1.0, "k10"), (300, 16, 0.4, "k16"), (33, 10, 0.25, "k10")] {
+        let r = c * k2;
+        let mut cand = vec![-1i32; r];
+        let mut wts = vec![0f32; r];
+        let mut live = 0usize;
+        for i in 0..r {
+            wts[i] = ((rnd() % 1000) + 1) as f32 / 1000.0 * 0.3;
+            if (rnd() % 10000) as f64 / 10000.0 < p { cand[i] = live as i32; live += 1; }
+        }
+        let d_yd = dev.htod_sync_copy(&synth_x(r, h, 0x31 ^ c as u32))?;
+        let d_ysh = dev.htod_sync_copy(&synth_x(c, h, 0x32 ^ c as u32))?;
+        let d_x = dev.htod_sync_copy(&synth_x(c, h, 0x33 ^ c as u32))?;
+        let sg: Vec<u16> = synth_x(1, h, 0x34).iter().map(|b| f16::from_f32(f16::from_bits(*b).to_f32() / 64.0).to_bits()).collect();
+        let d_sg = dev.htod_sync_copy(&sg)?;
+        let d_cand = dev.htod_sync_copy(&cand)?;
+        let d_wts = dev.htod_sync_copy(&wts)?;
+        let poison = f32::from_bits(0x7fc0_dead);
+        let mut o_old = dev.htod_sync_copy(&vec![poison; c * h])?;
+        let mut o_new = dev.htod_sync_copy(&vec![poison; c * h])?;
+        let f_new = if name == "k10" { &f_c10 } else { &f_c16 };
+        let cfg_old = LaunchConfig { grid_dim: (c as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 4096 };
+        let cfg_new = LaunchConfig { grid_dim: (c as u32, 1, 1), block_dim: (320, 1, 1), shared_mem_bytes: 0 };
+        for add_sh in [1i32, 0] {
+            dev.htod_sync_copy_into(&vec![poison; c * h], &mut o_old)?;
+            dev.htod_sync_copy_into(&vec![poison; c * h], &mut o_new)?;
+            unsafe {
+                f_old_c.clone().launch(cfg_old, (&mut o_old, &d_yd, &d_ysh, &d_cand, &d_wts, &d_sg, &d_x, k2 as i32, h as i32, c as i32, add_sh))?;
+                f_new.clone().launch(cfg_new, (&mut o_new, &d_yd, &d_ysh, &d_cand, &d_wts, &d_sg, &d_x, k2 as i32, h as i32, c as i32, add_sh))?;
+            }
+            dev.synchronize()?;
+            let a = dev.dtoh_sync_copy(&o_old)?;
+            let b = dev.dtoh_sync_copy(&o_new)?;
+            if a.iter().filter(|v| **v != 0.0 && v.is_finite()).count() < c * h * 80 / 100 || a.iter().any(|v| !v.is_finite()) {
+                bail!("EXL3-MOEGLUE FAIL: implausible combine reference (c={c} k={k2} p={p} add_shared={add_sh})");
+            }
+            let mism = a.iter().zip(b.iter()).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+            if mism > 0 { bail!("EXL3-MOEGLUE FAIL: combine_ep2_{name} c={c} p={p} add_shared={add_sh}: {mism}/{} fp32 outputs differ", c * h); }
+            compared += c * h;
+        }
+        println!("EXL3-MOEGLUE: combine c={c:>4} k={k2:>2} local-pick p={p:.2} (live rows {live:>5}): ep2_{name} bitwise == xq_moe_combine_rows_ep, add_shared 1 and 0");
+        if c == 2043 {
+            for add_sh in [1i32, 0] {
+                let (ow, oc) = time_it(&mut || { unsafe { f_old_c.clone().launch(cfg_old, (&mut o_old, &d_yd, &d_ysh, &d_cand, &d_wts, &d_sg, &d_x, k2 as i32, h as i32, c as i32, add_sh))?; } Ok(()) })?;
+                let (nw, nc) = time_it(&mut || { unsafe { f_new.clone().launch(cfg_new, (&mut o_new, &d_yd, &d_ysh, &d_cand, &d_wts, &d_sg, &d_x, k2 as i32, h as i32, c as i32, add_sh))?; } Ok(()) })?;
+                let bytes = (c * h * 4 + live * h * 2 + if add_sh == 1 { 2 * c * h * 2 } else { 0 }) as f64;
+                table.push(format!("  combine add_shared={add_sh} (c={c}, live rows {live}):  OLD warm {ow:>7.1} us cold {oc:>7.1} us | NEW warm {nw:>7.1} us cold {nc:>7.1} us | \
+                                    x{:.2} cold / x{:.2} warm | floor {:.1} us ({:.0} GB/s new cold, {:.0} GB/s old cold)",
+                                   oc / nc, ow / nw, floor_us(bytes), bytes / (nc * 1e-6) / 1e9, bytes / (oc * 1e-6) / 1e9));
+            }
+        }
+    }
+    for ev in e { unsafe { sys::cuEventDestroy_v2(ev); } }
+    if compared == 0 { bail!("EXL3-MOEGLUE FAIL: nothing was compared"); }
+    println!("EXL3-MOEGLUE timing (served chunk c=2043, k=10, ne_l=128, h=K=2560; warm = median of 25 x 10 back-to-back, cold = 192 MB flush then one launch, median of 25; standalone ranking):");
+    for l in &table { println!("{l}"); }
+    println!("EXL3-MOEGLUE: PASS (had_suh_live u1/u2/u4 and combine_ep2 k10/k16 bitwise == the old kernels; {compared} elements compared)");
+    Ok(())
+}
+
 /// TP-I3 (b) (`--probe-exl3-hcw4`): the EXL3-HC-W4 section of --probe-exl3-binv alone (synthetic,
 /// no pack): xq_hc_w4 bitwise vs the p4c hc path over m = 1..8 x grids x flags + the standalone
 /// DRAM-cold timing table.
@@ -5373,7 +5823,7 @@ pub fn probe_sampler() -> Result<()> {
     // (T, top_k, top_p, min_p)
     let cfgs: [(f32, u32, f32, f32); 5] = [
         (0.7, 20, 0.8, 0.0),   // our server default
-        (0.8, 0, 1.0, 0.08),   // the rival shim default (min_p)
+        (0.8, 0, 1.0, 0.08),   // the reference implementation shim default (min_p)
         (1.0, 0, 1.0, 0.0),    // pure temperature, full vocab
         (0.6, 0, 0.95, 0.0),   // top-p over the full vocab
         (1.3, 50, 1.0, 0.0),   // top-k only, hot
@@ -5457,7 +5907,7 @@ pub fn probe_sampler() -> Result<()> {
 
 // ---------------------------------------------------------------------------
 // WP15 gate: `--probe-penalties` (no model, no weights: synthetic fp16 rows at the real vocab).
-// xq_pen_rows / xq_pen_draft vs a DENSE host transcription of the rival's two kernels
+// xq_pen_rows / xq_pen_draft vs a DENSE host transcription of the reference implementation's two kernels
 // (exllamav3_ext/generator/rep_pen.cu: every logit rewritten, float factors, float frequency
 // sum in ascending position order). Asserts:
 //   (a) every logit the window did not touch is bit-identical (the sparse rewrite is exact);
@@ -5676,7 +6126,7 @@ pub fn probe_penalties() -> Result<()> {
                  c.0, c.1, c.2, c.3, c.4, if ring_ok { "ok" } else { "BAD" }, if flag0_ok { "ok" } else { "BAD" },
                  if ok { "PASS" } else { "FAIL" });
     }
-    println!("  penalized logits vs the rival transcription: exact={n_exact} 1-ulp={n_ulp1}");
+    println!("  penalized logits vs the reference implementation transcription: exact={n_exact} 1-ulp={n_ulp1}");
     println!("{}", if all_ok { "PROBE_PENALTIES_OK" } else { "PROBE_PENALTIES_FAIL" });
     if !all_ok { bail!("penalty probe failed"); }
     Ok(())

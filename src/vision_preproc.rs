@@ -22,6 +22,9 @@ pub struct VisionPreprocConfig {
     pub in_channels: usize,           // 3
     pub min_pixels: usize,            // size.shortest_edge = 65536
     pub max_pixels: usize,            // size.longest_edge = 16777216
+    /// D-VIS-RESIZE (owner 2026-09-30): longer side capped at this many pixels (aspect kept) BEFORE
+    /// smart_resize's grid snap; 0 = no cap. Server flag `--image-max-edge` (default 1024).
+    pub max_edge: usize,
 }
 
 impl VisionPreprocConfig {
@@ -41,6 +44,7 @@ pub const QWEN27B_PREPROC: VisionPreprocConfig = VisionPreprocConfig {
     in_channels: 3,
     min_pixels: 65536,
     max_pixels: 16777216,
+    max_edge: 1024,
 };
 
 /// Area-based smart_resize, mirroring `image_processing_qwen2_vl.py::smart_resize`.
@@ -69,6 +73,22 @@ pub fn smart_resize(h: usize, w: usize, cfg: &VisionPreprocConfig) -> (usize, us
         wb = (wf * beta / factor).ceil() * factor;
     }
     (hb as usize, wb as usize)
+}
+
+/// D-VIS-RESIZE: the final `(hb, wb)` for an `h x w` input. When the longer side exceeds
+/// `cfg.max_edge`, the image is first scaled so that side is exactly `max_edge` (the other side by
+/// the same factor, rounded half-to-even), then `smart_resize` snaps both sides to the 32-px grid.
+/// The pixels are resampled ONCE, straight to these dims (one bicubic pass instead of two).
+pub fn capped_resize_dims(h: usize, w: usize, cfg: &VisionPreprocConfig) -> (usize, usize) {
+    let long = h.max(w);
+    if cfg.max_edge == 0 || long <= cfg.max_edge {
+        return smart_resize(h, w, cfg);
+    }
+    let s = cfg.max_edge as f64 / long as f64;
+    let scale = |v: usize| -> usize {
+        if v == long { cfg.max_edge } else { (round_ties_even(v as f64 * s) as usize).max(1) }
+    };
+    smart_resize(scale(h), scale(w), cfg)
 }
 
 /// `round()` with ties-to-even (Python `round` semantics used by smart_resize).
@@ -183,7 +203,7 @@ pub fn preprocess_image(
     rgb: &[u8], // len == h*w*3
     cfg: &VisionPreprocConfig,
 ) -> PreprocessedImage {
-    let (hb, wb) = smart_resize(h, w, cfg);
+    let (hb, wb) = capped_resize_dims(h, w, cfg);
     // build [C, H, W] f32 in 0..255
     let mut img = vec![0.0f32; 3 * h * w];
     for c in 0..3 {

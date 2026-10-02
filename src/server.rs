@@ -306,7 +306,10 @@ fn engine_unavailable() -> Response {
 
 /// WP02: HTTP status for an engine error reason (busy / stopped = 503, anything else = 500).
 fn engine_error_status(reason: &str) -> StatusCode {
-    if reason.contains("busy") || reason.contains("engine stopped") { StatusCode::SERVICE_UNAVAILABLE }
+    // VIS-2: an engine refusal the CLIENT caused carries its class in the reason
+    if reason.starts_with("error: bad request:") { StatusCode::BAD_REQUEST }
+    else if reason.starts_with("error: unprocessable:") { StatusCode::UNPROCESSABLE_ENTITY }
+    else if reason.contains("busy") || reason.contains("engine stopped") { StatusCode::SERVICE_UNAVAILABLE }
     else { StatusCode::INTERNAL_SERVER_ERROR }
 }
 
@@ -364,7 +367,7 @@ struct ChatCompletionRequest {
     presence_penalty: Option<f32>,
     #[serde(default)]
     frequency_penalty: Option<f32>,
-    /// WP08: min-p truncation in [0, 1] (0 = off), applied after temperature (the rival's
+    /// WP08: min-p truncation in [0, 1] (0 = off), applied after temperature (the reference implementation's
     /// ComboSampler order). Honoured by the EXL3 serve path; the NVFP4 sampler has none.
     #[serde(default)]
     min_p: Option<f32>,
@@ -498,7 +501,7 @@ struct ChatChoice {
 fn spec_finish_reason(reason: &str) -> &str {
     match reason {
         "context_length_exceeded" => "length",
-        // WP08: the loop detector ends a response as a normal stop (the rival's eos_reason
+        // WP08: the loop detector ends a response as a normal stop (the reference implementation's eos_reason
         // "loop_detected"); the reason itself rides `stop_reason`.
         "loop_detected" => "stop",
         // WP02: an engine error / cancel is not a spec value; the SSE error event carries the reason
@@ -513,8 +516,8 @@ fn stop_reason_of(reason: &str) -> Option<String> {
 }
 
 /// WP08: validate a request's penalty / min_p values (the OpenAI/vLLM 400 contract; semantics are
-/// the rival's ComboSampler, WP15). repetition_penalty must be finite and > 0 — a value < 1
-/// REWARDS repetition and is accepted as the rival accepts it, with a log warning (owner decision
+/// the reference implementation's ComboSampler, WP15). repetition_penalty must be finite and > 0 — a value < 1
+/// REWARDS repetition and is accepted as the reference implementation accepts it, with a log warning (owner decision
 /// 2026-09-26); presence/frequency_penalty finite in [-2, 2]; min_p finite in [0, 1].
 /// Err = the client-facing message.
 pub fn validate_penalties(rep: Option<f32>, pres: Option<f32>, freq: Option<f32>,
@@ -810,24 +813,34 @@ async fn chat_completions(
     // merged embeddings + spans for the model prefill splice. Text-only traffic is unchanged.
     let mut image_embeds: Option<Vec<f32>> = None;
     let mut image_spans: Vec<crate::vision_encoder::ImageSpan> = Vec::new();
+    // VID-0 (VIS-5): a content part this server cannot take (video, audio, file, ...) is a 400 naming the
+    // type — it used to be dropped silently (the model then answered about content it never saw).
+    if let Some(t) = req.messages.iter().flat_map(|m| m.unsupported_parts.iter()).next() {
+        return (StatusCode::BAD_REQUEST,
+                format!("content part type '{t}' is not supported (text and images only; video input is not available yet)"))
+            .into_response();
+    }
     let urls: Vec<String> = req.messages.iter()
         .flat_map(|m| m.images.iter().filter_map(|i| i.url.clone()))
         .collect();
     if !urls.is_empty() {
         let vt0 = std::time::Instant::now();
         // Prefer the GPU tower (fast path) unless --vision-cpu forces the CPU reference.
-        let prep = if let Some(g) = state.vision_gpu.clone() {
-            if !state.vision_cpu {
+        // VIS-2: decode + preprocess + tower run on a blocking worker, not inline on the async
+        // handler (a long tower used to pin a tokio worker under the std Mutex).
+        let (gpu, cpu_tower, force_cpu) = (state.vision_gpu.clone(), state.vision_tower.clone(), state.vision_cpu);
+        let toks = prompt_tokens.clone();
+        let urls_w = urls.clone();
+        let prep = tokio::task::spawn_blocking(move || {
+            if let Some(g) = gpu.filter(|_| !force_cpu) {
                 let mut gvt = g.lock().expect("vision_gpu lock");
-                crate::vision_encoder::prepare_vision_request_gpu(&mut gvt, &urls, &prompt_tokens)
+                crate::vision_encoder::prepare_vision_request_gpu(&mut gvt, &urls_w, &toks)
+            } else if let Some(tower) = cpu_tower {
+                crate::vision_encoder::prepare_vision_request(&tower, &urls_w, &toks)
             } else {
-                state.vision_tower.as_ref().map(|t| crate::vision_encoder::prepare_vision_request(t, &urls, &prompt_tokens)).unwrap_or_else(|| Err(anyhow::anyhow!("vision_gpu forced but no CPU tower")))
+                Err(anyhow::anyhow!("no vision tower loaded"))
             }
-        } else if let Some(tower) = state.vision_tower.clone() {
-            crate::vision_encoder::prepare_vision_request(&tower, &urls, &prompt_tokens)
-        } else {
-            Err(anyhow::anyhow!("no vision tower loaded"))
-        };
+        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("vision worker failed: {e}")));
         eprintln!("[vision] dispatch {} images, prepare took {} ms, len={}",
             urls.len(), vt0.elapsed().as_millis(), prep.as_ref().map(|p| p.image_embeds.len()).unwrap_or(0));
         match prep {
@@ -851,6 +864,12 @@ async fn chat_completions(
         if n == 0 {
             return (StatusCode::BAD_REQUEST,
                     "'truncate_prompt_tokens' must be an integer >= 1").into_response();
+        }
+        if prompt_tokens.len() > n && !image_spans.is_empty() {
+            // VIS-2: dropping the front of an image prompt would leave the image spans pointing at the
+            // wrong rows (the spans index the expanded stream) — refuse instead of splicing wrongly.
+            return (StatusCode::BAD_REQUEST,
+                    "'truncate_prompt_tokens' cannot cut a prompt that carries images").into_response();
         }
         if prompt_tokens.len() > n {
             let dropped = prompt_tokens.len() - n;
@@ -1935,7 +1954,7 @@ mod wp08_validation_tests {
 
     #[test]
     fn inactive_penalties_stage_nothing() {
-        // the rival's alt() NoOp rule: defaults never launch a penalty kernel
+        // the reference implementation's alt() NoOp rule: defaults never launch a penalty kernel
         assert_eq!(PenParams::new(1.0, 0.0, 0.0, 1024, 1024), None);
         assert_eq!(PenParams::new(1.1, 0.0, 0.0, 0, 0), None);
         assert!(PenParams::new(1.1, 0.0, 0.0, 1024, 1024).is_some());

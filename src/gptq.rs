@@ -507,7 +507,7 @@ fn calib_tokens_mode(
             if let Some(t) = v["text"].as_str() { return Some(t.to_string()); }
             let msgs: Vec<crate::tokenizer::ChatMessage> = v["messages"].as_array()?.iter().map(|m| crate::tokenizer::ChatMessage {
                 role: m["role"].as_str().unwrap_or("user").to_string(), content: m["content"].as_str().map(|s| s.to_string()),
-                tool_calls: None, tool_call_id: None, name: None, reasoning_content: None, images: vec![] }).collect();
+                tool_calls: None, tool_call_id: None, name: None, reasoning_content: None, images: vec![], layout: vec![], unsupported_parts: vec![] }).collect();
             tok.apply_chat_template_no_gen(&msgs, None, None).ok()
         }).filter(|s| !s.is_empty()).collect()
     } else { raw.split("\n\n").map(|s| s.to_string()).filter(|s| !s.trim().is_empty()).collect() };

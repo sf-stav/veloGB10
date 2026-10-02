@@ -25,8 +25,11 @@ static GATE_VP_OFF: AtomicBool = AtomicBool::new(false);
 // Expert-parallel deal (static per (layer, expert); design §1.3 "Why static EP")
 // ---------------------------------------------------------------------------------------------
 
+mod ep_deal4; // TP-4F-prep: the world-4 `freq` table (loader, validator, tests)
+
 /// The deal in effect: "interleave" (e % W == rank, the default), "contig" (e / (ne/W)) or, TP-I #6,
-/// "freq" (a per-layer frequency-balanced deal from the committed table, see `freq_deal`).
+/// "freq" (a per-layer frequency-balanced deal from the committed table, see `freq_deal`; world 2, and
+/// world 4 through `ep_deal4`; opt-in, output-changing).
 /// SPMD-relevant (it fixes each rank's expert GROUPING, hence the partial sums): `--ep-deal`
 /// interleave|contig|freq is a registry option (CLI-1: the GB10_TP_EP_DEAL env override merged into
 /// it); the head's value rides TpConfig (exl3_ep_deal + the option registry) to the node.
@@ -75,8 +78,13 @@ fn freq_deal() -> Result<&'static Vec<Vec<usize>>> {
 
 /// Owner rank of every expert of trunk layer `layer` under the deal in effect.
 pub fn ep_layer_owners(ne: usize, world: usize, layer: usize) -> Result<Vec<usize>> {
-    let kind = ep_deal_kind();
-    if kind != "freq" { return Ok((0..ne).map(|e| ep_owner(e, ne, world, &kind)).collect()); }
+    ep_layer_owners_kind(&ep_deal_kind(), ne, world, layer)
+}
+
+/// `ep_layer_owners` for an explicit deal kind (the body is the world-2 original; TP-4F-prep added the world-4 line).
+pub fn ep_layer_owners_kind(kind: &str, ne: usize, world: usize, layer: usize) -> Result<Vec<usize>> {
+    if kind != "freq" { return Ok((0..ne).map(|e| ep_owner(e, ne, world, kind)).collect()); }
+    if world == 4 { return ep_deal4::table()?.layer_owners(ne, world, layer); }
     anyhow::ensure!(world == 2, "--ep-deal=freq: the committed table is a world-2 deal (world {world})");
     let t = freq_deal()?;
     let r0 = t.get(layer).with_context(|| format!("--ep-deal=freq: the table has {} layers, no layer {layer} \
@@ -173,25 +181,50 @@ impl EpShard {
 // TP-B: head-sharded attention / GDN + row-parallel dense (design §1.3, T1 rung "step 3")
 // ---------------------------------------------------------------------------------------------
 
+/// KV heads of rank `r` at world `w` as (first global KV head, count). Whole heads per rank when
+/// `nkv` divides by `w` (the W=1/W=2 rule, unchanged); otherwise `w` must be a multiple of `nkv`
+/// and every KV head is REPLICATED across `w / nkv` adjacent ranks — rank r holds head
+/// `r / (w / nkv)` (W=4, nkv=2: ranks {0,1} hold head 0, {2,3} hold head 1). The loader's
+/// `planned_split` k/v classes use the same `r * nkv / w`.
+pub(super) fn kv_span(nkv: usize, r: usize, w: usize) -> Result<(usize, usize)> {
+    anyhow::ensure!(w >= 1 && r < w && nkv >= 1, "kv_span: nkv {nkv} rank {r} world {w}");
+    if nkv % w == 0 { return Ok((r * (nkv / w), nkv / w)); }
+    anyhow::ensure!(w > 2, "TP-B: num_kv_heads = {nkv} does not divide by world {w} — KV heads shard whole at world <= 2 \
+                            (replication starts above it)");
+    anyhow::ensure!(w % nkv == 0, "TP-B: num_kv_heads = {nkv} and world {w} divide neither way — \
+                                  KV heads are sharded whole or replicated in equal groups");
+    Ok((r / (w / nkv), 1))
+}
+
 /// The TRUNK's per-rank geometry at world `w`: attention query heads / KV heads and GDN key /
-/// value heads divided by W (every other field unchanged). The per-rank model IS a model with
-/// fewer heads as far as every mixer kernel is concerned (GQA ratio 12 : 1 and GDN k : v = 1 : 3
-/// are preserved), so kernels take the local counts unchanged. The MTP head stays replicated and
+/// value heads divided by W (every other field unchanged; KV heads replicate in groups when
+/// `w > num_kv_heads`, see `kv_span`). The per-rank model IS a model with fewer heads as far as
+/// every mixer kernel is concerned (GQA ratio 12 : 1 at W <= 2, 6 : 1 at W=4; GDN k : v = 1 : 3
+/// is preserved), so kernels take the local counts unchanged. The MTP head stays replicated and
 /// keeps the global `cfg` (T1 contract). Refuses a geometry that does not divide (boot fails).
 pub(super) fn trunk_cfg(cfg: &crate::qwen::Config, w: usize) -> Result<crate::qwen::Config> {
     anyhow::ensure!(w >= 1, "trunk_cfg: world 0");
-    let checks = [("num_heads", cfg.num_heads), ("num_kv_heads", cfg.num_kv_heads),
+    let checks = [("num_heads", cfg.num_heads),
                   ("lin_num_k_heads", cfg.lin_num_k_heads), ("lin_num_v_heads", cfg.lin_num_v_heads)];
     for (what, v) in checks {
         anyhow::ensure!(v % w == 0 && v / w >= 1,
-            "TP-B: {what} = {v} does not divide by world {w} — head-sharding needs whole heads per rank \
-             (W=4 KV-pair replication is T3 work)");
+            "TP-B: {what} = {v} does not divide by world {w} — head-sharding needs whole heads per rank");
     }
-    anyhow::ensure!((cfg.num_heads / w) % (cfg.num_kv_heads / w) == 0 && (cfg.lin_num_v_heads / w) % (cfg.lin_num_k_heads / w) == 0,
+    let (_, kv_local) = kv_span(cfg.num_kv_heads, 0, w)?;
+    anyhow::ensure!((cfg.num_heads / w) % kv_local == 0 && (cfg.lin_num_v_heads / w) % (cfg.lin_num_k_heads / w) == 0,
         "TP-B: per-rank GQA / GDN k:v grouping broken at world {w}");
+    // every query head a rank owns must read a KV head that rank holds (GQA: head q -> KV q / (nh/nkv))
+    let group = cfg.num_heads / cfg.num_kv_heads.max(1);
+    for r in 0..w {
+        let (kv0, kvn) = kv_span(cfg.num_kv_heads, r, w)?;
+        let (q0, q1) = (r * (cfg.num_heads / w), (r + 1) * (cfg.num_heads / w));
+        anyhow::ensure!(group >= 1 && q0 / group >= kv0 && (q1 - 1) / group < kv0 + kvn,
+            "TP-B: world {w} rank {r}: query heads [{q0}, {q1}) read KV heads [{}, {}], rank holds [{kv0}, {})",
+            q0 / group, (q1 - 1) / group, kv0 + kvn);
+    }
     let mut t = cfg.clone();
     t.num_heads /= w;
-    t.num_kv_heads /= w;
+    t.num_kv_heads = kv_local;
     t.lin_num_k_heads /= w;
     t.lin_num_v_heads /= w;
     Ok(t)
@@ -238,10 +271,10 @@ impl TrunkSplit {
         let s = cfg.num_heads / self.world * 2 * cfg.head_dim;
         (self.rank * s, (self.rank + 1) * s)
     }
-    /// attention k/v columns (KV heads r*nkv/W ..; GQA: query head q reads KV head q / (nh/nkv)).
-    pub fn attn_kv(&self, cfg: &crate::qwen::Config) -> (usize, usize) {
-        let s = cfg.num_kv_heads / self.world * cfg.head_dim;
-        (self.rank * s, (self.rank + 1) * s)
+    /// attention k/v columns (this rank's KV heads per `kv_span`; GQA: query head q reads KV head q / (nh/nkv)).
+    pub fn attn_kv(&self, cfg: &crate::qwen::Config) -> Result<(usize, usize)> {
+        let (first, n) = kv_span(cfg.num_kv_heads, self.rank, self.world)?;
+        Ok((first * cfg.head_dim, (first + n) * cfg.head_dim))
     }
     /// attention o_proj rows (the attention output of this rank's query heads).
     pub fn attn_o(&self, cfg: &crate::qwen::Config) -> (usize, usize) {
@@ -293,6 +326,19 @@ pub struct TpState {
     aux: Option<usize>,
     /// TP-G decode transport (--tp-dec-xport): None = the TP-B..F serial K1/K2 + cvt pair.
     pub(super) dec: Option<DecXport>,
+    /// TP-4F2 (`--tp-reduce single`): the dedicated single-stage reduce transport (None = rd, today's path).
+    single: Option<SingleXport>,
+    /// TP-4Z2 (`--tp-k2-prefetch`): hint the NEXT decode K2 with the weights of the kernel that consumes this reduce's
+    /// output, so its idle threads pull them into L2 during the wait. `pf_hint` = [p0, n0, p1, n1], set by the layer
+    /// loop at capture time and consumed (swapped to zero) by the first K2 launched after it. A prefetch only.
+    pf_on: bool,
+    pf_hint: [std::sync::atomic::AtomicU64; 4],
+}
+
+/// TP-4F2: the uniform one-shot ctx the single-stage decode/verify reduce rides (its own proxy + epoch counter).
+struct SingleXport {
+    /// device address of the ctx (the first argument of the folded K1 producers and `xq_tp_wait_add_dec_single`)
+    ctx: u64,
 }
 
 /// TP-G (T2 lever #2): the decode (<= 16 rows) all-reduce with K1 folded into the producer's last
@@ -343,8 +389,10 @@ pub fn route_fold_on() -> bool {
 ///                    the merged ids are bitwise the replicated argmax. Sampled / penalized /
 ///                    ratio-rule rows keep the replicated head (the sampler needs the full row).
 ///   0 / off        : the replicated lm_head + xq_argmax_rows everywhere (the TP-G path; escape)
-/// Rides TpConfig (the EXL3 env snapshot). Not world-general yet (world 2 only; a world > 2 needs a
-/// multi-round key merge — the exchange is one canonical round).
+/// Rides TpConfig (the EXL3 env snapshot). TP-4C: world 2 or 4 — at world 4 each rank owns V/4 columns and
+/// the keys are merged over `rounds` exchanges (xq_tp_wait_keys merges in place each round; the plain K1
+/// republishes the merged keys between rounds): the total order (value desc, lowest id) makes the merge
+/// association-free, so the ids are bitwise the replicated argmax at every world.
 pub fn vp_head_on() -> bool {
     static G: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         !matches!(crate::opts::var(crate::opt!("tp-vp-head")).map(|v| v.trim().to_ascii_lowercase()).as_deref(),
@@ -362,7 +410,8 @@ pub fn vp_head_on() -> bool {
 ///                    Candidate selection + the exact rescore stay replicated, so drafts, dconf and
 ///                    every trajectory are bitwise the replicated head's.
 ///   0 / off        : the replicated screen (the TP-G / TP-H #4 path; escape)
-/// Rides TpConfig (the EXL3 env snapshot). World 2 only (the decode doorbell is one canonical round).
+/// Rides TpConfig (the EXL3 env snapshot). TP-4C: world 2 or 4 (at world 4 each rank streams a QUARTER of
+/// the blocks and the two-exchange K2 reassembles the array; bitwise — every entry has one non-zero term).
 pub fn dh_shard_on() -> bool {
     static G: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         !matches!(crate::opts::var(crate::opt!("tp-dh-shard")).map(|v| v.trim().to_ascii_lowercase()).as_deref(),
@@ -373,15 +422,18 @@ pub fn dh_shard_on() -> bool {
 
 /// TP-H2 — `--tp-vp-sampled <on|off>` (a CLI flag, no env): the vocab-parallel lm_head for the rows the
 /// TP-H #4 greedy tail refuses (sampled / penalized / ratio-rule plain steps and verify rows). Each rank
-/// runs the lm_head GEMM on its OWN 124160-column shard (bitwise the replicated head's columns), the
-/// shard rows are ALL-GATHERED into the full logits rows through the decode doorbell
-/// (xq_vp_gather_k1 / xq_vp_gather_k2, <= 4 rows per 1 MiB epoch), and the UNCHANGED penalty / argmax /
-/// sampler kernels run on the reassembled rows — bitwise the replicated head's buffer by construction.
-/// Needs the TP-H #4 shard (--tp-vp-head on, world 2). The head resolves it and ships the code in
-/// TpConfig.exl3_vp_sampled (v21); the node installs the head's value (`set_vp_sampled`); the code
-/// joins the TP boot agree hash. DEFAULT ON (TP-H2 A/B: sampled thinking-on class -0.72 ms/round at identical
-/// trajectories and identical sampled bytes, greedy classes untouched by construction and tie; API thinking-on
-/// median +2.4 %). `--tp-vp-sampled off` = the replicated head for those rows (the TP-H..TP-I3 path).
+/// runs the lm_head GEMM on its OWN shard (V / world columns, bitwise the replicated head's columns), the
+/// shard rows are ALL-GATHERED into the full logits rows through the decode doorbell, and the UNCHANGED
+/// penalty / argmax / sampler kernels run on the reassembled rows — bitwise the replicated head's buffer by
+/// construction. World 2: one exchange per group of <= 4 rows (xq_vp_gather_k1 / xq_vp_gather_k2, TP-H2).
+/// World 4 (TP-4H2): recursive doubling, two exchanges per group of <= 4 rows (xq_vp_gather4_k1 /
+/// xq_vp_gather4_k2, src/tp_vpgather.rs). Needs the TP-H #4 shard (--tp-vp-head on, world 2 or 4). The head
+/// resolves it and ships the code in TpConfig.exl3_vp_sampled (v21); the node installs the head's value
+/// (`set_vp_sampled`); the code joins the TP boot agree hash. DEFAULT ON at world 2 (TP-H2 A/B: sampled
+/// thinking-on class -0.72 ms/round at identical trajectories and identical sampled bytes, greedy classes
+/// untouched by construction and tie; API thinking-on median +2.4 %) and at world 4 (owner ruling D-TP4-3,
+/// 2026-10-01: sampled requests take the fastest path; hardware-UNVERIFIED until PLAN/TP-4H2_GATES.md has
+/// run). `--tp-vp-sampled off` = the replicated head for those rows (the TP-H..TP-I3 path).
 pub const VP_SAMPLED_DEFAULT: u32 = 1;
 static VP_SAMPLED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(VP_SAMPLED_DEFAULT);
 pub fn set_vp_sampled(code: u32) { VP_SAMPLED.store(code, AtOrd::Relaxed); }
@@ -398,6 +450,24 @@ pub fn parse_vp_sampled(v: Option<&str>) -> Result<u32> {
         _ => anyhow::bail!("--tp-vp-sampled takes on|off, got '{s}'"),
     }
 }
+/// The head's `--tp-vp-sampled` code at `world`. Worlds <= 2 return `parse_vp_sampled` unchanged (the TP-H2
+/// behaviour, no note). World 4 (TP-4H2: the N-way gather kernels exist): absent => the default, ON;
+/// explicit `on` => ON; explicit `off` => OFF; no note. Any other world > 2 has no gather kernels: absent
+/// => OFF (the replicated head for the sampled / penalized / ratio-rule rows, correct and still resident;
+/// the greedy vp tail is unaffected), explicit `on` => refused loudly (never a silent downgrade), explicit
+/// `off` => OFF. Returns (code, note) where `note` is a banner line to print when the default was overridden.
+pub fn resolve_vp_sampled(world: u32, v: Option<&str>) -> Result<(u32, Option<&'static str>)> {
+    let code = parse_vp_sampled(v)?;
+    if world <= 2 || world == 4 { return Ok((code, None)); }
+    match (v.is_some(), code) {
+        (true, 1) => anyhow::bail!("--tp-vp-sampled on is a world-2 / world-4 option (the row all-gather has kernels for those \
+                                    worlds only; world {world}). Leave it unset or pass --tp-vp-sampled off."),
+        (false, _) => Ok((0, Some("--tp-vp-sampled defaults to OFF at this world (the row all-gather has kernels at world 2 and \
+                                   4 only): sampled / penalized / ratio-rule rows take the replicated lm_head"))),
+        _ => Ok((0, None)),
+    }
+}
+
 /// TP-SP1 — `--tp-seq-parallel <on|off>` (a CLI flag, no env): SEQUENCE-PARALLEL prefill (TP-I3 §3.2).
 /// For a chunk of T..=SP_MAX rows, rank r owns rows row_block(c, r, W) (rank 0 the first ceil(c/2)):
 /// every hc_pre (inject + norm, the hc down/up GEMMs with the full chunk's cuBLASLt plan PINNED on the
@@ -448,12 +518,29 @@ pub const SP_MIN_ROWS: usize = 128;
 /// (--probe-exl3-sppin, default range = [SP_MIN_ROWS, SP_MAX_ROWS]) covers every c of it.
 pub const SP_MAX_ROWS: usize = TP_MAX_ROWS - 1;
 
-/// TP-SP: this rank's row block of a sequence-parallel chunk and the peer's (world 2).
+/// TP-SP: this rank's row block of a sequence-parallel chunk. World 2: `peer` = rank ^ 1's block (one exchange
+/// round). TP-4S, world 4: `blocks` = every rank's quarter (ceil(c/4) rows each, rank 0 first), `peer` = the
+/// rank ^ 1 quarter (the log line only; the exchanges are `tp_xport::*_w4` over `blocks`). World 2 callers read
+/// `own` / `peer` / `c` exactly as before.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SpRows {
     pub own: (usize, usize),
     pub peer: (usize, usize),
     pub c: usize,
+    pub world: usize,
+    pub rank: usize,
+    /// every rank's row block (entries >= `world` are empty (c, c))
+    pub blocks: crate::tp_xport::Blocks4,
+}
+
+impl SpRows {
+    /// The row split of a `c`-row chunk at `world` (2 or 4) for `rank`: `row_block(c, r, world)` for every rank.
+    pub(crate) fn new(c: usize, rank: usize, world: usize) -> SpRows {
+        let mut blocks = [(c, c); 4];
+        for r in 0..world.min(4) { blocks[r] = crate::tp_xport::row_block(c, r, world); }
+        SpRows { own: crate::tp_xport::row_block(c, rank, world), peer: crate::tp_xport::row_block(c, rank ^ 1, world),
+                 c, world, rank, blocks }
+    }
 }
 
 /// Rows per gather epoch: 4 x 248,320 B = 993,280 B fits one 1 MiB ring slot (the payload capacity is
@@ -589,12 +676,209 @@ impl PfHook {
 }
 /// The dual-rail transport's second proxy core (a big X925; the TP host-worker mask excludes it).
 pub const TP_AUX_PROXY_CORE: i32 = 18;
-/// Rail-2 TCP handshake port (its liveness responder takes +1).
+/// Rail-2 TCP handshake port at WORLD 2 (its liveness responder takes +1). World > 2 uses `rail2_nway_base`.
 const TP_AUX_PORT_OFF: u16 = 10;
+/// TP-4F2 (`--tp-reduce single`): the single-stage reduce ctx's proxy core — a big X925 (cores 5-9 and 15-19 on
+/// GB10; 19 = rail 1, 18 = rail 2, 9 = the scheduler) that no other thread is pinned to; the TP host-worker mask
+/// excludes it when the flag is on (exl3_serve `tp_worker_mask`).
+pub const TP_SINGLE_PROXY_CORE: i32 = 17;
+/// TP-4Z2 (diagnostic counters, cumulative): hints armed by the layer loop / K2 launches that carried a non-empty hint. At capture
+/// time they count the baked graph nodes, so after boot `armed == used` means every armed hint reached a K2.
+pub static PF_ARMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PF_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// TP-4F2: the single-stage ctx's N-way TCP base = TP_PORT + 40 (rail 1 = +0 .. +13, rail 2 = +20 .. +33 at world 4).
+const TP_SINGLE_PORT_OFF: u16 = 40;
+
+/// `--tp-reduce` (TP-4F2; default flipped by TP-4Z1, owner D-TP4-7): the PURE resolution of the flag value.
+/// `single` = the decode/verify all-reduce is ONE all-peers stage on a dedicated transport (bit-identical sum);
+/// `rd` = the two recursive-doubling stages; `auto` (the default, and an unset flag) = `single` at world 4 on the
+/// folded decode transport (`--tp-dec-xport` 1), `rd` everywhere else. An explicit value always wins (`single` at
+/// another world is a refusal, see `tp_reduce_refusal`). Rides TpConfig (Spmd), so every rank resolves the same
+/// value (it is hashed into the boot agree).
+pub fn tp_reduce_resolve(raw: Option<&str>, world: i32, dec_xport: u8) -> bool {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("rd") => false,
+        Some("single") => true,
+        _ => world == 4 && dec_xport == 1,
+    }
+}
+
+/// The resolved schedule at `world` (reads `--tp-reduce` and `--tp-dec-xport`).
+pub fn tp_reduce_single_for(world: i32) -> bool {
+    let raw = crate::opts::var(crate::opt!("tp-reduce")).ok();
+    tp_reduce_resolve(raw.as_deref(), world, dec_xport_mode())
+}
+
+/// True only when the operator typed `--tp-reduce single` (the refusal check must not fire on `auto`).
+pub fn tp_reduce_explicit_single() -> bool {
+    matches!(crate::opts::var(crate::opt!("tp-reduce")).map(|v| v.trim().to_ascii_lowercase()).as_deref(), Ok("single"))
+}
+
+/// TP-4F2: the refusals of `--tp-reduce single` (pure function of the resolved flag, so it is unit-testable).
+/// Single is a world-4 decode/verify schedule that rides the folded decode transport: world 2 has one stage already
+/// (nothing to fuse), and `--tp-dec-xport 0` (the serial pair) has no producer-folded K1 to retarget.
+fn tp_reduce_refusal(single: bool, world: i32, dec_xport: u8) -> Result<()> {
+    if !single { return Ok(()); }
+    anyhow::ensure!(world == 4, "--tp-reduce single is a world-4 schedule (got world {world}): world 2 already reduces in ONE stage");
+    anyhow::ensure!(dec_xport == 1, "--tp-reduce single rides the folded decode transport: leave --tp-dec-xport at its default (1)");
+    Ok(())
+}
+
+/// TP-4F2: the single-stage ctx's TCP base at `world` 4, verified disjoint from rail 1 (TP_PORT) and rail 2's
+/// N-way base so no handshake can mis-pair; a future change of any rail layout fails loudly here.
+pub fn single_nway_base(world: i32) -> Result<u16> {
+    let (b1, b2) = (crate::tp::TP_PORT, rail2_nway_base(world)?);
+    let b3 = b1 as u32 + TP_SINGLE_PORT_OFF as u32;
+    anyhow::ensure!(b3 + 2 + (world * world) as u32 <= u16::MAX as u32, "single-stage base port {b3} at world {world} is beyond 65535");
+    let b3 = b3 as u16;
+    let p3 = rail_ports(b3, world);
+    for (name, other) in [("rail 1", rail_ports(b1, world)), ("rail 2", rail_ports(b2, world))] {
+        if let Some(p) = p3.iter().find(|p| other.contains(p)) {
+            anyhow::bail!("TP single-stage port collision at world {world}: ctx (base {b3}) and {name} both use TCP port {p}");
+        }
+    }
+    Ok(b3)
+}
 
 fn rail2_dev() -> String {
     crate::opts::var(crate::opt!("rdma-dev")).ok().and_then(|s| s.split(',').nth(1).map(|x| x.trim().to_string()))
         .filter(|s| !s.is_empty()).unwrap_or_else(|| "roceP2p1s0f1".to_string())
+}
+
+/// TP-4E: every TCP port one rail's bring-up may bind or dial at `world` — the world-2 control port `base`
+/// itself (reserved: the N-way path never binds it, the world-2 path does), the liveness responder
+/// (`base + 1`) and one handshake port per rank pair (`base + 2 + lo * world + hi`, native/net_shim.c
+/// `nway_pair_port`, mirrored by `net::nway_link_ports`).
+fn rail_ports(base: u16, world: i32) -> Vec<u32> {
+    let mut v = vec![base as u32];
+    v.extend(crate::net::nway_link_ports(base, world));
+    v
+}
+
+/// TP-4E: the two rails' port sets must be disjoint and inside the u16 range. A rail-2 pair port equal to a
+/// rail-1 pair port would make two different handshakes contend for one listener (a mis-pair, or a bind
+/// failure that hangs the peer's 300 s connect loop).
+pub fn check_rail_ports(world: i32, base1: u16, base2: u16) -> Result<()> {
+    let (a, b) = (rail_ports(base1, world), rail_ports(base2, world));
+    if let Some(p) = b.iter().find(|p| a.contains(p)) {
+        anyhow::bail!("TP rail port collision at world {world}: rail 1 (base {base1}) and rail 2 (base {base2}) both use TCP port {p}");
+    }
+    let top = a.iter().chain(b.iter()).copied().max().unwrap_or(0);
+    anyhow::ensure!(top <= u16::MAX as u32, "TP rail ports at world {world} (bases {base1}, {base2}) reach {top}, beyond 65535");
+    Ok(())
+}
+
+/// TP-4E: the rail-2 N-way base port at `world` > 2: the first multiple of 10 at or above
+/// `2 + world^2` past the rail-1 base (TP_PORT), so the pair-port block of rail 1 (`+2 ..= +1 + world^2`)
+/// is cleared at any world (world 4: TP_PORT + 20, liveness +21, pairs +23..+25, +28, +29, +33). It is
+/// `check_rail_ports`-verified, so a future change of either rail's layout fails loudly here.
+pub fn rail2_nway_base(world: i32) -> Result<u16> { rail2_nway_base_for(world, crate::tp::TP_PORT) }
+
+/// `rail2_nway_base` for an arbitrary rail-1 base port (the `--tp-reduce-bench --world 4` harness runs on its
+/// own port range, default 29700, so it can coexist with a serving head on TP_PORT).
+pub fn rail2_nway_base_for(world: i32, base1: u16) -> Result<u16> {
+    anyhow::ensure!(world > 2, "rail2_nway_base: world {world} takes the world-2 rail-2 port (TP_PORT + {TP_AUX_PORT_OFF})");
+    let w = world as u32;
+    let base = base1 as u32 + (2 + w * w).div_ceil(10) * 10;
+    anyhow::ensure!(base + 2 + w * w <= u16::MAX as u32, "rail-2 base port {base} at world {world} is beyond 65535");
+    let base = base as u16;
+    check_rail_ports(world, base1, base)?;
+    Ok(base)
+}
+
+/// TP-4B: the world > 2 refusals that depend only on flags. The head runs it BEFORE the model load (a
+/// refused launch must not cost a 100 s load) and `attach` runs it again on every rank. World 2 passes
+/// untouched.
+///   * worlds other than 2 and 4;
+///   * --ep-deal freq outside world 4 (TP-4F-prep: world 4 has its own committed table, validated here);
+///   * --tp-oneshot: the bf16-wire all-peers push (tp_wait_add_4way) — no fp32 intermediate, caused the
+///     NVFP4 wedge, measured at parity with the two-shot;
+///   * --tp-dec-grecv other than 0 (TP-4C): the decode K2's GPU-side receive (payload-tail proof) is not
+///     armed at world > 2 — the N-way proxy's CPU-bounce recv loop has no `rx_done` skip, so a K2 that
+///     passes on the hint + tail while the proxy lags can see a newer tail and abort (code 2). The decode
+///     path at world > 2 receives on cpu_done only (forced at attach; TP-4F lever: add the skip, then arm);
+///   * --tp-vp-sampled on at a world other than 2 or 4 (TP-4C / TP-4H2): the TP-H2 row all-gather has kernels
+///     at world 2 (peer = rank ^ 1) and world 4 (TP-4H2, recursive doubling). World 4 = ON by default (an
+///     explicit `on` is accepted); any other world > 2 = OFF by default (the replicated head, resolved by the
+///     head, `resolve_vp_sampled`) and an explicit `--tp-vp-sampled on` bails.
+///
+/// TP-4E: the dual-rail prefill transport (--tp-prefill-xport unset/dual/2) is NO LONGER refused at world
+/// > 2 — its second rail is the N-way `connect_nway` link `attach` builds (`rail2_nway_base`). All three
+/// transports (0 serial, 1 single-rail pipelined, 2 dual-rail pipelined) are rounds-aware and admitted;
+/// their W=4 hardware proof is the TP-4E gate list (PLAN/TP-4E_GATES.md).
+pub fn world_gt2_flag_refusals(world: i32) -> Result<()> {
+    tp_reduce_refusal(tp_reduce_explicit_single(), world, dec_xport_mode())?;   // TP-4F2: refusal-only; `auto` / `rd` never refuse
+    if world <= 2 { return Ok(()); }
+    anyhow::ensure!(world == 4, "EXL3 TP: --tp 2 or --tp 4 only (got {world})");
+    anyhow::ensure!(!crate::opts::var(crate::opt!("tp-oneshot")).map_or(false, |v| v != "0"),
+        "EXL3 TP world {world}: --tp-oneshot is refused on the EXL3 path (bf16 wire, no fp32 intermediate between \
+         rounds; it wedged NVFP4 serving and measured at parity with the two-shot)");
+    anyhow::ensure!(crate::opts::var(crate::opt!("tp-dec-grecv")).map_or(true, |v| v.trim() == "0"),
+        "EXL3 TP world {world}: --tp-dec-grecv is world 2 only (the N-way proxy's recv loop has no rx_done skip, so the \
+         GPU-side payload-tail receive can race it — TP-4F); leave the flag unset or pass --tp-dec-grecv 0");
+    ep_deal4::flag_refusal(&ep_deal_kind(), world)?; // --ep-deal freq: world 4 only (table validated here, pre-load)
+    Ok(())
+}
+
+/// TP-4B: the world > 2 refusals that depend on the probe's options. `--xtp-sp-fault` arms a fault in the
+/// sequence-parallel run; where no SP run exists (`sp_ready`) the gate would pass as a silent
+/// negative control, so it is refused before the load. World 2 passes untouched.
+pub fn world_gt2_opts_refusals(world: i32, opts: &XtpOpts) -> Result<()> {
+    opts_refusals_with_sp(world, opts, seq_parallel_on())
+}
+
+/// `world_gt2_opts_refusals` with the resolved sequence-parallel state passed in (the unit tests do not touch the global).
+fn opts_refusals_with_sp(world: i32, opts: &XtpOpts, sp_on: bool) -> Result<()> {
+    if world <= 2 { return Ok(()); }
+    // TP-4S: world 4 runs the sequence-parallel prefill, so the fault (the rank-identity gate's negative control)
+    // is meaningful there when SP is on; above world 4 (or with SP off) the gate would pass as a silent negative control
+    anyhow::ensure!(opts.sp_fault.is_none() || (world == 4 && sp_on),
+        "EXL3 TP world {world}: --xtp-sp-fault needs a sequence-parallel schedule (world 2, or world 4 with --tp-seq-parallel \
+         on|hc|router); here the run is replicated and the gate would pass as a silent negative control");
+    Ok(())
+}
+
+/// TP-4E: `--tp-prefill-overlap fold` needs whole-row epochs and ONE exchange per chunk (the fused consumer
+/// replaces K2m, which at world > 2 is a per-round kernel over a staged fp32 sum), so it is a world-2
+/// schedule. `inline` / `dual` / `on` are program-driven and world-general (`tp_xport::build_program`). The
+/// head runs this right after it resolves the flag (before any load); `attach` runs it again on every rank.
+/// World 2 passes untouched.
+pub fn world_gt2_overlap_refusal(world: i32, code: u32) -> Result<()> {
+    if world <= 2 || code & PF_FOLD == 0 { return Ok(()); }
+    anyhow::bail!("EXL3 TP world {world}: --tp-prefill-overlap fold is a world-2 schedule (whole-row epochs, K2m replaced by the fused \
+                   consumer; the world > 2 reduce is {} rounds of K2m over a staged fp32 sum) — use on|dual|inline|off",
+                  world.ilog2())
+}
+
+/// TP-4E / TP-4S: an EXPLICIT `--tp-seq-parallel <on|hc|router>` is honoured at world 2 and (TP-4S) world 4, where
+/// it runs the quarter-row sequence-parallel prefill (recursive-halving reduce-scatter + recursive-doubling
+/// all-gather over the world-4 doorbell rounds, `tp_xport::*_w4`). Above world 4 there is no SP schedule, so an
+/// explicit flag would be a silent no-op and is refused; `off` is always fine. (The DEFAULT, flag absent, stays ON
+/// in the config and yields at runtime (`sp_ready`) wherever no SP schedule exists.)
+pub fn world_gt2_sp_refusal(world: i32, explicit: bool, code: u32) -> Result<()> {
+    if world <= 4 || !explicit || code == 0 { return Ok(()); }
+    anyhow::bail!("EXL3 TP world {world}: --tp-seq-parallel {} has no schedule at world {world} (sequence-parallel prefill exists at \
+                   world 2 (two-rank row exchange) and world 4 (TP-4S quarter rows); it would silently not run here) — drop the \
+                   flag (the replicated prefill runs) or pass off",
+                  seq_parallel_desc(code))
+}
+
+/// TP-4E: the boot-log reason for the resolved `--tp-prefill-xport`, a pure function so the wording is
+/// tested. The DEFAULT is dual-rail at EVERY world (flag default `dual`); `single` / `off` are explicit loud
+/// opt-outs, never a fallback. Numbers are labelled MEASURED (TP-F, world 2 bench) or PROJECTION (TP-4A, not
+/// yet measured at world 4 — the TP-4E hardware gates decide).
+pub fn prefill_xport_why(world: i32, mode: u8, explicit: bool) -> String {
+    let src = if explicit { "explicit" } else { "default" };
+    match (mode, world > 2) {
+        (2, false) => format!("{src} dual-rail (TP-F, measured at world 2: 993 us vs 1,700 us single-rail per 20 MiB reduce); both rails must be healthy, a missing second rail fails the boot"),
+        (2, true) => format!("{src} dual-rail at world {world}: each chunk reduce runs {} rounds, the later rounds ship fp32, so one rail (~13.6 GB/s per direction, measured) is wire-bound; \
+                              TP-4A projects ~831 ms/chunk dual-rail vs ~1,064 ms single-rail (PROJECTIONS, to be measured by the TP-4E gates); \
+                              rail 2 is a full N-way link, both must be healthy (preflight agrees it before any dial), no silent fallback", world.ilog2()),
+        (1, false) => format!("{src} single-rail pipelined (opt-out of the dual-rail default: expect the TP-F single-rail cost, 1,700 us vs 993 us per 20 MiB reduce, measured)"),
+        (1, true) => format!("{src} single-rail pipelined at world {world} — a PERF OPT-OUT of the dual-rail default (TP-4A projects ~1,064 ms/chunk vs ~831 ms dual-rail, a regression vs the TP=2 SP-on baseline; projection)"),
+        (_, false) => format!("{src} serial single-block K1/K2 (the TP-B..E path; diagnostic escape, no pipelining, no overlap hooks)"),
+        (_, true) => format!("{src} serial single-block K1/K2 at world {world} — a diagnostic escape, no pipelining, no overlap hooks (PERF OPT-OUT)"),
+    }
 }
 
 /// TP-I (C6): the post-load boot rendezvous of the dual-rail attach. Probe-tolerant (net_exchange):
@@ -618,20 +902,160 @@ fn boot_rendezvous(rank: i32, mode: u8) -> Result<()> {
     const MAGIC: u32 = 0xB00F_0C06;
     let t0 = std::time::Instant::now();
     println!("[exl3-tp] rank {rank}: entering the post-load boot rendezvous (probe-tolerant, no overall deadline)");
-    let peer = crate::net::exchange_u32s(&[MAGIC, mode as u32], 4)
+    let all = crate::net::exchange_u32s_all(&[MAGIC, mode as u32], 4)
         .context("TP-F dual-rail boot rendezvous (probe-tolerant exchange; peer dead or link aborted)")?;
-    if peer[0] != MAGIC || peer[1] != mode as u32 {
-        anyhow::bail!("TP-F dual-rail rendezvous: peer frame {:08x}/{} vs mine {MAGIC:08x}/{mode} (SPMD or mode desync)",
-                      peer[0], peer[1]);
+    for (r, peer) in all.iter().enumerate().filter(|(r, _)| *r as i32 != rank) {
+        if peer[0] != MAGIC || peer[1] != mode as u32 {
+            anyhow::bail!("TP-F dual-rail rendezvous: rank {r} frame {:08x}/{} vs mine {MAGIC:08x}/{mode} (SPMD or mode desync)",
+                          peer[0], peer[1]);
+        }
     }
     println!("[exl3-tp] rank {rank}: boot rendezvous OK after {:.1}s wait (probe-tolerant; mode {mode})",
              t0.elapsed().as_secs_f64());
     Ok(())
 }
 
+/// Pad exchanges that bring a device epoch counter to a multiple of `rounds` (0 when already aligned).
+fn round_pad(epoch: u64, rounds: usize) -> usize { let r = rounds as u64; ((r - epoch % r) % r) as usize }
+
+/// R10 (world > 2 only; the same rule gpu.rs `tp_align_rounds` applies to the batch engine): every logical
+/// all-reduce consumes a whole multiple of `rounds` epochs and epoch e runs round e % rounds, so the
+/// association the reduce realises is frozen by the counter's parity at the first reduce. One fixed
+/// parity on every rank and every launch keeps the result deterministic and rank-identical. A fresh ctx
+/// starts at epoch 0 (the boot rendezvous rides the control slots, not the GPU epoch) so the pad is 0 in
+/// practice; if anything ever consumes an odd number of epochs first, pad it out here and say so. The
+/// first reduce then runs round (e + 1) % rounds first: world 4 => partner ^ 2 first, (p0+p2)+(p1+p3).
+/// World 2 never calls this (rounds == 1, no association to fix).
+///
+/// TP-4E: one call PER RAIL (`rail` labels the log line; `epoch` reads THAT rail's device counter: rail 1 is
+/// the registered agree link `traced_device_epoch`, rail 2 its own ctx `ctx_device_epoch`). The pipelined
+/// schedule (`rail_seq`) indexes each rail's epochs from its own counter, so BOTH rails must start on the
+/// same phase (a multiple of `rounds`); a pad exchange needs that rail's peers' proxies running, so rail 2
+/// is aligned only after its proxy is spawned. Every rank pads identically because every rank's fresh
+/// counter is 0 (a nonzero pad on one rank only would desync the partner map — the agree hash catches it).
+fn align_round_phase(dev: &Arc<CudaDevice>, kern: &crate::tp_xport::Kernels, stream: &CudaStream, ctx: u64,
+                     part: &mut CudaSlice<f32>, world: i32, rank: i32, rail: &str,
+                     epoch: &dyn Fn() -> u64) -> Result<()> {
+    let rounds = crate::tp_xport::rounds_of(world as usize)?;
+    dev.synchronize()?;
+    let e0 = epoch();
+    let pad = round_pad(e0, rounds);
+    if pad > 0 {
+        dev.memset_zeros(part)?;   // AGENTS §2.2: alloc_zeros does not zero
+        dev.synchronize()?;
+        let p = *part.device_ptr() as u64;
+        for _ in 0..pad {
+            crate::tp_xport::k1_serial(kern, stream, ctx, p, 4)?;
+            crate::tp_xport::k2_serial(kern, stream, ctx, p, 4)?;
+        }
+        dev.synchronize()?;
+    }
+    let e1 = epoch();
+    anyhow::ensure!(e1 % rounds as u64 == 0, "TP round phase ({rail}): device epoch {e1} is not a multiple of {rounds} after alignment");
+    println!("[exl3-tp] rank {rank}: round phase aligned ({rail}: device epoch {e0} -> {e1}, {pad} pad exchange(s)): the first all-reduce \
+              runs round {} first", (e1 + 1) % rounds as u64);
+    Ok(())
+}
+
+/// TP-4E: the rail-2 device must be present, its port ACTIVE and its RoCE v2 GID usable on EVERY rank before any
+/// rank dials rail 2. `connect_nway` blocks in `accept` (no timeout) and a 300 s connect loop: one rank whose
+/// second device is missing, down or without the GID the engine binds (`GID_IDX`) would bail alone while its
+/// peers hang in the handshake. The check is agreed over rail 1's
+/// control plane (`exchange_u32s_all`, which touches neither the GPU epoch nor the rail-2 ports), so a
+/// failure anywhere fails EVERY rank, loudly, in seconds. Runs only at world > 2
+/// (world 2 keeps its TP-F bring-up unchanged).
+fn rail2_preflight(rank: i32, dev2: &str) -> Result<()> {
+    let (ok, why) = rail_device_state(std::path::Path::new("/sys/class/infiniband"), dev2, crate::tp::GID_IDX);
+    if !ok { println!("[exl3-tp] rank {rank}: rail 2 preflight FAILED locally: {why}"); }
+    let all = crate::net::exchange_u32s_all(&[preflight_word(ok), rank as u32], 4)
+        .context("TP-4E rail 2 preflight exchange (rail 1 control plane)")?;
+    let bad = preflight_failures(&all.iter().map(|f| f[0]).collect::<Vec<_>>());
+    anyhow::ensure!(bad.is_empty(),
+        "TP-4E dual-rail bring-up refused before any rail-2 dial: {} (this rank: {why}). Every rank needs the second RDMA device \
+         (--rdma-dev <first>,<second>; default second entry roceP2p1s0f1) present with port 1 state 4 (ACTIVE) and a non-zero \
+         RoCE v2 GID at index {}; run with --tp-prefill-xport single only as an explicit, owner-consented opt-out",
+        bad.join("; "), crate::tp::GID_IDX);
+    Ok(())
+}
+
+/// The same local check as a `Result`, for a caller that dials rail 2 without the engine's rail-1 agreement
+/// (the `--tp-reduce-bench --world > 2` harness): this box fails by name before it dials, instead of leaving
+/// its peers blocked in `accept`.
+pub(crate) fn rail_local_preflight(dev: &str, gid_idx: i32) -> Result<()> {
+    let (ok, why) = rail_device_state(std::path::Path::new("/sys/class/infiniband"), dev, gid_idx);
+    anyhow::ensure!(ok, "rail-2 device preflight failed on this box before any rail-2 dial: {why}");
+    Ok(())
+}
+
+/// The preflight frame word: a magic plus the verdict (1 = this rank's rail-2 device is usable). The frame is
+/// two words because `exchange_u32s_all` needs 8 B of tail headroom in its 16 B frame.
+const PREFLIGHT_MAGIC: u32 = 0x5232_0F10;
+fn preflight_word(ok: bool) -> u32 { PREFLIGHT_MAGIC + ok as u32 }
+/// Per-rank verdict words -> the list of failing ranks (empty = every rank usable). A word that is neither
+/// verdict is an SPMD desync (different binaries), reported as such.
+fn preflight_failures(words: &[u32]) -> Vec<String> {
+    words.iter().enumerate().filter_map(|(r, &w)| match w {
+        w if w == preflight_word(true) => None,
+        w if w == preflight_word(false) => Some(format!("rank {r}: rail-2 device not usable")),
+        w => Some(format!("rank {r}: frame {w:08x} (SPMD desync)")),
+    }).collect()
+}
+
+/// The text of the three sysfs files a rail device must pass (`None` = unreadable).
+#[derive(Clone, Copy)]
+struct RailFiles<'a> { state: Option<&'a str>, gid: Option<&'a str>, gid_type: Option<&'a str> }
+
+/// Pure decision over the file contents (so it is testable with fake text). Fails closed: an unreadable file is a
+/// failure. Every message names the device, the file and the expected value.
+///   * `<dev>/ports/1/state` must be state number 4 ("4: ACTIVE"); "5: ACTIVE_DEFER" and anything else fail;
+///   * `<dev>/ports/1/gids/<gid_idx>` must be a readable, non-zero GID (the index `connect_nway` binds);
+///   * `<dev>/ports/1/gid_attrs/types/<gid_idx>` must read "RoCE v2" (the engine's QPs use RoCE v2 addressing).
+fn rail_files_verdict(dev: &str, dir: &std::path::Path, gid_idx: i32, f: &RailFiles) -> (bool, String) {
+    let (p_state, p_gid, p_type) = (dir.join("ports/1/state"), dir.join(format!("ports/1/gids/{gid_idx}")),
+                                    dir.join(format!("ports/1/gid_attrs/types/{gid_idx}")));
+    let st = match f.state {
+        None => return (false, format!("{dev}: cannot read {} (expected \"4: ACTIVE\"; an unreadable state is refused, not assumed up)", p_state.display())),
+        Some(s) => s.trim(),
+    };
+    if st.split(':').next().map(str::trim) != Some("4") {
+        return (false, format!("{dev}: {} is '{st}' (expected \"4: ACTIVE\", state number 4)", p_state.display()));
+    }
+    let gid = match f.gid {
+        None => return (false, format!("{dev}: cannot read {} (expected a non-zero GID)", p_gid.display())),
+        Some(g) => g.trim(),
+    };
+    if !gid.chars().all(|c| c == ':' || c.is_ascii_hexdigit()) || !gid.chars().any(|c| c.is_ascii_hexdigit() && c != '0') {
+        return (false, format!("{dev}: {} is '{gid}' (expected a non-zero GID, the entry the engine binds: GID index {gid_idx})", p_gid.display()));
+    }
+    let ty = match f.gid_type {
+        None => return (false, format!("{dev}: cannot read {} (expected \"RoCE v2\")", p_type.display())),
+        Some(t) => t.trim(),
+    };
+    if ty != "RoCE v2" {
+        return (false, format!("{dev}: {} is '{ty}' (expected \"RoCE v2\")", p_type.display()));
+    }
+    (true, format!("{dev} port 1 ACTIVE, GID {gid_idx} {gid} (RoCE v2)"))
+}
+
+/// Is `dev` (a /sys/class/infiniband entry under `root`) present with port 1 ACTIVE and a usable RoCE v2 GID at
+/// `gid_idx`? Returns (ok, why). Reads the three sysfs files and defers the decision to `rail_files_verdict`.
+fn rail_device_state(root: &std::path::Path, dev: &str, gid_idx: i32) -> (bool, String) {
+    let d = root.join(dev);
+    if !d.exists() { return (false, format!("{dev}: {} does not exist (expected the RDMA device directory)", d.display())); }
+    let rd = |rel: String| std::fs::read_to_string(d.join(rel)).ok();
+    let (state, gid, gid_type) = (rd("ports/1/state".into()), rd(format!("ports/1/gids/{gid_idx}")),
+                                  rd(format!("ports/1/gid_attrs/types/{gid_idx}")));
+    rail_files_verdict(dev, &d, gid_idx, &RailFiles { state: state.as_deref(), gid: gid.as_deref(), gid_type: gid_type.as_deref() })
+}
+
 impl TpState {
-    pub fn attach(dev: &Arc<CudaDevice>, t: TpAttach, h: usize) -> Result<Self> {
-        anyhow::ensure!(t.world == 2, "EXL3 TP: rung 3 supports world 2 only (got {})", t.world);
+    pub fn attach(dev: &Arc<CudaDevice>, stream: &CudaStream, t: TpAttach, h: usize) -> Result<Self> {
+        anyhow::ensure!(t.world >= 2, "EXL3 TP: attach needs world >= 2 (got {})", t.world);
+        world_gt2_flag_refusals(t.world)?;
+        world_gt2_overlap_refusal(t.world, pf_overlap_code())?;
+        anyhow::ensure!(t.world == 2 || !t.link.oneshot_on(),
+            "EXL3 TP world {}: the transport ctx selected the one-shot all-peers push — refused on the EXL3 path \
+             (bf16 wire, tp_wait_add_4way; it wedged NVFP4 serving and measured at parity with the two-shot)", t.world);
         let kern = crate::tp_xport::Kernels::load(dev, TP_MODULE)?;
         let mut link = t.link;
         // DEFAULT payload = one fp32 hidden row (per-barrier lengths are explicit at every site).
@@ -647,49 +1071,104 @@ impl TpState {
         // The proxy OWNS the transport from here (gpu.rs attach_tp contract); the OS reclaims at exit.
         std::mem::forget(link);
         crate::net::spawn_proxy(addr, TP_PROXY_CORE);
-        let part = dev.alloc_zeros::<f32>(TP_MAX_ROWS * h)?;
+        let mut part = dev.alloc_zeros::<f32>(TP_MAX_ROWS * h)?;
         let mode = prefill_xport_mode();
+        // TP-I (audit C6): the FIRST cross-rank sync after each rank's independent shard load (50-220 s,
+        // skewed by page-cache warmth), so it must tolerate minutes of legitimate skew: probe-tolerant,
+        // no overall deadline, a dead peer is still caught by the out-of-band liveness probe (abort
+        // code 10). It was a 10 s net_agree once (abort code 7). Live-round deadlines are untouched.
+        // TP-4B: at world > 2 it runs in EVERY prefill mode — round partners meet in the very first
+        // reduce and a load skew above the 10 s proxy watchdog would abort it (code 6). World 2 keeps
+        // its old condition (mode 2 only): modes 0/1 never had the rendezvous and still do not.
+        // It also rendezvouses the primary link before rank 1 dials rail 2 (mode 2), and the frame
+        // carries the mode (SPMD check).
+        if t.world > 2 || mode == 2 { boot_rendezvous(t.rank, mode)?; }
+        if t.world > 2 {
+            align_round_phase(dev, &kern, stream, ctx, &mut part, t.world, t.rank, "rail 1", &crate::net::traced_device_epoch)?;
+        }
         let mut aux: Option<usize> = None;
         let xport = if mode > 0 {
             let mut rails = vec![ctx];
             if mode == 2 {
-                // Rendezvous on the primary link first (both ranks are inside attach), so rank 1 never
-                // dials rail 2 before rank 0 listens; the frame carries the mode (SPMD check).
-                // TP-I (audit C6): this is the FIRST cross-rank sync after each rank's independent
-                // shard load (50-220 s, skewed by page-cache warmth), so it must tolerate minutes of
-                // legitimate skew. It used to be a 10 s net_agree (abort code 7: a cold-cache rank
-                // failed the boot). It is now the probe-tolerant net_exchange: no overall deadline,
-                // a dead peer is still caught by the out-of-band liveness probe (every
-                // TP_LIVE_PROBE_NS = 5 s of silence, two failed connects -> abort code 10). Live-round
-                // deadlines (step_go / pre_verify / tp_round / net_agree) are untouched.
-                boot_rendezvous(t.rank, mode)?;
                 let dev2 = rail2_dev();
-                let port = crate::tp::TP_PORT + TP_AUX_PORT_OFF;
-                if t.rank != 0 { std::thread::sleep(std::time::Duration::from_millis(300)); }
-                let mut l2 = crate::net::TpLink::connect(t.rank, if t.rank == 0 { "" } else { &peer_ip }, port, &dev2,
+                let (mut l2, how) = if t.world == 2 {
+                    let port = crate::tp::TP_PORT + TP_AUX_PORT_OFF;
+                    if t.rank != 0 { std::thread::sleep(std::time::Duration::from_millis(300)); }
+                    let l2 = crate::net::TpLink::connect(t.rank, if t.rank == 0 { "" } else { &peer_ip }, port, &dev2,
                                                          crate::tp::GID_IDX, crate::tp::TP_SLOT_BYTES)
-                    .with_context(|| format!("TP-F rail 2 ({dev2}, port {port}, peer {peer_ip})"))?;
+                        .with_context(|| format!("TP-F rail 2 ({dev2}, port {port}, peer {peer_ip})"))?;
+                    (l2, format!("TCP {port}, peer {peer_ip}"))
+                } else {
+                    // TP-4E: rail 2 as a full N-way link. Every rank is past the boot rendezvous (rail 1, above),
+                    // and the preflight agrees the second device's health over rail 1 BEFORE anyone dials, so a
+                    // missing device fails every rank in seconds instead of hanging the handshake (accept has no
+                    // timeout). Its own port base (`rail2_nway_base`, collision-checked against rail 1).
+                    rail2_preflight(t.rank, &dev2)?;
+                    let base = rail2_nway_base(t.world)?;
+                    let ips = crate::tp::resolve_topology(t.world)?;
+                    let l2 = crate::net::TpLink::connect_nway(t.rank, t.world, &ips, base, &dev2,
+                                                              crate::tp::GID_IDX, crate::tp::TP_SLOT_BYTES)
+                        .with_context(|| format!("TP-4E rail 2 N-way link ({dev2}, TCP base {base}, world {})", t.world))?;
+                    (l2, format!("N-way, TCP base {base}, {} peers", t.world - 1))
+                };
                 l2.set_payload(h * 4, true).context("rail 2 net_set_payload")?;
                 rails.push(l2.ctx_device_ptr());
                 let a2 = l2.ctx_addr();
                 std::mem::forget(l2);
                 crate::net::spawn_proxy_aux(a2, TP_AUX_PROXY_CORE);
                 aux = Some(a2);
-                println!("[exl3-tp] rank {} rail 2 UP: {dev2} (TCP {port}, peer {peer_ip}), proxy pinned to core {TP_AUX_PROXY_CORE}", t.rank);
+                if t.world > 2 {
+                    // the pad exchanges (none in practice: a fresh ctx is at epoch 0) need rail 2's proxy running
+                    align_round_phase(dev, &kern, stream, *rails.last().unwrap(), &mut part, t.world, t.rank, "rail 2",
+                                      &move || crate::net::ctx_device_epoch(a2))?;
+                }
+                println!("[exl3-tp] rank {} rail 2 UP: {dev2} ({how}), proxy pinned to core {TP_AUX_PROXY_CORE}", t.rank);
             }
             let lookahead = crate::opts::var(crate::opt!("tp-xport-lookahead")).ok().and_then(|v| v.parse().ok()).unwrap_or(4usize);
             let blocks = crate::opts::var(crate::opt!("tp-xport-blocks")).ok().and_then(|v| v.parse().ok()).unwrap_or(16u32);
             Some(crate::tp_xport::Pipe::new(dev, rails, t.world as usize, lookahead, blocks)?)
         } else { None };
+        // TP-4F2 (`--tp-reduce single`): the dedicated single-stage reduce ctx. Built here — every rank is past the
+        // boot rendezvous and rail 2 (same sequence on every rank, so handshake skew is bounded) — as a full world-4
+        // N-way link on the PRIMARY device, a uniform one-shot ctx (net_shim `oneshot_uniform`) with its OWN epoch
+        // counter, so the rail-1 R10 round phase (`align_round_phase` above) is never perturbed by it. Its abort is
+        // mirrored into rail 1's inside its proxy (`set_parent`), because a graph replay never returns to the host
+        // between reduces. Absent the flag nothing here runs (no ctx, no thread, no ports).
+        let single = if tp_reduce_single_for(t.world) {
+            tp_reduce_refusal(true, t.world, dec_xport_mode())?;
+            let base = single_nway_base(t.world)?;
+            let ips = crate::tp::resolve_topology(t.world)?;
+            let dev1 = crate::tp::rdma_dev();
+            let mut l3 = crate::net::TpLink::connect_nway_uniform(t.rank, t.world, &ips, base, &dev1,
+                                                                  crate::tp::GID_IDX, XPORT_MIN_BYTES)
+                .with_context(|| format!("TP-4F2 single-stage ctx ({dev1}, TCP base {base}, world {})", t.world))?;
+            l3.set_payload(h * 4, true).context("single-stage ctx net_set_payload")?;
+            l3.set_parent(addr);
+            let ctx3 = l3.ctx_device_ptr();
+            let a3 = l3.ctx_addr();
+            std::mem::forget(l3);
+            crate::net::spawn_proxy_aux(a3, TP_SINGLE_PROXY_CORE);
+            println!("[exl3-tp] rank {} --tp-reduce single UP: dedicated uniform one-shot ctx on {dev1} (N-way, TCP base {base}, {} peers), \
+                      proxy pinned to core {TP_SINGLE_PROXY_CORE}; decode/verify reduces = ONE all-peers fp32 stage, sum (p0+p2)+(p1+p3) \
+                      (bitwise the rd two-stage tree); prefill reduces and the key/screen exchanges stay on rail 1",
+                     t.rank, t.world - 1);
+            Some(SingleXport { ctx: ctx3 })
+        } else { None };
         let dec = if dec_xport_mode() == 1 {
             let mut arrive = dev.alloc_zeros::<u32>(1)?;
             dev.memset_zeros(&mut arrive)?;   // AGENTS §2.2: alloc_zeros does not zero
-            let grecv = crate::opts::var(crate::opt!("tp-dec-grecv")).map_or(true, |v| v.trim() != "0");
+            // TP-4C: world > 2 receives on cpu_done only (see world_gt2_flag_refusals); world 2 unchanged
+            let grecv = t.world <= 2 && crate::opts::var(crate::opt!("tp-dec-grecv")).map_or(true, |v| v.trim() != "0");
             let blocks = crate::opts::var(crate::opt!("tp-dec-blocks")).ok().and_then(|v| v.parse().ok()).unwrap_or(8u32).clamp(1, 64);
             Some(DecXport { arrive, grecv, blocks })
         } else { None };
         dev.synchronize()?;
         match &dec {
+            Some(d) if t.world > 2 => println!("[exl3-tp] decode transport: world {} = {} exchanges per logical reduce (TP-4C): the producer's \
+                                                folded K1 + multi-block K2 for round 0, plain K1 + K2 for the later rounds (fp32 \
+                                                intermediate, f16 only on the last round), {} K2 blocks, receive cpu_done only \
+                                                (--tp-dec-grecv is world 2 only — TP-4F lever)",
+                                               t.world, (t.world as u32).trailing_zeros(), d.blocks),
             Some(d) => println!("[exl3-tp] decode transport: K1 FOLDED into the producers + multi-block K2 ({} blocks, f16 cvt folded), \
                                  receive {} (--tp-dec-xport default; =0 = the serial pair)", d.blocks,
                                 if d.grecv { "GPU-side (payload tail) or cpu_done" } else { "cpu_done only (--tp-dec-grecv=0)" }),
@@ -703,6 +1182,8 @@ impl TpState {
                                  x.rails.len(), x.lookahead, x.blocks, XPORT_MIN_BYTES / 1024),
             None => println!("[exl3-tp] prefill transport: serial single-block K1/K2 (--tp-prefill-xport=0)"),
         }
+        println!("[exl3-tp] prefill transport choice: {}",
+                 prefill_xport_why(t.world, mode, crate::opts::var(crate::opt!("tp-prefill-xport")).is_ok()));
         match pf_overlap_rows() {
             0 => println!("[exl3-tp] prefill overlap: OFF (--tp-prefill-overlap off)"),
             _ if pf_overlap_fold() => println!("[exl3-tp] prefill overlap: FOLD — whole-row epochs, each epoch's K2m replaced \
@@ -713,15 +1194,29 @@ impl TpState {
                           if pf_overlap_dual() { "K1m/K2m on the transport's own stream (dual)" } else { "same stream (inline)" },
                           pf_overlap_desc(pf_overlap_code())),
         }
-        if seq_parallel_on() {
-            println!("[exl3-tp] TP-SP sequence-parallel prefill: ON (--tp-seq-parallel {}) — chunks of {SP_MIN_ROWS}..={SP_MAX_ROWS} \
-                      rows: hc_pre on the own row block (rank 0 the first ceil(c/2) rows, hc GEMM plans pinned to the full \
-                      chunk's), x all-gathered before every mixer / router, reduce-scatters instead of all-reduces{}{}",
-                     seq_parallel_desc(seq_parallel_code()),
+        if t.world > 2 && pf_overlap_rows() > 0 {
+            println!("[exl3-tp] prefill overlap at world {}: the hooks ride the round-aware program (TP-4E): a row range is consumed \
+                      only after its LAST round's K2m (fp32 running sum staged in the partial buffer, one f16 rounding at the end); \
+                      --tp-prefill-overlap fold is refused at world > 2", t.world);
+        }
+        if seq_parallel_on() && t.world > 4 {
+            println!("[exl3-tp] TP-SP sequence-parallel prefill: INACTIVE at world {} (the default ON yields: SP exists at world 2 \
+                      and world 4 only; the replicated prefill runs; an explicit --tp-seq-parallel is refused here)",
+                     t.world);
+        } else if seq_parallel_on() {
+            println!("[exl3-tp] TP-SP sequence-parallel prefill: ON (--tp-seq-parallel {}) at world {} — chunks of {SP_MIN_ROWS}..={SP_MAX_ROWS} \
+                      rows: hc_pre on the own row block (rank r the rows [r*ceil(c/{}), (r+1)*ceil(c/{})), hc GEMM plans pinned to the full \
+                      chunk's), x all-gathered before every mixer / router, reduce-scatters instead of all-reduces{}{}{}",
+                     seq_parallel_desc(seq_parallel_code()), t.world, t.world, t.world,
+                     if t.world == 4 { " (TP-4S world 4: quarter rows; recursive-halving reduce-scatter / recursive-doubling all-gather on the two doorbell rounds)" } else { "" },
                      if seq_parallel_router() { "; the MoE router on the own rows + one ids/weights all-gather per layer (SP-2)" } else { "" },
                      if xport.is_some() { "" } else { " — INACTIVE: needs the pipelined transport (--tp-prefill-xport != 0)" });
         }
-        Ok(TpState { rank: t.rank, world: t.world, ctx, part, xport, kern, aux, dec })
+        let pf_on = !matches!(crate::opts::var(crate::opt!("tp-k2-prefetch")).map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+                              Ok("off") | Ok("0") | Ok("false"));
+        println!("[exl3-tp] rank {} --tp-k2-prefetch {} (L2 run-ahead of the next hc mixer's weights from the idle threads of the decode K2)",
+                 t.rank, if pf_on { "ON" } else { "OFF" });
+        Ok(TpState { rank: t.rank, world: t.world, ctx, part, xport, kern, aux, dec, single, pf_on, pf_hint: Default::default() })
     }
 
     /// In-place FP32 sum-all-reduce of `n` floats at device address `p` (world 2): K1 publishes
@@ -744,7 +1239,7 @@ impl TpState {
                 return crate::tp_xport::reduce_pipe(&self.kern, l.stream, x, crate::tp_xport::Io::f32_inplace(p), n);
             }
         }
-        crate::tp_xport::reduce_serial(&self.kern, l.stream, self.ctx, p, n)
+        crate::tp_xport::reduce_serial(&self.kern, l.stream, self.ctx, p, n, self.rounds())
     }
 
     /// TP-F fused prefill reduce: the local partial at `io.src` (f16 or f32) -> canonical fp32 sum ->
@@ -753,10 +1248,18 @@ impl TpState {
     /// caller then runs its explicit cvt + all_reduce_f32 + cvt sequence.
     fn all_reduce_io(&self, io: crate::tp_xport::Io, n: usize) -> Result<Option<crate::tp_xport::Io>> {
         match &self.xport {
-            // world>2 (rounds > 1): round k's local is round k-1's fp32 SUM, which an f16 in-place
-            // buffer would round between rounds (output-changing) — those worlds take the explicit
-            // cvt + fp32 all-reduce + cvt path until an fp32 intermediate is wired (TP-F.md §7).
-            Some(x) if x.rounds == 1 && n * 4 > XPORT_MIN_BYTES && crate::tp_xport::pipe_ok(n) => Ok(Some(io)),
+            Some(x) if n * 4 > XPORT_MIN_BYTES && crate::tp_xport::pipe_ok(n) => {
+                if x.rounds == 1 { return Ok(Some(io)); }
+                // world>2 (rounds > 1): round k's local is round k-1's fp32 SUM, which an f16 in-place
+                // buffer would round between rounds (output-changing). The running sum is staged in fp32
+                // in `part` (the fp32 scratch both fallback chains already reduce through; at the MoE
+                // site src == part, consumed in place), round 0 still ships the f16-exact partial at f16,
+                // the last round writes `io.out` (one f16 rounding): bitwise the explicit cvt + fp32
+                // all-reduce + cvt path, without its two conversion passes.
+                anyhow::ensure!(n <= self.part.len(), "world > 2 staged reduce: {n} floats exceed the fp32 partial buffer ({})",
+                                self.part.len());
+                Ok(Some(crate::tp_xport::Io { mid: if io.mid != 0 { io.mid } else { self.part_ptr() }, ..io }))
+            }
             _ => Ok(None),
         }
     }
@@ -781,9 +1284,13 @@ impl TpState {
 
     fn part_ptr(&self) -> u64 { *self.part.device_ptr() as u64 }
 
-    /// TP-SP: the exchanges need the pipelined transport at world 2 (one exchange round).
+    /// Recursive-doubling rounds per all-reduce: log2(world) (1 at world 2; attach admits 2 and 4 only).
+    fn rounds(&self) -> usize { (self.world as u32).trailing_zeros() as usize }
+
+    /// TP-SP: the exchanges need the pipelined transport with one doorbell round per rank-bit: world 2 (one round)
+    /// or, TP-4S, world 4 (two rounds: A = rank ^ 2, B = rank ^ 1). Other worlds have no SP schedule.
     pub(super) fn sp_ready(&self) -> bool {
-        self.world == 2 && self.xport.as_ref().map_or(false, |x| x.rounds == 1)
+        matches!(self.world, 2 | 4) && self.xport.as_ref().map_or(false, |x| x.rounds == self.rounds())
     }
 
     /// The rail-2 abort surfaced on the primary link (rail 2 is invisible to the agrees, I9).
@@ -803,6 +1310,7 @@ impl TpState {
     pub(super) fn sp_all_gather(&self, l: &Launcher, base: u64, row_bytes: usize, sp: &SpRows) -> Result<()> {
         let x = self.xport.as_ref().context("TP-SP all-gather without the pipelined transport")?;
         self.rail2_check()?;
+        if sp.world == 4 { return crate::tp_xport::all_gather_rows_w4(&self.kern, l.stream, x, base, row_bytes, &sp.blocks, sp.rank); }
         crate::tp_xport::all_gather_rows(&self.kern, l.stream, x, base, row_bytes, sp.own, sp.peer)
     }
 
@@ -811,6 +1319,7 @@ impl TpState {
     pub(super) fn sp_all_gather_multi(&self, l: &Launcher, bufs: &[(u64, usize)], sp: &SpRows) -> Result<()> {
         let x = self.xport.as_ref().context("TP-SP all-gather without the pipelined transport")?;
         self.rail2_check()?;
+        if sp.world == 4 { return crate::tp_xport::all_gather_rows_multi_w4(&self.kern, l.stream, x, bufs, &sp.blocks, sp.rank); }
         crate::tp_xport::all_gather_rows_multi(&self.kern, l.stream, x, bufs, sp.own, sp.peer)
     }
 
@@ -820,6 +1329,14 @@ impl TpState {
                                     hook: Option<crate::tp_xport::SpHook<'_>>) -> Result<()> {
         let x = self.xport.as_ref().context("TP-SP reduce-scatter without the pipelined transport")?;
         self.rail2_check()?;
+        if sp.world == 4 {
+            // world 4: the running sum between the two exchanges lives in an fp32 stage indexed by absolute row
+            // (`part`, as `all_reduce_io` stages the world > 2 all-reduce); an fp32 in-place src stages itself
+            anyhow::ensure!(sp.c * row_len <= self.part.len(), "TP-4S reduce-scatter: {} floats exceed the fp32 partial buffer ({})",
+                            sp.c * row_len, self.part.len());
+            let io = crate::tp_xport::Io { mid: if io.mid != 0 { io.mid } else { self.part_ptr() }, ..io };
+            return crate::tp_xport::reduce_scatter_rows_w4(&self.kern, l.stream, x, io, row_len, &sp.blocks, sp.rank, hook);
+        }
         crate::tp_xport::reduce_scatter_rows(&self.kern, l.stream, x, io, row_len, sp.own, sp.peer, hook)
     }
 
@@ -831,22 +1348,90 @@ impl TpState {
 
     /// TP-H #3 K2: out[n] (fp32) = canonical lower + upper of `local` (this rank's zero-padded fp32 block
     /// maxima) and the peer's payload of the epoch the preceding xq_dh_screen_k1 published.
+    /// TP-4C: world-general (2 or 4). At world 4 it is the two-exchange screen (`dec_reduce_finish`): the
+    /// intermediate is `out` itself (fp32), so the zero-padded `local` keeps its zeros for the next screen,
+    /// and the sum over the ranks' disjoint spans (one non-zero contributor per entry) is bitwise the
+    /// replicated array under any association.
     pub(super) fn dh_bmax_k2(&self, l: &Launcher, out: u64, local: u64, n: usize) -> Result<()> {
         let d = self.dec.as_ref().context("the sharded DHEAD screen without the decode transport")?;
-        anyhow::ensure!(self.world == 2 && n % 4 == 0, "the sharded DHEAD screen K2: world {} n {n}", self.world);
-        self.dec_k2(l, d, out, local, n, false, false)
+        anyhow::ensure!(n % 4 == 0 && n * 4 <= XPORT_MIN_BYTES, "the sharded DHEAD screen K2: n {n} is not a float4-clean decode-sized payload");
+        anyhow::ensure!(out != local, "the sharded DHEAD screen K2: out must not alias the zero-padded local (the multi-round intermediate lives in out)");
+        self.dec_reduce_finish(l, d, out, local, n, false, false)
     }
 
     /// TP-G decode K2: out (f16 when `out_f16`) = canonical lower + upper of `local` (f16 when
     /// `local_f16`) and the peer's fp32 payload of the epoch the preceding folded K1 published.
     fn dec_k2(&self, l: &Launcher, d: &DecXport, out: u64, local: u64, n: usize, local_f16: bool, out_f16: bool) -> Result<()> {
         let io = (local_f16 as i32) | ((out_f16 as i32) << 1) | ((d.grecv as i32) << 3);
-        xqlaunch!(l, "xq_tp_wait_add_dec", (d.blocks, 1, 1), (256, 1, 1), 0, (self.ctx, out, local, n as i32, io))
+        let pf = self.take_pf_hint();
+        xqlaunch!(l, "xq_tp_wait_add_dec", (d.blocks, 1, 1), (256, 1, 1), 0,
+                  (self.ctx, out, local, n as i32, io, pf[0], pf[1] as u32, pf[2], pf[3] as u32))
     }
 
-    /// TP-G: this reduce takes the folded decode path (world 2, decode-sized, float4-clean).
+    /// TP-4C: one decode-path LOGICAL reduce = `rounds` exchanges (`tp_xport::dec_exchanges`), exactly
+    /// `rounds` device epochs (every K1 bumps the counter once, so the R10 round phase is invariant across
+    /// arms). Exchange 0's K1 is the PRODUCER's folded K1 (already launched by the caller); K2 reads the
+    /// caller's `local`. Exchanges k > 0 launch the plain single-block K1 over the fp32 intermediate (the
+    /// round k-1 sum) and a K2 that reads it; only the last K2 writes `out` (f16 when `out_f16`).
+    /// At world 2 (rounds == 1) this is exactly the single `dec_k2(out, local, ..)` launch of TP-G.
+    fn dec_reduce_finish(&self, l: &Launcher, d: &DecXport, out: u64, local: u64, n: usize,
+                         local_f16: bool, out_f16: bool) -> Result<()> {
+        let rounds = self.rounds();
+        anyhow::ensure!(rounds == 1 || !local_f16,
+            "decode reduce at world {}: an f16 local operand would round between rounds", self.world);
+        anyhow::ensure!(n <= crate::tp_xport::EPOCH_FLOATS, "decode reduce: {n} floats exceed one epoch");
+        let inter = crate::tp_xport::dec_intermediate(local, out, out_f16);
+        for x in crate::tp_xport::dec_exchanges(rounds) {
+            if !x.folded_k1 { crate::tp_xport::k1_serial(&self.kern, l.stream, self.ctx, inter, n)?; }
+            let a = crate::tp_xport::dec_exchange_args(&x, local, local_f16, out, out_f16);
+            self.dec_k2(l, d, a.out, a.local, n, a.local_f16, a.out_f16)?;
+        }
+        Ok(())
+    }
+
+    /// TP-4F2: the doorbell ctx the producer-folded K1 of a decode/verify SUM reduce (chain_rowpar / ep_combine_reduce)
+    /// publishes on: the single-stage ctx under `--tp-reduce single`, else rail 1 (today). The screen / key
+    /// exchanges keep `ctx_addr()` / `tp.ctx` (rail 1, rd) — only the 96 per-round sum reduces move.
+    pub(super) fn dec_ctx(&self) -> u64 { self.single.as_ref().map_or(self.ctx, |s| s.ctx) }
+
+    /// TP-4Z2: arm the L2 run-ahead of the NEXT decode K2 (two byte ranges: p0/n0, p1/n1). No-op when
+    /// `--tp-k2-prefetch off`. The K2 that follows in launch (= capture) order consumes it.
+    pub(super) fn set_pf_hint(&self, r: [(u64, u32); 2]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.pf_on { return; }
+        PF_ARMED.fetch_add(1, Relaxed);
+        self.pf_hint[0].store(r[0].0, Relaxed); self.pf_hint[1].store(r[0].1 as u64, Relaxed);
+        self.pf_hint[2].store(r[1].0, Relaxed); self.pf_hint[3].store(r[1].1 as u64, Relaxed);
+    }
+
+    /// TP-4Z2: take (and clear) the pending hint: [p0, n0, p1, n1], all zero when none is armed.
+    fn take_pf_hint(&self) -> [u64; 4] {
+        use std::sync::atomic::Ordering::Relaxed;
+        let h = [self.pf_hint[0].swap(0, Relaxed), self.pf_hint[1].swap(0, Relaxed), self.pf_hint[2].swap(0, Relaxed), self.pf_hint[3].swap(0, Relaxed)];
+        if h[1] != 0 || h[3] != 0 { PF_USED.fetch_add(1, Relaxed); }
+        h
+    }
+
+    /// TP-4F2: the K2 of a decode/verify sum reduce (fp32 `local` -> f16 `out`): `dec_reduce_finish` (rd: `rounds`
+    /// exchanges) by default, or ONE `xq_tp_wait_add_dec_single` launch on the single-stage ctx whose epoch the
+    /// preceding folded K1 published.
+    fn dec_sum_finish(&self, l: &Launcher, d: &DecXport, out: u64, local: u64, n: usize) -> Result<()> {
+        match &self.single {
+            None => self.dec_reduce_finish(l, d, out, local, n, false, true),
+            Some(s) => {
+                anyhow::ensure!(n % 4 == 0 && n <= crate::tp_xport::EPOCH_FLOATS && out != local,
+                                "single-stage decode reduce: n {n} is not a float4-clean single-epoch payload / out aliases local");
+                let pf = self.take_pf_hint();
+                xqlaunch!(l, "xq_tp_wait_add_dec_single", (d.blocks, 1, 1), (256, 1, 1), 0,
+                          (s.ctx, out, local, n as i32, pf[0], pf[1] as u32, pf[2], pf[3] as u32))
+            }
+        }
+    }
+
+    /// TP-G: this reduce takes the folded decode path (decode-sized, float4-clean). TP-4C: at every attached
+    /// world (2 or 4) — `dec_reduce_finish` runs the `rounds` exchanges.
     fn dec_ok(&self, n: usize) -> Option<&DecXport> {
-        self.dec.as_ref().filter(|_| self.world == 2 && n % 4 == 0 && n * 4 <= XPORT_MIN_BYTES)
+        self.dec.as_ref().filter(|_| n % 4 == 0 && n * 4 <= XPORT_MIN_BYTES)
     }
 }
 
@@ -863,6 +1448,10 @@ impl FwdModel {
     /// shard GEMM + row all-gather tail (vp_gather_rows) and then the unchanged pen / argmax / sampler.
     pub(super) fn vp_gather(&self, sc: &Scratch, m: usize) -> bool {
         if self.lm_head_vp.is_none() || !(1..=16).contains(&m) || GATE_VP_OFF.load(AtOrd::Relaxed) { return false; }
+        // the row all-gather has kernels at world 2 (TP-H2: peer rank ^ 1) and world 4 (TP-4H2: recursive
+        // doubling) only — never live at another world, whatever the code says (resolve_vp_sampled resolves
+        // it OFF / refuses there; this is the structural backstop)
+        if self.tp.as_ref().map_or(true, |t| t.world != 2 && t.world != 4) { return false; }
         if GATE_VP_GATHER.load(AtOrd::Relaxed) { return true; }
         vp_sampled_on() && (sc.samp_live || sc.pen_live || sc.rq_live)
     }
@@ -881,7 +1470,7 @@ impl FwdModel {
         let vp = self.lm_head_vp.as_ref().context("vp_gather_rows without the lm_head shard")?;
         let tp = self.tp.as_ref().context("vp_gather_rows without a TP attachment")?;
         let d = tp.dec.as_ref().context("vp_gather_rows without the decode transport")?;
-        anyhow::ensure!(tp.world == 2, "the vocab-parallel row gather is world 2 only (world {})", tp.world);
+        anyhow::ensure!(tp.world == 2, "vp_gather_rows is the world-2 row gather (world 4 is vp_gather_rows_w4, TP-4H2; world {})", tp.world);
         let v = self.cfg.vocab_size;
         let n_sh = vp.n_sh as usize;
         anyhow::ensure!(n_sh * 2 == v && n_sh % 8 == 0 && v % 8 == 0 && (vp.base as usize) % 8 == 0,
@@ -911,6 +1500,59 @@ impl FwdModel {
         Ok(())
     }
 
+    /// TP-4H2: the row all-gather tail at either world that has kernels. World 2 = `vp_gather_rows` (TP-H2,
+    /// untouched: same launches, same arguments); world 4 = `vp_gather_rows_w4`. Both call sites (plain step
+    /// and verify) go through here.
+    pub(super) fn vp_gather_tail(&self, l: &Launcher, sc: &mut Scratch, m: usize) -> Result<()> {
+        match self.tp.as_ref().map(|t| t.world) {
+            Some(2) => self.vp_gather_rows(l, sc, m),
+            Some(4) => self.vp_gather_rows_w4(l, sc, m),
+            w => anyhow::bail!("vp gather: world {w:?} has no row-gather kernels (2 or 4)"),
+        }
+    }
+
+    /// TP-4H2: the WORLD-4 row all-gather. The shard GEMM writes sc.vp_rows [m][n_sh] (n_sh = V / 4, this
+    /// rank's columns [rank * n_sh, (rank + 1) * n_sh)); the launches of `tp_vpgather::gather4_plan` — per
+    /// group of <= 4 rows K1(stage 0) K2(stage 0) K1(stage 1) K2(stage 1), every K2 lag 0 — then assemble
+    /// all four shards into sc.logits [m][V] by recursive doubling (2 epochs per group; the epoch, the
+    /// partner masks and every shard index are derived ON DEVICE from `c->epoch`, so every launch argument is
+    /// a per-width constant and the sequence is graph-capturable). sc.logits rows 0..m are then the
+    /// replicated head's rows bit for bit on all four ranks. Launches only; the plan (and the tests that pin
+    /// it) live in src/tp_vpgather.rs.
+    pub(super) fn vp_gather_rows_w4(&self, l: &Launcher, sc: &mut Scratch, m: usize) -> Result<()> {
+        use crate::tp_vpgather as g;
+        let vp = self.lm_head_vp.as_ref().context("vp_gather_rows_w4 without the lm_head shard")?;
+        let tp = self.tp.as_ref().context("vp_gather_rows_w4 without a TP attachment")?;
+        let d = tp.dec.as_ref().context("vp_gather_rows_w4 without the decode transport")?;
+        anyhow::ensure!(tp.world as usize == g::WORLD && tp.rounds() == g::ROUNDS,
+                        "the world-4 vocab-parallel row gather needs world {} (rounds {}); got world {} (rounds {})",
+                        g::WORLD, g::ROUNDS, tp.world, tp.rounds());
+        let v = self.cfg.vocab_size;
+        let n_sh = vp.n_sh as usize;
+        anyhow::ensure!(n_sh * g::WORLD == v && n_sh % 8 == 0 && v % 8 == 0 && (vp.base as usize) == (tp.rank as usize) * n_sh,
+                        "vp gather (world 4): shard {n_sh} x 4 != vocab {v}, or not 16 B aligned, or base {} != rank {} x shard",
+                        vp.base, tp.rank);
+        anyhow::ensure!(g::slot_fits(g::GROUP_ROWS, n_sh, crate::tp::TP_SLOT_BYTES),
+                        "vp gather (world 4): {} rows x 2 shards x {n_sh} halves exceed one ring slot", g::GROUP_ROWS);
+        anyhow::ensure!((1..=g::MAX_ROWS).contains(&m) && m * n_sh <= sc.vp_rows.len() && m * v <= sc.logits.len(),
+                        "vp gather (world 4): m {m} outside 1..={} or exceeds the scratch (vp_rows {}, logits {})",
+                        g::MAX_ROWS, sc.vp_rows.len(), sc.logits.len());
+        // the shard's fused-Hadamard logits (the TP-H #4 shard Quad; ks = 1 asserted at build)
+        exl3_chain(l, &vp.q, &sc.x, &mut sc.chain_xh, &mut sc.chain_yraw, &mut sc.vp_rows, m, &sc.chain_ws)?;
+        let arrive = *d.arrive.device_ptr() as u64;
+        for la in g::gather4_plan(m, n_sh) {
+            match la.half {
+                g::Half::K1 => xqlaunch_raw!(l, "xq_vp_gather4_k1", (la.blocks, 1, 1), (256, 1, 1), 0,
+                                             (tp.ctx, &sc.vp_rows, &mut sc.logits, v as i64, vp.n_sh, la.r0 as i32,
+                                              la.nr as i32, la.stage as i32, arrive))?,
+                g::Half::K2 => xqlaunch_raw!(l, "xq_vp_gather4_k2", (la.blocks, 1, 1), (256, 1, 1), 0,
+                                             (tp.ctx, &mut sc.logits, v as i64, vp.n_sh, la.r0 as i32, la.nr as i32,
+                                              la.stage as i32, la.lag, (d.grecv as i32) << 3))?,
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn vp_greedy_tail(&self, l: &Launcher, sc: &mut Scratch, m: usize) -> Result<()> {
         let vp = self.lm_head_vp.as_ref().context("vp_greedy_tail without the lm_head shard")?;
         let tp = self.tp.as_ref().context("vp_greedy_tail without a TP attachment")?;
@@ -925,8 +1567,20 @@ impl FwdModel {
         xqlaunch_raw!(l, "xq_argmax_rows_vp", (nb as u32, m as u32, 1), (256, 1, 1), 0,
                  (tp.ctx, &mut sc.vp_keys, &sc.logits, vp.n_sh as i64, vp.n_sh as i32, vp.base,
                   &mut sc.am_part, &mut sc.am_cnt, arrive, nbytes as u32))?;
-        xqlaunch_raw!(l, "xq_tp_wait_keys", (1u32, 1, 1), (32, 1, 1), 0,
-                 (tp.ctx, &mut sc.vp_keys, &mut sc.argmax, m as i32, nbytes as i32, (d.grecv as i32) << 3))
+        // TP-4C: `rounds` key exchanges (1 at world 2 = the single TP-H #4 launch). Exchange 0's K1 is the
+        // fold of xq_argmax_rows_vp; later rounds republish the in-place merged keys with the plain K1
+        // (byte-agnostic copy of nbytes; the keys buffer is 8-byte keys, `nbytes / 4` floats' worth) and every
+        // round's xq_tp_wait_keys merges the partner's keys into sc.vp_keys (max = the total order: value
+        // desc, lowest global id) and rewrites sc.argmax from them — the last round's ids are the global argmax.
+        for x in crate::tp_xport::dec_exchanges(tp.rounds()) {
+            if !x.folded_k1 {
+                let kp = *sc.vp_keys.device_ptr() as u64;
+                crate::tp_xport::k1_serial(&tp.kern, l.stream, tp.ctx, kp, nbytes / 4)?;
+            }
+            xqlaunch_raw!(l, "xq_tp_wait_keys", (1u32, 1, 1), (32, 1, 1), 0,
+                     (tp.ctx, &mut sc.vp_keys, &mut sc.argmax, m as i32, nbytes as i32, (d.grecv as i32) << 3))?;
+        }
+        Ok(())
     }
 
     pub fn tp_rank(&self) -> Option<(i32, i32)> { self.tp.as_ref().map(|t| (t.rank, t.world)) }
@@ -947,10 +1601,10 @@ impl FwdModel {
             // TP-G: combine + K1 in one launch, then K2 writes moe_out (f16) directly
             let arrive = *d.arrive.device_ptr() as u64;
             xqlaunch_raw!(l, "xq_moe_combine_ep_k1l", (m as u32, 1, 1), (1024, 1, 1), 4096,
-                     (tp.ctx, part, &sc.yd, &sc.ysh, &sc.ids, &sc.wts, &sc.slotmap, &moe.sg, &sc.x,
+                     (tp.dec_ctx(), part, &sc.yd, &sc.ysh, &sc.ids, &sc.wts, &sc.slotmap, &moe.sg, &sc.x,
                       topk as i32, h as i32, m as i32, (ep.shared_split || ep.rank == 0) as i32, arrive))?;
             let mo = *sc.moe_out.device_ptr() as u64;
-            return tp.dec_k2(l, d, mo, part, n, false, true);
+            return tp.dec_sum_finish(l, d, mo, part, n);
         }
         xqlaunch!(l, "xq_moe_combine_ep", (m as u32, 1, 1), (1024, 1, 1), 4096,
                  (part, &sc.yd, &sc.ysh, &sc.ids, &sc.wts, &sc.slotmap, &moe.sg, &sc.x,
@@ -1020,13 +1674,13 @@ impl FwdModel {
                     xqlaunch!(l, "exl3_hmma_gemm_ks", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
                              (&q.tr, &mut *xh, ws, m as i32, q.k, q.n, q.bits))?;
                     xqlaunch!(l, "xq_ks_combine_f32_k1l", g(mn), (256, 1, 1), 0,
-                             (tp.ctx, ws, part, m as i32, q.n, q.ks as i32, arrive))?;
+                             (tp.dec_ctx(), ws, part, m as i32, q.n, q.ks as i32, arrive))?;
                 } else {
                     xqlaunch!(l, "exl3_hmma_gemm", ((q.n as u32) / 128, 1, 1), (256, 1, 1), 0,
                              (&q.tr, &mut *xh, &mut *yraw, m as i32, q.k, q.n, q.bits))?;
-                    xqlaunch!(l, "xq_cvt_f16_f32_k1l", g(mn), (256, 1, 1), 0, (tp.ctx, part, yp, mn as i32, arrive))?;
+                    xqlaunch!(l, "xq_cvt_f16_f32_k1l", g(mn), (256, 1, 1), 0, (tp.dec_ctx(), part, yp, mn as i32, arrive))?;
                 }
-                tp.dec_k2(l, d, yp, part, mn, false, true)?;
+                tp.dec_sum_finish(l, d, yp, part, mn)?;
                 xqlaunch!(l, "exl3_had_svh", (m as u32 * (q.n as u32 / 128), 1, 1), (32, 1, 1), 0, (&*yraw, &q.svh, &mut *y, q.n))?;
                 return Ok(false);
             }
@@ -1052,7 +1706,7 @@ impl FwdModel {
                 anyhow::ensure!(sp.c == m, "TP-SP: chunk {} vs chain m {m}", sp.c);
                 let yp = *yraw.device_ptr() as u64;
                 let (svh, yo) = (*q.svh.device_ptr() as u64, *y.device_ptr() as u64);
-                let io = crate::tp_xport::Io { src: yp, src_f16: true, out: yp, out_f16: true, wire_f16: true };
+                let io = crate::tp_xport::Io { src: yp, src_f16: true, out: yp, out_f16: true, wire_f16: true, mid: 0 };
                 if let Some(hk) = hook {
                     anyhow::ensure!(hk.y == yo, "prefill overlap hook: y {:#x} is not this chain's output {yo:#x}", hk.y);
                     let mut f = |r0: usize, r1: usize| -> Result<()> {
@@ -1072,7 +1726,7 @@ impl FwdModel {
             // TP-F: y_raw (f16) -> f16 wire (exact: y_raw IS the partial) -> canonical fp32 sum -> y_raw
             // (f16, one __float2half_rn) — the two cvt passes fused, half the wire bytes
             let yp = *yraw.device_ptr() as u64;
-            if let Some(io) = tp.all_reduce_io(crate::tp_xport::Io { src: yp, src_f16: true, out: yp, out_f16: true, wire_f16: true }, mn)? {
+            if let Some(io) = tp.all_reduce_io(crate::tp_xport::Io { src: yp, src_f16: true, out: yp, out_f16: true, wire_f16: true, mid: 0 }, mn)? {
                 if let Some(hk) = hook {
                     // TP-I2 item 1: per landed row range, the output Hadamard + svh (exl3_had_svh's CTA =
                     // one (row, 128-block): row-offset pointers give the full launch's bits on those
@@ -1121,9 +1775,24 @@ impl FwdModel {
         let n = c * h;
         anyhow::ensure!(n <= tp.part.len(), "EP prefill combine: c={c} exceeds the partial buffer ({TP_MAX_ROWS} rows)");
         let part = tp.part_ptr();
-        xqlaunch!(l, "xq_moe_combine_rows_ep", (c as u32, 1, 1), (1024, 1, 1), 4096,
-                 (part, &psc.yd, &psc.ysh, &psc.cand, &psc.wts, &moe.sg, &psc.x,
-                  topk as i32, h as i32, c as i32, (ep.shared_split || ep.rank == 0) as i32))?;
+        let add_sh = (ep.shared_split || ep.rank == 0) as i32;
+        // TP-4M1: the vectorised combine (bitwise equal: same per-element fma chain, same 1024-lane sgv tree) when the
+        // shapes / alignment it needs hold (h == 2560, topk <= 16, every base 16-B aligned); else the original kernel.
+        let al16 = |p: u64| p % 16 == 0;
+        let ep2 = if h == 2560 && topk <= 16 && al16(part)
+            && al16(*psc.yd.device_ptr() as u64) && al16(*psc.ysh.device_ptr() as u64)
+            && al16(*moe.sg.device_ptr() as u64) && al16(*psc.x.device_ptr() as u64) {
+            Some(if topk <= 10 { "xq_moe_combine_rows_ep2_k10" } else { "xq_moe_combine_rows_ep2_k16" })
+        } else { None };
+        if let Some(name) = ep2 {
+            xqlaunch!(l, name, (c as u32, 1, 1), (320, 1, 1), 0,
+                     (part, &psc.yd, &psc.ysh, &psc.cand, &psc.wts, &moe.sg, &psc.x,
+                      topk as i32, h as i32, c as i32, add_sh))?;
+        } else {
+            xqlaunch!(l, "xq_moe_combine_rows_ep", (c as u32, 1, 1), (1024, 1, 1), 4096,
+                     (part, &psc.yd, &psc.ysh, &psc.cand, &psc.wts, &moe.sg, &psc.x,
+                      topk as i32, h as i32, c as i32, add_sh))?;
+        }
         // TP-F: the fp32 partial -> canonical sum -> moe_out (f16), the cvt pass fused into K2m
         let mo = *psc.moe_out.device_ptr() as u64;
         if let Some(sp) = psc.sp_rows {
@@ -1131,7 +1800,7 @@ impl FwdModel {
             // reduce-scatter gives this rank the canonical sum + one f16 rounding on its OWN rows of
             // moe_out (the all-reduce's values there), with the next inject+norm hooked on those rows.
             anyhow::ensure!(sp.c == c, "TP-SP: chunk {} vs MoE c {c}", sp.c);
-            let io = crate::tp_xport::Io { src: part, src_f16: false, out: mo, out_f16: true, wire_f16: false };
+            let io = crate::tp_xport::Io { src: part, src_f16: false, out: mo, out_f16: true, wire_f16: false, mid: 0 };
             if let Some(hk) = psc.pf_hook.take() {
                 anyhow::ensure!(hk.y == mo, "prefill overlap hook: y {:#x} is not moe_out {mo:#x}", hk.y);
                 let mut f = |r0: usize, r1: usize| -> Result<()> { hk.inj_norm(l, r0, r1) };
@@ -1141,7 +1810,7 @@ impl FwdModel {
             }
             return tp.sp_reduce_scatter(l, io, h, &sp, None);
         }
-        if let Some(io) = tp.all_reduce_io(crate::tp_xport::Io { src: part, src_f16: false, out: mo, out_f16: true, wire_f16: false }, n)? {
+        if let Some(io) = tp.all_reduce_io(crate::tp_xport::Io { src: part, src_f16: false, out: mo, out_f16: true, wire_f16: false, mid: 0 }, n)? {
             // TP-I2 item 1: the next hc_pre's inject+norm per landed row range (prefill_chunk set the
             // hook; psc.pf_hooked tells it the norm already ran)
             if let Some(hk) = psc.pf_hook.take() {
@@ -2115,7 +2784,16 @@ fn gates_inner(model: &FwdModel, psc: Option<&mut PrefillScratch>, prompt: &[u32
     // output is the FULL logits rows, so every row is compared bit for bit against the replicated-head
     // reference (lref: a different class — the replicated lm_head GEMM), plus the ids, the committed state
     // and the rows' rank identity. N = 1 = the plain-step tail (forward_step), N >= 2 = the verify tail.
-    if model.lm_head_vp.is_some() {
+    // TP-4H2: the section runs at world 2 (one exchange per group) AND world 4 (recursive doubling, two per
+    // group of <= 4 rows; N = 1..nmax <= 8 covers groups 1-2 incl. the 4 -> 5 change; m = 9..16 is the
+    // `--tp-reduce-bench --mode decwvpg` arm's). At any other world > 2 it is reported SKIPPED (never a silent
+    // omission: the report line names why, and the sampled rows' replicated head is what serves)
+    let vp_world = model.tp_rank().map_or(0, |(_, w)| w);
+    if model.lm_head_vp.is_some() && vp_world > 2 && vp_world != 4 {
+        rep.push(format!("G-T1-v: SKIPPED at world {vp_world} — the TP-H2 row all-gather has kernels at world 2 and 4 only; \
+                          sampled / penalized / ratio-rule rows take the replicated lm_head"));
+    }
+    if model.lm_head_vp.is_some() && (vp_world == 2 || vp_world == 4) {
         GATE_VP_GATHER.store(true, AtOrd::Relaxed); // cleared by gates_bv_state on every exit
         {
             for n in 1..=nmax {
@@ -2141,8 +2819,9 @@ fn gates_inner(model: &FwdModel, psc: Option<&mut PrefillScratch>, prompt: &[u32
                 let dm = (d as u32) ^ ((d >> 32) as u32);
                 let same = sync(0xD0 + n as u64, dm)? == dm;
                 ok &= same;
-                rep.push(format!("G-T1-v N={n} (vp row all-gather tail, {}): full logits rows bit-neq {:?}/{v} vs the replicated head, \
+                rep.push(format!("G-T1-v N={n} (vp row all-gather tail, {}{}): full logits rows bit-neq {:?}/{v} vs the replicated head, \
                                   ids {} decode, accepted {a}/{}, state max|diff| {md:.1} bit-neq {neq}, rows rank-identical {} -> {}",
+                                 if vp_world == 2 { String::new() } else { format!("world {vp_world}, ") },
                                  if n == 1 { "plain step" } else { "verify" }, rows_neq, if ids_ok { "==" } else { "!=" },
                                  n - 1, if same { "yes" } else { "NO" }, if pass && same { "EXACT" } else { "DIVERGES" }));
             }
@@ -2409,7 +3088,7 @@ struct SpTally { chunks: usize, r_n: usize, r_bad: usize, g_n: usize, g_bad: usi
 ///   (P) the peer's S own-row blocks equal to this rank's R blocks (both ranks reach one verdict).
 /// S whole buffers of the own-row classes are not compared (their non-owned rows are stale by design).
 fn sp_check(tag: &str, ent: &Caps, names_bad: &mut BTreeMap<String, usize>, first_bad: &mut Option<String>,
-            t: &mut SpTally) -> Result<(usize, usize)> {
+            t: &mut SpTally, rank: usize) -> Result<(usize, usize)> {
     let hash = |v: &[f32]| { let h = fnv64(v); [h as u32, (h >> 32) as u32] };
     let cls = |n: &str| n.split('@').next().unwrap_or(n).trim_end_matches(|c: char| c.is_ascii_digit()).to_string();
     let r_whole: Vec<&(String, Vec<f32>)> = ent.iter()
@@ -2419,8 +3098,12 @@ fn sp_check(tag: &str, ent: &Caps, names_bad: &mut BTreeMap<String, usize>, firs
         .filter(|(n, _)| !n.starts_with("R:") && !n.contains('@') && !rank_local_capture(n) && !sp_row_class(n)).collect();
     let s_own: Vec<&(String, Vec<f32>)> = ent.iter().filter(|(n, _)| !n.starts_with("R:") && n.contains('@')).collect();
     let mine: Vec<u32> = r_whole.iter().chain(&r_blk).chain(&s_glob).chain(&s_own).flat_map(|(_, v)| hash(v)).collect();
-    let peer = crate::net::exchange_u32s(&mine, mine.len().max(4) + 4)?;
-    anyhow::ensure!(peer.len() == mine.len(), "{tag}: the peer's TP-SP2 digest list has {} words, this rank's {}", peer.len(), mine.len());
+    // TP-4S: every rank's digest list (world 2: exactly the pairwise exchange; world 4: the hub all-gather)
+    let all = crate::net::exchange_u32s_all(&mine, mine.len().max(4) + 4)?;
+    anyhow::ensure!(rank < all.len(), "{tag}: rank {rank} outside the {}-rank digest exchange", all.len());
+    for (p, v) in all.iter().enumerate() {
+        anyhow::ensure!(v.len() == mine.len(), "{tag}: rank {p}'s TP-SP2 digest list has {} words, this rank's {}", v.len(), mine.len());
+    }
     let at = |v: &[u32], i: usize| (v[2 * i], v[2 * i + 1]);
     let (o_rb, o_sg, o_so) = (r_whole.len(), r_whole.len() + r_blk.len(), r_whole.len() + r_blk.len() + s_glob.len());
     let r_by_name: BTreeMap<&str, usize> = r_whole.iter().enumerate().map(|(i, (n, _))| (&n[2..], i)).collect();
@@ -2430,43 +3113,43 @@ fn sp_check(tag: &str, ent: &Caps, names_bad: &mut BTreeMap<String, usize>, firs
         *names_bad.entry(format!("{what}:{}", cls(n))).or_default() += 1;
         if first_bad.is_none() { *first_bad = Some(format!("{tag} {what} buffer {n}")); }
     };
-    // (R) the replicated reference, whole buffers, across ranks
+    // (R) the replicated reference, whole buffers, across ALL ranks
     for (i, (n, _)) in r_whole.iter().enumerate() {
         t.r_n += 1;
-        if at(&mine, i) != at(&peer, i) { t.r_bad += 1; bad += 1; flag("R", &n[2..], names_bad, first_bad); }
+        if all.iter().any(|p| at(&mine, i) != at(p, i)) { t.r_bad += 1; bad += 1; flag("R", &n[2..], names_bad, first_bad); }
     }
-    // (G) gathered / all-row buffers of the SP run: across ranks and vs this rank's R
+    // (G) gathered / all-row buffers of the SP run: across ALL ranks and vs this rank's R
     for (j, (n, _)) in s_glob.iter().enumerate() {
         t.g_n += 1;
         let i = o_sg + j;
         let r = r_by_name.get(n.as_str()).map(|&k| at(&mine, k));
-        if at(&mine, i) != at(&peer, i) || r != Some(at(&mine, i)) { t.g_bad += 1; bad += 1; flag("S", n, names_bad, first_bad); }
+        if all.iter().any(|p| at(&mine, i) != at(p, i)) || r != Some(at(&mine, i)) { t.g_bad += 1; bad += 1; flag("S", n, names_bad, first_bad); }
     }
-    // (O) own-row blocks vs this rank's R block and the peer's R block of the same rows; (P) the peer's
-    // own-row blocks (its S list: same class order, the peer's block index) vs this rank's R blocks
-    let peer_blk = |n: &str| -> String {
-        let (base, b) = n.split_once('@').unwrap_or((n, "0"));
-        format!("{base}@{}", 1 - b.parse::<usize>().unwrap_or(0).min(1))
-    };
+    // (O) own-row blocks vs this rank's R block and EVERY other rank's R block of the same rows; (P) every other
+    // rank's own-row blocks (its S list: same class order, that rank's block index) vs this rank's R blocks.
+    // World 2: the one peer, block 1 - rank: the pre-TP-4S check exactly.
     for (j, (n, _)) in s_own.iter().enumerate() {
         let i = o_so + j;
         t.o_n += 1;
         match rb_by_name.get(n.as_str()) {
-            Some(&k) if at(&mine, i) == at(&mine, k) && at(&mine, i) == at(&peer, k) => {}
+            Some(&k) if at(&mine, i) == at(&mine, k) && all.iter().all(|p| at(&mine, i) == at(p, k)) => {}
             _ => { t.o_bad += 1; bad += 1; flag("S-own", n, names_bad, first_bad); }
         }
-        t.p_n += 1;
-        let pn = peer_blk(n);
-        match rb_by_name.get(pn.as_str()) {
-            Some(&k) if at(&peer, i) == at(&mine, k) => {}
-            _ => { t.p_bad += 1; bad += 1; flag("S-peer-own", &pn, names_bad, first_bad); }
+        let base = n.split_once('@').map_or(n.as_str(), |(b, _)| b);
+        for (p, pv) in all.iter().enumerate().filter(|&(p, _)| p != rank) {
+            t.p_n += 1;
+            let pn = format!("{base}@{p}");
+            match rb_by_name.get(pn.as_str()) {
+                Some(&k) if at(pv, i) == at(&mine, k) => {}
+                _ => { t.p_bad += 1; bad += 1; flag("S-peer-own", &pn, names_bad, first_bad); }
+            }
         }
     }
     t.chunks += 1;
-    Ok((r_whole.len() + s_glob.len() + 2 * s_own.len(), bad))
+    Ok((r_whole.len() + s_glob.len() + (1 + all.len().saturating_sub(1)) * s_own.len(), bad))
 }
 
-/// The TP=2 xtp run, both ranks (SPMD). `ref_dir` = Some on rank 0 unless `ident` — it reads the
+/// The TP=W xtp run (W = ctx.world), every rank (SPMD). `ref_dir` = Some on rank 0 unless `ident` — it reads the
 /// reference and broadcasts the teacher-forced sequence; the node receives it over the link.
 /// `head_prompt` = (prompt, gen) on rank 0 for an `ident` run (no reference).
 pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&str>, head_prompt: Option<(Vec<u32>, usize)>,
@@ -2495,6 +3178,7 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     };
     anyhow::ensure!(plen >= 2 && seq.len() == plen + gen, "xtp: bad broadcast (plen {plen}, gen {gen}, seq {})", seq.len());
     if let Some(r) = &rref { anyhow::ensure!(r.max_pos == max_pos, "xtp: max_pos {max_pos} != reference {}", r.max_pos); }
+    world_gt2_opts_refusals(ctx.world, opts)?;
     let (rank, world, link) = ctx.into_parts();
     // The launch thread pinned to a big core (gpu.rs / tp_serve rule: an unpinned launch thread
     // presents exactly like a protocol stall) — the proxy takes core 19.
@@ -2520,10 +3204,10 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     let mut check = |tag: &str, ent: &Caps, names_bad: &mut BTreeMap<String, usize>, first_bad: &mut Option<String>| -> Result<(usize, usize)> {
         let rep: Vec<&(String, Vec<f32>)> = ent.iter().filter(|(n, _)| !rank_local_capture(n)).collect();
         let mine: Vec<u32> = rep.iter().flat_map(|(_, v)| { let h = fnv64(v); [h as u32, (h >> 32) as u32] }).collect();
-        let peer = crate::net::exchange_u32s(&mine, mine.len().max(4) + 4)?;
+        let all = crate::net::exchange_u32s_all(&mine, mine.len().max(4) + 4)?;
         let mut bad = 0;
         for (i, (n, _)) in rep.iter().enumerate() {
-            if mine[2 * i] != peer[2 * i] || mine[2 * i + 1] != peer[2 * i + 1] {
+            if all.iter().any(|peer| mine[2 * i] != peer[2 * i] || mine[2 * i + 1] != peer[2 * i + 1]) {
                 let cls = n.trim_end_matches(|c: char| c.is_ascii_digit()).to_string();
                 *names_bad.entry(cls).or_default() += 1;
                 bad += 1;
@@ -2548,7 +3232,7 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     let p1 = trace_pass(&model, &mut sc, psc_store.as_mut(), true, &prompt, forced, gen, cmp, None, rank == 0,
         &mut |k, ent| {
             let (n, bad) = if ent.iter().any(|(n, _)| n.starts_with("R:")) {
-                sp_check(&format!("prefill chunk {k}"), ent, &mut nb2, &mut fb2, &mut spt)?
+                sp_check(&format!("prefill chunk {k}"), ent, &mut nb2, &mut fb2, &mut spt, rank as usize)?
             } else {
                 check(&format!("prefill chunk {k}"), ent, &mut nb2, &mut fb2)?
             };
@@ -2631,7 +3315,7 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
             }
             Ok(())
         })?;
-        println!("XTP_TIME TP=2 rank {rank}: prefill {pf_s:.3}s ({plen} tok{}) | decode eager {ms:.2} ms/token over {} tokens (48 x 3 all-reduces per token){}",
+        println!("XTP_TIME TP={world} rank {rank}: prefill {pf_s:.3}s ({plen} tok{}) | decode eager {ms:.2} ms/token over {} tokens (48 x 3 all-reduces per token){}",
                  if opts.pf_chunk.is_some() { ", chunked" } else { ", token-by-token" }, opts.time_tokens - 1,
                  rref.as_ref().and_then(|r| r.timing).map(|(p1s, e, g)| format!(" | TP=1 ref: prefill {p1s:.3}s, eager {e:.2} ms/token, graphed {g:.2} ms/token")).unwrap_or_default());
         let tokz = crate::tokenizer::QwenTokenizer::from_file(&format!("{pack_dir}/tokenizer.json"))?;
@@ -2639,19 +3323,25 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
         println!("[exl3-tp] rank {rank}: {}", lat_line("(incl. the untraced timing pass)"));
     }
 
-    // ---- TP-B: G-T1-c / G-T1-d at TP=2 ----
+    // ---- TP-B: G-T1-c / G-T1-d at TP=W ----
     let mut gates_ok = true;
     if opts.gates > 0 {
         let (ok, rep) = gates_bv_state(&model, psc_store.as_mut(), &prompt, opts.gates, &mut |tag, v| {
-            let peer = crate::net::exchange_u32s(&[tag as u32, v], 8)?;
-            anyhow::ensure!(peer[0] == tag as u32, "gates: peer at check {:#x}, this rank at {tag:#x} — desync", peer[0]);
-            Ok(peer[1])
+            let all = crate::net::exchange_u32s_all(&[tag as u32, v], 8)?;
+            for (r, peer) in all.iter().enumerate() {
+                anyhow::ensure!(peer[0] == tag as u32, "gates: rank {r} at check {:#x}, this rank at {tag:#x} — desync", peer[0]);
+            }
+            // The caller compares the returned word with its own: hand back a differing rank's word if any.
+            Ok(all.iter().map(|p| p[1]).find(|&w| w != v).unwrap_or(v))
         })?;
-        for l in &rep { println!("TP2 rank {rank} {l}"); }
-        let peer_ok = crate::net::exchange_u32s(&[ok as u32], 4)?[0] != 0;
+        for l in &rep { println!("TP{world} rank {rank} {l}"); }
+        let peer_ok = crate::net::exchange_u32s_all(&[ok as u32], 4)?
+            .iter().enumerate().filter(|(r, _)| *r as i32 != rank).all(|(_, p)| p[0] != 0);
         gates_ok = ok && peer_ok;
-        println!("TP2 GATES rank {rank}: this rank {} | peer {} => {}", if ok { "EXACT" } else { "DIVERGES" },
-                 if peer_ok { "EXACT" } else { "DIVERGES" }, if gates_ok { "G-T1-c/d EXACT at TP=2" } else { "G-T1-c/d FAIL" });
+        println!("TP{world} GATES rank {rank}: this rank {} | {} => {}", if ok { "EXACT" } else { "DIVERGES" },
+                 if world == 2 { format!("peer {}", if peer_ok { "EXACT" } else { "DIVERGES" }) }
+                 else { format!("all peers {}", if peer_ok { "EXACT" } else { "DIVERGE" }) },
+                 if gates_ok { format!("G-T1-c/d EXACT at TP={world}") } else { "G-T1-c/d FAIL".to_string() });
         if let Some(r) = &rref { for l in &r.gates { println!("  (TP=1 control) {l}"); } }
     }
 
@@ -2668,21 +3358,21 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
         let (lm, lx, hm, hx, div, per) = compare(&ref_lg, &ref_layers, &r.seq, plen, &lg1, &lay1, &am1, pt0);
         let rel = |x: f64, f: f64| x / f.max(1e-30);
         let flips = router_flips(&ref_layers, &lay1, model.cfg.num_experts, model.cfg.num_experts_per_tok);
-        println!("XTP router top-{} flips at cmp TP=2 vs TP=1 (layer, ids, ref gap k|k+1): {:?}", model.cfg.num_experts_per_tok, flips);
+        println!("XTP router top-{} flips at cmp TP={world} vs TP=1 (layer, ids, ref gap k|k+1): {:?}", model.cfg.num_experts_per_tok, flips);
         println!("XTP floors (TP=1): bit-0 GDN-state logits med {:.3e} hidden med {:.3e} | moe-ulp (reduction site) logits med {:.3e} hidden med {:.3e}",
                  r.floor_logits_med, r.floor_hidden_med, r.moeulp_logits_med, r.moeulp_hidden_med);
-        println!("XTP TP=2 vs the bit-0 floor: logits {:.2}x hidden {:.2}x | vs the moe-ulp floor: logits {:.2}x hidden {:.2}x",
+        println!("XTP TP={world} vs the bit-0 floor: logits {:.2}x hidden {:.2}x | vs the moe-ulp floor: logits {:.2}x hidden {:.2}x",
                  rel(lm, r.floor_logits_med), rel(hm, r.floor_hidden_med), rel(lm, r.moeulp_logits_med), rel(hm, r.moeulp_hidden_med));
         let mut bl: Vec<f64> = r.band.iter().map(|b| b.2).collect();
         let band_l = median(&mut bl);
         let band_h = r.band.iter().map(|b| b.3).fold(0f64, f64::max);
         println!("XTP band ({} floor members): logits med {:.3e} | hidden med max {:.3e} | member first flips {:?}",
                  r.band.len(), band_l, band_h, r.band.iter().map(|b| (b.0.clone(), b.1, b.4)).collect::<Vec<_>>());
-        println!("XTP TP=2 vs the band: logits {:.2}x (<= 3x) | hidden {:.2}x of the band edge (<= 3x) | TP=2 first flip {:?}",
+        println!("XTP TP={world} vs the band: logits {:.2}x (<= 3x) | hidden {:.2}x of the band edge (<= 3x) | TP={world} first flip {:?}",
                  rel(lm, band_l), rel(hm, band_h), flips.first());
         let tier_ok = !r.band.is_empty() && lm <= 3.0 * band_l && hm <= 3.0 * band_h;
         let gdiv = (0..gen).find(|&i| seq2[plen + i] != r.seq[plen + i]);
-        println!("XTP per-layer hidden relL2 at the last prompt position (TP=2 vs TP=1):");
+        println!("XTP per-layer hidden relL2 at the last prompt position (TP={world} vs TP=1):");
         for chunk in per.iter().filter(|(n, _)| n.starts_with("layer")).collect::<Vec<_>>().chunks(8) {
             println!("  {}", chunk.iter().map(|(n, v)| format!("{n}={v:.2e}")).collect::<Vec<_>>().join(" "));
         }
@@ -2691,13 +3381,13 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
             println!("XTP per-layer mixer-output (yatt, post all-reduce) relL2 at cmp: {}",
                      yatt.iter().take(12).map(|(n, v)| format!("{n}={v:.2e}")).collect::<Vec<_>>().join(" "));
         }
-        println!("XTP TP=2 vs TP=1 (teacher-forced, {} steps): logits relL2 med {lm:.3e} ({:.2}x floor) max {lx:.3e} | hidden relL2 med {hm:.3e} ({:.2}x floor) max {hx:.3e} | first argmax divergence {:?} (floor {:?})",
+        println!("XTP TP={world} vs TP=1 (teacher-forced, {} steps): logits relL2 med {lm:.3e} ({:.2}x floor) max {lx:.3e} | hidden relL2 med {hm:.3e} ({:.2}x floor) max {hx:.3e} | first argmax divergence {:?} (floor {:?})",
                  total_steps, rel(lm, r.floor_logits_med), rel(hm, r.floor_hidden_med),
                  div.map(|d| d as i64 - (plen as i64 - 1)), r.floor_div.map(|d| d as i64 - (plen as i64 - 1)));
         let text = tok.decode(&seq2[plen..], false).unwrap_or_default();
-        println!("XTP greedy[{gen}] TP=2: {:?}", text);
+        println!("XTP greedy[{gen}] TP={world}: {:?}", text);
         println!("XTP greedy[{gen}] TP=1: {:?}", r.text);
-        println!("XTP greedy divergence index (free-running TP=2 vs TP=1): {}",
+        println!("XTP greedy divergence index (free-running TP={world} vs TP=1): {}",
                  gdiv.map(|i| i.to_string()).unwrap_or_else(|| format!("none — all {gen} tokens identical")));
         println!("RESULT: {} (tier: logits relL2 med <= 3x band median {band_l:.3e}, hidden relL2 med <= 3x band edge {band_h:.3e}; {} floor members) ; {}{}",
                  if tier_ok { "XTP_TIER_OK" } else { "XTP_TIER_FAIL" }, r.band.len(),
@@ -2706,7 +3396,7 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
         if !(tier_ok && ident_ok && gates_ok) { anyhow::bail!("xtp gate failed"); }
     } else {
         if rank == 0 {
-            println!("XTP greedy[{gen}] TP=2 (free-running, agreed every step): {:?}", tok.decode(&seq2[plen..], false).unwrap_or_default());
+            println!("XTP greedy[{gen}] TP={world} (free-running, agreed every step): {:?}", tok.decode(&seq2[plen..], false).unwrap_or_default());
         }
         println!("RESULT: {} ; {}{}", if opts.ident_only { "IDENT_ONLY (no TP=1 reference)" } else { "node (the head holds the reference)" },
                  if ident_ok { "RANK_IDENTITY_OK" } else { "RANK_IDENTITY_FAIL" },
@@ -2778,7 +3468,8 @@ impl FwdModel {
             let a0 = unsafe { *p.kernelParams };
             if a0.is_null() { continue; }
             // TP-G: any grid — the folded K1 producers and the multi-block decode K2 carry the ctx first too
-            if unsafe { *(a0 as *const u64) } == tp.ctx { bells.push(i); }
+            let a0v = unsafe { *(a0 as *const u64) };
+            if a0v == tp.ctx || tp.single.as_ref().map_or(false, |s| s.ctx == a0v) { bells.push(i); }   // TP-4F2: the single-stage ctx's doorbells too
         }
         let reach = |start: usize, adj: &Vec<Vec<usize>>| -> usize {
             let mut seen = vec![false; n];
@@ -2808,5 +3499,458 @@ impl FwdModel {
                      if ok { "OK (every barrier is a cut vertex of the DAG)" } else { "VIOLATION — graph discarded, this shape runs eager" });
         }
         ok
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn round_pad_aligns_to_a_multiple() {
+        for rounds in [2usize, 3, 4] {
+            for e in 0..40u64 {
+                let pad = round_pad(e, rounds);
+                assert!(pad < rounds);
+                assert_eq!((e + pad as u64) % rounds as u64, 0, "e {e} rounds {rounds}");
+                assert_eq!(pad == 0, e % rounds as u64 == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn world_gt2_refusals_leave_world_2_alone() {
+        let sp = XtpOpts { sp_fault: Some((3, 1)), ..Default::default() };
+        assert!(world_gt2_flag_refusals(2).is_ok() && world_gt2_flag_refusals(1).is_ok());
+        assert!(world_gt2_opts_refusals(2, &sp).is_ok() && world_gt2_opts_refusals(1, &sp).is_ok());
+        assert!(world_gt2_opts_refusals(4, &XtpOpts::default()).is_ok());
+        // TP-4S: the fault is the W=4 SP gate's negative control, so it is admitted at world 4 with SP on and refused
+        // everywhere no SP run exists (world 4 with SP off, worlds above 4)
+        assert!(opts_refusals_with_sp(4, &sp, true).is_ok() && opts_refusals_with_sp(4, &XtpOpts::default(), false).is_ok());
+        for (w, on) in [(4, false), (8, true), (8, false)] {
+            let e = opts_refusals_with_sp(w, &sp, on).unwrap_err().to_string();
+            assert!(e.contains("--xtp-sp-fault") && e.contains(&format!("world {w}")) && e.contains("silent negative control"), "{e}");
+        }
+        for w in [3, 5, 8] { assert!(world_gt2_flag_refusals(w).is_err(), "world {w}"); }
+        // TP-4E: the DEFAULT dual-rail prefill transport is admitted at world 4 (its second rail is an N-way link)
+        assert!(world_gt2_flag_refusals(4).is_ok(), "the default posture must be admitted at world 4: {:?}",
+                world_gt2_flag_refusals(4).err());
+    }
+
+    #[test]
+    fn overlap_and_sp_refusals_are_world_gated() {
+        let fold = parse_pf_overlap(Some("fold")).unwrap();
+        assert!(fold & PF_FOLD != 0);
+        // world 2 and 1: every code passes untouched
+        for w in [1, 2] {
+            for c in [0, PF_OVERLAP_DEFAULT, fold, 64, 64 | PF_DUAL] { assert!(world_gt2_overlap_refusal(w, c).is_ok(), "world {w} code {c:#x}"); }
+        }
+        // world 4: the program-driven modes are admitted, fold is refused loudly
+        for s in [None, Some("on"), Some("dual"), Some("dual:64"), Some("inline"), Some("inline:256"), Some("off")] {
+            let c = parse_pf_overlap(s).unwrap();
+            assert!(world_gt2_overlap_refusal(4, c).is_ok(), "{s:?}");
+        }
+        let e = world_gt2_overlap_refusal(4, fold).unwrap_err().to_string();
+        assert!(e.contains("fold") && e.contains("world 4") && e.contains("world-2"), "{e}");
+        // SP: world 2 untouched; world 4 (TP-4S) admits explicit on/hc/router; above world 4 an explicit on/hc/router is
+        // refused (no schedule), default and off always fine
+        for code in [0, SP_HC, SP_HC | SP_ROUTER] {
+            for ex in [false, true] { assert!(world_gt2_sp_refusal(2, ex, code).is_ok()); assert!(world_gt2_sp_refusal(4, ex, code).is_ok()); }
+        }
+        assert!(world_gt2_sp_refusal(8, false, SEQ_PAR_DEFAULT).is_ok(), "the default ON yields at runtime, it is not a refusal");
+        assert!(world_gt2_sp_refusal(8, true, 0).is_ok(), "an explicit off is fine");
+        for code in [SP_HC, SP_HC | SP_ROUTER] {
+            let e = world_gt2_sp_refusal(8, true, code).unwrap_err().to_string();
+            assert!(e.contains("--tp-seq-parallel") && e.contains("world 8") && e.contains("no schedule"), "{e}");
+        }
+    }
+
+    #[test]
+    fn rail2_port_plan_is_disjoint_and_ordered() {
+        // world 4: the documented layout
+        assert_eq!(rail2_nway_base(4).unwrap(), crate::tp::TP_PORT + 20);
+        let r1: Vec<u32> = crate::net::nway_link_ports(crate::tp::TP_PORT, 4);
+        let base2 = rail2_nway_base(4).unwrap();
+        let r2: Vec<u32> = crate::net::nway_link_ports(base2, 4);
+        let t = crate::tp::TP_PORT as u32;
+        assert_eq!(r1, vec![t + 1, t + 3, t + 4, t + 5, t + 8, t + 9, t + 13], "rail 1 = liveness + 6 pair ports");
+        assert_eq!(r2.len(), 7);
+        assert!(r2.iter().all(|p| !r1.contains(p)) && !r1.contains(&(base2 as u32)) && !r2.contains(&(t)), "rails must not share a port");
+        // the world-2 rail-2 port (TP_PORT + 10, liveness + 11) is outside both world-4 sets: no stale-listener overlap
+        let w2 = [t + TP_AUX_PORT_OFF as u32, t + TP_AUX_PORT_OFF as u32 + 1];
+        assert!(w2.iter().all(|p| !r1.contains(p) && !r2.contains(p)));
+        // every pair port is unique within a rail (each ordered pair has its own listener)
+        for w in [4, 8] {
+            let mut v = crate::net::nway_link_ports(crate::tp::TP_PORT, w);
+            let n = v.len();
+            v.sort(); v.dedup();
+            assert_eq!(v.len(), n, "world {w}: duplicate pair port");
+            assert_eq!(n, 1 + (w * (w - 1) / 2) as usize);
+        }
+        // the collision check fires on an overlapping base, and on a u16 overflow; world 2 has no N-way base
+        let e = check_rail_ports(4, crate::tp::TP_PORT, crate::tp::TP_PORT + 4).unwrap_err().to_string();
+        assert!(e.contains("collision"), "{e}");
+        assert!(check_rail_ports(4, crate::tp::TP_PORT, crate::tp::TP_PORT).is_err());
+        assert!(check_rail_ports(4, 65000, 65530).unwrap_err().to_string().contains("65535"));
+        assert!(rail2_nway_base(2).is_err());
+        assert!(rail2_nway_base(8).is_ok());
+    }
+
+    /// TP-4F2 (found by the first served boot, F2.2 leg B1: "kernel xq_tp_wait_add_dec_single missing from exl3_bench"): a
+    /// kernel launched by name in the serving path must be in the module load list (`MODULE_FNS`, else `get_func` finds
+    /// nothing at the first launch) and in the capture pre-resolve list, and defined in the .cu. The micro-probe has its
+    /// own load list, so only the served boot exposes this; this test is what would have caught it before hardware.
+    #[test]
+    fn single_stage_k2_kernel_is_registered_for_serving() {
+        const K: &str = "xq_tp_wait_add_dec_single";
+        assert!(include_str!("../../kernels/exl3_bench.cu").contains(&format!("void {K}(")), "{K} is not defined in exl3_bench.cu");
+        assert!(crate::exl3_bench::MODULE_FNS.contains(&K), "{K} missing from MODULE_FNS (served boot would fail at the first launch)");
+        assert!(include_str!("../exl3_forward.rs").contains(&format!("\"{K}\", \"xq_argmax_rows_vp\"")),
+                "{K} missing from the graph-capture pre-resolve list in exl3_forward.rs");
+    }
+
+    /// TP-4F2: the single-stage ctx's port plan is disjoint from both rails (and from the world-2 rail-2 ports), and the
+    /// flag's refusals are exactly: single at a world other than 4, single with the serial decode pair; default rd never refuses.
+    #[test]
+    fn tp_reduce_default_resolves_per_world() {
+        // TP-4Z1 (owner D-TP4-7): `auto` (the default / unset) = single at world 4 on the folded decode transport,
+        // rd elsewhere; an explicit value always wins.
+        for raw in [None, Some("auto"), Some(" AUTO ")] {
+            assert!(tp_reduce_resolve(raw, 4, 1), "auto at world 4 resolves to single ({raw:?})");
+            assert!(!tp_reduce_resolve(raw, 2, 1), "auto at world 2 stays rd ({raw:?})");
+            assert!(!tp_reduce_resolve(raw, 1, 1), "auto at world 1 stays rd ({raw:?})");
+            assert!(!tp_reduce_resolve(raw, 4, 0), "auto with --tp-dec-xport 0 falls back to rd, never refuses ({raw:?})");
+        }
+        for w in [1, 2, 4] { for dx in [0u8, 1] {
+            assert!(!tp_reduce_resolve(Some("rd"), w, dx), "explicit rd always wins (w{w} dx{dx})");
+            assert!(tp_reduce_resolve(Some("single"), w, dx), "explicit single always resolves true (refusal is separate) (w{w} dx{dx})");
+        } }
+        assert!(tp_reduce_resolve(Some("RD "), 4, 1) == false && tp_reduce_resolve(Some(" Single"), 4, 1));
+        // the refusal only ever fires on an explicit single outside world 4 / without the folded decode transport
+        assert!(tp_reduce_refusal(tp_reduce_resolve(None, 2, 1) , 2, 1).is_ok(), "auto at world 2 never reaches a refusal");
+        assert!(tp_reduce_refusal(true, 2, 1).is_err());
+    }
+
+    #[test]
+    fn tp_reduce_single_ports_and_refusals() {
+        let t = crate::tp::TP_PORT as u32;
+        let b3 = single_nway_base(4).unwrap();
+        assert_eq!(b3 as u32, t + 40);
+        let p3 = rail_ports(b3, 4);
+        assert_eq!(p3.len(), 8, "base + liveness + 6 pair ports");
+        for other in [rail_ports(crate::tp::TP_PORT, 4), rail_ports(rail2_nway_base(4).unwrap(), 4), vec![t + 10, t + 11]] {
+            assert!(p3.iter().all(|p| !other.contains(p)), "single-stage ports collide: {p3:?} vs {other:?}");
+        }
+        assert!(single_nway_base(2).is_err(), "no N-way base at world 2 (the flag is refused there first)");
+        // refusals
+        for w in [1, 2, 4, 8] { for dx in [0u8, 1] { assert!(tp_reduce_refusal(false, w, dx).is_ok(), "rd never refuses (w{w} dx{dx})"); } }
+        assert!(tp_reduce_refusal(true, 4, 1).is_ok());
+        for w in [1, 2, 8] { assert!(tp_reduce_refusal(true, w, 1).unwrap_err().to_string().contains("world-4"), "world {w}"); }
+        assert!(tp_reduce_refusal(true, 4, 0).unwrap_err().to_string().contains("--tp-dec-xport"));
+    }
+
+    #[test]
+    fn nway_pair_port_mirrors_the_shim_formula() {
+        // native/net_shim.c nway_pair_port: tcp_port + 2 + lo * world + hi. Rebuild it from the C source text
+        // when it is reachable (the test runs from the crate root), so a change to the C formula fails here.
+        let shim = std::fs::read_to_string("native/net_shim.c");
+        if let Ok(src) = shim {
+            assert!(src.contains("return tcp_port + 2 + lo * world + hi;"), "net_shim.c nway_pair_port changed: update net::nway_link_ports");
+            assert!(src.contains("c->liveness_port = tcp_port + 1;"), "net_shim.c liveness port changed: update net::nway_link_ports");
+        }
+        let v = crate::net::nway_link_ports(1000, 4);
+        let expect: Vec<u32> = std::iter::once(1001).chain([(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+            .iter().map(|&(lo, hi)| 1000 + 2 + lo * 4 + hi)).collect();
+        assert_eq!(v, expect);
+    }
+
+    #[test]
+    fn rail2_preflight_words_and_device_state() {
+        assert_ne!(preflight_word(true), preflight_word(false));
+        assert!(preflight_failures(&[preflight_word(true); 4]).is_empty());
+        let f = preflight_failures(&[preflight_word(true), preflight_word(true), preflight_word(false), preflight_word(true)]);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].contains("rank 2") && f[0].contains("not usable"), "{f:?}");
+        let f = preflight_failures(&[preflight_word(true), 0xDEAD_BEEF, preflight_word(true), 0]);
+        assert_eq!(f.len(), 2);
+        assert!(f.iter().all(|m| m.contains("desync")), "{f:?}");
+        // device state against a fake sysfs tree (state + GID 3 + its type)
+        let root = std::env::temp_dir().join(format!("tp4e_ib_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        const GOOD_GID: &str = "0000:0000:0000:0000:0000:ffff:c0a8:b10d\n";
+        let mk = |dev: &str, state: Option<&str>, gid: Option<&str>, ty: Option<&str>| {
+            let p = root.join(dev).join("ports/1");
+            for d in ["gids", "gid_attrs/types"] { std::fs::create_dir_all(p.join(d)).unwrap(); }
+            for (rel, v) in [("state", state), ("gids/3", gid), ("gid_attrs/types/3", ty)] {
+                if let Some(v) = v { std::fs::write(p.join(rel), v).unwrap(); }
+            }
+        };
+        mk("up", Some("4: ACTIVE\n"), Some(GOOD_GID), Some("RoCE v2\n"));
+        mk("down", Some("1: DOWN\n"), Some(GOOD_GID), Some("RoCE v2\n"));
+        mk("init", Some("2: INIT\n"), Some(GOOD_GID), Some("RoCE v2\n"));
+        mk("defer", Some("5: ACTIVE_DEFER\n"), Some(GOOD_GID), Some("RoCE v2\n"));
+        mk("nostate", None, Some(GOOD_GID), Some("RoCE v2\n"));
+        mk("nogid", Some("4: ACTIVE\n"), None, Some("RoCE v2\n"));
+        mk("zerogid", Some("4: ACTIVE\n"), Some("0000:0000:0000:0000:0000:0000:0000:0000\n"), Some("RoCE v2\n"));
+        mk("v1", Some("4: ACTIVE\n"), Some(GOOD_GID), Some("IB/RoCE v1\n"));
+        mk("notype", Some("4: ACTIVE\n"), Some(GOOD_GID), None);
+        let (ok, why) = rail_device_state(&root, "up", 3);
+        assert!(ok && why.contains("ACTIVE") && why.contains("RoCE v2"), "{why}");
+        for (d, needle) in [("down", "ports/1/state"), ("init", "ports/1/state"), ("defer", "ports/1/state"),
+                            ("nostate", "cannot read"), ("nogid", "cannot read"), ("zerogid", "non-zero GID"),
+                            ("v1", "RoCE v2"), ("notype", "cannot read")] {
+            let (ok, why) = rail_device_state(&root, d, 3);
+            assert!(!ok && why.contains(d) && why.contains(needle), "{d}: {why}");
+        }
+        // a GID index the fixture does not have is unreadable, never assumed usable
+        let (ok, why) = rail_device_state(&root, "up", 5);
+        assert!(!ok && why.contains("gids/5") && why.contains("cannot read"), "{why}");
+        let (ok, why) = rail_device_state(&root, "absent", 3);
+        assert!(!ok && why.contains("does not exist") && why.contains("absent"), "{why}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pure decision over fake file text: good, zero GID, wrong type, unreadable, state not 4. Every refusal names
+    /// the device, the file path and the expected value.
+    #[test]
+    fn rail_files_verdict_fails_closed_and_names_everything() {
+        let dir = std::path::Path::new("/sys/class/infiniband/roceP2p1s0f1");
+        let dev = "roceP2p1s0f1";
+        let gid = "fe80:0000:0000:0000:ba3f:d2ff:fe5a:1c31";
+        let good = RailFiles { state: Some("4: ACTIVE\n"), gid: Some(gid), gid_type: Some("RoCE v2\n") };
+        let (ok, why) = rail_files_verdict(dev, dir, 3, &good);
+        assert!(ok && why.contains(dev) && why.contains(gid), "{why}");
+        let refused = |f: RailFiles, path: &str, expected: &str| {
+            let (ok, why) = rail_files_verdict(dev, dir, 3, &f);
+            assert!(!ok, "{path}: must be refused: {why}");
+            assert!(why.contains(dev) && why.contains(path) && why.contains(expected), "names device, path, expected: {why}");
+        };
+        // state: any number but 4, including the substring traps
+        for st in ["1: DOWN\n", "2: INIT\n", "3: ARMED\n", "5: ACTIVE_DEFER\n", "INACTIVE\n", "14: ACTIVE\n", "", "\n"] {
+            refused(RailFiles { state: Some(st), ..good }, "ports/1/state", "4: ACTIVE");
+        }
+        refused(RailFiles { state: None, ..good }, "ports/1/state", "4: ACTIVE");
+        // GID: unreadable, all zero (several spellings), empty, not a GID
+        refused(RailFiles { gid: None, ..good }, "ports/1/gids/3", "non-zero GID");
+        for z in ["0000:0000:0000:0000:0000:0000:0000:0000\n", "::\n", "0\n", "", "\n", "zzzz:0001\n"] {
+            refused(RailFiles { gid: Some(z), ..good }, "ports/1/gids/3", "non-zero GID");
+        }
+        // type: unreadable, RoCE v1, empty, a superstring
+        refused(RailFiles { gid_type: None, ..good }, "ports/1/gid_attrs/types/3", "RoCE v2");
+        for t in ["IB/RoCE v1\n", "RoCE v1\n", "", "RoCE v2 (x)\n"] {
+            refused(RailFiles { gid_type: Some(t), ..good }, "ports/1/gid_attrs/types/3", "RoCE v2");
+        }
+        // the index in the paths follows the caller's GID index (the bench's --gid)
+        let (ok, why) = rail_files_verdict(dev, dir, 7, &RailFiles { gid: None, ..good });
+        assert!(!ok && why.contains("ports/1/gids/7"), "{why}");
+    }
+
+    #[test]
+    fn prefill_xport_why_names_the_choice_and_labels_its_numbers() {
+        // every (world, mode, explicit) cell yields a non-empty reason that says default|explicit
+        for w in [2, 4] {
+            for m in [0u8, 1, 2] {
+                for ex in [false, true] {
+                    let s = prefill_xport_why(w, m, ex);
+                    assert!(s.contains(if ex { "explicit" } else { "default" }), "{w}/{m}/{ex}: {s}");
+                    assert!(s.len() > 40);
+                }
+            }
+        }
+        // the world-4 default names dual-rail and labels TP-4A's numbers as projections, not measurements
+        let s = prefill_xport_why(4, 2, false);
+        assert!(s.contains("dual-rail") && s.contains("PROJECTION") && s.contains("831") && s.contains("1,064") && s.contains("no silent fallback"), "{s}");
+        // single/serial at world 4 are flagged as perf opt-outs
+        assert!(prefill_xport_why(4, 1, true).contains("OPT-OUT"));
+        assert!(prefill_xport_why(4, 0, true).contains("OPT-OUT"));
+        // world 2 quotes the MEASURED TP-F numbers
+        assert!(prefill_xport_why(2, 2, false).contains("measured") && prefill_xport_why(2, 2, false).contains("993"));
+        // the default flag resolves to dual at every world
+        assert_eq!(prefill_xport_mode(), 2);
+    }
+
+    #[test]
+    fn vp_sampled_resolution_is_world_gated() {
+        // world <= 2: exactly parse_vp_sampled (no note) — the TP=2 behaviour is untouched
+        for w in [1u32, 2] {
+            for v in [None, Some("on"), Some("off"), Some("1"), Some("0")] {
+                assert_eq!(resolve_vp_sampled(w, v).unwrap(), (parse_vp_sampled(v).unwrap(), None), "world {w} {v:?}");
+            }
+        }
+        for w in [1u32, 2, 4] { assert!(resolve_vp_sampled(w, Some("maybe")).is_err(), "garbage is refused at world {w}"); }
+        // world 4 (TP-4H2, D-TP4-3): absent -> ON (no note); explicit on -> ON; explicit off / 0 -> OFF quietly
+        assert_eq!(resolve_vp_sampled(4, None).unwrap(), (1, None));
+        assert_eq!(resolve_vp_sampled(4, Some("on")).unwrap(), (1, None));
+        assert_eq!(resolve_vp_sampled(4, Some("1")).unwrap(), (1, None));
+        assert_eq!(resolve_vp_sampled(4, Some("off")).unwrap(), (0, None));
+        assert_eq!(resolve_vp_sampled(4, Some("0")).unwrap(), (0, None));
+        // any other world > 2: no kernels -> absent = OFF with a banner note, off quiet, explicit on refused loudly
+        for w in [3u32, 8] {
+            let (code, note) = resolve_vp_sampled(w, None).unwrap();
+            assert_eq!(code, 0, "world {w}");
+            assert!(note.map_or(false, |n| n.contains("defaults to OFF")), "world {w}");
+            assert_eq!(resolve_vp_sampled(w, Some("off")).unwrap(), (0, None), "world {w}");
+            let e = resolve_vp_sampled(w, Some("on")).unwrap_err().to_string();
+            assert!(e.contains("world-2 / world-4") && e.contains(&format!("world {w}")), "{e}");
+        }
+    }
+
+    /// The pack's config under `$HOME/models` (lab boxes); skipped where it is absent.
+    fn pack_config() -> std::path::PathBuf {
+        std::path::Path::new(&std::env::var("HOME").unwrap_or_default()).join("models/Qwen3.8-Flash-Next-exl3-3.05bpw/config.json")
+    }
+    const EMBEDDED: &str = r#"{"model_type":"qwen4_exp","text_config":{"hidden_size":2560,"head_dim":256,
+        "num_attention_heads":24,"num_key_value_heads":2,"linear_num_key_heads":16,"linear_num_value_heads":48,
+        "linear_key_head_dim":128,"linear_value_head_dim":128,"num_experts":512,"num_experts_per_tok":10,
+        "moe_intermediate_size":640,"shared_expert_intermediate_size":640,"num_hidden_layers":48,
+        "vocab_size":248320,"indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,
+        "indexer_compress_ratio":4,"indexer_kv_heads":1}}"#;
+
+    fn parse(txt: &str, tag: &str) -> crate::qwen::Config {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("tp4b_cfg_{}_{tag}_{n}.json", std::process::id()));
+        std::fs::write(&p, txt).unwrap();
+        let c = crate::qwen::Config::from_config_json(p.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&p);
+        c
+    }
+
+    fn cfg() -> crate::qwen::Config { parse(EMBEDDED, "emb") }
+
+    fn geometry(c: &crate::qwen::Config) -> [usize; 10] {
+        [c.num_heads, c.num_kv_heads, c.head_dim, c.lin_num_k_heads, c.lin_num_v_heads, c.lin_k_dim, c.lin_v_dim,
+         c.num_experts, c.moe_intermediate_size, c.shared_expert_intermediate_size]
+    }
+
+    fn partitions(mut v: Vec<(usize, usize)>, base: usize, total: usize) {
+        v.sort();
+        let mut at = base;
+        for (a, b) in v { assert_eq!(a, at, "gap or overlap at {a}"); at = b; }
+        assert_eq!(at, base + total);
+    }
+
+    #[test]
+    fn embedded_numbers_match_the_real_pack_when_present() {
+        let c = cfg();
+        assert_eq!(geometry(&c), [24, 2, 256, 16, 48, 128, 128, 512, 640, 640]);
+        if let Ok(txt) = std::fs::read_to_string(pack_config()) {
+            let real = parse(&txt, "real");
+            assert_eq!(geometry(&real), geometry(&c), "the embedded numbers drifted from the pack's config.json");
+            assert_eq!(real.vocab_size, 248320);
+        }
+    }
+
+    #[test]
+    fn kv_span_mapping() {
+        let table = |nkv: usize, w: usize| (0..w).map(|r| kv_span(nkv, r, w).unwrap()).collect::<Vec<_>>();
+        assert_eq!(table(2, 1), [(0, 2)]);
+        assert_eq!(table(2, 2), [(0, 1), (1, 1)]);
+        assert_eq!(table(2, 4), [(0, 1), (0, 1), (1, 1), (1, 1)]);
+        assert_eq!(table(2, 8), [(0, 1), (0, 1), (0, 1), (0, 1), (1, 1), (1, 1), (1, 1), (1, 1)]);
+        assert_eq!(table(8, 4), [(0, 2), (2, 2), (4, 2), (6, 2)]);
+        assert_eq!(table(4, 4), [(0, 1), (1, 1), (2, 1), (3, 1)]);
+        assert!(kv_span(3, 0, 2).is_err() && kv_span(3, 0, 4).is_err(), "neither-way geometries must refuse");
+        assert!(kv_span(1, 0, 2).is_err() && kv_span(1, 1, 2).is_err(), "world 2 with one KV head stays refused (as before TP-4B)");
+        assert_eq!(table(1, 4), [(0, 1), (0, 1), (0, 1), (0, 1)]);
+        assert!(kv_span(2, 4, 4).is_err() && kv_span(0, 0, 2).is_err());
+    }
+
+    #[test]
+    fn trunk_geometry_per_rank_w1_w2_w4() {
+        let c = cfg();
+        // (world, q heads, kv heads, gdn k heads, gdn v heads) per rank
+        for (w, nh, nkv, lk, lv) in [(1, 24, 2, 16, 48), (2, 12, 1, 8, 24), (4, 6, 1, 4, 12)] {
+            let t = trunk_cfg(&c, w).unwrap();
+            assert_eq!((t.num_heads, t.num_kv_heads, t.lin_num_k_heads, t.lin_num_v_heads), (nh, nkv, lk, lv), "world {w}");
+            assert_eq!((t.head_dim, t.lin_k_dim, t.lin_v_dim, t.hidden_size), (256, 128, 128, 2560));
+            assert_eq!(t.num_experts, 512, "the expert count stays global; the deal divides it");
+        }
+        assert!(trunk_cfg(&c, 3).is_err() && trunk_cfg(&c, 0).is_err());
+        let mut one_kv = cfg();
+        one_kv.num_kv_heads = 1;
+        assert!(trunk_cfg(&one_kv, 2).is_err(), "world 2 with nkv == 1 must keep refusing");
+    }
+
+    #[test]
+    fn world_1_and_2_equal_the_pre_tp4b_results() {
+        let c = cfg();
+        for w in [1usize, 2] {
+            let t = trunk_cfg(&c, w).unwrap();
+            assert_eq!((t.num_heads, t.num_kv_heads, t.lin_num_k_heads, t.lin_num_v_heads),
+                       (c.num_heads / w, c.num_kv_heads / w, c.lin_num_k_heads / w, c.lin_num_v_heads / w));
+            for rank in 0..w {
+                let ts = TrunkSplit { rank, world: w };
+                let old_kv = { let s = c.num_kv_heads / w * c.head_dim; (rank * s, (rank + 1) * s) };
+                assert_eq!(ts.attn_kv(&c).unwrap(), old_kv, "attn_kv world {w} rank {rank}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_rank_query_head_reads_a_kv_head_the_rank_holds() {
+        let c = cfg();
+        let group = c.num_heads / c.num_kv_heads;
+        for w in [1usize, 2, 4] {
+            let t = trunk_cfg(&c, w).unwrap();
+            let gqa_local = t.num_heads / t.num_kv_heads;
+            for r in 0..w {
+                let (kv0, kvn) = kv_span(c.num_kv_heads, r, w).unwrap();
+                assert_eq!(kvn, t.num_kv_heads);
+                for j in 0..t.num_heads {
+                    let kv_global = (r * t.num_heads + j) / group;
+                    assert!(kv_global >= kv0 && kv_global < kv0 + kvn, "world {w} rank {r} local q {j}");
+                    assert_eq!(kv_global - kv0, j / gqa_local, "the kernel's local KV index must be the held head");
+                }
+            }
+        }
+        let t4 = trunk_cfg(&c, 4).unwrap();
+        assert_eq!(t4.num_heads / t4.num_kv_heads, 6, "the W=4 per-rank GQA ratio");
+    }
+
+    #[test]
+    fn trunk_slices_partition_every_sharded_dimension() {
+        let c = cfg();
+        let (nh, nkv, hd) = (c.num_heads, c.num_kv_heads, c.head_dim);
+        let (nk, kd, nv, vd) = (c.lin_num_k_heads, c.lin_k_dim, c.lin_num_v_heads, c.lin_v_dim);
+        for w in [1usize, 2, 4] {
+            let ts = |rank| TrunkSplit { rank, world: w };
+            partitions((0..w).map(|r| ts(r).attn_q(&c)).collect(), 0, nh * 2 * hd);
+            partitions((0..w).map(|r| ts(r).attn_o(&c)).collect(), 0, nh * hd);
+            partitions((0..w).map(|r| ts(r).gdn_v(&c)).collect(), 0, nv * vd);
+            partitions((0..w).map(|r| ts(r).gdn_heads(&c)).collect(), 0, nv);
+            partitions((0..w).map(|r| ts(r).gdn_qkv(&c)[0]).collect(), 0, nk * kd);
+            partitions((0..w).map(|r| ts(r).gdn_qkv(&c)[1]).collect(), nk * kd, nk * kd);
+            partitions((0..w).map(|r| ts(r).gdn_qkv(&c)[2]).collect(), 2 * nk * kd, nv * vd);
+            // K/V columns: every KV head is held by exactly max(1, w / nkv) ranks, and ranks sharing a head
+            // slice the identical columns
+            let mut held = vec![0usize; nkv];
+            for r in 0..w {
+                let (a, b) = ts(r).attn_kv(&c).unwrap();
+                assert_eq!(b - a, trunk_cfg(&c, w).unwrap().num_kv_heads * hd);
+                for h in a / hd..b / hd { held[h] += 1; }
+                let (kv0, _) = kv_span(nkv, r, w).unwrap();
+                assert_eq!(a, kv0 * hd);
+            }
+            assert!(held.iter().all(|&n| n == (w / nkv).max(1)), "world {w}: holders per KV head {held:?}");
+        }
+    }
+
+    #[test]
+    fn shared_expert_and_expert_deals_at_w4() {
+        let c = cfg();
+        let sh = |w: usize| (0..w).map(|r| TrunkSplit { rank: r, world: w }.shared(c.moe_intermediate_size).unwrap()).collect::<Vec<_>>();
+        assert_eq!(sh(1), [(0, 640)]);
+        assert_eq!(sh(2), [(0, 384), (384, 640)], "the W=2 384|256 deal is unchanged");
+        assert_eq!(sh(4), [(0, 256), (256, 384), (384, 512), (512, 640)], "640 = 5 x 128 -> 2/1/1/1 blocks at W=4");
+        for kind in ["interleave", "contig"] {
+            for w in [2usize, 4] {
+                let mut per = vec![0usize; w];
+                for e in 0..c.num_experts { per[ep_owner(e, c.num_experts, w, kind)] += 1; }
+                assert!(per.iter().all(|&n| n == c.num_experts / w), "{kind} world {w}: {per:?}");
+            }
+        }
+        assert_eq!(c.num_experts / 4, 128);
+        assert_eq!((c.vocab_size / 4, c.vocab_size / 4 / 128), (62080, 485), "vocab shard at W=4");
     }
 }

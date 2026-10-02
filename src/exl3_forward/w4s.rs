@@ -391,21 +391,20 @@ impl FwdModel {
         if !w4s_on(W4S_DATTN) { return old; }
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| println!("W4S dattn: xq_attn_dense_acc4_w4 / _acc1_w4 ON (5-stage V ring; --w4s-off=dattn = v3 acc)"));
-        match old { "xq_attn_dense_acc4" => "xq_attn_dense_acc4_w4", "xq_attn_dense_acc1" => "xq_attn_dense_acc1_w4", k => k }
+        super::dv3_w4_twin(old)   // TP-4G: includes the G=6 (W=4) twins
     }
 
     /// (9) XCHECK after a W4 accumulate launch (eager only): the old kernel into a side buffer
     /// on the same score plane / chunk maxima / cache (acc writes only the attention rows).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn w4s_dattn_xcheck(&self, l: &Launcher, sc: &Scratch, kv: u64, m: usize, kname: &str,
-                                   old: &str, sd: usize) -> Result<()> {
+                                   old: &str, sd: usize, cfg: &crate::qwen::Config, block: u32) -> Result<()> {
         if kname == old || !w4s_xcheck(W4S_DATTN) || self.stream_capturing() { return Ok(()); }
-        let cfg = &self.cfg;
         let nh_p = (cfg.num_heads as i32) | ((cfg.num_kv_heads as i32) << 16);
         let hd_p = (cfg.head_dim as i32) | ((cfg.rotary_dim as i32) << 16);
         let n = m * cfg.num_heads * cfg.head_dim;
         let mut side = self.dev.alloc_zeros::<u16>(n)?;
-        xqlaunch!(l, old, ((cfg.head_dim / sd) as u32, cfg.num_kv_heads as u32, m as u32), (192, 1, 1), 0,
+        xqlaunch!(l, old, ((cfg.head_dim / sd) as u32, cfg.num_kv_heads as u32, m as u32), (block, 1, 1), 0,
                   (&mut side, &sc.dv3_s, &sc.dv3_pm, kv, &sc.qg, &sc.slots, nh_p, hd_p, self.mpf()))?;
         self.dev.synchronize()?;
         let (a, b) = (self.dev.dtoh_sync_copy(&sc.normed)?, self.dev.dtoh_sync_copy(&side)?);

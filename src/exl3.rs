@@ -203,7 +203,7 @@ pub struct HdrEntry {
 
 /// Header-only safetensors parse: 8-byte LE length prefix + JSON header. NO tensor
 /// bytes are touched — a census must not page 12 GB shards through memory.
-fn shard_header(path: &str) -> anyhow::Result<BTreeMap<String, HdrEntry>> {
+pub(crate) fn shard_header(path: &str) -> anyhow::Result<BTreeMap<String, HdrEntry>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).with_context(|| format!("open shard {path}"))?;
     let mut len8 = [0u8; 8];

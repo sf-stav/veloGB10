@@ -45,6 +45,36 @@ pub struct WireRequest {
     /// `into_request` keeps 0.0 — that sampler has none). Older peers: absent = 0.
     #[serde(default)]
     pub min_p: f32,
+    /// VIS-4: the request's image spans (empty = text). Their rows follow the Step frame on the
+    /// control stream as raw little-endian fp16 [sum(num_tokens)][hidden] (`image_bytes` bytes, FNV-1a
+    /// 64 `image_digest`) — the binary channel; the JSON frame never carries the rows.
+    #[serde(default)]
+    pub image_spans: Vec<crate::vision_encoder::ImageSpan>,
+    #[serde(default)]
+    pub image_bytes: u64,
+    #[serde(default)]
+    pub image_digest: u64,
+}
+
+/// VIS-4: the image rows of a request as the TP wire carries them (fp16 = the precision the splice
+/// uses on every rank), and their FNV-1a 64 digest.
+pub fn image_rows_wire(embeds: &[f32]) -> (Vec<u8>, u64) {
+    let mut out = Vec::with_capacity(embeds.len() * 2);
+    for v in embeds {
+        out.extend_from_slice(&half::f16::from_f32(*v).to_bits().to_le_bytes());
+    }
+    let d = fnv64(&out);
+    (out, d)
+}
+
+/// VIS-4: FNV-1a 64 of a byte payload.
+pub fn fnv64(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &x in b {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// One scheduler-visible event within a step. Ordering inside a step: all Admits (in admit order),
@@ -112,6 +142,9 @@ impl From<&BatchRequest> for WireRequest {
             min_new: r.min_new,
             ignore_eos: r.ignore_eos,
             min_p: r.min_p,
+            image_spans: r.image_spans.clone(),
+            image_bytes: 0,   // set by the head when it ships the rows (exl3_serve)
+            image_digest: 0,
         }
     }
 }
@@ -138,8 +171,8 @@ impl WireRequest {
             min_new: self.min_new,
             ignore_eos: self.ignore_eos,
             received_at: std::time::Instant::now(),
-            image_embeds: None,
-            image_spans: Vec::new(),
+            image_embeds: None,              // VIS-4: the node fills it from the binary payload
+            image_spans: self.image_spans,
             // W2: the schema FSM lives on the HEAD (that is where the sampler runs); the node's
             // mirror lane is unconstrained by construction.
             schema: None,

@@ -2,7 +2,7 @@
 //! the q8 host reference. A child module of `exl3_forward` (declared there with `#[path]`) so the
 //! teacher-forced verify step can reach the private verify/prefill internals without widening them.
 //!
-//! * `q8_quant_row` / `q8_dequant_row` / `h32r`: the rival's "-cq 8" cache format (exllamav3
+//! * `q8_quant_row` / `q8_dequant_row` / `h32r`: the reference implementation's "-cq 8" cache format (exllamav3
 //!   `cache/q_cache_kernels.cuh` quant_block_x4 + `triton_paged._qc_load_kt/_qc_load_v`, fork
 //!   523ecd3) with the kernels' exact op order — the device bytes are reproducible bit-for-bit.
 //! * `--probe-exl3-kvq`: every KV format through the SERVED device helpers (xq_kv_put / xq_kv_ld /
@@ -22,7 +22,7 @@ use std::io::{BufReader, BufWriter, Read};
 // q8 host reference (bit-exact twin of kernels/exl3_bench.cu xq_kv_put_q8 / xq_kv_ld / xq_h32r)
 // ---------------------------------------------------------------------------------------------
 
-/// 1/sqrt(32) as the rival writes it (`r32`).
+/// 1/sqrt(32) as the reference implementation writes it (`r32`).
 pub(crate) const R32: f32 = 0.176_776_695_296_636_881_10_f32;
 
 /// Unnormalized H32 butterfly on each 32-group, strides 1,2,4,8,16 — low index a+b, high a-b.

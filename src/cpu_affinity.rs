@@ -4,8 +4,8 @@
 //! GB10's CPU is 10 Cortex-X925 (3.9 GHz, `cpu_capacity` 997-1024) + 10 Cortex-A725 (2.8 GHz,
 //! capacity 718-731), in two clusters (CPUs 5-9 and 15-19 are the X925s on every box measured).
 //! Left to EAS, a thread can land on an A725: the per-pass DDS readback / PLE row work then runs
-//! ~1.5-1.9x slower (PLE 0.35 -> 0.66 ms per 6 rows) and the tokio HTTP thread likewise. The rival
-//! runs its whole process under `taskset -c 5-9,15-19` (r8c start_handoff_endpoint.sh:80,
+//! ~1.5-1.9x slower (PLE 0.35 -> 0.66 ms per 6 rows) and the tokio HTTP thread likewise. The reference
+//! implementation runs its whole process under `taskset -c 5-9,15-19` (r8c start_handoff_endpoint.sh:80,
 //! exl3_native_server.py:86). We pin only the threads that sit on the request / decode critical
 //! path (the EXL3 scheduler thread and the HTTP runtime thread) to the SET of big cores — a set,
 //! not one core, exactly like taskset — after the model load, so the load's own threads keep

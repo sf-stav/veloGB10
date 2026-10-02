@@ -1543,7 +1543,7 @@ fn cli_inner(args: &[String]) -> Result<bool> {
         match arg(args, k) { None => Ok(d), Some(v) => v.parse().map_err(|_| anyhow::anyhow!("{k} must be an integer")) }
     };
     let max_pos = num("--max-seq-len", 8192)?;
-    let chunk = num("--prefill-chunk", 2048)?.max(1);
+    let chunk = num("--prefill-chunk", crate::exl3_serve::DEFAULT_PREFILL_CHUNK)?.max(1);
     let max_new = num("--max-new-tokens", 384)?.max(8);
     let li_steps = num("--autotune-li-steps", 64)?;
     let out_dir = arg(args, "--autotune-out").unwrap_or("tune/receipts").to_string();
@@ -3131,7 +3131,7 @@ fn tune_cli(args: &[String]) -> Result<bool> {
     let max_seq_len = num("--max-seq-len", 4096)?;
     let lanes = num("--max-batch", 8)?.max(1);
     let max_pos = max_seq_len + crate::batch::decode_headroom(false);
-    let chunk = num("--prefill-chunk", 2048)?.max(1);
+    let chunk = num("--prefill-chunk", crate::exl3_serve::DEFAULT_PREFILL_CHUNK)?.max(1);
     let draft_conf: f64 = match arg(args, "--draft-confidence") {
         None => 0.4,
         Some(v) => v.parse().map_err(|_| anyhow::anyhow!("--draft-confidence must be a number"))?,

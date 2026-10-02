@@ -45,12 +45,12 @@ inference binary, the required PTX kernels, SHA-256 checksums, and build provena
 run an NVIDIA DGX Spark or a compatible OEM GB10 machine, you can use a release binary without
 compiling anything.
 
-## Update — Qwen3.8-Flash-Next support (veloGB10 v0.7.0)
+## Update — Qwen3.8-Flash-Next support (veloGB10 v0.7.1)
 
 **veloGB10 now serves EXL3 (ExLlamaV3 trellis) packs directly, and the model on that path is
 [Qwen3.8-Flash-Next](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw) — a 125B
-mixture-of-experts model with ~6B active parameters, running on one GB10 (TP=1) or two (TP=2) at the
-full 262,144-token context.**
+mixture-of-experts model with ~6B active parameters, running on one, two or four GB10s
+(TP=1/2/4) at the full 262,144-token context, and it now takes **image input**.**
 
 > **HUGE thanks to [@vcruz305](https://github.com/vcruz305)** for his EXL3 implementation — and for
 > introducing us to EXL3 in the first place. Full attribution in
@@ -70,32 +70,40 @@ full 262,144-token context.**
 
 ### Performance
 
-Measured 2026-09-30 with **VeloBenchmark 0.1.0** against the served model, one request at a time,
-reasoning effort low. Decode includes MTP speculation.
+Measured with **VeloBenchmark 0.1.0** against the served model, one request at a time, reasoning
+effort low. Decode includes MTP speculation. TP=1 and TP=2 are 2026-09-30 runs; **TP=4 is a
+2026-10-02 run on the v0.7.1 build.**
 
 **Pure-code decode** — ANSI C sorting, ~3.2K output tokens:
 
-| | Single (TP=1) | **TP=2** |
-|---|---:|---:|
-| Decode median | 137 tok/s | **186 tok/s** |
-| Decode min / max | 83.1 / 144 | 122 / 199 |
-| Decode p50 / p90 / p99 | 137 / 142 / 144 | 186 / 193 / 195 |
-| Time per output token (TPOT) | 7.5 ms | **5.4 ms** |
-| Draft acceptance / depth | 84% / 5.7 | 85% / 6.0 |
-| Stability (sustain / peak) | 99% | 99% |
+| | TP=1 | TP=2 | **TP=4** |
+|---|---:|---:|---:|
+| Decode median | 137 tok/s | 186 tok/s | **218 tok/s** |
+| Decode min / max | 83.1 / 144 | 122 / 199 | 138 / 231 |
+| Decode p50 / p90 / p99 | 137 / 142 / 144 | 186 / 193 / 195 | 218 / 228 / 231 |
+| Time per output token (TPOT) | 7.5 ms | **5.4 ms** | — |
+| Draft acceptance / depth | 84% / 5.7 | 85% / 6.0 | — |
+| Stability (sustain / peak) | 99% | 99% | — |
 
 **Prefill** — one measurement per input size:
 
-| Input tokens | TP=1 tok/s | TP=1 TTFT | **TP=2 tok/s** | **TP=2 TTFT** |
-|---|---:|---:|---:|---:|
-| ~550 | 1,323 | 0.42 s | 2,001 | 0.28 s |
-| ~2.1K | 1,470 | 1.42 s | 2,319 | 0.90 s |
-| ~6.2K | 1,517 | 4.08 s | 2,441 | 2.53 s |
-| ~10.3K | 1,541 | 6.67 s | **2,452** | 4.19 s |
-| ~18.5K | 1,541 | 12.0 s | 2,451 | 7.54 s |
-| ~34.9K | 1,525 | 22.9 s | 2,432 | 14.3 s |
+| Input tokens | TP=1 tok/s | TP=2 tok/s | **TP=4 tok/s** |
+|---|---:|---:|---:|
+| ~550 | 1,323 | 2,001 | 2,285 |
+| ~2.1K | 1,470 | 2,319 | **3,250** |
+| ~6.2K | 1,517 | 2,441 | 3,227 |
+| ~10.3K | 1,541 | 2,452 | 3,226 |
+| ~18.5K | 1,541 | 2,451 | 3,246 |
+| ~34.9K | 1,525 | 2,432 | 3,197 |
 
-On these runs TP=2 buys **×1.36** on decode and **×1.5–1.6** on prefill over a single GB10.
+| Time to first token | ~550 | ~2.1K | ~6.2K | ~10.3K | ~18.5K | ~34.9K |
+|---|---:|---:|---:|---:|---:|---:|
+| TP=1 | 0.42 s | 1.42 s | 4.08 s | 6.67 s | 12.0 s | 22.9 s |
+| TP=2 | 0.28 s | 0.90 s | 2.53 s | 4.19 s | 7.54 s | 14.3 s |
+| **TP=4** | 0.24 s | 0.64 s | 1.92 s | 3.19 s | 5.69 s | 10.90 s |
+
+Against a single GB10: TP=2 buys **×1.36** on decode and **×1.5–1.6** on prefill; TP=4 buys **×1.6**
+on decode and **×2.0–2.2** on prefill.
 
 > The decode figures are the VeloBenchmark code session (one ~3.2K-token ANSI C generation, 85%
 > draft acceptance); the prefill figures are its context sweep, one measurement per input size. The
@@ -105,14 +113,24 @@ On these runs TP=2 buys **×1.36** on decode and **×1.5–1.6** on prefill over
 Full setup (pack layout, node command, launch lines, expected output):
 **[QWEN_38_FLASH_NEXT_SETUP.md](QWEN_38_FLASH_NEXT_SETUP.md)**.
 
-### Also in v0.7.0
+### Also in v0.7.1
 
-- **TP=2 ships as a served mode** — sequence-parallel prefill, a vocab-parallel LM head and prefill
-  communication overlap — for NVFP4 as well as the EXL3 path.
-- **Breaking: the engine no longer reads environment variables.** Every option is a command-line
-  flag; leaving a `GB10_*` variable set refuses startup and names the replacement flag. Migration
-  table: **[docs/ENV_TO_FLAGS.md](docs/ENV_TO_FLAGS.md)**. Release notes:
-  **[CHANGELOG.md](CHANGELOG.md)**.
+- **TP=4 is supported on the EXL3 path** — three peer nodes plus the head. Measured on pure code:
+  **~218 tok/s decode** and **3.2K tok/s prefill**, which is ×1.6 decode and ×2.0–2.2 prefill over a
+  single GB10.
+- **Image input on every topology** (TP=1/2/4): the pack's original bf16 vision tower, images
+  resized so the longer side is at most `--image-max-edge` (default 1024), and images work past the
+  2,051-token dense window. **Video is not supported yet** — video and audio parts return `400`.
+- **Automatic shard shipping.** A multi-node run no longer needs the model hand-copied to the peers:
+  the head plans each rank's shard and ships only that through the blob cache (~57.5 GiB per node at
+  TP=2, ~46.8 GiB at TP=4). This is the same automatic path the NVFP4 models use.
+- **New defaults:** `--prefill-chunk 4095` (wider prefill chunks; `--prefill-chunk 2048` restores the
+  old grid) and `--qsa-key-rope full` (the indexer's pooled keys carry their full rotary dimensions).
+  Both change long-context output bytes versus v0.7.0.
+
+Still in force from v0.7.0: the engine reads **no environment variables** — every option is a
+command-line flag, and leaving a `GB10_*` variable set refuses startup and names the replacement flag
+(**docs/ENV_TO_FLAGS.md**). Release notes: **[CHANGELOG.md](CHANGELOG.md)**.
 
 ---
 
@@ -445,9 +463,15 @@ everything), then the head:
   --nodes <peer-ip>:29500 --port 9000 --max-seq-len 262144 --max-batch 1   # on the head
 ```
 
+**Four GB10 (TP=4)** — three peers running `./gb10_inference --node --port 29500`, then the head
+with `--tp 4 --nodes <ip1>:29500,<ip2>:29500,<ip3>:29500`. Measured: ~218 tok/s decode and 3.2K
+tok/s prefill on pure code (see the tables at the top).
+
 Run both from the build directory (the binary loads `src/ptx/*.ptx` relative to the working
-directory). The pack must sit at the **same path on both machines** — there is no cross-check of the
-two copies.
+directory). **The head ships each node only its own rank's shard** through the TP blob cache
+(`~/.cache/gb10_tp`) — roughly 57.5 GiB per node at TP=2 and 46.8 GiB at TP=4 — so you do not copy
+the pack to the peer machines. Only missing blobs move, so a second start of the same model syncs
+nothing.
 
 **Supported on this path:** the OpenAI-compatible API with streaming; built-in **MTP speculative
 decoding** (auto depth — greedy output is bitwise identical to non-speculative decoding, sampled
@@ -459,15 +483,14 @@ detection; and TP=2 speed features that are on by default with an `off` value ea
 **Limits on this path:**
 
 - **262,144 tokens maximum.** YaRN is not implemented, so there is no 1M context.
-- **Text only — no vision.** Image requests are rejected. (Vision is available on the NVFP4 /
-  Qwen3.8 27B path.)
-- **TP=1 and TP=2 only.** Any other world size exits with `--tp 2 only`.
-- `--max-batch 1` is what was tested at TP=2. A second lane works and is hash-exact per lane, but
-  lanes take turns, so there is no aggregate throughput gain yet.
+- **Images yes, video not yet.** Image parts are served at every topology (TP=1/2/4); **video and
+  audio parts return `400`** until video support lands.
+- `--max-batch 1` is what was tested. A second lane works and is hash-exact per lane, but lanes take
+  turns, so there is no aggregate throughput gain yet.
 - Seeded sampled requests are not byte-reproducible across runs.
 - A prefix-cache resume can word an answer differently from a cold prompt by design; pass
   `--prefix-tail-ckpt 0` for bit-identical resumes.
-- If the TP=2 link fails mid-serve the server stops; there is no auto-restart.
+- If a TP link fails mid-serve the server stops; there is no auto-restart.
 - The first request of each kind after boot is slower (CUDA graph capture), and a cold first boot is
   slower while ~85 GB is read from disk.
 

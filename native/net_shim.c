@@ -129,7 +129,10 @@ typedef struct NetCtx {
     int      world;           // TP rank count (2 = legacy single-QP path)
     int      rounds;          // log2(world)
     int      oneshot;         // P3-1: 1 = one-shot all-peers push at world==4 (GB10_TP_ONESHOT)
-    PeerLink* peers;          // array indexed by PEER RANK, size world (slot [rank] is unused/valid=0)
+    int      oneshot_uniform; // TP-4F2: 1 = EVERY epoch of this ctx is a one-shot all-peers push (a dedicated
+                              // single-stage reduce ctx; world==4 only). Set only by net_set_oneshot_uniform_once.
+    struct NetCtx* parent;    // TP-4F2: the primary link; this ctx's abort is mirrored into it (and vice versa)
+    PeerLink* peers;         // array indexed by PEER RANK, size world (slot [rank] is unused/valid=0)
     uint64_t nway_flags_off;  // byte offset of the per-peer flag region inside hbuf (0 at world==2)
     uint64_t nway_flags_d;    // device ptr to the per-peer flag region (0 at world==2)
     uint64_t nway_recv_off;   // byte offset of the per-round recv rings (0 at world==2); rounds*R slots
@@ -228,6 +231,12 @@ static int g_opt_tp_diag = 0;                  /* --tp-diag */
 void net_set_opts(unsigned long long spin_us, int tail_drill, int oneshot, int tp_diag) {
     g_opt_spin_us = spin_us; g_opt_tail_drill = tail_drill; g_opt_oneshot = oneshot; g_opt_tp_diag = tp_diag;
 }
+/* TP-4F2 (--tp-reduce single): the NEXT net_init_nway (world == 4) builds a uniform one-shot ctx — every
+ * epoch is the all-peers push into the sender-indexed block, the proxy releases all three peers together,
+ * the K1 reuse gate waits on all three QPs. One-shot by design: consumed (and cleared) by that init, so no
+ * other ctx — rail 1, rail 2 — is ever affected. The legacy --tp-oneshot global is untouched. */
+static int g_oneshot_uniform_once = 0;
+void net_set_oneshot_uniform_once(int on) { g_oneshot_uniform_once = on; }
 static inline uint64_t tp_spin_budget_ns(void) {
     uint64_t v = __atomic_load_n(&g_tp_spin_ns, __ATOMIC_RELAXED);
     if (__builtin_expect(v == 0, 0)) {
@@ -386,6 +395,9 @@ static int nway_pair_port(int tcp_port, int world, int a, int b) {
     return tcp_port + 2 + lo * world + hi;
 }
 
+// TP-4D (C8): how long a world > 2 pair listener waits for the higher rank to dial (ms).
+#define NWAY_ACCEPT_TIMEOUT_MS 600000
+
 static int nway_tcp_exchange(int my_rank, int peer_rank, const char* peer_ip, int port,
                              NwayExch* lo, NwayExch* re, char* peer_out, size_t peer_out_len) {
     int listener = (my_rank < peer_rank);
@@ -398,6 +410,23 @@ static int nway_tcp_exchange(int my_rank, int peer_rank, const char* peer_ip, in
         if (bind(ls,(struct sockaddr*)&a,sizeof(a))<0){ LOGE("nway bind: %s",strerror(errno)); return -1; }
         if (listen(ls,1)<0){ LOGE("nway listen"); return -1; }
         struct sockaddr_in pa; socklen_t plen = sizeof(pa); memset(&pa,0,sizeof(pa));
+        // TP-4D (audit C8, world > 2 ONLY — the world==2 tcp_exchange above keeps its bare accept): the listener
+        // waits for the higher rank's dial at most NWAY_ACCEPT_TIMEOUT_MS. The head accepts its world-1 pairs
+        // SEQUENTIALLY and a node dials only after its own pack check, so this bounds the skew of FOUR boots; a
+        // peer that never dials (silent hang, wrong host) becomes a named error instead of an unbounded accept().
+        // A peer that REPORTS its failure is handled earlier and faster by the head's node watch (cluster.rs).
+        {
+            struct pollfd pfd; memset(&pfd, 0, sizeof(pfd)); pfd.fd = ls; pfd.events = POLLIN;
+            int pr;
+            do { pr = poll(&pfd, 1, NWAY_ACCEPT_TIMEOUT_MS); } while (pr < 0 && errno == EINTR);
+            if (pr <= 0) {
+                LOGE("nway accept: rank %d never dialled rank %d on port %d within %d s (%s) — the peer did not "
+                     "reach its link bring-up; check its log", peer_rank, my_rank, port, NWAY_ACCEPT_TIMEOUT_MS / 1000,
+                     pr == 0 ? "timeout" : strerror(errno));
+                close(ls);
+                return -1;
+            }
+        }
         sock = accept(ls, (struct sockaddr*)&pa, &plen); close(ls);
         if (sock<0){ LOGE("nway accept"); return -1; }
         if (peer_out) inet_ntop(AF_INET, &pa.sin_addr, peer_out, peer_out_len);
@@ -558,6 +587,12 @@ static inline char* nway_recv_slot_ptr(NetCtx* c, uint64_t e) {
 static inline uint64_t nway_peer_recv_raddr(NetCtx* c, int peer_rank, uint64_t e) {
     return c->peers[peer_rank].remote_addr + nway_recv_slot_off(c, e);
 }
+// TP-4F2: the SENDER-indexed one-shot block's slot for sender p, epoch e (what post_range_oneshot writes:
+// oneshot_recv_off + (sender*R + e%R)*stride). Only the oneshot_uniform ctx's RECV branch reads it on the CPU.
+static inline char* oneshot_recv_slot_ptr(NetCtx* c, int p, uint64_t e) {
+    return (char*)c->hbuf + c->oneshot_recv_off
+         + ((uint64_t)p * (uint64_t)TP_RING_SLOTS + (e & (TP_RING_SLOTS - 1))) * c->slot_stride;
+}
 
 // ---- R9 DIAGNOSTIC helpers (world>2, tp_diag only) ----
 #define TP_DIAG_RING_EPOCHS 65536ull   // power of two; mismatch aborts long before a wrap matters
@@ -699,6 +734,7 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
 static void net_proxy_loop_world2(NetCtx* c, int core);
 static void net_proxy_loop_nway(NetCtx* c, int core);
 static int nway_recv_slot(NetCtx* c, uint64_t e, int p);
+static int nway_recv_slot_at(NetCtx* c, uint64_t e, int p, char* slot);
 static int peer_alive_at(NetCtx* c, int peer_rank);
 
 // rank: 0 = listen (head), 1 = connect (node).
@@ -860,8 +896,12 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
     // at world==4, so the region grows 2 slots — same allocation class). The option is the ONLY
     // selector; every rank resolves the same value at init (the head's option rides TpConfig to the
     // node before the link comes up; a mismatch aborts at the first barrier, loud by construction).
-    c->oneshot = (world == 4 && g_opt_oneshot) ? 1u : 0u;
-    if (c->oneshot) LOGE("P3-1 ONE-SHOT PUSH ACTIVE (world=%d): sender-indexed recv rings, "
+    c->oneshot_uniform = (world == 4 && g_oneshot_uniform_once) ? 1 : 0;   // TP-4F2: a dedicated uniform ctx
+    g_oneshot_uniform_once = 0;                                              // consumed: never leaks to the next init
+    c->oneshot = (world == 4 && (g_opt_oneshot || c->oneshot_uniform)) ? 1u : 0u;
+    if (c->oneshot_uniform) LOGE("TP-4F2 SINGLE-STAGE REDUCE CTX (world=%d): uniform one-shot all-peers push, "
+                                 "sender-indexed recv rings, proxy releases all peers together", world);
+    else if (c->oneshot) LOGE("P3-1 ONE-SHOT PUSH ACTIVE (world=%d): sender-indexed recv rings, "
                          "all-peers post, tp_wait_add_4way", world);
     c->tail_drill = g_opt_tail_drill != 0;
     if (c->tail_drill) LOGE("TAIL DRILL ON: inverting commit/payload order every 4096th epoch");
@@ -1086,6 +1126,10 @@ unsigned long long net_gpu_ready(NetCtx* c)    { return *flagp(c, TP_F_GPU_READY
 unsigned long long net_tail_fires(NetCtx* c)   { return c->tail_fires; }
 unsigned long long net_gpu_rx_skips(NetCtx* c) { return c->gpu_rx_skips; }   // TP-G
 unsigned long long net_abort_status(NetCtx* c) { return *flagp(c, TP_F_ABORT); }
+/* TP-4F2: tie the single-stage reduce ctx's abort to the primary link's, both ways, inside its proxy loop (a
+ * graph replay never returns to the host between reduces, so a host-side per-launch check cannot be the only
+ * surfacing path). NULL = no parent (every other ctx). Set once, before the proxy starts. */
+void net_set_parent(NetCtx* c, NetCtx* parent) { c->parent = parent; }
 
 // Pin the CALLING thread to `core` (GB10 is big.LITTLE; a launch or poll thread parked on a little
 // A725 balloons latency and drains the GPU stream mid-token). Returns 0 if the affinity read back.
@@ -1798,6 +1842,13 @@ static void net_proxy_loop_nway(NetCtx* c, int core) {
     while (!c->aborted && !__atomic_load_n(flagp(c, TP_F_ABORT), __ATOMIC_ACQUIRE)) {
         int did_work = 0;
 
+        // TP-4F2: a ctx with a parent (the single-stage reduce ctx) follows the primary link's abort — one
+        // plain load per iteration; every other ctx has parent == NULL and skips this entirely.
+        if (c->parent) {
+            uint64_t pv = __atomic_load_n(flagp(c->parent, TP_F_ABORT), __ATOMIC_ACQUIRE);
+            if (pv || c->parent->aborted) { tp_set_abort(c, (pv ? pv : 1ull) | (1ull << 61)); break; }
+        }
+
         uint64_t rx_done = c->recv_gpu ? *flagp(c, TP_F_RX_DONE) : 0;
         // R10: exclusive-ize rx_done in v2 (see net_proxy_loop_world2) — the raw inclusive counter
         // leaves a phantom one-epoch debt at every quiescent point and aborts a healthy link.
@@ -1833,8 +1884,8 @@ static void net_proxy_loop_nway(NetCtx* c, int core) {
                 // regions are disjoint, so mixed algorithms cannot collide.
                 volatile uint64_t* ll = (volatile uint64_t*)((char*)c->hbuf + TP_LEN_LOCAL_OFF);
                 uint64_t wl = TP_LEN_TAG_BYTES(ll[e & (TP_LEN_EPOCHS - 1)]);
-                int os = net_use_oneshot(c, wl);
-                if (c->oneshot && e <= 8)   // P3-1 DIAG: the wedge lives at the mixed-width boundary
+                int os = c->oneshot_uniform ? 1 : net_use_oneshot(c, wl);   // TP-4F2: uniform ctx = always one-shot
+                if (c->oneshot && !c->oneshot_uniform && e <= 8)   // P3-1 DIAG: the wedge lives at the mixed-width boundary
                     LOGE("[os-dispatch] epoch=%llu wire=%llu payload_bytes=%u -> %s",
                          (unsigned long long)e, (unsigned long long)wl, c->payload_bytes,
                          os ? "ONESHOT" : "tree");
@@ -1886,6 +1937,42 @@ static void net_proxy_loop_nway(NetCtx* c, int core) {
             if (peer_ab) { tp_set_abort(c, peer_ab | (1ull << 62)); break; }
         }
 
+        // -- RECV, TP-4F2 uniform one-shot ctx: epoch e is owed by ALL world-1 peers (all-peers push into the
+        //    sender-indexed block). The CPU bounce is the tree's, per peer: the peer's commit hint, the len
+        //    tag, the slot's generation-tagged tail (R9) — each peer's slot is validated at its own
+        //    sender-indexed address — then ONE fence and a RELEASE-store of cpu_done[p] = e for every peer
+        //    (I5). Epochs release strictly in order; nothing of the round-keyed rings is read.
+        if (c->oneshot_uniform) {
+            uint64_t e = next_release;
+            uint64_t advanced = 0;
+            while (!c->aborted && !*flagp(c, TP_F_ABORT)) {
+                int all = 1;
+                for (int p = 0; p < c->world; p++) {
+                    if (p == c->rank) continue;
+                    if (*peer_committed_flagp(c, p) < e) { all = 0; break; }
+                }
+                if (!all) break;
+                int ok = 1;
+                for (int p = 0; p < c->world; p++) {
+                    if (p == c->rank) continue;
+                    if (!nway_recv_slot_at(c, e, p, oneshot_recv_slot_ptr(c, p, e))) { ok = 0; break; }
+                }
+                if (!ok) break;
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                for (int p = 0; p < c->world; p++) {
+                    if (p == c->rank) continue;
+                    __atomic_store_n(cpu_done_flagp(c, p), e, __ATOMIC_RELEASE);
+                }
+                advanced = e;
+                e++;
+            }
+            if (advanced) {
+                c->released_epochs = advanced;
+                if (c->ts_on) stamp(c, advanced, TP_CTS_RELEASED, now_ns());
+                next_release = advanced + 1;
+                did_work = 1;
+            }
+        } else
         // -- RECV: CPU bounce, per-peer. Advance the global watermark while each epoch's partner slot
         //    releases independently (the round schedule is serial, so `next_release` advances in order).
         if (!c->recv_gpu) {
@@ -1947,6 +2034,11 @@ recv_out:
     // Best-effort unsigned inline WRs; peers poll these slots in the loop above.
     {
         uint64_t ab = *flagp(c, TP_F_ABORT);
+        // TP-4F2: this ctx's abort (a kernel's device status, a guard, the watchdog) must reach the primary
+        // link too — its agree / step checks are the ones the host reads. Never overwrite an abort code the
+        // parent already carries.
+        if (ab && c->parent && !c->parent->aborted && !*flagp(c->parent, TP_F_ABORT))
+            tp_set_abort(c->parent, ab | (1ull << 60));
         if (ab) {
             for (int p = 0; p < c->world; p++) {
                 if (p == c->rank) continue;
@@ -1966,6 +2058,11 @@ recv_out:
 // Wait (bounded) for the length tag + slot tail of epoch e from peer p, then report placement OK.
 // Mirrors the world==2 RECV tail-epoch guard on a per-QP basis. Returns 1 when the slot is ready.
 static int nway_recv_slot(NetCtx* c, uint64_t e, int p) {
+    return nway_recv_slot_at(c, e, p, nway_recv_slot_ptr(c, e));
+}
+// `slot` = the receive slot's base: the round ring's (tree path) or the sender-indexed one-shot block's
+// (TP-4F2 uniform ctx). Everything else is the tree path's guard, unchanged.
+static int nway_recv_slot_at(NetCtx* c, uint64_t e, int p, char* slot) {
     volatile uint64_t* len_peer = (volatile uint64_t*)((char*)c->hbuf + TP_LEN_PEER_OFF);
     volatile uint64_t* lp = len_peer + (e & (TP_LEN_EPOCHS - 1));
     uint64_t tag = *lp;
@@ -1995,10 +2092,10 @@ static int nway_recv_slot(NetCtx* c, uint64_t e, int p) {
         tp_set_abort(c, 2);
         return 0;
     }
-    volatile uint64_t* tailp = (volatile uint64_t*)(nway_recv_slot_ptr(c, e) + len);
+    volatile uint64_t* tailp = (volatile uint64_t*)(slot + len);
     if (*tailp == e) {
         // R9 DIAGNOSTIC: checksum the EXACT bytes this rank's GPU is about to consume for epoch e.
-        tp_diag_log_recv(c, e, p, nway_recv_slot_ptr(c, e), len);
+        tp_diag_log_recv(c, e, p, slot, len);
         return 1;
     }
     uint64_t t0 = now_ns();
@@ -2018,7 +2115,7 @@ static int nway_recv_slot(NetCtx* c, uint64_t e, int p) {
         tp_host_backoff(dt);
     }
     // R9 DIAGNOSTIC: same, on the recovered path (tail landed after the commit).
-    tp_diag_log_recv(c, e, p, nway_recv_slot_ptr(c, e), len);
+    tp_diag_log_recv(c, e, p, slot, len);
     return 1;
 }
 
@@ -2216,7 +2313,14 @@ uint64_t net_agree(NetCtx* c, uint64_t val, uint64_t step_mask, uint64_t step_va
 //     `(g << 8) | peer_rank` in ITS control slot for sender rank `peer_rank` — the rank bits make the
 //     proof unambiguous even though all ranks share the MR.
 // world==2 is never routed here (the pairwise net_exchange/net_agree stay untouched).
-int net_exchange_one(NetCtx* c, int peer_rank, int nbytes) {
+//
+// TP-4D (audit C5): `deadline_ns` (0 = none, the pre-TP-4D behaviour of every caller) bounds EACH of the two waits
+// (send CQE, peer tail tag) from the moment that wait began. The dead-peer probe only proves the peer PROCESS is up
+// (its liveness port answers), so a peer that is alive but never reaches this lockstep point — GPU hung in a kernel,
+// host thread stuck — held the other ranks forever: the proxy watchdog (code 6) only fires with hot-path epochs
+// outstanding, and between lockstep points there are none. On expiry: abort code 12, return -4. Routed only at
+// world > 2 (world == 2 never reaches this function), so the pairwise wire path is untouched.
+static int exchange_one_impl(NetCtx* c, int peer_rank, int nbytes, uint64_t deadline_ns) {
     if (c->world == 2) { LOGE("net_exchange_one: world==2 must use net_exchange"); return -1; }
     if (peer_rank < 0 || peer_rank >= c->world || peer_rank == c->rank) {
         LOGE("net_exchange_one: bad peer_rank %d (world %d)", peer_rank, c->world);
@@ -2270,6 +2374,12 @@ int net_exchange_one(NetCtx* c, int peer_rank, int nbytes) {
             return -2;
         }
         uint64_t s_dt = now_ns() - s_t0;
+        if (deadline_ns && s_dt >= deadline_ns) {
+            LOGE("exchange_one: lockstep deadline (send CQE to peer %d) expired after %llums — peer alive but not progressing; aborting (code 12)",
+                 peer_rank, (unsigned long long)(s_dt / 1000000ull));
+            tp_set_abort(c, 12);
+            return -4;
+        }
         if (s_dt >= TP_LIVE_PROBE_NS && now_ns() - s_last_probe >= TP_LIVE_PROBE_NS) {
             s_last_probe = now_ns();
             if (!peer_alive_at(c, peer_rank)) {
@@ -2293,6 +2403,12 @@ int net_exchange_one(NetCtx* c, int peer_rank, int nbytes) {
         if (*tailp == expect) break;
         if (c->aborted || *flagp(c, TP_F_ABORT)) return -2;
         uint64_t dt = now_ns() - t0;
+        if (deadline_ns && dt >= deadline_ns) {
+            LOGE("exchange_one: lockstep deadline (frame from peer %d) expired after %llums — peer alive but not progressing; aborting (code 12)",
+                 peer_rank, (unsigned long long)(dt / 1000000ull));
+            tp_set_abort(c, 12);
+            return -4;
+        }
         if (dt >= TP_LIVE_PROBE_NS && now_ns() - last_probe >= TP_LIVE_PROBE_NS) {
             last_probe = now_ns();
             if (!peer_alive_at(c, peer_rank)) {
@@ -2308,7 +2424,24 @@ int net_exchange_one(NetCtx* c, int peer_rank, int nbytes) {
     // R10: copy the validated payload to the stable per-sender slot — net_ctrl_recv_hptr readers
     // have no generation bookkeeping, and the ring slot may be overwritten by a later exchange.
     memcpy(ctrl_last_slot(c, peer_rank), (const void*)ctrl_recv_slot(c, peer_rank, g), (size_t)nbytes);
+    // TP-4D: retire the consumed frame. The ring slot is next written at generation g + TP_CTRL_RING, never before
+    // we get here (a pair runs at most one agree ahead: the peer cannot complete its exchange g+3 without OUR frame
+    // g+3, which we post only after this function returned), and the tag wait above compares ONE u64 at
+    // `nbytes - 8`. Frames of different wire sizes share these slots (the world > 2 lockstep ops carry several
+    // sizes), so a payload word pair an older, LARGER frame left at that offset — a device epoch, a digest, a
+    // counter — could equal a future expected tag `(g << 8) | rank` and make the wait return on stale data before
+    // the peer posted. Zeroing every byte the consumed frame wrote leaves the slot "all zero" until the next post,
+    // so a stale interior word can never be mistaken for a tag. (The slot escapes to the NIC, so the memset is not a
+    // dead store; the fence orders it before our next post.)
+    memset((void*)ctrl_recv_slot(c, peer_rank, g), 0, (size_t)nbytes);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     return 0;
+}
+
+int net_exchange_one(NetCtx* c, int peer_rank, int nbytes) { return exchange_one_impl(c, peer_rank, nbytes, 0); }
+// TP-4D: the lockstep-deadline variant (see exchange_one_impl). deadline_ns == 0 is exactly net_exchange_one.
+int net_exchange_one_dl(NetCtx* c, int peer_rank, int nbytes, uint64_t deadline_ns) {
+    return exchange_one_impl(c, peer_rank, nbytes, deadline_ns);
 }
 
 void net_abort(NetCtx* c){ if (c) tp_set_abort(c, 1); }

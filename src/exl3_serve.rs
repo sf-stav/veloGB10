@@ -36,7 +36,7 @@ struct Lane {
     min_p: f32,
     // WP15: this request's penalties (None = unpenalized: no penalty kernel runs for it).
     pen: Option<crate::exl3_forward::PenParams>,
-    // WP08: the rival's streaming loop detector (None = --loop-detect off) + log context.
+    // WP08: the reference implementation's streaming loop detector (None = --loop-detect off) + log context.
     loop_det: Option<crate::loop_detect::LoopDetector>,
     prompt_hash: u64,
     history: Vec<u32>,
@@ -57,7 +57,7 @@ struct Lane {
     ema_tok: f64,
     mtp_rounds: usize,
     wp23: Wp23Lane, // WP23: DDS cost-guard fit + per-width round counts (the [dds] line)
-    // per-request round anatomy, logged at finish ([mtp-stats]): comparable to the rival's
+    // per-request round anatomy, logged at finish ([mtp-stats]): comparable to the reference implementation's
     // draft_accepted/draft_rejected counters (tokens = accepted + rounds).
     st_rounds: usize,
     st_drafted: usize,
@@ -98,9 +98,9 @@ struct Exl3Scheduler {
     // off, --wp16-off=1, or a --prefix-ckpt-mem-gb cap that holds none) + the XCHECK diagnostic.
     wp16: Option<crate::exl3_forward::CkptStore<crate::exl3_forward::RecurCkpt>>,
     wp16_xcheck: bool,
-    // WP08: stop_on_loop (window, min_reps) — the rival's (300, 3) unless --loop-detect off.
+    // WP08: stop_on_loop (window, min_reps) — the reference implementation's (300, 3) unless --loop-detect off.
     loop_cfg: Option<(usize, usize)>,
-    // WP15: penalty window (sustain = decay = this; the rival's penalty_range 1024).
+    // WP15: penalty window (sustain = decay = this; the reference implementation's penalty_range 1024).
     pen_range: usize,
     // WP24: --spec-sampling ratio (real-q: sampled drafts, accept min(1, p/q'), exact residual)
     // for sampled lanes; false = match (today). draft_temp = --draft-temperature (None = the
@@ -123,6 +123,12 @@ struct Exl3Scheduler {
     // TP-D: the last admit's resume points (prompt-end reuse, WP16/C1 checkpoint q) — proven
     // identical on every rank by the seam lockstep
     last_resume: (usize, usize),
+    // VIS-2: the text config's interleaved mrope_section (rope_parameters.mrope_section; None = the
+    // model declares no interleaved mrope -> image requests are refused)
+    mrope_section: Option<[usize; 3]>,
+    // VIS-4: the last image admit's (image tokens, rope delta, FNV of the fp16 rows) — proven equal on
+    // every rank by the seam lockstep (None = a text admit)
+    vis_seam: Option<(u32, i32, u64)>,
 }
 
 /// WP24 gate: MTP round anatomy of one arm (non-plain rounds only) + the first-round drafts.
@@ -191,12 +197,22 @@ impl WaitProf {
         // TP-G: transport health (cumulative): tail-guard fires (MUST stay 0) and GPU-proved epochs
         o += &format!(" | xport tail_fires {} gpu_rx_skips {} abort {} reuse-gate binds {}", crate::net::traced_tail_fires(),
                       crate::net::traced_gpu_rx_skips(), crate::net::traced_abort_status(), crate::net::traced_gate_waits());
+        o += &format!(" | k2-prefetch hints armed {} used {}", crate::exl3_forward::xtp::PF_ARMED.load(std::sync::atomic::Ordering::Relaxed),
+                      crate::exl3_forward::xtp::PF_USED.load(std::sync::atomic::Ordering::Relaxed));
         o
     }
 }
 
 pub(crate) struct TpSync {
     pub rank: i32,
+    /// TP-4D: the TP world (2 = the pairwise lockstep of TP-C..TP-I, byte-for-byte; > 2 = the head-hub lockstep
+    /// of `tp_lockstep`, ONE merged hub op per lockstep point).
+    pub world: i32,
+    /// TP-4D (audit C5): per-wait deadline of a world > 2 lockstep hub op, ms (0 = unbounded; always 0 at world 2,
+    /// which keeps the pairwise channel and its own 10 s `net_agree` timeout).
+    pub deadline_ms: u64,
+    /// TP-4D: rounds that reported a device-epoch skew between ranks (diagnostic print throttle)
+    epoch_warns: u64,
     pub wp: WaitProf,
     /// agree_ext step counter (24-bit field on the wire)
     step: u64,
@@ -214,9 +230,10 @@ pub(crate) struct TpSync {
 }
 
 impl TpSync {
-    pub(crate) fn new(rank: i32) -> Self {
-        TpSync { rank, step: 0, ident: false, ident_bufs: 0, ident_bad: 0, agrees: 0, pre_agrees: 0, ctl: Vec::new(),
-                 wp: WaitProf::default() }
+    pub(crate) fn new(rank: i32, world: i32) -> Self {
+        let deadline_ms = if world > 2 { lockstep_deadline_ms() } else { 0 };
+        TpSync { rank, world, deadline_ms, epoch_warns: 0, step: 0, ident: false, ident_bufs: 0, ident_bad: 0, agrees: 0,
+                 pre_agrees: 0, ctl: Vec::new(), wp: WaitProf::default() }
     }
 
     /// TP-D: a boolean the HEAD decides inside a step (a prefill chunk boundary's "client gone"),
@@ -249,8 +266,12 @@ impl TpSync {
     /// exchange (rendezvous) then agree (fence): the exchange reuses hot-path ring slot memory, and a
     /// plain / seam step may run collectives right after it (TP-C fence-B rule). The node adopts the
     /// head's words; the head's own words come back as the node's zeros (ignored).
-    /// `--exl3-tp-fastctl=0` (diagnostic, rides the env snapshot) = the TP-D TCP-every-step path.
+    /// `--exl3-tp-fastctl=0` (diagnostic, rides TpConfig's CLI option-registry snapshot) = the TP-D TCP-every-step path.
     fn step_go(&mut self, step_no: u64, n_events: usize) -> Result<(u64, usize)> {
+        if self.world > 2 {
+            let mut x = crate::net::link_hub(self.deadline_ms)?;
+            return self.step_go_hub(&mut x, step_no, n_events);
+        }
         let tag = 0x60_000000u32 | (step_no as u32 & 0xFF_FFFF);
         let mine: [u32; 3] = if self.rank == 0 { [tag, step_no as u32, n_events as u32] } else { [0, 0, 0] };
         let (t0, s0) = (std::time::Instant::now(), crate::net::wait_sleeps());
@@ -289,6 +310,10 @@ impl TpSync {
     /// first barrier with the wasted pass's; the count is agreed HERE, before the verify launches
     /// (fail-stop, never a mis-paired all-reduce). Free at world 2 with a replicated head too.
     fn pre_verify(&mut self, w: usize, drafts: &[i32], launched: usize) -> Result<()> {
+        if self.world > 2 {
+            let mut x = crate::net::link_hub(self.deadline_ms)?;
+            return self.pre_verify_hub(&mut x, w, drafts, launched);
+        }
         let step = agree_field(self.step + 1, AGREE_PV);
         let h = fnv32(0x5EED, drafts.iter().map(|&d| d as u32));
         let tag = 0x9E00_0000u32 | (step as u32 & 0xFFFF);
@@ -312,6 +337,127 @@ impl TpSync {
         }
         self.pre_agrees += 1;
         Ok(())
+    }
+}
+
+// ------------------------------------------------------------------------------------------------------
+// TP-4D: the world > 2 lockstep — ONE merged head-hub op per lockstep point.
+//
+// World 2 keeps the TP-C..TP-I sequence above (fence A agree, u32 exchange, fence B agree). Those agrees and
+// that exchange are PAIRWISE ops over the HOT-PATH ring memory (the exchange stages in send slot 0 and lands in
+// recv slot gen & 7, the rings the device doorbell epochs use), which is the only reason fence A/B and
+// `drain_sends` exist. At world > 2 every lockstep frame rides `net::hub_all` on the DEDICATED control slots
+// (`net_exchange_one`: its own send staging slot, its own per-sender recv rings of depth TP_CTRL_RING, a stable
+// copy per sender) — no byte of a hub frame shares memory with the hot path, so
+//   * fence B has nothing to protect: after the op the next forward may start at once (its epochs cannot reach
+//     the control slots), and the op's two rounds are already a barrier (a rank leaves round 2 only after the
+//     head has heard from every rank);
+//   * fence A's "both ranks finished the forward" is the op's own arrival condition (the frame is built from
+//     the finished forward's host results);
+//   * `drain_sends` (exl3_forward.rs, gated to world 2) has no aliasing left to drain.
+// The claim is void if a hub frame ever shares memory with the hot path (the model in `net::hub_tests` assumes
+// separate slots). Every rank ends up holding EVERY rank's frame, runs the same pure verdict
+// (`tp_lockstep::*_verdict`) over the same data and therefore reaches the same verdict: all ranks abort together,
+// none is left parked in a later exchange. Transport failure (dead peer, code 10 / deadline, code 12 / link
+// abort) makes `hub_all` fail on the ranks that see it; the dead rank's block reads zero on the rest, which the
+// verdict rejects (tags differ), so every live rank ends in an error (`net::hub_tests` kills / hangs a node).
+
+/// The per-wait deadline of a world > 2 lockstep hub op: `--tp-lockstep-timeout-ms`, default 30 s, 0 = unbounded.
+pub(crate) fn lockstep_deadline_ms() -> u64 {
+    crate::opts::var(crate::opt!("tp-lockstep-timeout-ms")).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(30_000)
+}
+
+impl TpSync {
+    fn hub_fail(&self, what: &str, why: &dyn std::fmt::Display) -> anyhow::Error {
+        // keep an abort code a failed exchange already recorded (10 = peer dead, 12 = lockstep deadline)
+        crate::net::abort_link_keep_code();
+        anyhow::anyhow!("TP lockstep {what} FAILED at rank {} (world {}): {why}", self.rank, self.world)
+    }
+
+    /// world > 2 `step_go`: [tag, counter field, head step, head events] from every rank; the verdict proves all
+    /// ranks are at the same lockstep counter and the nodes adopt the head's (step, events).
+    pub(crate) fn step_go_hub<X: crate::net::HubXport>(&mut self, x: &mut X, step_no: u64, n_events: usize)
+                                                       -> Result<(u64, usize)> {
+        use crate::tp_lockstep as ls;
+        let (t0, s0) = (std::time::Instant::now(), crate::net::wait_sleeps());
+        self.step += 1;
+        let field = agree_field(self.step, AGREE_GO) as u32;
+        let frame = ls::go_frame(self.rank == 0, field, step_no, n_events);
+        let all = crate::net::hub_all(x, &frame, ls::GO_WIRE).map_err(|e| self.hub_fail("step-go", &format!("{e:#}")))?;
+        self.wp.rec(7, t0, s0);
+        let (hs, hn) = ls::go_verdict(&all, self.world as usize)
+            .map_err(|why| self.hub_fail("step-go", &format!("fence FAILED at control step {step_no}: {why}")))?;
+        // same adoption rule as the pairwise path: the head's low 32 bits under this rank's own high bits
+        let hs = if self.rank == 0 { step_no } else { (step_no & !0xFFFF_FFFF) | hs as u64 };
+        Ok((hs, hn as usize))
+    }
+
+    /// world > 2 `pre_verify`: every rank's (width, drafts hash, head passes launched) at the same lockstep
+    /// counter — compared by EVERY rank, BEFORE the verify graph (whose width selects the barrier sequence) launches.
+    pub(crate) fn pre_verify_hub<X: crate::net::HubXport>(&mut self, x: &mut X, w: usize, drafts: &[i32], launched: usize)
+                                                          -> Result<()> {
+        use crate::tp_lockstep as ls;
+        let field = agree_field(self.step + 1, AGREE_PV) as u32;
+        let h = fnv32(0x5EED, drafts.iter().map(|&d| d as u32));
+        let frame = ls::pv_frame(field, w, h, launched);
+        let (t0, s0) = (std::time::Instant::now(), crate::net::wait_sleeps());
+        let all = crate::net::hub_all(x, &frame, ls::PV_WIRE).map_err(|e| self.hub_fail("pre-verify", &format!("{e:#}")))?;
+        self.wp.rec(3, t0, s0);
+        ls::pv_verdict(&all, self.world as usize).map_err(|why| {
+            self.hub_fail("pre-verify", &format!("round {}: this rank width {w} drafts {h:08x} head passes launched \
+                {launched}; {why} — ranks chose different verify widths, drafts or speculative head-pass launches; \
+                link aborted before the verify", self.step + 1))
+        })?;
+        self.pre_agrees += 1;
+        Ok(())
+    }
+
+    /// world > 2 `tp_round`: the merged lockstep op (tripwire words + the head's timing + a device-epoch probe) and,
+    /// with `ident` on, a second op with the digests of `digests(m)` compared against the head's. `digests` runs
+    /// only after the verdict proved every rank chose the same width `m`.
+    pub(crate) fn round_hub<X: crate::net::HubXport>(&mut self, x: &mut X, what: &str, a: usize, m: usize, words: &[u32],
+                                                     ms: f64, plain_ms: f64, captured: bool, epoch: u64,
+                                                     digests: impl FnOnce(usize) -> Result<Vec<u64>>)
+                                                     -> Result<(f64, f64, bool)> {
+        use crate::tp_lockstep as ls;
+        self.step += 1;
+        let (step, world) = (self.step, self.world as usize);
+        let h = fnv32(0, words.iter().copied());
+        let field = agree_field(step, AGREE_A) as u32;
+        let frame = ls::rnd_frame(&ls::RoundIn { step, field, accept: a.min(255), width: m.min(15), hash: h, epoch, ms,
+                                                 plain_ms, captured });
+        let (t0, s0) = (std::time::Instant::now(), crate::net::wait_sleeps());
+        let all = crate::net::hub_all(x, &frame, ls::RND_WIRE)
+            .map_err(|e| self.hub_fail("round", &format!("at {what} (lockstep step {step}): {e:#}")))?;
+        self.wp.rec(1, t0, s0);
+        self.wp.rounds += 1;
+        let out = ls::rnd_verdict(&all, world).map_err(|why| {
+            self.hub_fail("round", &format!("agree() FAILED at {what} (lockstep step {step}, accept {a}, width {m}, \
+                hash {h:08x}): {why} — ranks diverged or the link aborted"))
+        })?;
+        if self.ident {
+            let d = digests(m).map_err(|e| self.hub_fail("ident", &format!("digest failed at {what}: {e:#}")))?;
+            let frame = ls::id_frame(step, &d);
+            let all = crate::net::hub_all(x, &frame, ls::id_wire(d.len()))
+                .map_err(|e| self.hub_fail("ident", &format!("at {what} (lockstep step {step}): {e:#}")))?;
+            let bad = ls::id_verdict(&all, world, d.len())
+                .map_err(|why| self.hub_fail("ident", &format!("step sync at {what}: {why}")))?;
+            self.ident_bufs += d.len() as u64;
+            self.ident_bad += bad as u64;
+            if bad > 0 && self.ident_bad as usize == bad {
+                eprintln!("[tp-ident] FIRST MISMATCH at {what} (lockstep step {step}, width {m}): {bad} of {} digests differ \
+                           (logits rows 0..{m}, resid, taps; some rank differs from the head)", d.len());
+            }
+        }
+        self.agrees += 1;
+        if !out.epoch_skew.is_empty() {
+            self.epoch_warns += 1;
+            if self.epoch_warns <= 5 || self.epoch_warns % 1000 == 0 {
+                eprintln!("[tp-round] EPOCH-PROBE at {what} (lockstep step {step}, #{}): device epoch differs from the head's on \
+                           (rank, delta) {:?}", self.epoch_warns, out.epoch_skew);
+            }
+        }
+        Ok((out.ms, out.plain_ms, out.captured))
     }
 }
 
@@ -386,7 +532,7 @@ impl Drop for FatalGuard {
 /// Port of exllamav3's DraftConfidenceCalibrator (vcruz305 fork 523ecd3,
 /// exllamav3/generator/draft_confidence.py): an online map from the draft head's argmax LOGIT
 /// to the observed acceptance rate, in 1-logit bins of exponentially decayed (tested, accepted)
-/// counts. One calibrator for the whole server, as in the rival (one per generator).
+/// counts. One calibrator for the whole server, as in the reference implementation (one per generator).
 pub(crate) struct DraftCal {
     bins: std::collections::BTreeMap<i64, (f64, f64)>,
     total: f64,
@@ -520,20 +666,111 @@ impl Default for CostFit {
 ///   unset / on : 2.7 at TP (world 2) — only lanes of a TP scheduler; TP=1 keeps 6.0 by construction
 ///   0 / off    : 6.0 (the TP=1 constant, the pre-TP-I behaviour)
 ///   <ms>       : that prior (diagnostic)
-/// --tp-dds-prior rides the exl3_env snapshot; the value joins the TP boot agree hash. The guard's
+/// --tp-dds-prior rides TpConfig's CLI option-registry snapshot; the value joins the TP boot agree hash. The guard's
 /// timing inputs stay the HEAD's (tp_round), so both ranks' targets are identical.
 pub(crate) const TP2_DDS_PRIOR: f64 = 2.7;
+/// World-4 default: an ESTIMATE, not a measurement — TP-4A (24.7-17.59)/5 = 1.42 ms/row + 0.73 draft = 2.15; see TP-4F_PREP_REPORT.md.
+pub(crate) const TP4_DDS_PRIOR: f64 = 2.1;
 /// CLI-1 (--print-config): the TP=2 prior this process resolves.
 pub fn dds_prior_tp() -> f64 { dds_prior(true) }
-pub(crate) fn dds_prior(tp: bool) -> f64 {
-    if !tp { return CostFit::PRIOR_SLOPE; }
-    static P: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *P.get_or_init(|| match crate::opts::var(crate::opt!("tp-dds-prior")).map(|v| v.trim().to_ascii_lowercase()) {
-        Ok(v) if v == "0" || v == "off" || v == "false" => CostFit::PRIOR_SLOPE,
-        Ok(v) if v == "1" || v == "on" || v.is_empty() => TP2_DDS_PRIOR,
-        Ok(v) => v.parse::<f64>().ok().filter(|x| *x > 0.0).unwrap_or(TP2_DDS_PRIOR),
-        Err(_) => TP2_DDS_PRIOR,
-    })
+/// CLI-1 (--print-config): the TP=4 prior this process resolves.
+pub fn dds_prior_tp4() -> f64 { dds_prior_w(4) }
+pub(crate) fn dds_prior(tp: bool) -> f64 { dds_prior_w(if tp { 2 } else { 1 }) }
+/// The prior for a scheduler of `world` ranks (1 = no TP): 6.0 / 2.7 / 2.1 at world 1 / 2 / 4 (any other world
+/// keeps the TP=2 value); `--tp-dds-prior` (off = 6.0, a number = that prior) applies at every TP world.
+pub(crate) fn dds_prior_w(world: usize) -> f64 {
+    if world < 2 { return CostFit::PRIOR_SLOPE; }
+    static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    resolve_dds_prior(RAW.get_or_init(|| crate::opts::var(crate::opt!("tp-dds-prior")).ok()).as_deref(), world)
+}
+/// Pure resolution of the prior from the raw `--tp-dds-prior` value (None = unset) at a TP `world` >= 2. The
+/// world-2 arms are the pre-TP-4F code verbatim: on/unset/garbage = 2.7, off = 6.0, a positive number = itself.
+pub(crate) fn resolve_dds_prior(raw: Option<&str>, world: usize) -> f64 {
+    let dflt = if world == 4 { TP4_DDS_PRIOR } else { TP2_DDS_PRIOR };
+    match raw.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if v == "0" || v == "off" || v == "false" => CostFit::PRIOR_SLOPE,
+        Some(v) if v == "1" || v == "on" || v.is_empty() => dflt,
+        Some(v) => v.parse::<f64>().ok().filter(|x| *x > 0.0).unwrap_or(dflt),
+        None => dflt,
+    }
+}
+/// The prior's word in the TP boot agree hash (`tp_boot_agree`).
+pub(crate) fn boot_prior_word(world: usize) -> u32 { (dds_prior_w(world) as f32).to_bits() }
+
+impl Exl3Scheduler {
+    /// Ranks of this scheduler's TP group for the world-aware DDS prior: 1 = no TP (an impossible tp-without-model
+    /// pairing keeps the pre-TP-4F value, world 2).
+    fn tp_world(&self) -> usize {
+        if self.tp.is_none() { 1 } else { self.model.tp_rank().map_or(2, |(_, w)| w as usize) }
+    }
+}
+
+#[cfg(test)]
+mod dds_prior_w4_tests {
+    use super::*;
+
+    /// The pre-TP-4F `dds_prior(true)` body, verbatim (only the option read is replaced by `raw`): the frozen
+    /// reference that world 2 must equal bit for bit.
+    fn old_world2(raw: Option<&str>) -> f64 {
+        match raw.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if v == "0" || v == "off" || v == "false" => CostFit::PRIOR_SLOPE,
+            Some(v) if v == "1" || v == "on" || v.is_empty() => TP2_DDS_PRIOR,
+            Some(v) => v.parse::<f64>().ok().filter(|x| *x > 0.0).unwrap_or(TP2_DDS_PRIOR),
+            None => TP2_DDS_PRIOR,
+        }
+    }
+
+    const RAWS: [Option<&str>; 16] = [None, Some(""), Some(" "), Some("on"), Some("ON"), Some("1"), Some("off"), Some("OFF"),
+        Some("0"), Some("false"), Some("2.7"), Some("3.5"), Some("0.0"), Some("-1"), Some("garbage"), Some(" 1.25 ")];
+
+    #[test]
+    fn world_1_and_2_are_bit_identical_to_the_pre_world_aware_prior() {
+        assert_eq!(dds_prior(false).to_bits(), CostFit::PRIOR_SLOPE.to_bits());
+        assert_eq!(dds_prior_w(1).to_bits(), 6.0f64.to_bits());
+        assert_eq!(dds_prior_w(0).to_bits(), 6.0f64.to_bits());
+        for raw in RAWS {
+            assert_eq!(resolve_dds_prior(raw, 2).to_bits(), old_world2(raw).to_bits(), "raw {raw:?}");
+        }
+        // unset (the test process has no --tp-dds-prior): the runtime entry points are the old constants
+        assert_eq!(dds_prior(true).to_bits(), 2.7f64.to_bits());
+        assert_eq!(dds_prior_tp().to_bits(), 2.7f64.to_bits());
+        assert_eq!(dds_prior_w(2).to_bits(), 2.7f64.to_bits());
+    }
+
+    #[test]
+    fn world_2_boot_hash_word_and_hash_are_unchanged() {
+        let sample = [128u32, 2048, 7, 1, 512, 0, 262144, 1, 0, 0x3F00_0000, 0, 0, 1, 2, 3];
+        let hash = |word: u32| fnv32(0xB007, sample.iter().copied().chain([word]).chain([9, 9, 9]));
+        assert_eq!(boot_prior_word(2), (2.7f64 as f32).to_bits(), "the world-2 word");
+        assert_eq!(boot_prior_word(2), (dds_prior(true) as f32).to_bits(), "== the pre-change `(dds_prior(true) as f32).to_bits()`");
+        assert_eq!(hash(boot_prior_word(2)), hash((dds_prior(true) as f32).to_bits()));
+        // every world-2 value the flag can produce hashes exactly as the old code did
+        for raw in RAWS {
+            assert_eq!(hash((resolve_dds_prior(raw, 2) as f32).to_bits()), hash((old_world2(raw) as f32).to_bits()), "raw {raw:?}");
+        }
+        // world 4's word differs (its prior is 2.1): ranks must agree among themselves, and do, both resolve the same flag
+        assert_eq!(boot_prior_word(4), (2.1f64 as f32).to_bits());
+        assert_ne!(hash(boot_prior_word(4)), hash(boot_prior_word(2)));
+    }
+
+    #[test]
+    fn world_4_default_is_the_derived_value_and_an_override_still_overrides() {
+        assert_eq!(TP4_DDS_PRIOR, 2.1);
+        assert_eq!(dds_prior_w(4).to_bits(), TP4_DDS_PRIOR.to_bits());
+        assert_eq!(dds_prior_tp4().to_bits(), TP4_DDS_PRIOR.to_bits());
+        // unset / on / unusable = the world's default (the TP=2 arms' "unusable falls back to default" rule)
+        for raw in [None, Some(""), Some("on"), Some("1"), Some("garbage"), Some("-1"), Some("0.0")] {
+            assert_eq!(resolve_dds_prior(raw, 4), TP4_DDS_PRIOR, "raw {raw:?}");
+        }
+        for raw in [Some("off"), Some("0"), Some("false")] { assert_eq!(resolve_dds_prior(raw, 4), 6.0, "raw {raw:?}"); }
+        assert_eq!(resolve_dds_prior(Some("2.7"), 4), 2.7, "a numeric override overrides at W=4 (even to the W=2 value)");
+        assert_eq!(resolve_dds_prior(Some("3.5"), 4), 3.5);
+        assert_eq!(resolve_dds_prior(Some(" 1.25 "), 4), 1.25);
+        // the override is world-independent: the same number at world 2 and 4
+        for n in ["0.5", "1.9", "4.4"] { assert_eq!(resolve_dds_prior(Some(n), 2), resolve_dds_prior(Some(n), 4)); }
+        // any other TP world keeps the TP=2 constant
+        assert_eq!(resolve_dds_prior(None, 3), 2.7);
+    }
 }
 
 impl CostFit {
@@ -622,7 +859,7 @@ impl Lane {
     }
 
     /// WP08: feed one emitted token (one that did not already end the request) to the loop
-    /// detector — the rival's job.py:1010-1013 order. True = end the response ("loop_detected").
+    /// detector — the reference implementation's job.py:1010-1013 order. True = end the response ("loop_detected").
     fn loop_feed(&mut self, t: u32) -> bool {
         self.loop_det.as_mut().map_or(false, |d| d.feed(t))
     }
@@ -644,9 +881,12 @@ impl Lane {
     }
 }
 
-/// C1 v2: prefill scratch rows — 2C - 1 with tail checkpoints on (merge_grid chunks), else C.
-fn psc_rows(c: usize) -> usize {
-    if crate::exl3_forward::tail_ckpt_on() && !crate::exl3_forward::wp16_off() { 2 * c - 1 } else { c }
+/// C1 v2: prefill scratch rows — the merged-chunk cap with tail checkpoints on (2C - 1; under TP
+/// min(2C - 1, 4,095) so `--prefill-chunk 4095` fits the all-reduce partial buffer, TP-4X1), else C.
+fn psc_rows(c: usize, tp: bool) -> usize {
+    if crate::exl3_forward::tail_ckpt_on() && !crate::exl3_forward::wp16_off() {
+        crate::exl3_forward::merge_cap(c, tp).max(c)
+    } else { c }
 }
 
 /// FNV-1a over the prompt ids — a replay key for the [loop] log (not a security hash).
@@ -685,13 +925,16 @@ impl Exl3Scheduler {
     /// C1 (`tail` Some only with prefix.tail_ckpt on): the grid is `run_grid(from, n, C, realign,
     /// tail)` — realigned to the C grid and split at the message boundary `tail`, which becomes a
     /// checkpoint of this (tracked) run. Knob off: realign = false, tail = None = today's grid.
-    fn prefill_range(&mut self, slot: usize, prompt: &[u32], from: usize, to: usize,
+    /// `key`: the prompt as the prefix cache / WP16 checkpoints see it (VIS-2: image rows carry
+    /// pixel-hash ids so two different same-size images never share a cached prefix); == `prompt`
+    /// for text.
+    fn prefill_range(&mut self, slot: usize, prompt: &[u32], key: &[u32], from: usize, to: usize,
                      tx: Option<&tokio::sync::mpsc::UnboundedSender<TokEvent>>, aligned: bool,
                      tail: Option<usize>, realign: bool) -> Result<bool> {
         let tp = std::time::Instant::now();
         let c = self.chunk.max(1);
         if self.psc.is_none() {
-            self.psc = Some(self.model.prefill_scratch(psc_rows(c))?);
+            self.psc = Some(self.model.prefill_scratch(psc_rows(c, self.tp.is_some()))?);
         }
         let psc = self.psc.as_mut().unwrap();
         let mut pos = from;
@@ -700,12 +943,20 @@ impl Exl3Scheduler {
         let mut taken: Vec<usize> = Vec::new();
         // C1 v2 (knob on == realign): merge away the chunk the split / realign would add (psc holds
         // 2C - 1 rows then, see run())
-        let grid = if realign {
-            crate::exl3_forward::merge_grid(from, crate::exl3_forward::run_grid(from, n, c, true, tail), tail, c)
-        } else {
-            crate::exl3_forward::run_grid(from, n, c, false, None)
-        };
+        let absorb = crate::exl3_forward::absorb_rmin();
+        let grid = crate::exl3_forward::plan_grid(from, n, c, realign, tail, psc_rows(c, self.tp.is_some()), absorb, aligned);
         let nchunks = grid.len();
+        if absorb.is_some() || c > 2048 {
+            // TP-4X1 receipts: the grid actually run (only with the new options on; default logs unchanged)
+            let mut rows = Vec::with_capacity(grid.len());
+            let mut s = from;
+            for &e in &grid { rows.push(e - s); s = e; }
+            let shown = if rows.len() > 16 {
+                format!("{:?} .. {:?}", &rows[..4], &rows[rows.len() - 6..])
+            } else { format!("{rows:?}") };
+            println!("[exl3-serve] prefill grid slot={slot} n={} (pos {from}..{n}) C={c}: {nchunks} chunk(s), rows {shown}{}",
+                     n - from, if absorb.is_some() { " (absorb-tail)" } else { "" });
+        }
         for end in grid {
             if pos > from {
                 let mut gone = tx.map_or(false, |t| t.is_closed());
@@ -722,10 +973,20 @@ impl Exl3Scheduler {
             self.model.prefill_chunk(psc, &toks, pos, slot, false, None)?;
             if aligned {
                 if let Some(st) = self.wp16.as_mut() {
-                    st.extend(slot, &prompt[pos..end]);
+                    st.extend(slot, &key[pos..end]);
                     if crate::exl3_forward::wp16_due(end, n, c) || tail == Some(end) {
                         let model = &self.model;
-                        if let Some(mut b) = st.acquire(|| model.ckpt_alloc()) {
+                        // TP-4D (audit C2): at world > 2 the allocation outcome is agreed across ranks (a rank-local
+                        // failure would desynchronise the checkpoint stores); world <= 2: the plain local alloc.
+                        let n_before = st.n_alloc;
+                        let mut tp_alloc = self.tp.as_mut().filter(|t| t.world > 2);
+                        let mut hub_err: Option<anyhow::Error> = None;
+                        let got = st.acquire(|| {
+                            let r = model.ckpt_alloc();
+                            match tp_alloc.as_mut() { Some(t) => t.wp16_alloc(n_before, r, &mut hub_err), None => r }
+                        });
+                        if let Some(e) = hub_err { return Err(e); }
+                        if let Some(mut b) = got {
                             match model.ckpt_save(slot, psc, &mut b) {
                                 Ok(()) => { st.insert(slot, end, b); taken.push(end); }
                                 Err(e) => { st.release(b); return Err(e); }
@@ -775,8 +1036,9 @@ impl Exl3Scheduler {
     /// generation prompt, server.rs) becomes a tail checkpoint of this run — the resume point of
     /// the next chat turn, which diverges right there — and every run is tracked (rows extend the
     /// checkpointed prefix) with its grid realigned to C. See wp16.rs T_PREFIX_TAIL_CKPT.
-    fn prefill_cached(&mut self, slot: usize, prompt: &[u32], ckpt_at: Option<usize>,
+    fn prefill_cached(&mut self, slot: usize, prompt: &[u32], key: &[u32], ckpt_at: Option<usize>,
                       tx: &tokio::sync::mpsc::UnboundedSender<TokEvent>) -> Result<bool> {
+        anyhow::ensure!(key.len() == prompt.len(), "prefix key length {} != prompt length {}", key.len(), prompt.len());
         let plen = prompt.len();
         let end = plen.saturating_sub(1);
         self.last_resume = (0, 0);
@@ -784,20 +1046,20 @@ impl Exl3Scheduler {
             // PFX1 (b): the chunked prefill below head-fills rows 0..plen-2 (no head-KV memset)
             self.model.reset_slot_for_prefill(slot)?;
             self.cache[slot] = None;
-            return self.prefill_range(slot, prompt, 0, end, Some(tx), false, None, false);
+            return self.prefill_range(slot, prompt, key, 0, end, Some(tx), false, None, false);
         }
         let tail_on = self.wp16.is_some() && crate::exl3_forward::tail_ckpt_on();
         let reuse = match &self.cache[slot] {
-            Some(t) if t.len() <= end && prompt[..t.len()] == t[..] => t.len(),
+            Some(t) if t.len() <= end && key[..t.len()] == t[..] => t.len(),
             _ => 0,
         };
         if self.psc.is_none() {
-            self.psc = Some(self.model.prefill_scratch(psc_rows(self.chunk.max(1)))?);
+            self.psc = Some(self.model.prefill_scratch(psc_rows(self.chunk.max(1), self.tp.is_some()))?);
         }
         let c = self.chunk.max(1);
         // WP16: only on a prompt-end miss (a hit is always the deeper, unchanged resume).
         let (q, lcp) = match (&self.wp16, reuse) {
-            (Some(st), 0) => st.resume_point(slot, prompt, end, c),
+            (Some(st), 0) => st.resume_point(slot, key, end, c),
             _ => (0, 0),
         };
         let mut tracked = reuse == 0 && self.wp16.is_some();
@@ -808,7 +1070,7 @@ impl Exl3Scheduler {
             // C1: with tail checkpoints the run is tracked instead (realigned grid, tail split) when
             // the slot's checkpointed prefix is exactly prompt[..reuse].
             if let Some(st) = self.wp16.as_mut() {
-                if tail_on && st.prefix_ok(slot, prompt, reuse, c) {
+                if tail_on && st.prefix_ok(slot, key, reuse, c) {
                     st.begin_aligned(slot, reuse, c);
                     tracked = true;
                 } else {
@@ -834,7 +1096,7 @@ impl Exl3Scheduler {
         self.last_resume = (reuse, q);
         let from = reuse.max(q);
         let tail = if tail_on && tracked { crate::exl3_forward::tail_point(ckpt_at, from, end, c, crate::exl3_forward::tail_ckpt_extra_chunk()) } else { None };
-        match self.prefill_range(slot, prompt, from, end, Some(tx), tracked, tail, tail_on && tracked) {
+        match self.prefill_range(slot, prompt, key, from, end, Some(tx), tracked, tail, tail_on && tracked) {
             Ok(true) => {}
             // WP02: cancelled mid-prefill — no snapshot, cache stays None. WP16: the checkpoints
             // taken so far stay (they describe prompt[..pos], rows this run did write).
@@ -844,11 +1106,11 @@ impl Exl3Scheduler {
                 return Err(e);
             }
         }
-        if q > 0 && self.wp16_xcheck {
+        if q > 0 && self.wp16_xcheck && key == prompt { // VIS-2: the xcheck's scratch prefill is text-only
             self.wp16_xcheck(slot, prompt, q)?;
         }
         self.model.snapshot_slot(slot, self.psc.as_ref().unwrap())?;
-        self.cache[slot] = Some(prompt[..end].to_vec());
+        self.cache[slot] = Some(key[..end].to_vec());
         Ok(true)
     }
 
@@ -880,7 +1142,7 @@ impl Exl3Scheduler {
         println!("[wp16-xcheck] slot={slot} resumed at {q}: fresh reference prefill 0..{end} into {} slot {x}",
                  if x != slot { "scratch" } else { "the same (no free lane)" });
         model.reset_slot_for_prefill(x)?;
-        self.prefill_range(x, prompt, 0, end, None, false, None, false)?;
+        self.prefill_range(x, prompt, prompt, 0, end, None, false, None, false)?;
         let mut f = model.ckpt_alloc()?;
         model.ckpt_save(x, self.psc.as_ref().unwrap(), &mut f)?;
         let d = model.ckpt_diff(&r, &f)?;
@@ -922,6 +1184,13 @@ impl Exl3Scheduler {
     fn tp_round(&mut self, what: &str, a: usize, m: usize, words: &[u32], ms: f64, plain_ms: f64,
                 captured: bool) -> Result<(f64, f64, bool)> {
         let Some(t) = self.tp.as_mut() else { return Ok((ms, plain_ms, captured)) };
+        if t.world > 2 {
+            // TP-4D: ONE merged head-hub op (tp_lockstep::RND) instead of agree / exchange / agree
+            let mut x = crate::net::link_hub(t.deadline_ms)?;
+            let epoch = crate::net::traced_device_epoch();
+            let (model, sc) = (&self.model, &self.sc);
+            return t.round_hub(&mut x, what, a, m, words, ms, plain_ms, captured, epoch, |m| model.tp_ident_digests(sc, m));
+        }
         t.step += 1;
         let (step, rank, ident) = (t.step, t.rank, t.ident);
         let h = fnv32(0, words.iter().copied());
@@ -1114,7 +1383,7 @@ impl Exl3Scheduler {
             }, ms, Vec::new())
         } else if self.draft_conf > 0.0 {
             // API-parity DDS: draft until the running product of calibrated per-position
-            // acceptance estimates falls below the target (the rival's -dds -dc), then verify
+            // acceptance estimates falls below the target (the reference implementation's -dds -dc), then verify
             // only the proposed window; every verified position labels the calibrator.
             // WP23: the target carries the lane's cost guard, the estimate its draft's depth bucket
             // (both identity at k <= 5 unless forced: the K5 build's decisions exactly).
@@ -1285,6 +1554,7 @@ impl Exl3Scheduler {
                     if reason == "loop_detected" { lane.log_loop(s, &self.tok); }
                     lane.log_stats(s, &reason);
                     self.model.dump_expert_hist(); // TP-I #6 diagnostic (no-op unless --tp-ep-hist)
+                    self.model.dump_esel_hist(); // S-A3-o diagnostic (no-op unless --exl3-esel-hist)
                     let _ = lane.tx.send(crate::batch::TokEvent::Finish { reason });
                     // after the Finish: the DHEADP line may sync the device once (penalized requests)
                     self.model.dhead_request_report(); // DHEADP fallback line (penalized requests) + DHEAD XCHECK lines (when on)
@@ -1365,6 +1635,7 @@ impl Exl3Scheduler {
                 if reason == "loop_detected" { lane.log_loop(s, &self.tok); }
                 lane.log_stats(s, reason);
                 self.model.dump_expert_hist(); // TP-I #6 diagnostic (no-op unless --tp-ep-hist)
+                self.model.dump_esel_hist(); // S-A3-o diagnostic (no-op unless --exl3-esel-hist)
                 let _ = lane.tx.send(TokEvent::Finish { reason: reason.to_string() });
                 self.lanes[s] = None;
                 self.model.dhead_request_report(); // DHEADP fallback line (penalized requests) + DHEAD XCHECK lines (when on)
@@ -1454,6 +1725,52 @@ impl Exl3Scheduler {
         }
     }
 
+    /// VIS-2 (TP=1): arm `slot` for an image request — the 3-axis RoPE map + image-token rows
+    /// (FwdModel::set_slot_vision) and the prefill splice data (psc.vis_img / vis_src). Returns the
+    /// prefix-cache key (image rows replaced by pixel-hash ids, so a cached prefix is reused only
+    /// for the SAME image) and a generated-token cap (none since VIS-3).
+    fn vision_setup(&mut self, slot: usize, req: &BatchRequest) -> Result<(Vec<u32>, usize)> {
+        let sec = self.mrope_section.context("bad request: this server has no vision tower for this model (text-only)")?;
+        let embeds = req.image_embeds.as_ref().context("image spans without image embeddings")?;
+        let h = self.model.cfg.hidden_size;
+        let plen = req.prompt.len();
+        let n_img: usize = req.image_spans.iter().map(|s| s.num_tokens).sum();
+        anyhow::ensure!(embeds.len() == n_img * h, "image embeddings {} != {n_img} tokens x {h}", embeds.len());
+        anyhow::ensure!(n_img <= crate::exl3_forward::VIS_MROPE_ROWS,
+                        "bad request: {n_img} image tokens exceed the per-request limit of {}", crate::exl3_forward::VIS_MROPE_ROWS);
+        let (pos3, delta) = crate::vision_encoder::mrope_positions(plen, &req.image_spans)?;
+        self.model.set_slot_vision(slot, &pos3, delta, sec)?;
+        let mut src = vec![-1i32; plen];
+        let mut key = req.prompt.clone();
+        let mut off = 0usize;
+        for sp in &req.image_spans {
+            let hh = (sp.pixel_hash as u32) ^ ((sp.pixel_hash >> 32) as u32);
+            for j in 0..sp.num_tokens {
+                src[sp.start + j] = (off + j) as i32;
+                // ids >= 2^31 never collide with a vocabulary id; only the cache compares them
+                key[sp.start + j] = 0x8000_0000 | (hh.wrapping_add((j as u32).wrapping_mul(0x9E37_79B1)) & 0x7FFF_FFFF);
+            }
+            off += sp.num_tokens;
+        }
+        // the embedding table is fp16: image rows enter the residual in the same precision class
+        // (VIS-4: also the TP wire's precision, so every rank splices bit-identical rows)
+        let rows: Vec<f32> = embeds.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+        let (_, digest) = crate::tp_serve::image_rows_wire(&rows);
+        self.vis_seam = Some((n_img as u32, delta as i32, digest));
+        if self.psc.is_none() {
+            self.psc = Some(self.model.prefill_scratch(psc_rows(self.chunk.max(1), self.tp.is_some()))?);
+        }
+        let img = self.model.vis_rows_upload(&rows)?;
+        let psc = self.psc.as_mut().unwrap();
+        psc.vis_img = Some(img);
+        psc.vis_src = src;
+        println!("[exl3-serve] VIS-2 slot={slot}: {} image(s), {n_img} image tokens in a {plen}-token prompt; rope delta {delta}",
+                 req.image_spans.len());
+        // VIS-3: the QSA indexer ropes its pooled keys through the same per-slot map, so an image
+        // request runs past the dense window like text (no generated-token cap)
+        Ok((key, usize::MAX))
+    }
+
     fn admit(&mut self, req: BatchRequest) {
         let t_admit = std::time::Instant::now();
         // prefix cache: prefer the free lane whose snapshot is the longest prefix of this prompt,
@@ -1491,18 +1808,44 @@ impl Exl3Scheduler {
             });
             return;
         }
-        if req.image_embeds.is_some() || !req.image_spans.is_empty() {
-            let _ = req.tx.send(TokEvent::Finish {
-                reason: "error: vision input not supported on the exl3 serve path".into(),
-            });
-            return;
-        }
         if req.prompt.is_empty() {
             let _ = req.tx.send(TokEvent::Finish { reason: "error: empty prompt".into() });
             return;
         }
-        let max_new = req.max_new.min(self.model.max_pos().saturating_sub(req.prompt.len() + 1));
-        match self.prefill_cached(free, &req.prompt, req.ckpt_at, &req.tx) {
+        let mut max_new = req.max_new.min(self.model.max_pos().saturating_sub(req.prompt.len() + 1));
+        // VIS-2: an image request arms the slot's 3-axis RoPE map and the prefill splice; every other
+        // request puts the slot back on plain text RoPE (a previous image request may have armed it).
+        self.vis_seam = None;
+        let key: Vec<u32> = if req.image_spans.is_empty() {
+            if let Err(e) = self.model.clear_slot_vision(free) {
+                let _ = req.tx.send(TokEvent::Finish { reason: format!("error: slot reset failed: {e}") });
+                self.fatal = Some(format!("{e:#}"));
+                return;
+            }
+            req.prompt.clone()
+        } else {
+            match self.vision_setup(free, &req) {
+                Ok((key, cap)) => {
+                    max_new = max_new.min(cap);
+                    key
+                }
+                Err(e) => {
+                    let _ = self.model.clear_slot_vision(free);
+                    if let Some(p) = self.psc.as_mut() { p.vis_img = None; p.vis_src.clear(); }
+                    let msg = format!("{e:#}");
+                    let reason = if msg.starts_with("bad request:") || msg.starts_with("unprocessable:") {
+                        format!("error: {msg}")
+                    } else {
+                        format!("error: vision setup failed: {msg}") // an engine fault, not the client's
+                    };
+                    let _ = req.tx.send(TokEvent::Finish { reason });
+                    return;
+                }
+            }
+        };
+        let pre = self.prefill_cached(free, &req.prompt, &key, req.ckpt_at, &req.tx);
+        if let Some(p) = self.psc.as_mut() { p.vis_img = None; p.vis_src.clear(); } // VIS-2: splice data is per prefill
+        match pre {
             Ok(true) => {}
             // WP02: the client left mid-prefill — the slot is free again, nobody to tell
             Ok(false) => return,
@@ -1533,7 +1876,7 @@ impl Exl3Scheduler {
             return;
         }
         // WP15: penalties from the first generated token on (the seam step's row), over the
-        // prompt tail + everything generated — the rival's past_ids = the full sequence.
+        // prompt tail + everything generated — the reference implementation's past_ids = the full sequence.
         let pen = crate::exl3_forward::PenParams::new(req.rep_penalty, req.presence_penalty,
                                                       req.frequency_penalty, self.pen_range, self.pen_range);
         if pen.is_some() {
@@ -1572,6 +1915,10 @@ impl Exl3Scheduler {
             // shape (live, allocated, this slot's checkpoint positions) — proven equal on every rank
             let (reuse, q) = self.last_resume;
             let mut w = vec![last, plen as u32, free as u32, reuse as u32, q as u32];
+            if let Some((n, d, h)) = self.vis_seam {
+                // VIS-4: the image rows, their count and the rope delta are identical on every rank
+                w.extend([0x7155_0000, n, d as u32, h as u32, (h >> 32) as u32]);
+            }
             if let Some(st) = self.wp16.as_ref() {
                 w.extend([st.live() as u32, st.n_alloc as u32,
                           fnv32(0, st.positions(free).iter().map(|&x| x as u32))]);
@@ -1626,7 +1973,7 @@ impl Exl3Scheduler {
         } else {
             None
         };
-        // WP08: the rival feeds the detector every emitted token, the first one included.
+        // WP08: the reference implementation feeds the detector every emitted token, the first one included.
         let mut loop_det = self.loop_cfg
             .map(|(w, r)| crate::loop_detect::LoopDetector::for_stop_on_loop(w, r));
         if let Some(d) = loop_det.as_mut() { d.feed(last); }
@@ -1653,7 +2000,7 @@ impl Exl3Scheduler {
             ema_tok: 0.0,
             mtp_rounds: 0,
             // TP-I #7: a TP lane's cost prior is the TP=2 one (dds_prior; TP=1 = 6.0 unchanged)
-            wp23: Wp23Lane { fit: CostFit::with_prior(dds_prior(self.tp.is_some())), ..Default::default() },
+            wp23: Wp23Lane { fit: CostFit::with_prior(dds_prior_w(self.tp_world())), ..Default::default() },
             st_rounds: 0,
             st_drafted: 0,
             st_accepted: 0,
@@ -1673,9 +2020,6 @@ impl Exl3Scheduler {
 fn exl3_reject(req: &BatchRequest) -> Option<String> {
     if req.schema.is_some() {
         return Some("error: json-schema constraint not supported on the exl3 serve path yet".into());
-    }
-    if req.image_embeds.is_some() || !req.image_spans.is_empty() {
-        return Some("error: vision input not supported on the exl3 serve path".into());
     }
     if req.prompt.is_empty() {
         return Some("error: empty prompt".into());
@@ -1702,6 +2046,23 @@ impl Exl3Scheduler {
                 t.wp = WaitProf::default();
             }
         }
+    }
+
+    /// VIS-4: the binary channel — raw image-row payloads written right after a Step frame, in the
+    /// order of that Step's image admits (every node reads them back by `image_bytes`).
+    fn tp_ship_raw(&mut self, payloads: &[Vec<u8>]) -> Result<()> {
+        if payloads.is_empty() { return Ok(()); }
+        use std::io::Write;
+        let t = self.tp.as_mut().context("TP ship without TP state")?;
+        let t0 = std::time::Instant::now();
+        let total: usize = payloads.iter().map(|p| p.len()).sum();
+        for s in t.ctl.iter_mut() {
+            for p in payloads { s.write_all(p)?; }
+            s.flush()?;
+        }
+        println!("[exl3-serve] VIS-4: shipped {} image payload(s), {:.1} MB to {} node(s) in {:.1} ms",
+                 payloads.len(), total as f64 / 1e6, t.ctl.len(), t0.elapsed().as_secs_f64() * 1e3);
+        Ok(())
     }
 
     fn tp_ship(&mut self, m: &crate::tp_serve::ServingMsg) -> Result<()> {
@@ -1771,6 +2132,7 @@ impl Exl3Scheduler {
             }
             let mut events: Vec<TpEvent> = Vec::new();
             let mut admits: std::collections::VecDeque<BatchRequest> = std::collections::VecDeque::new();
+            let mut payloads: Vec<Vec<u8>> = Vec::new(); // VIS-4: image rows of this step's admits, in order
             let mut free = 0usize;
             for s in 0..self.lanes.len() {
                 match &self.lanes[s] {
@@ -1794,7 +2156,15 @@ impl Exl3Scheduler {
                 if req.seed.is_none() {
                     req.seed = Some(entropy_seed()); // head-resolved: every rank samples one stream
                 }
-                events.push(TpEvent::Admit(WireRequest::from(&req)));
+                let mut w = WireRequest::from(&req);
+                if let Some(e) = req.image_embeds.as_ref().filter(|_| !req.image_spans.is_empty()) {
+                    // VIS-4: the rows ride the binary channel right after this step's frame
+                    let (bytes, digest) = crate::tp_serve::image_rows_wire(e);
+                    w.image_bytes = bytes.len() as u64;
+                    w.image_digest = digest;
+                    payloads.push(bytes);
+                }
+                events.push(TpEvent::Admit(w));
                 admits.push_back(req);
                 free -= 1;
             }
@@ -1817,6 +2187,9 @@ impl Exl3Scheduler {
                 let msg = ServingMsg::Step(StepEvents { step: step_no, events: events.clone() });
                 if let Err(e) = self.tp_ship(&msg) {
                     return Err(self.tp_fail(format!("control plane send failed at step {step_no}: {e:#}"), &mut waiting, Some(&mut rx)));
+                }
+                if let Err(e) = self.tp_ship_raw(&payloads) {
+                    return Err(self.tp_fail(format!("image payload send failed at step {step_no}: {e:#}"), &mut waiting, Some(&mut rx)));
                 }
             }
             for ev in events {
@@ -1900,8 +2273,20 @@ impl Exl3Scheduler {
                             TpEvent::Admit(w) => {
                                 let (tx, _) = tokio::sync::mpsc::unbounded_channel::<TokEvent>();
                                 let min_p = w.min_p;
+                                let (ib, idg) = (w.image_bytes, w.image_digest);
                                 let mut req = w.into_request(tx);
                                 req.min_p = min_p;
+                                if ib > 0 {
+                                    // VIS-4: this admit's image rows follow the Step frame (binary channel)
+                                    use std::io::Read;
+                                    let mut buf = vec![0u8; ib as usize];
+                                    let t = self.tp.as_mut().context("mirror without TP state")?;
+                                    t.ctl[0].read_exact(&mut buf).context("TP node: image payload read")?;
+                                    anyhow::ensure!(crate::tp_serve::fnv64(&buf) == idg,
+                                                    "TP node: image payload digest mismatch (step {step_no})");
+                                    req.image_embeds = Some(buf.chunks_exact(2)
+                                        .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect());
+                                }
                                 admitted += 1;
                                 self.admit(req);
                             }
@@ -1921,6 +2306,54 @@ impl Exl3Scheduler {
     }
 }
 
+impl TpSync {
+    /// TP-4D (audit C2) world > 2: the outcome of ONE WP16 checkpoint allocation attempt as a lockstep decision.
+    /// `CkptStore::acquire` freezes its cap when THIS rank's `cuMemAlloc` fails; ranks whose allocation outcomes
+    /// differ hold different checkpoint sets and every later store-dependent decision (resume point, chunk grid)
+    /// goes rank-local. Every rank sends (buffers held, ok); Ok(ranks that failed) — if any, ALL ranks must treat
+    /// the allocation as failed (and drop a buffer they did get) so the stores stay identical.
+    pub(crate) fn alloc_agree_hub<X: crate::net::HubXport>(&mut self, x: &mut X, n_alloc: usize, ok: bool)
+                                                           -> Result<Vec<usize>> {
+        use crate::tp_lockstep as ls;
+        let all = crate::net::hub_all(x, &ls::alloc_frame(n_alloc, ok), ls::ALLOC_WIRE)
+            .map_err(|e| self.hub_fail("wp16 alloc", &format!("{e:#}")))?;
+        ls::alloc_verdict(&all, self.world as usize).map_err(|why| self.hub_fail("wp16 alloc", &why))
+    }
+
+    /// The body of `CkptStore::acquire`'s allocation closure with the cross-rank agreement applied: `r` = this rank's
+    /// local `ckpt_alloc` result, `n_before` = the buffers this rank held before it. Every rank runs this at the same
+    /// program point (the store state is identical by invariant) and gets the same outcome: Ok = every rank got its
+    /// buffer, Err = at least one rank's allocation failed (a buffer this rank did get is dropped) so `acquire` freezes
+    /// the cap on ALL ranks. A transport failure of the agree itself lands in `hub_err` (the caller must return it:
+    /// `acquire` would otherwise swallow it as an allocation failure).
+    pub(crate) fn alloc_outcome<B, X: crate::net::HubXport>(&mut self, x: &mut X, n_before: usize, r: Result<B>,
+                                                            hub_err: &mut Option<anyhow::Error>) -> Result<B> {
+        match self.alloc_agree_hub(x, n_before, r.is_ok()) {
+            Ok(failed) if failed.is_empty() => r,
+            Ok(failed) => match r {
+                Ok(_dropped) => Err(anyhow::anyhow!("checkpoint allocation failed on rank(s) {failed:?} (agreed across ranks)")),
+                Err(e) => Err(e),
+            },
+            Err(e) => { let m = format!("{e:#}"); *hub_err = Some(e); Err(anyhow::anyhow!(m)) }
+        }
+    }
+
+    /// World 2 keeps today's rank-local decision (NO exchange, no behaviour change: the gap stays open there, see
+    /// PLAN/TP-4D_REPORT.md); world > 2 runs `alloc_outcome` over the hub's control slots.
+    fn wp16_alloc<B>(&mut self, n_before: usize, r: Result<B>, hub_err: &mut Option<anyhow::Error>) -> Result<B> {
+        if self.world <= 2 { return r; }
+        match crate::net::link_hub(self.deadline_ms) {
+            Ok(mut x) => self.alloc_outcome(&mut x, n_before, r, hub_err),
+            Err(e) => { let m = format!("{e:#}"); *hub_err = Some(e); Err(anyhow::anyhow!(m)) }
+        }
+    }
+}
+
+/// TP-4D: the head's rank/host map (`rank r = host (addr)`, r >= 1), set once by main after the node sync so the API
+/// startup line can name which box is which rank. Display only — nothing reads it for a decision.
+static TP_RANK_MAP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+pub fn set_tp_rank_map(map: Vec<String>) { let _ = TP_RANK_MAP.set(map); }
+
 /// TP-D: bring up the EXL3 TP attachment from a TpContext (the sanity + branch handshakes).
 fn tp_attach(mut ctx: crate::tp::TpContext) -> Result<crate::exl3_forward::xtp::TpAttach> {
     ctx.sanity()?;
@@ -1931,13 +2364,13 @@ fn tp_attach(mut ctx: crate::tp::TpContext) -> Result<crate::exl3_forward::xtp::
 
 /// TP-D: --exl3-tp-preverify=0 (diagnostic, prices the belt): skip the pre-verify width/drafts
 /// exchange + agree (the post-round agree still proves the width, one round late — TP-C's shape).
-/// Rides TpConfig's env snapshot, so both ranks decide alike.
+/// Rides TpConfig's CLI option-registry snapshot, so both ranks decide alike.
 fn tp_preverify_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::opts::var(crate::opt!("exl3-tp-preverify")).map_or(true, |v| v != "0"))
 }
 
-/// TP-D: --exl3-tp-ident=1 (diagnostic; rides TpConfig's env snapshot, so both ranks agree):
+/// TP-D: --exl3-tp-ident=1 (diagnostic; rides TpConfig's CLI option-registry snapshot, so both ranks agree):
 /// the served scheduler digests the logits rows, residual and taps at every lockstep point and
 /// compares them across ranks (TP-C's G-T1-b graphed identity, through the API). Costs a dtoh per
 /// step — a gate knob, never a serving default.
@@ -1948,6 +2381,23 @@ fn tp_ident_knob(s: &mut Exl3Scheduler) {
             println!("[exl3-serve] TP ident digests ON (--exl3-tp-ident=1, diagnostic): logits rows + resid + taps compared across ranks every lockstep point");
         }
     }
+}
+
+/// TP-4D: the world > 2 boot-agree frame magic (class prefix; a frame of another class at this point is a desync).
+const BOOT_AGREE_MAGIC: u32 = 0xB007_A612;
+
+/// TP-4D: Ok when every rank sent the boot magic and rank 0's config hash; Err names every differing rank with both
+/// hashes (`all[r] = [magic, hash]`).
+fn boot_hash_verdict(all: &[Vec<u32>], my_rank: usize) -> std::result::Result<(), String> {
+    let mut bad = Vec::new();
+    for (r, f) in all.iter().enumerate() {
+        if f[0] != BOOT_AGREE_MAGIC {
+            bad.push(format!("rank {r} sent frame class {:#010x}, not a boot-agree frame", f[0]));
+        } else if f[1] != all[0][1] {
+            bad.push(format!("rank {r} hash {:08x} != head {:08x}", f[1], all[0][1]));
+        }
+    }
+    if bad.is_empty() { Ok(()) } else { Err(format!("{} (this is rank {my_rank})", bad.join("; "))) }
 }
 
 /// TP-D: every resolved scheduler knob, hashed and AGREED across ranks before the first request
@@ -1966,7 +2416,7 @@ fn tp_boot_agree(s: &mut Exl3Scheduler) -> Result<()> {
     w.push(crate::exl3_forward::tail_ckpt_on() as u32);
     w.push(crate::exl3_forward::kv_fmt_from_opts() as u32);
     // TP-I #7: the WP23 cost-guard prior both ranks resolved (it only matters if the targets differ)
-    w.push((dds_prior(true) as f32).to_bits());
+    w.push(boot_prior_word(s.tp_world()));
     // TP-I2 item 1: the prefill-overlap granularity both ranks resolved (--tp-prefill-overlap, TpConfig v19)
     w.push(crate::exl3_forward::xtp::pf_overlap_code());
     // TP-H2: the sampled-row vocab-parallel tail both ranks resolved (--tp-vp-sampled, TpConfig v21)
@@ -1985,17 +2435,30 @@ fn tp_boot_agree(s: &mut Exl3Scheduler) -> Result<()> {
     w.extend(tune.bytes().map(|b| b as u32));
     let h = fnv32(0xB007, w.iter().copied());
     let rank = s.tp.as_ref().map_or(0, |t| t.rank);
-    println!("[exl3-serve] TP=2 rank {rank}: boot config hash {h:08x} (width {} chunk {} k {} dds {} prefix {} wp16 cap {} tail {} tune {tune} \
+    let world = s.tp.as_ref().map_or(2, |t| t.world);
+    println!("[exl3-serve] TP={world} rank {rank}: boot config hash {h:08x} (width {} chunk {} k {} dds {} prefix {} wp16 cap {} tail {} tune {tune} \
               dds-guard prior {} ms/draft (--tp-dds-prior; TP=1 6.0) prefill-overlap {} vp-sampled {}{})",
              s.width, s.chunk, s.mtp_k, s.draft_conf, s.prefix_on, s.wp16.as_ref().map_or(0, |st| st.cap),
-             crate::exl3_forward::tail_ckpt_on(), dds_prior(true),
+             crate::exl3_forward::tail_ckpt_on(), dds_prior_w(s.tp_world()),
              crate::exl3_forward::xtp::pf_overlap_desc(crate::exl3_forward::xtp::pf_overlap_code()),
              crate::exl3_forward::xtp::vp_sampled_desc(crate::exl3_forward::xtp::vp_sampled_code()),
              if crate::exl3_forward::xtp::seq_parallel_on() {
                  format!(" seq-parallel {}", crate::exl3_forward::xtp::seq_parallel_desc(crate::exl3_forward::xtp::seq_parallel_code()))
              } else { String::new() });
-    println!("[exl3-serve] TP=2 rank {rank}: options {} (spmd digest {})", crate::opts::set_summary(),
+    println!("[exl3-serve] TP={world} rank {rank}: options {} (spmd digest {})", crate::opts::set_summary(),
              spmd.map_or("none".to_string(), |d| format!("{d:08x}")));
+    if world > 2 {
+        // TP-4D: world > 2 — every rank's hash through the head hub (probe-tolerant, unbounded: the four model
+        // loads finish at different times; a dead peer still aborts within the dead-peer probe): EVERY rank sees
+        // EVERY hash and names the offender, instead of one head-side verdict. world 2 keeps the pairwise agree.
+        let all = crate::net::exchange_u32s_all(&[BOOT_AGREE_MAGIC, h], 4)
+            .context("TP boot agree (head hub; peer dead or link aborted)")?;
+        if let Err(why) = boot_hash_verdict(&all, rank as usize) {
+            crate::net::abort_link_keep_code();
+            anyhow::bail!("TP boot agree FAILED: the ranks resolved different serve configs (hash {h:08x} on rank {rank}): {why}");
+        }
+        return Ok(());
+    }
     if let Err(why) = tp_agree_eq(0xB0_0700, 0, 0, h) {
         crate::net::abort_link();
         anyhow::bail!("TP boot agree FAILED: the ranks resolved different serve configs (hash {h:08x} on rank {rank}): {why}");
@@ -2022,10 +2485,62 @@ pub fn run_tp_head_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
             other => anyhow::bail!("expected Ready from node rank {}, got {other:?}", i + 1),
         }
     }
-    println!("[exl3-serve] TP=2 serving: every §1b feature as TP=1 (graphs, MTP k={}, DDS {}, WP27 forks, prefix cache {}, \
-              WP16 {}) — head-authoritative Step/Cancel/Admit(seed) + HeadFlag, agree per seam/round + pre-verify",
-             parts.sched.mtp_k, parts.sched.draft_conf, parts.sched.prefix_on,
-             parts.sched.wp16.as_ref().map_or("off".to_string(), |st| format!("cap {}", st.cap)));
+    let world = parts.sched.tp.as_ref().map_or(2, |t| t.world);
+    if world <= 2 {
+        println!("[exl3-serve] TP={world} serving: every §1b feature as TP=1 (graphs, MTP k={}, DDS {}, WP27 forks, prefix cache {}, \
+                  WP16 {}) — head-authoritative Step/Cancel/Admit(seed) + HeadFlag, agree per seam/round + pre-verify",
+                 parts.sched.mtp_k, parts.sched.draft_conf, parts.sched.prefix_on,
+                 parts.sched.wp16.as_ref().map_or("off".to_string(), |st| format!("cap {}", st.cap)));
+    }
+    if world > 2 {
+        // TP-4D (review F1): at world > 2 some §1b features are OFF, INERT or refused, so the world-2 "every §1b feature as
+        // TP=1" claim is not printed. The `TP=N serving: ` prefix is the launcher's exactly-once marker (tp4_launch.sh
+        // SERVE_SERVING_RE); the per-feature state rides the next line. Option-resolved state, read from the same predicates
+        // the load uses; the `TP-H ...` / `[exl3-tp] ...` load lines above show what attached.
+        {
+            use crate::exl3_forward::xtp;
+            let s = &parts.sched;
+            let mtp_on = s.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt();
+            let graphs = if crate::opts::var(crate::opt!("exl3-no-graph")).is_ok()
+                || crate::opts::var(crate::opt!("mtp-dump")).map_or(false, |v| !v.is_empty()) { "OFF (--exl3-no-graph / --mtp-dump)" }
+                else if arg(args, "--graph-precapture") == Some("off") { "ON (lazy capture: --graph-precapture off)" }
+                else { "ON (precaptured at boot)" };
+            let mtp = if mtp_on { format!("ON k={}", s.mtp_k) }
+                else if s.model.mtp.is_some() { "OFF (--exl3-no-mtp)".to_string() } else { "OFF (pack has no MTP head)".to_string() };
+            let dds = if mtp_on && s.draft_conf > 0.0 { format!("ON at {}", s.draft_conf) } else { "OFF".to_string() };
+            let dec = xtp::dec_xport_mode() == 1;
+            println!("[exl3-serve] TP={world} serving: head-authoritative Step/Cancel/Admit(seed) + HeadFlag, hub lockstep agree per \
+                      seam/round + pre-verify — some TP=1 §1b features are OFF / INERT / refused at world {world}; per-feature state on the \
+                      next line, table in PLAN/TP-4D_REPORT.md");
+            println!("[exl3-serve] TP={world} features: graphs {graphs}; MTP {mtp}; DDS {dds}; prefix cache {}; WP16 {}; WP27 forks not \
+                      world-gated (--wp27-off / --wp27-forks / PDL decide); TP-H greedy vocab-parallel head {}; sampled / penalized / \
+                      ratio-rule rows = {}; sharded MTP-head screen {}; decode \
+                      transport {}; prefill transport {}; prefill overlap {}; sequence-parallel prefill {}; EP deal '{}'; pre-verify \
+                      drain SKIPPED at world > 2 (it runs at world 2 only; hardware-unproven); refused if passed: --tp-oneshot, --tp-dec-grecv != 0, \
+                      --ep-deal freq outside world 4",
+                     if s.prefix_on { "ON" } else { "OFF (--prefix-cache off)" },
+                     s.wp16.as_ref().map_or("OFF".to_string(), |st| format!("ON (cap {} checkpoints)", st.cap)),
+                     if xtp::vp_head_on() && dec { "ON" } else { "OFF (--tp-vp-head off / --tp-dec-xport 0)" },
+                     if xtp::vp_head_on() && dec && xtp::vp_sampled_on() { "ON (vocab-parallel all-gather, TP-4H2)" }
+                         else { "REPLICATED head (--tp-vp-sampled off / --tp-vp-head off / --tp-dec-xport 0)" },
+                     if mtp_on && xtp::dh_shard_on() && dec { "ON" } else { "OFF (no MTP head / --tp-dh-shard off / --tp-dec-xport 0)" },
+                     if dec { format!("folded K1 + multi-block K2, {} exchange(s) per reduce{}, receive cpu_done only",
+                                      if xtp::tp_reduce_single_for(world) { 1 } else { (world as u32).trailing_zeros() },
+                                      if xtp::tp_reduce_single_for(world) { " (--tp-reduce single: ONE all-peers stage, the world-4 default)" } else { "" }) }
+                         else { "serial K1/K2 + cvt (--tp-dec-xport 0)".to_string() },
+                     match xtp::prefill_xport_mode() { 0 => "serial rounds-aware K1/K2", 1 => "single-rail pipelined (hardware-unproven at world > 2)", _ => "dual-rail pipelined (hardware-unproven at world > 2)" },
+                     if xtp::pf_overlap_rows() == 0 { "OFF" } else { "INERT" },
+                     if !xtp::seq_parallel_on() { "OFF" }
+                         else if world == 4 { "ON (TP-4S quarter rows: recursive-halving reduce-scatter + recursive-doubling all-gather; hardware-unproven until PLAN/TP-4S_GATES.md rungs 1-2 pass)" }
+                         else { "INERT" },
+                     xtp::ep_deal_kind());
+        }
+        // TP-4D: the API startup line names the world, the lockstep protocol and the rank/host map
+        println!("[exl3-serve] TP={world} API up: head = rank 0; {}; lockstep = head-hub (one merged op per point, per-wait \
+                  deadline {} ms — --tp-lockstep-timeout-ms); Step/Cancel/Admit/HeadFlag over {} node control streams",
+                 TP_RANK_MAP.get().map_or("rank/host map unavailable".to_string(), |m| m.join("; ")),
+                 parts.sched.tp.as_ref().map_or(0, |t| t.deadline_ms), world - 1);
+    }
     serve_http(parts, Some(streams))
 }
 
@@ -2036,6 +2551,7 @@ pub fn run_tp_head_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
 /// loudly with this reason, instead of loading for minutes and then losing the node in a probe.
 pub fn run_tp_node_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpContext,
                          mut stream: std::net::TcpStream) -> Result<()> {
+    let node_world = ctx.world;   // TP-4Z1: the worker mask needs the world to know whether the single-stage proxy (core 17) is live
     let boot = (|| -> Result<(Exl3Scheduler, Option<Vec<usize>>)> {
         let attach = tp_attach(ctx)?;
         let parts = build_serve(args, model_dir, Some(attach))?;
@@ -2052,7 +2568,7 @@ pub fn run_tp_node_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
             return Err(e);
         }
     };
-    set_worker_mask(tp_worker_mask(&cpu_mask, true));
+    set_worker_mask(tp_worker_mask(&cpu_mask, true, node_world));
     crate::tp_serve::send_serving(&mut stream, &crate::tp_serve::ServingMsg::Ready)?;
     println!("[exl3-serve] TP node: mirror armed (Ready sent) — waiting for the head's steps");
     sched.tp.as_mut().context("node without TP state")?.ctl = vec![stream];
@@ -2089,6 +2605,9 @@ pub fn parse_spec_sampling(args: &[String]) -> Result<(bool, Option<f32>)> {
     }
     Ok((spec_ratio, draft_temp))
 }
+
+/// The served `--prefill-chunk` default (owner 2026-10-02, v0.7.1: steady 4,095-row chunks, TP-4X1).
+pub const DEFAULT_PREFILL_CHUNK: usize = 4095;
 
 /// Detection: a dir is an EXL3 pack iff quantization_config.json exists and the safetensors
 /// index carries `.trellis` entries (the A3 spec's quadruple manifest).
@@ -2128,7 +2647,8 @@ pub fn run(args: &[String], model_dir: &str) -> Result<()> {
 /// proves the resolved scheduler config equal across ranks before a request is served.
 fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward::xtp::TpAttach>) -> Result<ServeParts> {
     let tp_rank: Option<i32> = tp.as_ref().map(|a| a.rank);
-    let who = match tp_rank { Some(r) => format!("TP=2 rank {r}"), None => "TP=1".to_string() };
+    let tp_world: u32 = tp.as_ref().map_or(1, |a| a.world as u32);
+    let who = match tp_rank { Some(r) => format!("TP={tp_world} rank {r}"), None => "TP=1".to_string() };
     let port: u16 = arg(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(8000);
     let max_seq_len: usize = arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let width: usize = arg(args, "--max-batch").and_then(|s| s.parse().ok()).unwrap_or(8);
@@ -2152,7 +2672,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         crate::opts::set(crate::opt!("ple-ram"), v);
     }
     // --kv-cache f32|f16|fp8|q8: attention KV storage format (PLAN/KV_CACHE_FORMATS.md). Default
-    // q8 (owner decision 2026-09-26, after the WP25 quality gate); f32 is exact; f16 halves, fp8 (e4m3 + per-row f32 scale) and q8 (the rival's H32-rotated int8 +
+    // q8 (owner decision 2026-09-26, after the WP25 quality gate); f32 is exact; f16 halves, fp8 (e4m3 + per-row f32 scale) and q8 (the reference implementation's H32-rotated int8 +
     // f16 per-32 scale, WP25) quarter the long-context KV bytes. Transported to the loader via
     // [kv-cache] (an explicit env value wins when the flag is absent).
     if let Some(v) = arg(args, "--kv-cache") {
@@ -2203,10 +2723,10 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
             dds: arg(args, "--draft-confidence").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.4) > 0.0,
             kv_fmt: crate::exl3_forward::kv_fmt_from_opts(),
             max_pos,
-            prefill_chunk: arg(args, "--prefill-chunk").and_then(|v| v.parse().ok()).unwrap_or(2048),
+            prefill_chunk: arg(args, "--prefill-chunk").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PREFILL_CHUNK),
         };
         tune::boot(&tune::BootReq { sel, model_dir, posture, profile_mhz, draft_on,
-                                    tp: if tp_rank.is_some() { 2 } else { 1 } });
+                                    tp: tp_world });
     }
     println!("[exl3-serve] {who}: loading EXL3 pack {model_dir} (width {width}, max_pos {max_pos}, kv-cache {kv_name})");
     let model = FwdModel::load_tp(model_dir, width, max_pos, tp)?;
@@ -2225,18 +2745,18 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     println!("[exl3-serve] stop_ids={eos:?}");
 
     let mtp_k = crate::exl3_forward::mtp_depth_default();
-    // API-parity DDS: dynamic draft stop (the rival's -dds -dc 0.6). CLI --draft-confidence <p>;
+    // API-parity DDS: dynamic draft stop (the reference implementation's -dds -dc 0.6). CLI --draft-confidence <p>;
     // 0 = fixed-depth chain. Output-neutral (greedy lossless, sampled distribution-exact).
-    // Default 0.4, not the rival's 0.6: our draft pass is cheaper relative to a verify row, so
+    // Default 0.4, not the reference implementation's 0.6: our draft pass is cheaper relative to a verify row, so
     // longer drafts pay (sweep 2026-09-25, k5 greedy 1024 tok: 0.4 -> ansic 87.9 / python 77.6 /
     // prose 55.8; 0.6 -> 85.2 / 74.2 / 55.6; 0.2-0.7 all within +-2).
     let draft_conf: f64 = arg(args, "--draft-confidence").and_then(|s| s.parse().ok()).unwrap_or(0.4);
     anyhow::ensure!((0.0..1.0).contains(&draft_conf), "--draft-confidence must be in [0, 1)");
-    // WP08 (owner decision 2026-09-26): the rival's streaming loop detector, ON by default at its
+    // WP08 (owner decision 2026-09-26): the reference implementation's streaming loop detector, ON by default at its
     // launcher setting stop_on_loop = (300, 3) (chat.py -lw 300 -lmr 3): a response whose last
     // 300 tokens are one repeating sequence of period <= 100 ends as a normal stop
     // (stop_reason "loop_detected"). --loop-detect off disables; --loop-window / --loop-min-reps
-    // tune it (the rival's asserts: window > 1, 1 < reps < window). It only changes output when
+    // tune it (the reference implementation's asserts: window > 1, 1 < reps < window). It only changes output when
     // the model is already looping.
     let loop_cfg = match arg(args, "--loop-detect") {
         None | Some("on") => {
@@ -2255,7 +2775,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         Some("off") => None,
         Some(v) => anyhow::bail!("--loop-detect must be on or off (got '{v}')"),
     };
-    // WP15: penalty window, the rival's -penr (penalty_range, default 1024) used as both its
+    // WP15: penalty window, the reference implementation's -penr (penalty_range, default 1024) used as both its
     // full-strength (sustain) and fading (decay) spans. Penalties themselves are per request.
     let pen_range: usize = match arg(args, "--penalty-range") {
         None => 1024,
@@ -2266,7 +2786,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // WP24 (owner-consent class: seeded sampled bytes change; default match = today bit for bit).
     let (spec_ratio, draft_temp) = parse_spec_sampling(args)?;
     // Server-wide penalty defaults for requests that send none (the shared server flags; the
-    // rival's defaults 1.0 / 0 / 0 when absent). Same validity rules as a request's values.
+    // reference implementation's defaults 1.0 / 0 / 0 when absent). Same validity rules as a request's values.
     let dflt = |name: &str, d: f32| -> Result<f32> {
         match arg(args, name) {
             None => Ok(d),
@@ -2292,15 +2812,18 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // fixed flash256 kernel) shows 112 tok/s @ C=512 vs 234 @ C=2048 (the KV
     // re-scan term ~N^2/2C); serve == bench at matched C, so the chunk width is
     // the whole serve-side lever. Scratch cost is ~4x of a few hundred MB.
-    let chunk: usize = arg(args, "--prefill-chunk").and_then(|v| v.parse().ok()).unwrap_or(2048);
+    // v0.7.1 (owner 2026-10-02, D-TP4-6): default 2048 -> 4095 (TP-4X1: W=4 prefill -3% at 8K, -5.4% at 32K).
+    let chunk: usize = arg(args, "--prefill-chunk").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PREFILL_CHUNK);
     if tp_rank.is_some() {
-        anyhow::ensure!(psc_rows(chunk.max(1)) <= crate::exl3_forward::xtp::TP_MAX_ROWS,
-                        "TP: --prefill-chunk {chunk} gives prefill chunks up to {} rows (C1 tail checkpoints merge up to 2C-1), \
-                         above the TP all-reduce partial buffer ({} rows)", psc_rows(chunk.max(1)), crate::exl3_forward::xtp::TP_MAX_ROWS);
+        anyhow::ensure!(psc_rows(chunk.max(1), true) <= crate::exl3_forward::xtp::TP_MAX_ROWS,
+                        "TP: --prefill-chunk {chunk} gives prefill chunks up to {} rows, above the TP all-reduce \
+                         partial buffer ({} rows; C1 tail checkpoints merge up to min(2C-1, {}) rows)",
+                        psc_rows(chunk.max(1), true), crate::exl3_forward::xtp::TP_MAX_ROWS,
+                        crate::exl3_forward::xtp::TP_MAX_ROWS - 1);
     }
     // S-A3-u: build the prefill scratch at startup and warm cuBLASLt (lazy kernel loads + plans
     // ~0.4 s) so request 1 does not pay it. --exl3-no-prefill-warmup skips (diagnostics).
-    let mut psc0 = model.prefill_scratch(psc_rows(chunk.max(1)))?;
+    let mut psc0 = model.prefill_scratch(psc_rows(chunk.max(1), tp_rank.is_some()))?;
     if crate::opts::var(crate::opt!("exl3-no-prefill-warmup")).is_err() {
         model.prefill_warmup(&mut psc0, 0, &crate::exl3_forward::FwdModel::prefill_warmup_widths(chunk.max(1)))?;
     }
@@ -2382,6 +2905,18 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
                   carry and the first-token logits ([wp16-xcheck] lines)",
                  if width > 1 { "a free lane's slot" } else { "--max-batch 1: the resumed slot itself, then the resumed state is restored" });
     }
+    // VIS-2: the vision tower (TP=1; TP > 1 serves images from VIS-4). Loaded when config.json declares
+    // a vision_config and the text config an interleaved mrope; a load failure serves text-only with a
+    // visible notice (image requests then answer 400).
+    // VIS-4: the head (TP=1, or rank 0) runs the tower; a node only needs the mrope section (it splices
+    // the rows the head ships).
+    let (vision_tower, vision_gpu, mrope_section) = if tp_rank.map_or(true, |r| r == 0) {
+        vision_boot(model_dir)
+    } else {
+        let sec = mrope_section_of(model_dir);
+        println!("[exl3-serve] vision (node): mrope section {sec:?}; image rows arrive from the head");
+        (None, None, sec)
+    };
     let sched = Exl3Scheduler {
         model: model.clone(), sc, width,
         lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, psc: Some(psc0),
@@ -2389,8 +2924,8 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         prefix_on, cache: (0..width).map(|_| None).collect(),
         wp16, wp16_xcheck,
         loop_cfg, pen_range, spec_ratio, draft_temp, gate: None, tok: tok.clone(),
-        tp: tp_rank.map(TpSync::new),
-        exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0),
+        tp: tp_rank.map(|r| TpSync::new(r, tp_world as i32)),
+        exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0), mrope_section, vis_seam: None,
     };
     println!("[exl3-serve] liveness: sticky CUDA error / scheduler thread crash -> {}",
              if exit_on_fatal { "exit 70 (--exit-on-fatal)" } else { "engine DEAD, /health 503 (no --exit-on-fatal)" });
@@ -2433,8 +2968,8 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         // exl3 snapshots at the prompt end: no ckpt_at render needed — except C1 tail checkpoints,
         // which take one at the message boundary (ckpt_at) of every prompt
         prefix_cache: prefix_on && tail_ckpt_boot,
-        vision_tower: None,
-        vision_gpu: None,
+        vision_tower,
+        vision_gpu,
         vision_cpu: false,
         stop_ids: eos,
         otel: None,
@@ -2442,14 +2977,61 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     Ok(ServeParts { sched, state, port, cpu_aff, exit_on_fatal, rx: srx })
 }
 
+/// VIS-2: the text config's interleaved mrope_section (None = the model declares no interleaved mrope).
+fn mrope_section_of(model_dir: &str) -> Option<[usize; 3]> {
+    crate::vision_tower::vision_geometry(model_dir).ok()??;
+    let raw = std::fs::read_to_string(std::path::Path::new(model_dir).join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let rp = v.get("text_config").unwrap_or(&v).get("rope_parameters")?;
+    if rp.get("mrope_interleaved").and_then(|x| x.as_bool()) != Some(true) { return None; }
+    let a = rp.get("mrope_section")?.as_array()?;
+    if a.len() != 3 { return None; }
+    Some([a[0].as_u64()? as usize, a[1].as_u64()? as usize, a[2].as_u64()? as usize])
+}
+
+/// VIS-2: load the vision tower for the EXL3 server (CPU weights + the f32 GPU tower) and the text
+/// config's interleaved mrope_section. Any failure = text-only with a printed reason.
+#[allow(clippy::type_complexity)]
+fn vision_boot(model_dir: &str) -> (Option<Arc<crate::vision_tower::VisualTower>>,
+                                    Option<Arc<std::sync::Mutex<crate::vision_gpu::GpuVisualTower>>>,
+                                    Option<[usize; 3]>) {
+    match crate::vision_tower::vision_geometry(model_dir) {
+        Ok(Some(_)) => {}
+        Ok(None) => return (None, None, None),
+        Err(e) => { println!("[exl3-serve] vision: geometry probe failed ({e:#}) — text-only"); return (None, None, None); }
+    }
+    let Some(sec) = mrope_section_of(model_dir) else {
+        println!("[exl3-serve] vision: the text config declares no interleaved mrope_section — text-only");
+        return (None, None, None);
+    };
+    let t0 = std::time::Instant::now();
+    let tower = match crate::vision_tower::VisualTower::load(model_dir) {
+        Ok(t) => Arc::new(t),
+        Err(e) => { println!("[exl3-serve] vision: tower load failed ({e:#}) — text-only"); return (None, None, None); }
+    };
+    let gpu = match cudarc::driver::CudaDevice::new(0).map_err(anyhow::Error::from)
+        .and_then(|d| crate::vision_gpu::GpuVisualTower::new(d, &tower)) {
+        Ok(g) => g,
+        Err(e) => { println!("[exl3-serve] vision: GPU tower unavailable ({e:#}) — text-only"); return (None, None, None); }
+    };
+    let d = tower.dims;
+    println!("[exl3-serve] vision ON: tower from {}: {} blocks x {} wide -> {} ({:.1} s); images resized to a longer side <= {} px \
+              (--image-max-edge), mrope section {sec:?}; QSA indexer pooled keys follow the image positions (VIS-3)",
+             tower.source, d.depth, d.hidden, d.out_hidden, t0.elapsed().as_secs_f64(),
+             if tower.preproc.max_edge == 0 { "unlimited".to_string() } else { tower.preproc.max_edge.to_string() });
+    (Some(tower), Some(Arc::new(std::sync::Mutex::new(gpu))), Some(sec))
+}
+
 /// TP-D: the host-thread mask at TP — the big cores minus the launch core (9, the pinned scheduler
 /// thread) and the RDMA proxy core (19). TP=1: the resolved mask unchanged.
-fn tp_worker_mask(m: &Option<Vec<usize>>, tp: bool) -> Option<Vec<usize>> {
+fn tp_worker_mask(m: &Option<Vec<usize>>, tp: bool, world: i32) -> Option<Vec<usize>> {
     let m = m.clone()?;
     if !tp { return Some(m); }
     // TP-F: the dual-rail prefill transport pins its second proxy on TP_AUX_PROXY_CORE (18).
     let aux = if crate::exl3_forward::xtp::prefill_xport_mode() == 2 { crate::exl3_forward::xtp::TP_AUX_PROXY_CORE as usize } else { usize::MAX };
-    let f: Vec<usize> = m.into_iter().filter(|&c| c != 9 && c != 19 && c != aux).collect();
+    // TP-4F2: `--tp-reduce single` pins a third proxy (the single-stage reduce ctx) on TP_SINGLE_PROXY_CORE (17).
+    let single = if crate::exl3_forward::xtp::tp_reduce_single_for(world) { crate::exl3_forward::xtp::TP_SINGLE_PROXY_CORE as usize } else { usize::MAX };
+    let f: Vec<usize> = m.into_iter().filter(|&c| c != 9 && c != 19 && c != aux && c != single).collect();
     if f.is_empty() { None } else { Some(f) }
 }
 
@@ -2474,7 +3056,7 @@ fn serve_http(parts: ServeParts, tp_ctl: Option<Vec<std::net::TcpStream>>) -> Re
     // scheduler thread is spawned — a new thread inherits its creator's mask (Linux), and so do
     // the threads either of them spawns later (prefill PLE workers, tokio's blocking pool).
     println!("[exl3-serve] {}", cpu_aff.1);
-    let mask = tp_worker_mask(&cpu_aff.0, tp_ctl.is_some());
+    let mask = tp_worker_mask(&cpu_aff.0, tp_ctl.is_some(), tp_ctl.as_ref().map_or(1, |c| c.len() as i32 + 1));
     if let Some(cpus) = mask.as_ref() {
         if let Err(e) = crate::cpu_affinity::pin_current_thread(cpus) {
             println!("[exl3-serve] cpu affinity: pinning FAILED ({e:#}) — threads left to the OS scheduler");
@@ -2683,7 +3265,7 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
         prefix_on: true, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: None, pen_range: 1024, spec_ratio: false, draft_temp, gate: None, tok: tok.clone(), tp: None,
-        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0),
+        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), mrope_section: None, vis_seam: None,
     };
     let quick = args.iter().any(|a| a == "--quick");
     wp24_gate_conditions(&mut sched, &prompt, &text, trials, positions, n_seeds, top_k, draft_conf, draft_temp, quick)
@@ -3060,12 +3642,27 @@ fn spec_unpack(v: &[u32]) -> Result<Vec<(String, Vec<u32>)>> {
     Ok(out)
 }
 
+/// TP-4D: fold the world > 2 end-of-program hub result: `all[r] = [rank r's verdict (1 = OK), rank r's agree count]`.
+/// Ok only when EVERY rank reports OK and every rank's agree count equals this rank's (the same lockstep points were
+/// crossed everywhere). The line names each rank, so one failing rank of four is visible in every rank's log.
+fn tpspec_fold(all: &[Vec<u32>], my_rank: usize, agrees: u64) -> (bool, String) {
+    let mut ok = true;
+    let mut parts = Vec::new();
+    for (r, f) in all.iter().enumerate() {
+        let good = f[0] != 0 && f[1] as u64 == agrees;
+        ok &= good;
+        parts.push(format!("rank {r}{} {} (agrees {})", if r == my_rank { " (this)" } else { "" },
+                           if f[0] != 0 { "OK" } else { "FAIL" }, f[1]));
+    }
+    (ok, format!("{} | this rank agrees {agrees}", parts.join(" | ")))
+}
+
 /// The spec program (see the section comment). `ctx` = Some on both TP ranks (the head passes
 /// `prompts`, the node None — they arrive over the link); None = TP=1 (prompts required).
 pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Option<Vec<(String, Vec<u32>)>>,
                 max_pos: usize, o: &SpecOpts) -> Result<()> {
     use sha2::{Digest, Sha256};
-    let (prompts, attach, rank) = match ctx {
+    let (prompts, attach, rank, world) = match ctx {
         Some(mut ctx) => {
             ctx.sanity()?;
             ctx.branch_check(&crate::tp::TpBranch::Exl3Xtp)?;
@@ -3077,12 +3674,13 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
             let prompts = spec_unpack(&seq)?;
             let (rank, world, link) = ctx.into_parts();
             anyhow::ensure!(crate::net::pin_thread(9), "launch thread failed to pin to core 9 — TP refuses to run unpinned");
-            (prompts, Some(crate::exl3_forward::xtp::TpAttach { rank, world, link }), rank)
+            (prompts, Some(crate::exl3_forward::xtp::TpAttach { rank, world, link }), rank, world)
         }
-        None => (prompts.context("spec (TP=1): no prompts")?, None, 0),
+        None => (prompts.context("spec (TP=1): no prompts")?, None, 0, 1),
     };
     let tp_on = attach.is_some();
-    let who = if tp_on { format!("TP=2 rank {rank}") } else { "TP=1".to_string() };
+    // "TP=2 rank N" at world 2 (the label the gate scripts grep), "TP=4 rank N" at world 4
+    let who = if tp_on { format!("TP={world} rank {rank}") } else { "TP=1".to_string() };
     if o.prefix { crate::opts::set(crate::opt!("exl3-prefix"), "1"); }
     println!("[tpspec] {who}: program {} — {} prompt(s) {:?}; loading {model_dir} (width {}, max_pos {max_pos}, kv-cache {})",
              o.to_mode(), prompts.len(), prompts.iter().map(|(n, p)| format!("{n}:{}", p.len())).collect::<Vec<_>>(),
@@ -3114,8 +3712,8 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
         prefix_on: o.prefix, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: Some((300, 3)), pen_range: 1024, spec_ratio: true, draft_temp: None, gate: None, tok: tok.clone(),
-        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0),
-        tp: if tp_on { Some(TpSync::new(rank)) } else { None },
+        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), mrope_section: None, vis_seam: None,
+        tp: if tp_on { Some(TpSync::new(rank, world)) } else { None },
     };
     let mut arms = vec![SpecArm::Plain];
     if o.dds { arms.push(SpecArm::Dds); }
@@ -3221,10 +3819,19 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
     let (ident_bufs, ident_bad, agrees) = sched.tp.as_ref().map_or((0, 0, 0), |t| (t.ident_bufs, t.ident_bad, t.agrees));
     let mut all_ok = e_ok && samp_ok && ident_bad == 0;
     if let Some(t) = sched.tp.as_ref() {
-        let peer = crate::net::exchange_u32s(&[all_ok as u32, t.agrees as u32], 4)?;
-        println!("[tpspec] {who}: this rank {} | peer {} (peer agrees {}, this rank {agrees}; graphed digests {ident_bufs} compared, {ident_bad} differ)",
-                 if all_ok { "OK" } else { "FAIL" }, if peer[0] != 0 { "OK" } else { "FAIL" }, peer[1]);
-        all_ok &= peer[0] != 0 && peer[1] as u64 == agrees;
+        if t.world > 2 {
+            // TP-4D: world > 2 — every rank's verdict + agree count through the head hub (unbounded: the ranks
+            // finish the gate's last rep at different times); every rank prints the same per-rank table
+            let all = crate::net::exchange_u32s_all(&[all_ok as u32, t.agrees as u32], 4)?;
+            let (ok, line) = tpspec_fold(&all, t.rank as usize, agrees);
+            println!("[tpspec] {who}: {line} (graphed digests {ident_bufs} compared, {ident_bad} differ)");
+            all_ok &= ok;
+        } else {
+            let peer = crate::net::exchange_u32s(&[all_ok as u32, t.agrees as u32], 4)?;
+            println!("[tpspec] {who}: this rank {} | peer {} (peer agrees {}, this rank {agrees}; graphed digests {ident_bufs} compared, {ident_bad} differ)",
+                     if all_ok { "OK" } else { "FAIL" }, if peer[0] != 0 { "OK" } else { "FAIL" }, peer[1]);
+            all_ok &= peer[0] != 0 && peer[1] as u64 == agrees;
+        }
     }
     println!("RESULT: {} ({who}; G-T1-e {}{}{})", if all_ok { "TPSPEC_OK" } else { "TPSPEC_FAIL" },
              if e_ok { "OK" } else { "MISMATCH" },
@@ -3232,4 +3839,223 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
              if tp_on { if ident_bad == 0 { " ; RANK_IDENTITY_OK (graphed)" } else { " ; RANK_IDENTITY_FAIL" } } else { "" });
     anyhow::ensure!(all_ok, "spec program gates failed ({who})");
     Ok(())
+}
+
+/// TP-4D: CPU models of every world > 2 lockstep op of the serve path — the REAL `TpSync::*_hub` functions and the
+/// REAL `net::hub_all` over the in-memory `net::hub_mock` transport, one thread per rank (4 ranks). What these prove:
+/// the merged hub ops are symmetric (every rank runs the same op sequence and reaches the same verdict), counters
+/// stay in lockstep, nodes adopt the head's words, a divergent / dead / hung rank fails EVERY live rank (none is left
+/// parked), and the WP16 allocation agree keeps four checkpoint stores identical. What they do NOT prove: anything
+/// about RDMA placement, the proxy, the hot-path rings or the GPU (hardware questions for the W=4 gate run).
+#[cfg(test)]
+mod tp_hub_tests {
+    use super::*;
+    use crate::net::hub_mock::{run_ranks, Net};
+    use std::time::Duration;
+
+    const W: usize = 4;
+
+    fn sync(rank: usize) -> TpSync { TpSync::new(rank as i32, W as i32) }
+
+    #[test]
+    fn step_go_hub_adopts_head_words_and_advances_counters_in_lockstep() {
+        let net = Net::new(W, true);
+        let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+            let mut t = sync(r);
+            let mut got = Vec::new();
+            for round in 0..5u64 {
+                let (events, local_step) = if r == 0 { ((round % 3) as usize, 100 + round) } else { (0, 100 + round) };
+                got.push(t.step_go_hub(hub, local_step, events).expect("a healthy step-go"));
+            }
+            (got, t.step)
+        });
+        for (r, (got, step)) in out.iter().enumerate() {
+            assert_eq!(*step, 5, "rank {r}: one lockstep counter tick per step-go");
+            let want: Vec<(u64, usize)> = (0..5u64).map(|i| (100 + i, (i % 3) as usize)).collect();
+            assert_eq!(got, &want, "rank {r} adopts the head's (step, events)");
+        }
+        assert!(net.clobbers().is_empty(), "control ring clobbers: {:?}", net.clobbers());
+    }
+
+    #[test]
+    fn a_rank_one_lockstep_point_ahead_fails_every_rank_and_names_it() {
+        let net = Net::new(W, true);
+        let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+            let mut t = sync(r);
+            if r == 2 { t.step += 1; }
+            t.step_go_hub(hub, 7, 0).map_err(|e| format!("{e:#}"))
+        });
+        for (r, o) in out.iter().enumerate() {
+            let e = o.as_ref().expect_err(&format!("rank {r} must fail: the ranks are at different lockstep points"));
+            assert!(e.contains("step-go") && e.contains("FAILED") && e.contains("rank 2 counter field"), "rank {r}: {e}");
+        }
+    }
+
+    #[test]
+    fn pre_verify_hub_compares_width_drafts_and_launches_on_every_rank() {
+        let net = Net::new(W, true);
+        let ok = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+            let mut t = sync(r);
+            let res = t.pre_verify_hub(hub, 6, &[1, 2, 3, 4, 5], 7);
+            (res.is_ok(), t.pre_agrees)
+        });
+        assert!(ok.iter().all(|&(good, n)| good && n == 1), "{ok:?}");
+        for (what, r_bad) in [("drafts", 3usize), ("width", 1), ("launched", 2)] {
+            let net = Net::new(W, true);
+            let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+                let mut t = sync(r);
+                let (w, d, l) = match (what, r == r_bad) {
+                    ("drafts", true) => (6, vec![1, 2, 3, 4, 6], 7),
+                    ("width", true) => (5, vec![1, 2, 3, 4, 5], 7),
+                    ("launched", true) => (6, vec![1, 2, 3, 4, 5], 8),
+                    _ => (6, vec![1, 2, 3, 4, 5], 7),
+                };
+                t.pre_verify_hub(hub, w, &d, l).map_err(|e| format!("{e:#}"))
+            });
+            for (r, o) in out.iter().enumerate() {
+                let e = o.as_ref().expect_err(&format!("{what}: rank {r} must fail on a divergent rank {r_bad}"));
+                assert!(e.contains("pre-verify") && e.contains(&format!("rank {r_bad}")), "{what} rank {r}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn round_hub_ships_head_timing_and_reports_ident_digests() {
+        let net = Net::new(W, true);
+        let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+            let mut t = sync(r);
+            t.ident = true;
+            let words = [3u32, 1, 4, 1, 5];
+            // rank 3's second digest differs: counted, but it is diagnostic (the round itself stays OK)
+            let res = t.round_hub(hub, "verify", 3, 5, &words, if r == 0 { 12.5 } else { 99.0 }, 20.0, true, 1000 + r as u64,
+                                  |m| { assert_eq!(m, 5); Ok(vec![0xAA, if r == 3 { 0xBC } else { 0xBB }, 0xCC]) });
+            (res.expect("a healthy round"), t.agrees, t.ident_bufs, t.ident_bad, t.step)
+        });
+        for (r, (res, agrees, bufs, bad, step)) in out.iter().enumerate() {
+            assert_eq!(*res, (12.5, 20.0, true), "rank {r} gets the head's timing, not its own");
+            assert_eq!((*agrees, *bufs, *bad, *step), (1, 3, 1, 1), "rank {r}");
+        }
+    }
+
+    #[test]
+    fn round_hub_fails_every_rank_on_a_divergent_accept_count() {
+        let net = Net::new(W, true);
+        let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+            let mut t = sync(r);
+            t.round_hub(hub, "verify", if r == 1 { 2 } else { 3 }, 5, &[1, 2, 3], 1.0, 1.0, false, 0, |_| Ok(vec![]))
+                .map(|_| ()).map_err(|e| format!("{e:#}"))
+        });
+        for (r, o) in out.iter().enumerate() {
+            let e = o.as_ref().expect_err(&format!("rank {r} must fail"));
+            assert!(e.contains("rank 1 accept count"), "rank {r}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_node_that_dies_fails_every_live_rank_and_a_hung_one_trips_the_deadline() {
+        // dead node: rank 2 "crashes" before its step-go (its thread ends: the mock's dead-peer probe fires)
+        let net = Net::new(W, true);
+        let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+            if r == 2 { return Err("node crashed".to_string()); }
+            sync(r).step_go_hub(hub, 9, 1).map(|_| ()).map_err(|e| format!("{e:#}"))
+        });
+        for (r, o) in out.iter().enumerate() {
+            let e = o.as_ref().expect_err(&format!("rank {r}: a dead rank 2 must fail the op"));
+            if r != 2 { assert!(e.contains("step-go") && e.contains("FAILED"), "rank {r}: {e}"); }
+        }
+        assert!(net.abort_code(0) == 10 || net.abort_code(0) == 0, "the head saw the dead peer (code 10) or a failed verdict");
+        // hung node: alive but never posts; the head's deadline fires (code 12) and every other rank fails too
+        let net = Net::new(W, true);
+        let out = run_ranks(&net, Some(Duration::from_millis(300)), |r, hub| {
+            if r == 3 { std::thread::sleep(Duration::from_millis(1500)); return Err("hung".to_string()); }
+            sync(r).step_go_hub(hub, 9, 1).map(|_| ()).map_err(|e| format!("{e:#}"))
+        });
+        for r in 0..3 { assert!(out[r].is_err(), "rank {r} must not stay parked behind a hung rank 3"); }
+        assert_eq!(net.abort_code(0), 12, "the head's wait hit the lockstep deadline");
+    }
+
+    #[test]
+    fn checkpoint_allocation_outcome_is_agreed_so_four_stores_stay_identical() {
+        use crate::exl3_forward::CkptStore;
+        // rank 2's third allocation fails (its device memory is tighter); the others would succeed.
+        let local = |r: usize, n_before: usize| -> Result<u32> {
+            if r == 2 && n_before >= 2 { anyhow::bail!("CUDA_ERROR_OUT_OF_MEMORY (model)") } else { Ok(n_before as u32 + 1) }
+        };
+        // WITHOUT the agree (today's world-2 behaviour): the stores diverge — the C2 bug, reproduced
+        let plain: Vec<(usize, usize)> = (0..W).map(|r| {
+            let mut st: CkptStore<u32> = CkptStore::new(1, 8);
+            st.begin_aligned(0, 0, 2048);
+            for i in 0..5 {
+                let n = st.n_alloc;
+                if let Some(b) = st.acquire(|| local(r, n)) { st.insert(0, 2048 * (i + 1), b); }
+            }
+            (st.n_alloc, st.live())
+        }).collect();
+        assert!(plain.iter().any(|&p| p != plain[0]), "without the agree rank 2 freezes at 2 while the others grow: {plain:?}");
+        // WITH the agree: every rank's store ends identical
+        let net = Net::new(W, true);
+        let agreed = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+            let mut t = sync(r);
+            let mut st: CkptStore<u32> = CkptStore::new(1, 8);
+            st.begin_aligned(0, 0, 2048);
+            let mut hub_err = None;
+            for i in 0..5 {
+                let n = st.n_alloc;
+                let got = st.acquire(|| { let l = local(r, n); t.alloc_outcome(hub, n, l, &mut hub_err) });
+                assert!(hub_err.is_none(), "rank {r}: a healthy hub");
+                if let Some(b) = got { st.insert(0, 2048 * (i + 1), b); }
+            }
+            (st.n_alloc, st.live(), st.positions(0))
+        });
+        assert!(agreed.iter().all(|a| *a == agreed[0]), "the four stores must be identical: {agreed:?}");
+        assert_eq!(agreed[0].0, 2, "the cap froze at the two buffers every rank could allocate");
+        assert!(net.clobbers().is_empty());
+    }
+
+    #[test]
+    fn a_failed_alloc_agree_is_reported_not_swallowed_as_an_allocation_failure() {
+        use crate::exl3_forward::CkptStore;
+        // rank 3 dies before the allocation agree: the live ranks' `acquire` would freeze the cap on the Err, so the
+        // transport failure must come back through `hub_err`
+        let net = Net::new(W, true);
+        let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+            if r == 3 { return None; }
+            let mut t = sync(r);
+            let mut st: CkptStore<u32> = CkptStore::new(1, 8);
+            let mut hub_err = None;
+            let _ = st.acquire(|| t.alloc_outcome(hub, 0, Ok(1u32), &mut hub_err));
+            hub_err.map(|e| format!("{e:#}"))
+        });
+        for r in 0..3 {
+            let e = out[r].as_ref().unwrap_or_else(|| panic!("rank {r}: the agree failure must surface in hub_err"));
+            assert!(e.contains("wp16 alloc"), "rank {r}: {e}");
+        }
+    }
+
+    #[test]
+    fn boot_hash_verdict_names_every_differing_rank() {
+        let ok: Vec<Vec<u32>> = (0..W).map(|_| vec![BOOT_AGREE_MAGIC, 0x1234]).collect();
+        assert_eq!(boot_hash_verdict(&ok, 1), Ok(()));
+        let mut bad = ok.clone();
+        bad[2][1] = 0x9999;
+        bad[3][0] = 0x6000_0001;
+        let e = boot_hash_verdict(&bad, 1).unwrap_err();
+        assert!(e.contains("rank 2 hash 00009999 != head 00001234") && e.contains("rank 3 sent frame class") && e.contains("this is rank 1"), "{e}");
+        assert!(!e.contains("rank 1 hash") && !e.contains("rank 0"), "{e}");
+    }
+
+    #[test]
+    fn tpspec_fold_requires_every_rank_ok_with_equal_agree_counts() {
+        let good: Vec<Vec<u32>> = (0..W).map(|_| vec![1, 77]).collect();
+        let (ok, line) = tpspec_fold(&good, 2, 77);
+        assert!(ok && line.contains("rank 2 (this) OK (agrees 77)"), "{line}");
+        let mut one_fail = good.clone();
+        one_fail[3][0] = 0;
+        let (ok, line) = tpspec_fold(&one_fail, 0, 77);
+        assert!(!ok && line.contains("rank 3 FAIL"), "{line}");
+        let mut skew = good.clone();
+        skew[1][1] = 76;
+        let (ok, _) = tpspec_fold(&skew, 0, 77);
+        assert!(!ok, "a rank that crossed a different number of lockstep points must fail the fold");
+    }
 }

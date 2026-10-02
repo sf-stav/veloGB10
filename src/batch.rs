@@ -6394,7 +6394,7 @@ mod vision_image_cache_tests {
     use crate::vision_encoder::ImageSpan;
     use crate::vision_tower::OUT_HIDDEN;
 
-    fn span(start: usize, n: usize) -> ImageSpan { ImageSpan { start, num_tokens: n } }
+    fn span(start: usize, n: usize) -> ImageSpan { ImageSpan { start, num_tokens: n, ..Default::default() } }
 
     /// Build a deterministic concatenated embeds buffer for two images of width OUT_HIDDEN.
     fn two_image_embeds(n0: usize, n1: usize) -> (Vec<f32>, Vec<ImageSpan>) {

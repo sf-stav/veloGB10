@@ -6,7 +6,6 @@
 //! them strictly: a missing or unexpected `model.visual.*` tensor is an ERROR, never a warning.
 
 use anyhow::{anyhow, Result};
-use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -192,10 +191,17 @@ pub struct VisualTower {
     pub merger_fc1_b: Vec<f32>,  // [merge_inter]
     pub merger_fc2_w: Vec<f32>,  // [out_hidden, merge_inter]
     pub merger_fc2_b: Vec<f32>,  // [out_hidden]
+    /// Where the weights came from (boot/probe line): the model's shards, or `VISION_BF16_FILE`.
+    pub source: String,
 }
 
+/// VIS (owner 2026-10-01): an EXL3 pack may carry the ORIGINAL bf16 tower next to its quantized one in
+/// this file (the 333 `model.visual.*` tensors); the loader then takes the tower ONLY from it.
+pub const VISION_BF16_FILE: &str = "vision_tower_bf16.safetensors";
+
 struct Map {
-    m: HashMap<String, (String, Vec<u8>)>,
+    /// name -> (safetensors dtype, raw little-endian bytes, shape)
+    m: HashMap<String, (String, Vec<u8>, Vec<usize>)>,
 }
 
 impl Map {
@@ -232,10 +238,13 @@ impl Map {
                     .ok_or_else(|| anyhow!("{}: bad data_offsets start", name))? as usize;
                 let end = offs.get(1).and_then(|x| x.as_u64())
                     .ok_or_else(|| anyhow!("{}: bad data_offsets end", name))? as usize;
+                let shape: Vec<usize> = meta.get("shape").and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|d| d.as_u64()).map(|d| d as usize).collect())
+                    .unwrap_or_default();
                 let mut data = vec![0u8; end - start];
                 f.seek(SeekFrom::Start((8 + hlen + start) as u64))?;
                 f.read_exact(&mut data)?;
-                m.insert(name, (dt, data));
+                m.insert(name, (dt, data, shape));
             }
         }
         if m.is_empty() {
@@ -245,12 +254,12 @@ impl Map {
     }
 
     fn get(&self, name: &str, n: usize) -> Result<Vec<f32>> {
-        let (dt, data) = self
+        let (dt, data, _) = self
             .m
             .get(name)
             .ok_or_else(|| anyhow!("missing tensor: {}", name))?;
         let v = match dt.as_str() {
-            "BF16" | "F16" => {
+            "BF16" => {
                 let m = data.len() / 2;
                 let mut out = Vec::with_capacity(m);
                 for i in 0..m {
@@ -259,6 +268,11 @@ impl Map {
                 }
                 out
             }
+            // IEEE half. (Until VIS-1 this arm shared the BF16 bit-shift, which is wrong for F16;
+            // no earlier tower stored F16. The EXL3 pack stores norms, biases and patch_embed as F16.)
+            "F16" => data.chunks_exact(2)
+                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                .collect(),
             "F32" => {
                 let m = data.len() / 4;
                 let mut out = Vec::with_capacity(m);
@@ -290,12 +304,15 @@ impl Map {
             return self.get(&raw, m * k);
         }
         let pname = format!("{stem}.weight_packed");
-        let (_, pdata) = self.m.get(&pname).ok_or_else(|| {
+        if self.m.contains_key(&format!("{stem}.trellis")) {
+            return self.get_exl3(stem, m, k);
+        }
+        let (_, pdata, _) = self.m.get(&pname).ok_or_else(|| {
             anyhow!("missing tensor: {} (or {})", raw, pname)
         })?;
-        let (_, sdata) = self.m.get(&format!("{stem}.weight_scale"))
+        let (_, sdata, _) = self.m.get(&format!("{stem}.weight_scale"))
             .ok_or_else(|| anyhow!("missing tensor: {}.weight_scale", stem))?;
-        let (_, gdata) = self.m.get(&format!("{stem}.weight_global_scale"))
+        let (_, gdata, _) = self.m.get(&format!("{stem}.weight_global_scale"))
             .ok_or_else(|| anyhow!("missing tensor: {}.weight_global_scale", stem))?;
         let gs = f32::from_le_bytes(gdata[..4].try_into().unwrap());
         let q = crate::quant::Nvfp4Tensor {
@@ -308,6 +325,114 @@ impl Map {
         let v = crate::quant::dequantize_nvfp4_f32(&q);
         debug_assert_eq!(v.len(), m * k, "packed dequant size {} vs {}x{}", v.len(), m, k);
         Ok(v)
+    }
+
+    /// VIS-1: one EXL3 trellis linear (`{stem}.trellis/.suh/.svh/.mul1`, the Flash-Next pack's
+    /// 5-bit tower) reconstructed to a dense row-major `[m, k]` f32 weight (out = m, in = k):
+    /// W[in][out] = suh[in] * (H · decode(trellis) · H)[in][out] * svh[out], H the orthonormal
+    /// 128-block Hadamard — the reference's `LinearEXL3.get_weight_tensor` (exl3.py:227-237),
+    /// kept in f32 here (the reference rounds to fp16 between steps). The decode is the
+    /// oracle-proven bit-exact `exl3::decode_trellis_host`.
+    ///
+    /// The pack pads a width that is not a multiple of 128 (MLP 4304 -> 4352). Padded OUTPUT
+    /// columns must carry svh = 0 (so they are exactly 0) and are dropped; padded INPUT rows are
+    /// dropped, which is exact only because their producer's padded outputs are exactly 0 — the
+    /// caller checks that on the producer (`check_zero_pad`).
+    fn get_exl3(&self, stem: &str, m: usize, k: usize) -> Result<Vec<f32>> {
+        let fetch = |suf: &str| self.m.get(&format!("{stem}.{suf}"))
+            .ok_or_else(|| anyhow!("missing tensor: {stem}.{suf}"));
+        let (tdt, tdata, tshape) = fetch("trellis")?;
+        if tdt != "I16" || tshape.len() != 3 || tshape[2] % 16 != 0 {
+            return Err(anyhow!("{stem}.trellis: expected I16 [K/16, N/16, 16*bits], got {tdt} {tshape:?}"));
+        }
+        let (kb, nb, bits) = (tshape[0], tshape[1], tshape[2] / 16);
+        let (kp, np) = (kb * 16, nb * 16);
+        if kp < k || np < m || kp % 128 != 0 || np % 128 != 0 {
+            return Err(anyhow!("{stem}: padded shape {kp}x{np} cannot hold in={k} out={m} (or is not 128-aligned)"));
+        }
+        let (_, mul1, _) = fetch("mul1")?;
+        let mul1 = u32::from_le_bytes(mul1.get(..4).ok_or_else(|| anyhow!("{stem}.mul1 empty"))?.try_into().unwrap());
+        if mul1 != crate::exl3::MUL1 {
+            return Err(anyhow!("{stem}: mul1 {mul1:#x} != the mul1 codebook constant {:#x}", crate::exl3::MUL1));
+        }
+        let half_vec = |suf: &str, n: usize| -> Result<Vec<f32>> {
+            let (dt, data, _) = fetch(suf)?;
+            if dt != "F16" || data.len() != 2 * n {
+                return Err(anyhow!("{stem}.{suf}: expected F16 [{n}], got {dt} {} bytes", data.len()));
+            }
+            Ok(data.chunks_exact(2).map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect())
+        };
+        let (suh, svh) = (half_vec("suh", kp)?, half_vec("svh", np)?);
+        if svh[m..].iter().any(|&v| v != 0.0) {
+            return Err(anyhow!("{stem}: padded output columns {m}..{np} have non-zero svh — cannot drop them"));
+        }
+        let trellis: Vec<i16> = tdata.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        let dec = crate::exl3::decode_trellis_host(&trellis, kb, nb, bits);
+        let mut w: Vec<f32> = dec.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect(); // [kp][np]
+        let s = 1.0f32 / (128f32).sqrt();
+        // left: H over each 128-row block of every column, then scale row i by suh[i]
+        let mut col = [0f32; 128];
+        for blk in 0..kp / 128 {
+            for n in 0..np {
+                for j in 0..128 { col[j] = w[(blk * 128 + j) * np + n]; }
+                had128(&mut col);
+                for j in 0..128 { w[(blk * 128 + j) * np + n] = col[j] * s * suh[blk * 128 + j]; }
+            }
+        }
+        // right: H over each 128-column block of every row, then scale column n by svh[n]
+        for i in 0..kp {
+            let row = &mut w[i * np..(i + 1) * np];
+            for blk in 0..np / 128 {
+                let r = &mut row[blk * 128..(blk + 1) * 128];
+                had128(r);
+                for j in 0..128 { r[j] *= s * svh[blk * 128 + j]; }
+            }
+        }
+        // transpose [in][out] -> row-major [out][in], dropping padding
+        let mut out = vec![0f32; m * k];
+        for o in 0..m {
+            for i in 0..k { out[o * k + i] = w[i * np + o]; }
+        }
+        Ok(out)
+    }
+
+    /// The padded tail `[n..]` of a bias must be exactly zero (EXL3 width padding).
+    fn check_zero_pad(&self, name: &str, n: usize) -> Result<()> {
+        let (dt, data, _) = self.m.get(name).ok_or_else(|| anyhow!("missing tensor: {}", name))?;
+        let esz = if dt == "F32" { 4 } else { 2 };
+        if data.len() / esz > n && data[n * esz..].iter().any(|&b| b != 0) {
+            return Err(anyhow!("{name}: padded tail beyond {n} is not zero"));
+        }
+        Ok(())
+    }
+
+    /// `get` that accepts a zero-padded tensor longer than `n` (EXL3 pads widths to 128) and
+    /// returns its first `n` values.
+    fn get_padded(&self, name: &str, n: usize) -> Result<Vec<f32>> {
+        let len = self.m.get(name).map(|(dt, d, _)| d.len() / if dt == "F32" { 4 } else { 2 }).unwrap_or(n);
+        if len > n {
+            self.check_zero_pad(name, n)?;
+            let mut v = self.get(name, len)?;
+            v.truncate(n);
+            return Ok(v);
+        }
+        self.get(name, n)
+    }
+}
+
+/// In-place unnormalized Walsh-Hadamard butterfly on 128 values (natural / Sylvester order — the
+/// same op order as `exl3_bench::had128_ref` and the `exl3_had128` kernel).
+fn had128(v: &mut [f32]) {
+    let mut len = 1usize;
+    while len < 128 {
+        for i in 0..128 {
+            if i & len == 0 {
+                let (a, b) = (v[i], v[i + len]);
+                v[i] = a + b;
+                v[i + len] = a - b;
+            }
+        }
+        len <<= 1;
     }
 }
 
@@ -350,7 +475,10 @@ impl VisualTower {
         // gather safetensors shards
         let mut shards: Vec<String> = vec![];
         let index = dir.join("model.safetensors.index.json");
-        if index.exists() {
+        let bf16_file = dir.join(VISION_BF16_FILE);
+        if bf16_file.is_file() {
+            shards.push(bf16_file.to_string_lossy().to_string());
+        } else if index.exists() {
             let raw = std::fs::read_to_string(&index)?;
             let j: serde_json::Value = serde_json::from_str(&raw)?;
             if let Some(wm) = j["weight_map"].as_object() {
@@ -395,10 +523,10 @@ impl VisualTower {
                 norm2_b: map.get(&format!("{p}norm2.bias"), hidden)?,
                 qkv_w: map.get(&format!("{p}attn.qkv.weight"), 3 * hidden * hidden)?,
                 qkv_b: map.get(&format!("{p}attn.qkv.bias"), 3 * hidden)?,
-                proj_w: map.get(&format!("{p}attn.proj.weight"), hidden * hidden)?,
+                proj_w: map.get_linear(&format!("{p}attn.proj"), hidden, hidden)?,
                 proj_b: map.get(&format!("{p}attn.proj.bias"), hidden)?,
                 fc1_w: map.get_linear(&format!("{p}mlp.linear_fc1"), dims.inter, hidden)?,
-                fc1_b: map.get(&format!("{p}mlp.linear_fc1.bias"), dims.inter)?,
+                fc1_b: map.get_padded(&format!("{p}mlp.linear_fc1.bias"), dims.inter)?,
                 fc2_w: map.get_linear(&format!("{p}mlp.linear_fc2"), hidden, dims.inter)?,
                 fc2_b: map.get(&format!("{p}mlp.linear_fc2.bias"), hidden)?,
             };
@@ -422,6 +550,11 @@ impl VisualTower {
         consumed.insert("model.visual.merger.linear_fc2.weight_scale".into());
         consumed.insert("model.visual.merger.linear_fc2.weight_global_scale".into());
         consumed.insert("model.visual.merger.linear_fc2.bias".into());
+        for lin in ["linear_fc1", "linear_fc2"] {
+            for suf in crate::exl3::EXL3_SUFFIXES {
+                consumed.insert(format!("model.visual.merger.{lin}.{suf}"));
+            }
+        }
         for b in &block_names {
             consumed.insert(b.clone());
         }
@@ -441,6 +574,8 @@ impl VisualTower {
             merger_fc1_b: map.get("model.visual.merger.linear_fc1.bias", mi)?,
             merger_fc2_w: map.get_linear("model.visual.merger.linear_fc2", dims.out_hidden, mi)?,
             merger_fc2_b: map.get("model.visual.merger.linear_fc2.bias", dims.out_hidden)?,
+            source: if bf16_file.is_file() { format!("{VISION_BF16_FILE} (original bf16 tower)") }
+                    else { "the model shards".to_string() },
         };
 
         // Strict "unexpected tensor" check: every model.visual.* key must have been consumed.
@@ -471,7 +606,10 @@ fn block_names_12(bp: &str) -> Vec<String> {
 }
 
 /// The 12 standard block names plus the NVFP4 pack variants of the two MLP weights (the
-/// `nvfp4-*` quant dirs replace `*.weight` with `*_weight_packed/_scale/_global_scale`).
+/// `nvfp4-*` quant dirs replace `*.weight` with `*_weight_packed/_scale/_global_scale`) and the
+/// EXL3 pack variants (VIS-1: `attn.proj` and both MLP weights as trellis quadruples; the pack
+/// also stores quantized `attn.{q,k,v}_proj` copies of the EXACT bf16 fused `attn.qkv.weight`,
+/// which the tower uses instead — the copies are accepted and ignored).
 fn block_names_consumed(bp: &str) -> Vec<String> {
     let mut v = block_names_12(bp);
     for stem in [
@@ -481,6 +619,14 @@ fn block_names_consumed(bp: &str) -> Vec<String> {
         v.push(format!("{stem}.weight_packed"));
         v.push(format!("{stem}.weight_scale"));
         v.push(format!("{stem}.weight_global_scale"));
+    }
+    for lin in ["attn.proj", "mlp.linear_fc1", "mlp.linear_fc2", "attn.q_proj", "attn.k_proj", "attn.v_proj"] {
+        for suf in crate::exl3::EXL3_SUFFIXES {
+            v.push(format!("model.visual.{bp}{lin}.{suf}"));
+        }
+    }
+    for lin in ["attn.q_proj", "attn.k_proj", "attn.v_proj"] {
+        v.push(format!("model.visual.{bp}{lin}.bias"));
     }
     v
 }
@@ -504,6 +650,10 @@ fn load_preproc(dir: &Path, dims: &TowerDims) -> Result<crate::vision_preproc::V
             if let Some(x) = sz.get("shortest_edge").and_then(|x| x.as_u64()) { cfg.min_pixels = x as usize; }
             if let Some(x) = sz.get("longest_edge").and_then(|x| x.as_u64()) { cfg.max_pixels = x as usize; }
         }
+    }
+    // D-VIS-RESIZE: --image-max-edge N (default 1024; 0 = no cap)
+    if let Ok(v) = crate::opts::var(crate::opt!("image-max-edge")) {
+        cfg.max_edge = v.trim().parse().map_err(|_| anyhow!("--image-max-edge must be a pixel count (0 = no cap), got {v:?}"))?;
     }
     if cfg.patch_size != dims.patch || cfg.merge_size != dims.merge
         || cfg.temporal_patch_size != dims.temporal || cfg.in_channels != dims.in_ch
@@ -532,6 +682,36 @@ mod tests {
         assert_eq!(t.patch_embed_w.len(), 1152 * 3 * 2 * 16 * 16);
         assert_eq!(t.pos_embed_w.len(), 2304 * 1152);
         assert_eq!(t.merger_fc2_w.len(), 5120 * 4608);
+    }
+
+    /// VIS-1: F16 tensors decode as IEEE half (they used to share the BF16 bit-shift), BF16 unchanged.
+    #[test]
+    fn f16_and_bf16_decode() {
+        let vals = [1.0f32, -2.5, 0.000_123_4, 65504.0];
+        let f16: Vec<u8> = vals.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
+        let bf16: Vec<u8> = vals.iter().flat_map(|v| half::bf16::from_f32(*v).to_bits().to_le_bytes()).collect();
+        let mut m = HashMap::new();
+        m.insert("a".to_string(), ("F16".to_string(), f16, vec![4]));
+        m.insert("b".to_string(), ("BF16".to_string(), bf16, vec![4]));
+        let map = Map { m };
+        let a = map.get("a", 4).unwrap();
+        let b = map.get("b", 4).unwrap();
+        for (i, v) in vals.iter().enumerate() {
+            assert_eq!(a[i], half::f16::from_f32(*v).to_f32());
+            assert_eq!(b[i], half::bf16::from_f32(*v).to_f32());
+        }
+    }
+
+    /// VIS-1: the unnormalized 128-point butterfly is a Hadamard transform: applying it twice gives 128 x.
+    #[test]
+    fn had128_is_an_involution_up_to_128() {
+        let x: Vec<f32> = (0..128).map(|i| ((i * 37 % 11) as f32) - 5.0).collect();
+        let mut y = x.clone();
+        had128(&mut y);
+        had128(&mut y);
+        for i in 0..128 {
+            assert_eq!(y[i], 128.0 * x[i]);
+        }
     }
 
     /// The geometry probe: every Qwen3.5/3.8 VL geometry parses; `to_dims` requires all fields.

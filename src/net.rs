@@ -23,6 +23,10 @@ extern "C" {
                 tcp_port: c_int, dev_name: *const c_char,
                 gid_idx: c_int, fp32_capacity_bytes: c_int, payload_bytes: c_int) -> *mut NetCtx;
     fn net_set_payload(c: *mut NetCtx, payload_bytes: c_int, fp32: c_int) -> c_int;
+    /// TP-4F2: the NEXT net_init (world 4) builds a uniform one-shot ctx (consumed by that init).
+    fn net_set_oneshot_uniform_once(on: c_int);
+    /// TP-4F2: tie this ctx's abort to the primary link's (both ways, inside its proxy loop).
+    fn net_set_parent(c: *mut NetCtx, parent: *mut NetCtx);
     fn net_oneshot_on(c: *mut NetCtx) -> c_int;   // P3-1: the ctx's one-shot selector (single source of truth)
     fn net_set_recv_mode(c: *mut NetCtx, gpu: c_int) -> c_int;
     fn net_rx_done(c: *mut NetCtx) -> u64;
@@ -53,6 +57,7 @@ extern "C" {
                     released: *mut u64, tail_fires: *mut u64);
     fn net_agree(c: *mut NetCtx, val: u64, step_mask: u64, step_val: u64) -> u64;
     fn net_exchange_one(c: *mut NetCtx, peer_rank: c_int, nbytes: c_int) -> c_int;
+    fn net_exchange_one_dl(c: *mut NetCtx, peer_rank: c_int, nbytes: c_int, deadline_ns: u64) -> c_int;
     fn net_ctrl_recv_hptr(c: *mut NetCtx, src: c_int) -> *mut c_void;
     fn net_ctrl_send_hptr(c: *mut NetCtx) -> *mut c_void;
     fn net_world(c: *mut NetCtx) -> c_int;
@@ -326,6 +331,9 @@ pub fn exchange_u32s(mine: &[u32], wire_u32s: usize) -> anyhow::Result<Vec<u32>>
     }
     unsafe {
         let ctx = c as *mut NetCtx;
+        if net_world(ctx) > 2 {
+            anyhow::bail!("exchange_u32s: the pairwise channel of a world-{} link reaches rank 1 only; use exchange_u32s_all", net_world(ctx));
+        }
         let send = std::slice::from_raw_parts_mut(net_send_hptr(ctx) as *mut u32, wire_u32s);
         for x in send.iter_mut() { *x = 0; }
         send[..mine.len()].copy_from_slice(mine);
@@ -336,12 +344,176 @@ pub fn exchange_u32s(mine: &[u32], wire_u32s: usize) -> anyhow::Result<Vec<u32>>
     }
 }
 
+/// Place rank k's payload at word `k*wire` of the round-2 hub frame; a rank that failed to deliver stays zero.
+fn hub_pack(all: &[Option<Vec<u32>>], wire: usize, dst: &mut [u32]) {
+    dst.iter_mut().for_each(|x| *x = 0);
+    for (k, p) in all.iter().enumerate() {
+        if let Some(p) = p { dst[k * wire..k * wire + p.len()].copy_from_slice(p); }
+    }
+}
+
+fn hub_unpack(src: &[u32], wire: usize, len: usize, world: usize) -> Vec<Vec<u32>> {
+    (0..world).map(|k| src[k * wire..k * wire + len].to_vec()).collect()
+}
+
+/// The transport surface of the world>2 head hub: the dedicated control send staging slot, the stable
+/// per-sender "last received" slots and the symmetric `net_exchange_one`. `hub_all` is written against this so
+/// the REAL hub algorithm (round structure, failed-gather fan-out, pack/unpack, echo check) runs unchanged over
+/// the in-memory transport of the CPU tests (`hub_mock`) and over the RDMA link (`CtxHub`).
+pub(crate) trait HubXport {
+    fn world(&self) -> usize;
+    fn rank(&self) -> usize;
+    /// The control SEND staging slot, `words` u32 long.
+    fn send_buf(&mut self, words: usize) -> &mut [u32];
+    /// A copy of the first `words` u32 of the stable slot holding the last frame received from `src`.
+    fn recv_copy(&self, src: usize, words: usize) -> Vec<u32>;
+    /// `net_exchange_one`: post the first `nbytes` of the staging slot to `peer` and wait for the peer's frame
+    /// of the same size. 0 = ok; -2 = aborted; -3 = peer dead / link error; -4 = lockstep deadline expired.
+    fn exchange_one(&mut self, peer: usize, nbytes: usize) -> i32;
+}
+
+/// The registered link as a `HubXport`. `deadline_ns` 0 = unbounded (boot paths); non-zero = the per-wait lockstep
+/// deadline of `net_exchange_one_dl` (audit C5).
+pub(crate) struct CtxHub { ctx: *mut NetCtx, world: usize, rank: usize, deadline_ns: u64 }
+
+/// The registered link as a world>2 hub transport with a per-wait lockstep deadline (`deadline_ms` 0 =
+/// unbounded). Err on a single-node run and at world <= 2 (the pairwise channel has no hub; the W=2 lockstep
+/// stays on `exchange_u32s` + `agree_ext`).
+pub(crate) fn link_hub(deadline_ms: u64) -> anyhow::Result<CtxHub> {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { anyhow::bail!("link_hub: no registered TP link (single-node?)"); }
+    let ctx = c as *mut NetCtx;
+    let (world, rank) = unsafe { (net_world(ctx) as usize, net_rank(ctx) as usize) };
+    if world <= 2 { anyhow::bail!("link_hub: world {world} uses the pairwise channel, not the hub"); }
+    Ok(CtxHub { ctx, world, rank, deadline_ns: deadline_ms.saturating_mul(1_000_000) })
+}
+
+impl HubXport for CtxHub {
+    fn world(&self) -> usize { self.world }
+    fn rank(&self) -> usize { self.rank }
+    fn send_buf(&mut self, words: usize) -> &mut [u32] {
+        unsafe { std::slice::from_raw_parts_mut(net_ctrl_send_hptr(self.ctx) as *mut u32, words) }
+    }
+    fn recv_copy(&self, src: usize, words: usize) -> Vec<u32> {
+        unsafe { std::slice::from_raw_parts(net_ctrl_recv_hptr(self.ctx, src as c_int) as *const u32, words) }.to_vec()
+    }
+    fn exchange_one(&mut self, peer: usize, nbytes: usize) -> i32 {
+        unsafe { net_exchange_one_dl(self.ctx, peer as c_int, nbytes as c_int, self.deadline_ns) }
+    }
+}
+
+/// The world>2 hub exchange over any `HubXport` (see `exchange_u32s_all` for the contract). `mine` needs 8 bytes
+/// of headroom inside its `wire` frame (the tail tag overwrites the last 8).
+pub(crate) fn hub_all<X: HubXport>(x: &mut X, mine: &[u32], wire: usize) -> anyhow::Result<Vec<Vec<u32>>> {
+    const TAIL_BYTES: usize = 8;
+    let (world, rank) = (x.world(), x.rank());
+    let (n1, n2) = (wire * 4, world * wire * 4);
+    if n1 < 16 || mine.len() * 4 + TAIL_BYTES > n1 || n2 > crate::tp::TP_SLOT_BYTES {
+        anyhow::bail!("exchange_u32s_all: {} words in a {wire}-word frame at world {world} is outside the hub envelope \
+                       (frame >= 16 B with 8 B tail headroom, world * frame <= {} B)", mine.len(), crate::tp::TP_SLOT_BYTES);
+    }
+    {
+        let send = x.send_buf(n2 / 4);
+        send.iter_mut().for_each(|w| *w = 0);
+        send[..mine.len()].copy_from_slice(mine);
+    }
+    if rank != 0 {
+        let rc = x.exchange_one(0, n1);
+        if rc != 0 { anyhow::bail!("exchange_u32s_all: rank {rank} round 1 rc={rc}{}", hub_rc_note(rc)); }
+        x.send_buf(n2 / 4).iter_mut().for_each(|w| *w = 0);
+        let rc = x.exchange_one(0, n2);
+        if rc != 0 { anyhow::bail!("exchange_u32s_all: rank {rank} round 2 rc={rc}{}", hub_rc_note(rc)); }
+        let out = hub_unpack(&x.recv_copy(0, n2 / 4), wire, mine.len(), world);
+        anyhow::ensure!(out[rank] == mine, "exchange_u32s_all: rank {rank}'s payload came back altered from the head");
+        return Ok(out);
+    }
+    // A failed gather must not return early: nodes already in round 1 would park in round 2 (the agree_ext rule).
+    let mut all: Vec<Option<Vec<u32>>> = vec![None; world];
+    all[0] = Some(mine.to_vec());
+    // Every failed exchange is kept: once one link dies the abort fans out to the whole transport, so the
+    // FIRST rank in loop order usually reports rc=-2 (abort already set) while the dead node is another
+    // rank. A rc=-3/-4 failure names the peer that actually failed; the -2s are only echoes of it.
+    let mut failed: Vec<(u8, usize, i32)> = Vec::new();
+    for r in 1..world {
+        let rc = x.exchange_one(r, n1);
+        if rc != 0 { failed.push((1, r, rc)); continue; }
+        all[r] = Some(x.recv_copy(r, mine.len()));
+    }
+    hub_pack(&all, wire, x.send_buf(n2 / 4));
+    for r in 1..world {
+        let rc = x.exchange_one(r, n2);
+        if rc != 0 { failed.push((2, r, rc)); }
+    }
+    if !failed.is_empty() { anyhow::bail!("exchange_u32s_all: {}", hub_failure_summary(&failed)); }
+    Ok(all.into_iter().map(Option::unwrap).collect())
+}
+
+/// The head hub's failure line: the culprit first (a rc=-3/-4 link, which names the failed peer), then
+/// every exchange that failed. When every failure is rc=-2 the abort arrived from elsewhere before the
+/// head reached any live link, and the line says the rank numbers do not identify the failed node.
+fn hub_failure_summary(failed: &[(u8, usize, i32)]) -> String {
+    let all: Vec<String> = failed.iter().map(|&(rd, r, rc)| format!("round {rd} rank {r} rc={rc}")).collect();
+    match failed.iter().find(|&&(_, _, rc)| rc != -2) {
+        Some(&(rd, r, rc)) => format!("head round {rd} with rank {r} rc={rc}{} — failed node: rank {r} [all failed exchanges: {}]",
+                                      hub_rc_note(rc), all.join(", ")),
+        None => format!("transport already aborted before the head reached a live link (rc=-2 on every exchange: {}) — \
+                         these ranks are NOT necessarily the failed node; find it from the nodes (the one whose session \
+                         process is gone or whose log shows the first fault)", all.join(", ")),
+    }
+}
+
+fn hub_rc_note(rc: i32) -> &'static str {
+    match rc {
+        -2 => " (link already aborted)",
+        -3 => " (peer dead or link error; the abort status word names the code)",
+        -4 => " (lockstep deadline expired: the peer is alive but never reached this point; abort code 12)",
+        _ => "",
+    }
+}
+
+/// World-general `exchange_u32s`: every rank's payload, indexed by rank (`out[rank] == mine`); payload
+/// lengths equal on all ranks (SPMD). world <= 2 is exactly `exchange_u32s` (the pairwise startup channel,
+/// same wire bytes). world > 2 is a head hub over the DEDICATED control slots (`net_exchange_one`): round 1
+/// every node sends its frame and the head collects; round 2 the head sends every node the concatenation of
+/// all payloads, and the node's own block comes back as an echo check. The head is also a compute rank, so
+/// nothing here assumes it is quiet: the hub touches neither the hot-path rings nor the GPU epoch counter.
+/// `mine` needs 8 bytes of headroom inside its `wire_u32s` frame (the tail tag overwrites the last 8).
+/// No lockstep deadline (boot / probe paths, where load skew is legitimate); see `exchange_u32s_all_dl`.
+pub fn exchange_u32s_all(mine: &[u32], wire_u32s: usize) -> anyhow::Result<Vec<Vec<u32>>> {
+    exchange_u32s_all_dl(mine, wire_u32s, 0)
+}
+
+/// `exchange_u32s_all` with a per-wait lockstep deadline (audit C5) at world > 2: a peer that is alive (the
+/// dead-peer probe passes) but never reaches this lockstep point makes the wait fail with abort code 12 after
+/// `deadline_ms` instead of holding every rank forever. `deadline_ms == 0` = unbounded. At world <= 2 the pairwise
+/// channel is used unchanged and the deadline is IGNORED (the W=2 wire protocol and timing path stay as shipped).
+pub fn exchange_u32s_all_dl(mine: &[u32], wire_u32s: usize, deadline_ms: u64) -> anyhow::Result<Vec<Vec<u32>>> {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { anyhow::bail!("exchange_u32s_all: no registered TP link (single-node?)"); }
+    let ctx = c as *mut NetCtx;
+    let (world, rank) = unsafe { (net_world(ctx) as usize, net_rank(ctx) as usize) };
+    if world <= 2 {
+        let peer = exchange_u32s(mine, wire_u32s)?;
+        return Ok(if rank == 0 { vec![mine.to_vec(), peer] } else { vec![peer, mine.to_vec()] });
+    }
+    let mut x = CtxHub { ctx, world, rank, deadline_ns: deadline_ms.saturating_mul(1_000_000) };
+    hub_all(&mut x, mine, wire_u32s)
+}
+
 /// Abort the registered TP link (cooperative stop: the abort STATUS word makes in-flight kernels
 /// no-op through the stream rather than trapping, I9). No-op on a single-node run. Used by the
 /// per-step agreement guard (TP item D) to take both ranks down together on a proven divergence.
 pub fn abort_link() {
     let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
     if c != 0 { unsafe { net_abort(c as *mut NetCtx) } }
+}
+
+/// `abort_link`, except that an abort the link already recorded keeps its code: `net_abort` stores code 1
+/// unconditionally, which would overwrite the diagnostic 10 (peer dead) / 12 (lockstep deadline) that a failed
+/// hub exchange has just set. Used by the world > 2 lockstep paths only.
+pub fn abort_link_keep_code() {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c != 0 && unsafe { net_abort_status(c as *mut NetCtx) } == 0 { unsafe { net_abort(c as *mut NetCtx) } }
 }
 
 /// Device epoch / published watermark of the traced link — the I8 tripwire for graph instantiation.
@@ -438,6 +610,25 @@ pub fn spawn_proxy_aux(ctx_addr: usize, core: i32) -> std::thread::JoinHandle<()
     })
 }
 
+/// TP-4E: the device epoch of an AUXILIARY link's ctx (the rail-2 twin of `traced_device_epoch`, which reads
+/// only the registered agree/trace link). Same reader `TpLink::device_epoch` uses, by raw ctx address.
+pub fn ctx_device_epoch(ctx_addr: usize) -> u64 { unsafe { net_device_epoch(ctx_addr as *mut NetCtx) } }
+
+/// TP-4E: every TCP port an N-way bring-up with control port `tcp_port` may bind or dial at `world`:
+/// the liveness responder (`tcp_port + 1`) and the per-pair handshake ports. A mirror of the C shim's
+/// `nway_pair_port` (native/net_shim.c: `tcp_port + 2 + lo * world + hi`, lo < hi) — keep the two in step;
+/// `nway_pair_port_mirrors_the_shim_formula` pins the Rust side to the documented formula, and the
+/// hardware gate (TP-4E_GATES.md) checks the live listeners.
+pub fn nway_link_ports(tcp_port: u16, world: i32) -> Vec<u32> {
+    let mut v = vec![tcp_port as u32 + 1];
+    for lo in 0..world {
+        for hi in lo + 1..world {
+            v.push(tcp_port as u32 + 2 + (lo * world + hi) as u32);
+        }
+    }
+    v
+}
+
 /// A 2-node tensor-parallel link (one RC QP, RoCEv2). `rank` 0 = head (listens), 1 = node (connects).
 pub struct TpLink {
     ctx: *mut NetCtx,
@@ -509,6 +700,28 @@ impl TpLink {
             anyhow::bail!("net_init failed (see [net_shim] logs above)");
         }
         Ok(TpLink { ctx, slot_bytes })
+    }
+
+    /// TP-4F2 (`--tp-reduce single`): the dedicated single-stage reduce link. An ordinary world-4 N-way bring-up
+    /// whose ctx is a UNIFORM one-shot ctx — every epoch is the all-peers push into sender-indexed rings, the proxy
+    /// releases all three peers together, K1's reuse gate waits on all three QPs. It has its own epoch counter, so
+    /// the primary link's R10 round phase never sees it. `slot_bytes` = the ring-slot capacity (decode-sized
+    /// reduces only: XPORT_MIN_BYTES). World 4 only (the shim ignores the request elsewhere, which is refused here).
+    pub fn connect_nway_uniform(rank: i32, world: i32, peer_ips: &[IpAddr], tcp_port: u16, dev: &str,
+                                gid_idx: i32, slot_bytes: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(world == 4, "the single-stage reduce ctx is world 4 only (got {world})");
+        unsafe { net_set_oneshot_uniform_once(1) };
+        let r = Self::connect_nway(rank, world, peer_ips, tcp_port, dev, gid_idx, slot_bytes);
+        unsafe { net_set_oneshot_uniform_once(0) };     // never leak the request past this bring-up
+        let l = r?;
+        anyhow::ensure!(l.oneshot_on(), "the single-stage reduce ctx did not come up one-shot (shim/option mismatch)");
+        Ok(l)
+    }
+
+    /// TP-4F2: mirror this link's abort into `parent` (the primary link's NetCtx address) and the parent's into
+    /// this one, inside this link's proxy loop. MUST be called before the proxy thread starts.
+    pub fn set_parent(&mut self, parent_ctx_addr: usize) {
+        unsafe { net_set_parent(self.ctx, parent_ctx_addr as *mut NetCtx) }
     }
 
     /// Set the DEFAULT hot-path payload (the K1 nbytes==0 path — decode/bench barriers; chunked
@@ -649,3 +862,348 @@ impl Drop for TpLink {
 }
 
 unsafe impl Send for TpLink {}
+
+/// In-memory `HubXport` for the CPU tests: one thread per rank over a shared mailbox that mirrors
+/// `net_exchange_one` exactly where it matters — the per-generation tail tag `(g << 8) | sender` stamped in the
+/// last 8 bytes of the frame, per-(sender, receiver) ring slots of depth `TP_CTRL_RING` written in place by the
+/// post, the wait that compares ONE tag word at `nbytes - 8` (tag check first, abort second, exactly the C
+/// order), the copy to a stable "last received" slot, the optional retirement of the consumed frame
+/// (`clear_frame`, the TP-4D net_shim.c change), a per-rank abort status (each process has its own ctx), the
+/// dead-peer probe (a rank whose thread has ended counts as a dead process after `probe_after` of silence: abort
+/// code 10) and the lockstep deadline (abort code 12). It does NOT model RDMA placement ordering, NIC retries,
+/// the proxy, the hot-path rings or the GPU — those are hardware questions this model cannot answer.
+#[cfg(test)]
+pub(crate) mod hub_mock {
+    use super::*;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    pub const RING: usize = 4;
+    pub const SLOT_WORDS: usize = 8192;
+
+    pub struct Inner {
+        slots: Vec<Vec<u32>>,
+        pending: Vec<bool>,
+        pub dead: Vec<bool>,
+        pub abort_code: Vec<u64>,
+        pub clobbers: Vec<String>,
+    }
+
+    pub struct Net { pub world: usize, clear_frame: bool, pub inner: Mutex<Inner>, cv: Condvar }
+
+    impl Net {
+        pub fn new(world: usize, clear_frame: bool) -> Arc<Net> {
+            Arc::new(Net {
+                world, clear_frame, cv: Condvar::new(),
+                inner: Mutex::new(Inner {
+                    slots: vec![vec![0u32; SLOT_WORDS]; world * world * RING], pending: vec![false; world * world * RING],
+                    dead: vec![false; world], abort_code: vec![0; world], clobbers: Vec::new(),
+                }),
+            })
+        }
+        pub fn hub(self: &Arc<Net>, rank: usize, deadline: Option<Duration>) -> MockHub {
+            MockHub { net: self.clone(), rank, gen: vec![0; self.world], send: vec![0; SLOT_WORDS],
+                      last: vec![vec![0; SLOT_WORDS]; self.world], deadline, probe_after: Duration::from_millis(30) }
+        }
+        pub fn mark_dead(&self, r: usize) {
+            self.inner.lock().unwrap().dead[r] = true;
+            self.cv.notify_all();
+        }
+        pub fn abort_code(&self, r: usize) -> u64 { self.inner.lock().unwrap().abort_code[r] }
+        pub fn clobbers(&self) -> Vec<String> { self.inner.lock().unwrap().clobbers.clone() }
+    }
+
+    pub struct MockHub {
+        net: Arc<Net>, rank: usize, gen: Vec<u64>, send: Vec<u32>, last: Vec<Vec<u32>>,
+        deadline: Option<Duration>, probe_after: Duration,
+    }
+
+    impl HubXport for MockHub {
+        fn world(&self) -> usize { self.net.world }
+        fn rank(&self) -> usize { self.rank }
+        fn send_buf(&mut self, words: usize) -> &mut [u32] { &mut self.send[..words] }
+        fn recv_copy(&self, src: usize, words: usize) -> Vec<u32> { self.last[src][..words].to_vec() }
+        fn exchange_one(&mut self, peer: usize, nbytes: usize) -> i32 {
+            assert!(peer != self.rank && peer < self.net.world && nbytes >= 16 && nbytes % 4 == 0);
+            let (world, rank, words) = (self.net.world, self.rank, nbytes / 4);
+            assert!(words <= SLOT_WORDS, "mock slot is {SLOT_WORDS} words");
+            self.gen[peer] += 1;
+            let g = self.gen[peer];
+            let tag = (g << 8) | rank as u64;
+            self.send[words - 2] = tag as u32;
+            self.send[words - 1] = (tag >> 32) as u32;
+            let mut inn = self.net.inner.lock().unwrap();
+            let widx = (peer * world + rank) * RING + g as usize % RING;
+            if inn.pending[widx] {
+                inn.clobbers.push(format!("rank {rank} gen {g} overwrote an unconsumed frame in rank {peer}'s ring"));
+            }
+            inn.slots[widx][..words].copy_from_slice(&self.send[..words]);
+            inn.pending[widx] = true;
+            self.net.cv.notify_all();
+            let ridx = (rank * world + peer) * RING + g as usize % RING;
+            let expect = (g << 8) | peer as u64;
+            let t0 = Instant::now();
+            loop {
+                let w = &inn.slots[ridx];
+                if w[words - 2] as u64 | ((w[words - 1] as u64) << 32) == expect { break; }
+                if inn.abort_code[rank] != 0 { return -2; }
+                if let Some(d) = self.deadline {
+                    if t0.elapsed() >= d {
+                        if inn.abort_code[rank] == 0 { inn.abort_code[rank] = 12; }
+                        return -4;
+                    }
+                }
+                if t0.elapsed() >= self.probe_after && inn.dead[peer] {
+                    if inn.abort_code[rank] == 0 { inn.abort_code[rank] = 10; }
+                    return -3;
+                }
+                inn = self.net.cv.wait_timeout(inn, Duration::from_millis(5)).unwrap().0;
+            }
+            let frame: Vec<u32> = inn.slots[ridx][..words].to_vec();
+            self.last[peer][..words].copy_from_slice(&frame);
+            inn.pending[ridx] = false;
+            if self.net.clear_frame { inn.slots[ridx][..words].iter_mut().for_each(|w| *w = 0); }
+            0
+        }
+    }
+
+    /// Run `f(rank, hub)` on one thread per rank; a rank whose closure returns is marked dead (its process ended).
+    pub fn run_ranks<T: Send>(net: &Arc<Net>, deadline: Option<Duration>,
+                              f: impl Fn(usize, &mut MockHub) -> T + Sync) -> Vec<T> {
+        std::thread::scope(|s| {
+            let hs: Vec<_> = (0..net.world).map(|r| {
+                let (f, mut hub) = (&f, net.hub(r, deadline));
+                s.spawn(move || { let out = f(r, &mut hub); hub.net.mark_dead(r); out })
+            }).collect();
+            hs.into_iter().map(|h| h.join().expect("rank thread panicked")).collect()
+        })
+    }
+}
+
+#[cfg(test)]
+mod hub_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Interleaving model of the world>2 control plane (net_exchange_one over the per-sender ring slots):
+    /// every rank runs its exchange program, each exchange is POST (write into the peer's slot
+    /// (me, g % RING)), WAIT (own slot (peer, g % RING) carries tag g), CONSUME (copy to the stable slot).
+    /// Every interleaving is explored; a POST into an unconsumed slot is a clobber, a state with no enabled
+    /// step that is not final is a deadlock.
+    fn explore(world: usize, calls: usize, ring: usize) -> Result<usize, String> {
+        let mut prog: Vec<Vec<usize>> = vec![Vec::new(); world];
+        for _ in 0..calls {
+            for _round in 0..2 {
+                for r in 1..world { prog[0].push(r); prog[r].push(0); }
+            }
+        }
+        let gen = |x: usize, i: usize| 1 + prog[x][..i].iter().filter(|&&p| p == prog[x][i]).count() as u32;
+        let idx = |dst: usize, src: usize, g: u32| (dst * world + src) * ring + g as usize % ring;
+        #[derive(Clone, Hash, PartialEq, Eq)]
+        struct St { pc: Vec<usize>, ph: Vec<u8>, slot: Vec<Option<(u32, bool)>> }
+        let s0 = St { pc: vec![0; world], ph: vec![0; world], slot: vec![None; world * world * ring] };
+        let mut seen: HashSet<St> = HashSet::new();
+        let mut stack = vec![s0];
+        while let Some(s) = stack.pop() {
+            if !seen.insert(s.clone()) { continue; }
+            if (0..world).all(|x| s.pc[x] == prog[x].len()) { continue; }
+            let mut any = false;
+            for x in 0..world {
+                if s.pc[x] == prog[x].len() { continue; }
+                let (p, g) = (prog[x][s.pc[x]], gen(x, s.pc[x]));
+                let mut n = s.clone();
+                match s.ph[x] {
+                    0 => {
+                        let i = idx(p, x, g);
+                        if let Some((og, false)) = s.slot[i] {
+                            return Err(format!("clobber: rank {x} gen {g} overwrote unconsumed gen {og} in rank {p}'s slot (ring {ring})"));
+                        }
+                        n.slot[i] = Some((g, false)); n.ph[x] = 1;
+                    }
+                    1 => {
+                        if !matches!(s.slot[idx(x, p, g)], Some((sg, false)) if sg == g) { continue; }
+                        n.ph[x] = 2;
+                    }
+                    _ => {
+                        n.slot[idx(x, p, g)] = Some((g, true)); n.ph[x] = 0; n.pc[x] += 1;
+                    }
+                }
+                any = true;
+                stack.push(n);
+            }
+            if !any { return Err(format!("deadlock at pcs {:?} phases {:?}", s.pc, s.ph)); }
+        }
+        Ok(seen.len())
+    }
+
+    fn header_ring() -> usize {
+        let h = include_str!("../native/tp_doorbell.h");
+        let l = h.lines().find(|l| l.contains("#define TP_CTRL_RING")).expect("TP_CTRL_RING in tp_doorbell.h");
+        l.split_whitespace().nth(2).unwrap().parse().unwrap()
+    }
+
+    // World 4 is the shipping topology (every config here runs in milliseconds). World 8 has 1.1M states and takes
+    // ~17 s in release, so it lives in the #[ignore]d sweep below (`cargo test --release --lib -- --ignored hub_control_ring`).
+    #[test]
+    fn hub_control_ring_is_clobber_free_and_live() {
+        let ring = header_ring();
+        assert!(ring >= 2, "a depth-1 ring is the R10 clobber");
+        for r in [ring, 2] {
+            let n = explore(4, 3, r).unwrap_or_else(|e| panic!("world 4 ring {r}: {e}"));
+            assert!(n > 1000, "world 4 ring {r}: only {n} states explored");
+        }
+    }
+
+    #[test]
+    #[ignore = "world 8, 2 calls: 1.1M states, ~17 s in release"]
+    fn hub_control_ring_world8_full_sweep() {
+        let ring = header_ring();
+        let n = explore(8, 2, ring).unwrap_or_else(|e| panic!("world 8: {e}"));
+        assert!(n > 1_000_000, "world 8: only {n} states explored");
+    }
+
+    #[test]
+    fn hub_control_ring_depth_one_clobbers() {
+        for calls in [1usize, 3] {
+            let e = explore(4, calls, 1).unwrap_err();
+            assert!(e.starts_with("clobber"), "calls {calls}: {e}");
+        }
+    }
+
+    fn payload(rank: usize, op: usize, len: usize) -> Vec<u32> {
+        (0..len).map(|i| ((op as u32) << 24) | ((rank as u32) << 16) | i as u32).collect()
+    }
+
+    /// The REAL `hub_all` (not a re-implementation) over the mock: four ranks run a mixed-size op sequence shaped
+    /// like a served round (go / pre-verify / round frames, an ident-sized frame, an agree-sized frame) and every
+    /// rank must return every rank's exact payload, with no ring clobber.
+    #[test]
+    fn hub_all_mixed_sizes_four_ranks() {
+        use hub_mock::*;
+        let net = Net::new(4, true);
+        let sizes: Vec<(usize, usize)> = vec![(4, 6), (5, 8), (12, 14), (8, 10), (40, 44), (4, 6), (5, 8), (12, 14), (4, 6), (12, 14)];
+        let outs = run_ranks(&net, None, |rank, hub| {
+            sizes.iter().enumerate().map(|(op, &(len, wire))| {
+                hub_all(hub, &payload(rank, op, len), wire).expect("a healthy hub op")
+            }).collect::<Vec<_>>()
+        });
+        for (rank, per_rank) in outs.iter().enumerate() {
+            assert_eq!(per_rank.len(), sizes.len(), "rank {rank} completed every op");
+            for (op, all) in per_rank.iter().enumerate() {
+                let want: Vec<Vec<u32>> = (0..4).map(|r| payload(r, op, sizes[op].0)).collect();
+                assert_eq!(all, &want, "rank {rank} op {op}: every rank must hold every rank's payload");
+            }
+        }
+        assert!(net.clobbers().is_empty(), "no ring clobber: {:?}", net.clobbers());
+        assert!((0..4).all(|r| net.abort_code(r) == 0));
+    }
+
+    /// Mixed wire sizes share ring slots. A stale PAYLOAD word pair an older, larger frame left at a later, smaller
+    /// frame's tail offset can equal that frame's expected tag `(g << 8) | sender`; without the retirement of the
+    /// consumed frame (TP-4D net_shim.c) the head accepts the stale frame before the node has posted. Model of the
+    /// hazard AND of the fix — the C code itself is only exercised on hardware.
+    #[test]
+    fn stale_payload_can_fake_a_tag_until_the_frame_is_retired() {
+        use hub_mock::*;
+        use std::time::Duration;
+        // node 1's op-0 payload plants [(5 << 8) | 1, 0] at words 2..4 = the tag head expects from node 1 at its
+        // generation 5 (op 2 round 1); op 2 uses a 4-word frame whose tail is exactly words 2..4.
+        let plant = |rank: usize, op: usize| -> Vec<u32> {
+            let mut p = payload(rank, op, 8);
+            if rank == 1 && op == 0 { p[2] = (5 << 8) | 1; p[3] = 0; }
+            p
+        };
+        let run = |clear_frame: bool| {
+            let net = Net::new(4, clear_frame);
+            let res = run_ranks(&net, Some(Duration::from_secs(5)), |rank, hub| {
+                let r0 = hub_all(hub, &plant(rank, 0), 14);
+                let r1 = hub_all(hub, &payload(rank, 1, 4), 6);
+                if rank == 1 { std::thread::sleep(Duration::from_millis(150)); } // node 1 is late into op 2
+                let r2 = hub_all(hub, &payload(rank, 2, 2), 4);
+                (r0.is_ok() && r1.is_ok(), r2)
+            });
+            res
+        };
+        let good = run(true);
+        let want: Vec<Vec<u32>> = (0..4).map(|r| payload(r, 2, 2)).collect();
+        for (rank, (early_ok, r2)) in good.iter().enumerate() {
+            assert!(*early_ok, "rank {rank}: ops 0 and 1 are healthy");
+            assert_eq!(r2.as_ref().expect("with the frame retired op 2 completes"), &want, "rank {rank}");
+        }
+        let bad = run(false);
+        let broke = bad.iter().any(|(_, r2)| match r2 { Err(_) => true, Ok(all) => all != &want });
+        assert!(broke, "without retiring the consumed frame the stale payload must be accepted as node 1's op-2 frame \
+                         (the model has to demonstrate the hazard, else the fix is unproven)");
+    }
+
+    fn go_payload(rank: usize, op: u32) -> Vec<u32> {
+        crate::tp_lockstep::go_frame(rank == 0, 0xC0_0000 + op, 100 + op as u64, 3).to_vec()
+    }
+
+    /// Kill-a-node model: rank 3's process is gone before op 1. The head must NOT return early from its gather (nodes
+    /// 1 and 2 are already in round 2 — the agree_ext rule), every live rank must come back promptly, and the ranks
+    /// that did get a round-2 frame see the dead rank's block as zeros — so the lockstep verdict aborts them too.
+    #[test]
+    fn dead_node_fails_the_head_and_zeroes_its_block_for_the_rest() {
+        use crate::tp_lockstep::{go_verdict, GO_WIRE};
+        use hub_mock::*;
+        let net = Net::new(4, true);
+        let t0 = std::time::Instant::now();
+        let res = run_ranks(&net, None, |rank, hub| {
+            let first = hub_all(hub, &go_payload(rank, 0), GO_WIRE).expect("op 0 is healthy");
+            if rank == 3 { return (first, None); } // the process dies between op 0 and op 1
+            (first, Some(hub_all(hub, &go_payload(rank, 1), GO_WIRE)))
+        });
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "no live rank hangs");
+        for (rank, (first, _)) in res.iter().enumerate() {
+            assert_eq!(go_verdict(first, 4), Ok((100, 3)), "rank {rank}: op 0 reached a healthy verdict before the death");
+        }
+        let e = format!("{:#}", res[0].1.as_ref().unwrap().as_ref().unwrap_err());
+        assert!(e.contains("rank 3") && e.contains("rc=-3"), "the head names the dead rank: {e}");
+        for n in [1usize, 2] {
+            let all = res[n].1.as_ref().unwrap().as_ref().unwrap_or_else(|e| panic!("node {n} gets the head's round-2 frame: {e:#}"));
+            assert_eq!(all[n], go_payload(n, 1));
+            assert_eq!(all[3], vec![0; 4], "the dead rank's block is zero, never a stale copy of its previous frame");
+            let v = go_verdict(all, 4).unwrap_err();
+            assert!(v.contains("rank 3 tag"), "the verdict over a zeroed block aborts node {n} too and names rank 3: {v}");
+        }
+        assert_eq!(net.abort_code(0), 10, "the head records abort code 10 (peer dead)");
+    }
+
+    /// Hung-but-alive model (audit C5): rank 2 never reaches the lockstep point (its thread is alive, so the
+    /// dead-peer probe would wait for ever) — the per-wait deadline trips instead, the head aborts with code 12 and
+    /// EVERY rank ends in an error rather than parked or in a healthy verdict.
+    #[test]
+    fn hung_alive_node_trips_the_lockstep_deadline_on_every_rank() {
+        use crate::tp_lockstep::{go_verdict, GO_WIRE};
+        use hub_mock::*;
+        use std::time::Duration;
+        let net = Net::new(4, true);
+        let res = run_ranks(&net, Some(Duration::from_millis(120)), |rank, hub| {
+            if rank == 2 { std::thread::sleep(Duration::from_millis(600)); }
+            hub_all(hub, &go_payload(rank, 0), GO_WIRE)
+        });
+        let e = format!("{:#}", res[0].as_ref().unwrap_err());
+        assert!(e.contains("rc=-4") && e.contains("deadline"), "the head reports the deadline: {e}");
+        assert_eq!(net.abort_code(0), 12);
+        for (rank, r) in res.iter().enumerate() {
+            match r {
+                Err(_) => {}
+                // a node that still got a round-2 frame holds a zeroed block for the hung rank: the verdict aborts it
+                Ok(all) => assert!(go_verdict(all, 4).is_err(), "rank {rank} must not reach a healthy verdict"),
+            }
+        }
+        assert!(res.iter().filter(|r| r.is_err()).count() >= 1);
+    }
+
+    #[test]
+    fn hub_frames_round_trip() {
+        let (world, wire) = (4usize, 7usize);
+        let all: Vec<Option<Vec<u32>>> = (0..world).map(|k| Some((0..3).map(|i| (k * 100 + i) as u32).collect())).collect();
+        let mut frame = vec![0xFFFF_FFFFu32; world * wire];
+        hub_pack(&all, wire, &mut frame);
+        let out = hub_unpack(&frame, wire, 3, world);
+        for k in 0..world { assert_eq!(Some(&out[k]), all[k].as_ref()); }
+        assert!(frame[3..wire].iter().all(|&x| x == 0), "headroom of block 0 must be zero");
+    }
+}

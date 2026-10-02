@@ -12645,6 +12645,19 @@ extern "C" __global__ void hc_add_bcast_b(__nv_bfloat16* streams, const __nv_bfl
 //
 // `QsaParams` (a 64-B device struct built once per indexer at load) carries what would not fit the
 // 12-argument launch cap: the rope tables, the two norm weights, eps and the geometry.
+// VIS-3: per-slot indexer mrope (image requests on the EXL3 engine). A pooled block key starting at KV
+// position p of slot s is roped at row rmap[s * max_pos + p] inside the slot's prompt (p < rplen[s]),
+// p + rdelta[s] past it; rows >= max_pos index the slot's image-row tables mcos/msin ([rows][rdim],
+// QsaParams.cos_t's layout). QsaParams.mr == nullptr (the NVFP4 engine; any text-only build) = off.
+struct QsaMrope {
+    const int* rmap;
+    const int* rplen;
+    const int* rdelta;
+    const float* mcos;
+    const float* msin;
+    int nslots;
+    int max_pos;
+};
 struct QsaParams {
     const float* cos_t;     // [max_pos][rdim] (duplicated halves, see build_rope_tables)
     const float* sin_t;
@@ -12658,6 +12671,7 @@ struct QsaParams {
     int topk;               // block budget = indexer_budget / ratio (512)
     int sel_max;            // indexer_budget + ratio - 1 (2051): row pitch of the selection lists
     int pad;
+    const struct QsaMrope* mr; // VIS-3: per-slot mrope (nullptr = off)
 };
 #define QSA_HD_MAX 128
 #define QSA_HEADS_MAX 8
@@ -12693,7 +12707,7 @@ extern "C" __global__ void qsa_key_write_b(__nv_bfloat16* keys, const __nv_bfloa
 // rank `pos_rope` on dims [0, rdim) (f32, → bf16). Lane owns dims [lane*DPL, lane*DPL+DPL); `sm` is a
 // per-warp hd-float scratch used for the rotate-half pairing.
 __device__ __forceinline__ void qsa_block_key(float* v, const __nv_bfloat16* keys, const long long* rows,
-                                              const QsaParams* p, int pos_rope, float* sm, int lane) {
+                                              const QsaParams* p, int pos_rope, float* sm, int lane, int slot) {
     const int hd = p->hd, DPL = hd >> 5, rdim = p->rdim, half = rdim >> 1;
     #pragma unroll
     for (int i = 0; i < 4; i++) v[i] = 0.0f;
@@ -12716,6 +12730,15 @@ __device__ __forceinline__ void qsa_block_key(float* v, const __nv_bfloat16* key
     __syncwarp();
     const float* ct = p->cos_t + (long long)pos_rope * rdim;
     const float* st = p->sin_t + (long long)pos_rope * rdim;
+    // VIS-3: the slot's mrope row for this block start (text-only slot: rplen = rdelta = 0 -> unchanged)
+    const QsaMrope* mr = p->mr;
+    if (mr != nullptr && slot >= 0 && slot < mr->nslots) {
+        const long long idx = pos_rope < mr->rplen[slot]
+            ? (long long)mr->rmap[(long long)slot * mr->max_pos + pos_rope]
+            : (long long)pos_rope + mr->rdelta[slot];
+        if (idx < mr->max_pos) { ct = p->cos_t + idx * rdim; st = p->sin_t + idx * rdim; }
+        else { ct = mr->mcos + (idx - mr->max_pos) * rdim; st = mr->msin + (idx - mr->max_pos) * rdim; }
+    }
     #pragma unroll
     for (int i = 0; i < 4; i++) if (i < DPL) {
         const int d = lane * DPL + i;
@@ -12744,10 +12767,11 @@ extern "C" __global__ void qsa_score_b(float* scores, const __nv_bfloat16* q, co
     if (j >= nb) return;
     const int pos_start = cps ? cps[b] : pos[0];
     const long long slot_base = (long long)slot_ids[b] * stride;
+    const int qslot = slot_ids[b];
     long long rows[8];
     for (int r = 0; r < ratio; r++) rows[r] = slot_base + qsa_col(j * ratio + r, pos_start, path, b);
     float v[4];
-    qsa_block_key(v, keys, rows, p, j * ratio, sm + warp * QSA_HD_MAX, lane);
+    qsa_block_key(v, keys, rows, p, j * ratio, sm + warp * QSA_HD_MAX, lane, qslot);
     const int hd = p->hd, DPL = hd >> 5;
     float s = 0.0f;
     for (int h = 0; h < p->heads; h++) {
@@ -12767,7 +12791,8 @@ extern "C" __global__ void qsa_score_b(float* scores, const __nv_bfloat16* q, co
 }
 
 // 3. prefill block keys: blocks[j] for j < nblk from the slot's committed raw keys (identity ranks).
-extern "C" __global__ void qsa_block_keys_b(__nv_bfloat16* blocks, const __nv_bfloat16* keys, const QsaParams* p, int nblk) {
+extern "C" __global__ void qsa_block_keys_b(__nv_bfloat16* blocks, const __nv_bfloat16* keys, const QsaParams* p, int nblk,
+                                            int slot /* VIS-3: mrope slot (-1 = none) */) {
     __shared__ float sm[8 * QSA_HD_MAX];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int j = blockIdx.x * (blockDim.x >> 5) + warp;
@@ -12775,7 +12800,7 @@ extern "C" __global__ void qsa_block_keys_b(__nv_bfloat16* blocks, const __nv_bf
     long long rows[8];
     for (int r = 0; r < p->ratio; r++) rows[r] = (long long)j * p->ratio + r;
     float v[4];
-    qsa_block_key(v, keys, rows, p, j * p->ratio, sm + warp * QSA_HD_MAX, lane);
+    qsa_block_key(v, keys, rows, p, j * p->ratio, sm + warp * QSA_HD_MAX, lane, slot);
     const int DPL = p->hd >> 5;
     #pragma unroll
     for (int i = 0; i < 4; i++) if (i < DPL) blocks[(long long)j * p->hd + lane * DPL + i] = f2b(v[i]);
@@ -12804,7 +12829,7 @@ extern "C" __global__ void qsa_pool_update_b(__nv_bfloat16* plane, const __nv_bf
     long long rows[8];
     for (int r = 0; r < ratio; r++) rows[r] = slot * stride + (long long)j * ratio + r;
     float v[4];
-    qsa_block_key(v, keys, rows, p, j * ratio, sm + warp * QSA_HD_MAX, lane);
+    qsa_block_key(v, keys, rows, p, j * ratio, sm + warp * QSA_HD_MAX, lane, (int)slot);
     const int DPL = p->hd >> 5;
     __nv_bfloat16* dst = plane + ((long long)slot * nblk_stride + j) * p->hd + lane * DPL;
     #pragma unroll
@@ -12813,7 +12838,8 @@ extern "C" __global__ void qsa_pool_update_b(__nv_bfloat16* plane, const __nv_bf
 // (b) prefill: blocks [j0, j1) of ONE slot (plane_slot/keys_slot are that slot's bases) — qsa_block_keys_b's
 //     body over a block range.
 extern "C" __global__ void qsa_pool_range_b(__nv_bfloat16* plane_slot, const __nv_bfloat16* keys_slot,
-                                             const QsaParams* p, int j0, int j1) {
+                                             const QsaParams* p, int j0, int j1,
+                                             int slot /* VIS-3: mrope slot (-1 = none) */) {
     __shared__ float sm[8 * QSA_HD_MAX];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int j = j0 + blockIdx.x * (blockDim.x >> 5) + warp;
@@ -12821,7 +12847,7 @@ extern "C" __global__ void qsa_pool_range_b(__nv_bfloat16* plane_slot, const __n
     long long rows[8];
     for (int r = 0; r < p->ratio; r++) rows[r] = (long long)j * p->ratio + r;
     float v[4];
-    qsa_block_key(v, keys_slot, rows, p, j * p->ratio, sm + warp * QSA_HD_MAX, lane);
+    qsa_block_key(v, keys_slot, rows, p, j * p->ratio, sm + warp * QSA_HD_MAX, lane, slot);
     const int DPL = p->hd >> 5;
     #pragma unroll
     for (int i = 0; i < 4; i++) if (i < DPL) plane_slot[(long long)j * p->hd + lane * DPL + i] = f2b(v[i]);

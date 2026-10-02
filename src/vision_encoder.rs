@@ -321,6 +321,10 @@ pub struct VisionOutput {
     pub grid_w: usize,
     /// Number of image tokens = grid_h*grid_w / merge^2.
     pub num_tokens: usize,
+    /// VIS-2: PRE-tower identity of the image (hash of the preprocessed pixel_values + grid), for
+    /// prefix-cache / checkpoint keys: two different images of the same size expand to identical
+    /// image_pad runs, so token ids alone cannot tell them apart (the 2026-08-27 contamination class).
+    pub pixel_hash: u64,
 }
 
 /// Decode a `data:` image URL (or a bare base64), preprocess it, and run the vision tower.
@@ -329,7 +333,7 @@ pub fn process_data_url(tower: &VisualTower, data_url: &str) -> anyhow::Result<V
     let pre = preprocess_data_url(data_url, &tower.preproc)?;
     let merged = tower.forward_cpu(&pre.pixel_values, pre.grid_h, pre.grid_w);
     let tn = (pre.grid_h * pre.grid_w) / (tower.dims.merge * tower.dims.merge);
-    Ok(VisionOutput { merged, grid_h: pre.grid_h, grid_w: pre.grid_w, num_tokens: tn })
+    Ok(VisionOutput { merged, grid_h: pre.grid_h, grid_w: pre.grid_w, num_tokens: tn, pixel_hash: pixel_hash(&pre) })
 }
 
 /// Decode a `data:` image URL (or bare base64) and run the vision tower on the GPU.
@@ -339,29 +343,116 @@ pub fn process_data_url_gpu(gvt: &mut crate::vision_gpu::GpuVisualTower, data_ur
     let pre = preprocess_data_url(data_url, &gvt.host().preproc)?;
     let (merged, _states) = gvt.forward(&pre.pixel_values, pre.grid_h, pre.grid_w, false)?;
     let tn = (pre.grid_h * pre.grid_w) / (gvt.host().dims.merge * gvt.host().dims.merge);
-    Ok(VisionOutput { merged, grid_h: pre.grid_h, grid_w: pre.grid_w, num_tokens: tn })
+    Ok(VisionOutput { merged, grid_h: pre.grid_h, grid_w: pre.grid_w, num_tokens: tn, pixel_hash: pixel_hash(&pre) })
 }
 
 /// Decode + preprocess a `data:` URL into the flatten `pixel_values` + grid (the CPU and GPU paths
 /// share this; only the tower forward differs).
 fn preprocess_data_url(data_url: &str, cfg: &crate::vision_preproc::VisionPreprocConfig) -> anyhow::Result<crate::vision_preproc::PreprocessedImage> {
     use anyhow::anyhow;
+    if data_url.starts_with("http://") || data_url.starts_with("https://") {
+        // owner ruling 2026-09-29: no remote fetches (no SSRF surface) — base64 data URLs only
+        return Err(anyhow!("remote image URLs are not supported; send the image as a base64 data: URL"));
+    }
     let b64 = data_url
         .split("base64,")
         .nth(1)
         .ok_or_else(|| anyhow!("not a base64 data url: {}", &data_url[..data_url.len().min(32)]))?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim())?;
+    // VIS-2 raw-input safety bound (D-VIS-RESIZE keeps one, independent of --image-max-edge): read
+    // the dimensions from the header and refuse to DECODE anything above MAX_INPUT_PIXELS (an RGB
+    // decode costs 3 B/px before the resize brings it down).
+    let (w0, h0) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()?
+        .into_dimensions()?;
+    if (w0 as u64) * (h0 as u64) > MAX_INPUT_PIXELS {
+        return Err(anyhow!("image {w0}x{h0} exceeds the decode limit of {} MP", MAX_INPUT_PIXELS / 1_000_000));
+    }
     let img = image::load_from_memory(&bytes)?.to_rgb8();
     let (w, h) = img.dimensions();
     Ok(crate::vision_preproc::preprocess_image(h as usize, w as usize, img.as_raw(), cfg))
 }
 
+/// VIS-2: decoded-pixel ceiling (64 MP, ~192 MB as RGB8) for one input image, checked from the
+/// header before decoding. Everything below it is accepted and resized per --image-max-edge.
+pub const MAX_INPUT_PIXELS: u64 = 64_000_000;
+
+/// PRE-tower identity of one preprocessed image (pixel_values bits + grid).
+fn pixel_hash(pre: &crate::vision_preproc::PreprocessedImage) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_usize(pre.grid_h);
+    h.write_usize(pre.grid_w);
+    for v in &pre.pixel_values {
+        h.write_u32(v.to_bits());
+    }
+    h.finish()
+}
+
 /// A region of the token stream occupied by one image's merged embeddings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImageSpan {
     /// Token index (in the EXPANDED stream) where this image's embeddings begin.
     pub start: usize,
     pub num_tokens: usize,
+    /// VIS-2: the merged-token grid (rows x cols = num_tokens) — the mrope h/w extents.
+    pub grid_h: usize,
+    pub grid_w: usize,
+    /// VIS-2: PRE-tower pixel identity (see `VisionOutput::pixel_hash`).
+    pub pixel_hash: u64,
+}
+
+/// VIS-2: the 3-axis (t, h, w) RoPE position of every token of an EXPANDED prompt, plus the
+/// rope delta — HF `Qwen4ExpModel.get_rope_index` (transformers 5.17.0) for one sequence of text and
+/// images. Text runs count up from the current position on all three axes. An image span of
+/// `grid_h x grid_w` merged tokens at start position `st` gives token j (row r = j / grid_w,
+/// col c = j % grid_w) the position (st, st + r, st + c), then the current position advances by
+/// max(grid_h, grid_w). delta = max(position) + 1 - len: every position past the prompt is its KV
+/// index + delta (delta <= 0).
+pub fn mrope_positions(len: usize, spans: &[ImageSpan]) -> anyhow::Result<(Vec<[i64; 3]>, i64)> {
+    let mut out = Vec::with_capacity(len);
+    let mut cur: i64 = 0;
+    let mut i = 0usize;
+    let mut sp = spans.iter().peekable();
+    while i < len {
+        match sp.peek() {
+            Some(s) if s.start == i => {
+                anyhow::ensure!(s.grid_h * s.grid_w == s.num_tokens && s.num_tokens > 0 && s.start + s.num_tokens <= len,
+                                "image span at {} ({} tokens, grid {}x{}) is inconsistent with a {len}-token prompt",
+                                s.start, s.num_tokens, s.grid_h, s.grid_w);
+                for j in 0..s.num_tokens {
+                    let (r, c) = ((j / s.grid_w) as i64, (j % s.grid_w) as i64);
+                    out.push([cur, cur + r, cur + c]);
+                }
+                cur += s.grid_h.max(s.grid_w) as i64;
+                i += s.num_tokens;
+                sp.next();
+            }
+            Some(s) => {
+                anyhow::ensure!(s.start > i, "image spans out of order at {}", s.start);
+                out.push([cur; 3]);
+                cur += 1;
+                i += 1;
+            }
+            None => {
+                out.push([cur; 3]);
+                cur += 1;
+                i += 1;
+            }
+        }
+    }
+    anyhow::ensure!(sp.next().is_none(), "image span past the end of a {len}-token prompt");
+    let max = out.iter().flat_map(|p| p.iter().copied()).max().unwrap_or(-1);
+    Ok((out, max + 1 - len as i64))
+}
+
+/// What `expand_image_pads` needs per image (in prompt order).
+#[derive(Debug, Clone, Copy)]
+pub struct ImageInfo {
+    pub num_tokens: usize,
+    pub grid_h: usize,
+    pub grid_w: usize,
+    pub pixel_hash: u64,
 }
 
 /// Expand each `image_pad` placeholder in `tokens` into `n = grid_h*grid_w/merge²`
@@ -370,18 +461,19 @@ pub struct ImageSpan {
 /// same length as the merged-embedding rows, and each span tells the prefill where to overwrite.
 ///
 /// `image_token_count` must be in the same order as the images in the rendered prompt.
-pub fn expand_image_pads(tokens: &[u32], image_token_count: &[usize], image_pad: u32) -> (Vec<u32>, Vec<ImageSpan>) {
+pub fn expand_image_pads(tokens: &[u32], images: &[ImageInfo], image_pad: u32) -> (Vec<u32>, Vec<ImageSpan>) {
     let mut out = Vec::with_capacity(tokens.len());
     let mut spans = Vec::new();
     let mut img = 0usize;
     for &t in tokens {
-        if t == image_pad && img < image_token_count.len() {
-            let n = image_token_count[img];
+        if t == image_pad && img < images.len() {
+            let ii = images[img];
+            let n = ii.num_tokens;
             let start = out.len();
             for _ in 0..n {
                 out.push(image_pad);
             }
-            spans.push(ImageSpan { start, num_tokens: n });
+            spans.push(ImageSpan { start, num_tokens: n, grid_h: ii.grid_h, grid_w: ii.grid_w, pixel_hash: ii.pixel_hash });
             img += 1;
         } else {
             out.push(t);
@@ -413,13 +505,14 @@ pub fn prepare_vision_request(
         return Ok(PreparedVision { expanded_tokens: prompt_tokens.to_vec(), image_embeds: vec![], spans: vec![] });
     }
     let mut embeds: Vec<f32> = Vec::new();
-    let mut counts = Vec::with_capacity(image_urls.len());
+    let mut infos = Vec::with_capacity(image_urls.len());
     for url in image_urls {
         let o = process_data_url(tower, url)?;
-        counts.push(o.num_tokens);
+        let mg = tower.dims.merge;
+        infos.push(ImageInfo { num_tokens: o.num_tokens, grid_h: o.grid_h / mg, grid_w: o.grid_w / mg, pixel_hash: o.pixel_hash });
         embeds.extend_from_slice(&o.merged);
     }
-    let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &counts, tower.image_pad);
+    let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &infos, tower.image_pad);
     Ok(PreparedVision { expanded_tokens, image_embeds: embeds, spans })
 }
 
@@ -436,12 +529,37 @@ pub fn prepare_vision_request_gpu(
         return Ok(PreparedVision { expanded_tokens: prompt_tokens.to_vec(), image_embeds: vec![], spans: vec![] });
     }
     let mut embeds: Vec<f32> = Vec::new();
-    let mut counts = Vec::with_capacity(image_urls.len());
+    let mut infos = Vec::with_capacity(image_urls.len());
     for url in image_urls {
         let o = process_data_url_gpu(gvt, url)?;
-        counts.push(o.num_tokens);
+        let mg = gvt.host().dims.merge;
+        infos.push(ImageInfo { num_tokens: o.num_tokens, grid_h: o.grid_h / mg, grid_w: o.grid_w / mg, pixel_hash: o.pixel_hash });
         embeds.extend_from_slice(&o.merged);
     }
-    let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &counts, gvt.host().image_pad);
+    let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &infos, gvt.host().image_pad);
     Ok(PreparedVision { expanded_tokens, image_embeds: embeds, spans })
+}
+
+#[cfg(test)]
+mod vis2_tests {
+    use super::*;
+    #[test]
+    fn mrope_positions_hand_case() {
+        let spans = [ImageSpan { start: 3, num_tokens: 6, grid_h: 2, grid_w: 3, pixel_hash: 1 },
+                     ImageSpan { start: 11, num_tokens: 2, grid_h: 1, grid_w: 2, pixel_hash: 2 }];
+        let (p, d) = mrope_positions(14, &spans).unwrap();
+        let want: Vec<[i64; 3]> = vec![
+            [0, 0, 0], [1, 1, 1], [2, 2, 2],
+            [3, 3, 3], [3, 3, 4], [3, 3, 5], [3, 4, 3], [3, 4, 4], [3, 4, 5],
+            [6, 6, 6], [7, 7, 7],
+            [8, 8, 8], [8, 8, 9],
+            [10, 10, 10],
+        ];
+        assert_eq!(p, want);
+        assert_eq!(d, 11 - 14);
+        let (p, d) = mrope_positions(5, &[]).unwrap();
+        assert_eq!(p, (0..5).map(|i| [i; 3]).collect::<Vec<_>>());
+        assert_eq!(d, 0);
+        assert!(mrope_positions(4, &[ImageSpan { start: 2, num_tokens: 6, grid_h: 2, grid_w: 3, pixel_hash: 0 }]).is_err());
+    }
 }

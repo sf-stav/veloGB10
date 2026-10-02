@@ -1800,7 +1800,7 @@ fn e9_load_kernels() -> Option<E9Kernels> {
 
 /// Which shard (if any) a tensor gets at load. Mirrors `tp_shard_weights`'s per-site choices.
 #[derive(Debug)]
-enum LoadShardOp {
+pub(crate) enum LoadShardOp {
     None,
     /// Column-parallel, whole-M single segment (dense FFN gate/up, quantized LM head).
     Col,
@@ -1969,7 +1969,7 @@ fn hy3_load_shard_op(names: &[String], cfg: &Config, quantized: bool, world: usi
 /// experts col (the contiguous expert band); fused attention qkv per-head col-segs + o_proj row;
 /// fused GDN in_proj per-head col-segs + out_proj row; the LM head vocab-parallel (quantized);
 /// everything else (router, shared expert, norms, embed, the MTP head) replicated.
-fn qwen_load_shard_op(names: &[String], cfg: &Config, quantized: bool, world: usize) -> LoadShardOp {
+pub(crate) fn qwen_load_shard_op(names: &[String], cfg: &Config, quantized: bool, world: usize) -> LoadShardOp {
     let op = qwen_load_shard_op_inner(names, cfg, quantized, world);
     if crate::opts::var(crate::opt!("load-shard-trace")).is_ok() {
         eprintln!("[shard-op] names0={} n_names={} quant={} world={} -> {:?}",
@@ -2060,8 +2060,7 @@ fn shard_raw_nvfp4(qw: &[u8], sc: &[u8], gsv: &[f32], m: usize, k: usize,
     match op {
         LoadShardOp::None => (qw.to_vec(), sc.to_vec(), gsv.to_vec(), m, k),
         LoadShardOp::Col => {
-            let take = m / world;
-            let r0 = rank * take;
+            let (r0, take) = col_band(m, rank, world);
             (qw[r0*pw..(r0+take)*pw].to_vec(), sc[r0*nblk..(r0+take)*nblk].to_vec(),
              gsv[r0/16..(r0+take)/16].to_vec(), take, k)
         }
@@ -2090,6 +2089,14 @@ fn shard_raw_nvfp4(qw: &[u8], sc: &[u8], gsv: &[f32], m: usize, k: usize,
             (q, s, gsv.to_vec(), m, k / world)   // ROW: K splits by world
         }
     }
+}
+
+/// The rows [r0, r0 + take) a column-parallel (`LoadShardOp::Col`) shard gives rank `rank` of `world`
+/// out of `m` output rows — the ONE definition the load-time slicer (`shard_raw_nvfp4`) and the B32
+/// shard shipper (`shard_plan`, pre-sliced NVFP4 expert bands) share.
+pub(crate) fn col_band(m: usize, rank: usize, world: usize) -> (usize, usize) {
+    let take = m / world;
+    (rank * take, take)
 }
 
 /// RAW-side FP8 twin of `shard_raw_nvfp4` (data [m, k] + per-row f32 scales).
@@ -2690,6 +2697,30 @@ impl GpuModel {
         };
         assert!(sal.is_none() || crate::opts::var(crate::opt!("dequant-at-load")).is_err(),
                 "shard-at-load is incompatible with --dequant-at-load (a debug-only path)");
+        // B32: a shard dir (gb10_shard.json) must be this load's (nvfp4, world, rank); its PRE-SLICED tensors (the
+        // rank's stacked-expert bands, cut by the same `col_band`) skip the load-time slice — and only those.
+        let presliced: std::collections::HashSet<String> = {
+            let d = std::path::Path::new(model_dir);
+            let info = match sal {
+                Some(r) => crate::shard_plan::check_shard_dir(d, crate::shard_plan::ShardFormat::Nvfp4, world.max(1) as usize, r)?,
+                None => {
+                    if let Some(i) = crate::shard_plan::read_shard_info(d)? {
+                        anyhow::bail!("{model_dir} is a B32 shard dir (nvfp4 rank {} of world {}) — it loads only under TP \
+                                       shard-at-load with mixer sharding", i.rank, i.world);
+                    }
+                    None
+                }
+            };
+            if let Some(i) = &info {
+                eprintln!("[tp] B32 shard dir: nvfp4 rank {} of world {} — {} tensors arrive pre-sliced (their load-time \
+                           slice is skipped)", i.rank, i.world, i.presliced.len());
+            }
+            // the loader's slice decision is per ASSEMBLED tensor (its `.weight` base name, whose raw parts are
+            // `.weight_packed` / `.weight_scale` on disk) — key the set by that base
+            info.map(|i| i.presliced.into_iter().map(|n| {
+                n.strip_suffix("_packed").or_else(|| n.strip_suffix("_scale")).map(str::to_string).unwrap_or(n)
+            }).collect()).unwrap_or_default()
+        };
 
         // Find and load all safetensors shards
         let dir = std::path::Path::new(model_dir);
@@ -3591,7 +3622,8 @@ impl GpuModel {
                            hq8: &std::sync::Mutex<std::collections::HashMap<String, Q8H>>,
                            gpu_q4_sharded: &std::collections::HashMap<String, W>,
                            job_q: &std::sync::Arc<(std::sync::Mutex<std::collections::VecDeque<AssembleJob>>, std::sync::Condvar)>,
-                           sal: Option<usize>, cfg: &crate::qwen::Config, world: usize, PIPE_CAP_BYTES: usize) {
+                           sal: Option<usize>, cfg: &crate::qwen::Config, world: usize, PIPE_CAP_BYTES: usize,
+                           presliced: &std::collections::HashSet<String>) {
             for (idx, names) in recorded.iter().enumerate() {
                 if pushed[idx] { continue; }
                 if gpu_q4_sharded.contains_key(&names[0]) { pushed[idx] = true; continue; } // hy3 inline bands
@@ -3600,7 +3632,9 @@ impl GpuModel {
                 let in_q8 = g8.contains_key(&names[0]);
                 if (in_q4 || in_q8) && names.iter().all(|n| g4.contains_key(n) || g8.contains_key(n)) {
                     let shard_op = if sal.is_some() {
-                        Some(if cfg.family == crate::qwen::Family::HyV3 {
+                        Some(if presliced.contains(&names[0]) && names.iter().all(|n| presliced.contains(n)) {
+                            LoadShardOp::None // B32: shipped already sliced to this rank's band
+                        } else if cfg.family == crate::qwen::Family::HyV3 {
                             hy3_load_shard_op(names, cfg, true, world)
                         } else {
                             qwen_load_shard_op(names, cfg, true, world)
@@ -4413,7 +4447,7 @@ impl GpuModel {
             t_shard_loop += t_iter0.elapsed();
             // STREAMING LOAD: drain this shard's ready groups while the next shard is read.
             push_ready_jobs(&recorded, &mut pushed, &host_q4, &host_q8, &gpu_q4_sharded,
-                            &job_q, sal, &cfg, world.max(1) as usize, PIPE_CAP_BYTES);
+                            &job_q, sal, &cfg, world.max(1) as usize, PIPE_CAP_BYTES, &presliced);
         }
                     Ok(())
                 })();
@@ -4423,7 +4457,7 @@ impl GpuModel {
                     return Err(e);
                 }
                 // all parts are now present: push every remaining group, then release the workers.
-                push_ready_jobs(&recorded, &mut pushed, hq4, hq8, &gpu_q4_sharded, jq, sal_c, &cfg, world_c, PIPE_CAP_BYTES);
+                push_ready_jobs(&recorded, &mut pushed, hq4, hq8, &gpu_q4_sharded, jq, sal_c, &cfg, world_c, PIPE_CAP_BYTES, &presliced);
                 jdone.store(true, std::sync::atomic::Ordering::Relaxed);
                 jq.1.notify_all();
                 drop(tx);   // the uploader's recv ends once the workers' senders drop
@@ -18698,79 +18732,6 @@ impl GpuModel {
     /// the same weights through the inverse permutation and a completely different kernel — so a
     /// mis-mapped mma fragment cannot hide: the permutation and its inverse would have to be wrong
     /// in exactly compensating ways, and the inverse is separately unit-tested against the forward.
-    /// STREAM-style pure-read bandwidth. This is the roofline every other number is measured against,
-    /// and we had been quoting two different values for it (248 GB/s vs 216 GB/s observed) — a 15%
-    /// spread that decides whether the GEMMs have 10% left in them or 25%, and whether a competitor's
-    /// claimed tok/s is even physically possible on this part. So measure it, don't quote it.
-    /// §2.3 audit: hammer memory bandwidth CONTINUOUSLY for `seconds`, reporting achieved GB/s per
-    /// ~2s window. If sustained bandwidth sags vs the cold peak, LPDDR5x is thermally derating under
-    /// load — which would cap every roofline number (decode, TP2, Hy3). Prints one line per window.
-    pub fn probe_bandwidth_sustained(&self, seconds: u64) {
-        let gib: usize = 8;
-        let n4 = gib * 1024 * 1024 * 1024 / 16;
-        let buf = self.dev.alloc_zeros::<u8>(n4 * 16).expect("alloc bw buffer");
-        let sink = self.dev.alloc_zeros::<f32>(1).unwrap();
-        self.dev.synchronize().unwrap();
-        let bytes = (n4 * 16) as f64;
-        let run = || {
-            blaunch!(self, "bw_read_b", (8192u32,1,1), (256,1,1), 0,
-                (d(&sink), *buf.device_ptr() as u64, n4 as i64));
-        };
-        run(); self.sync_stream(); // warm
-        println!("=== SUSTAINED bandwidth ({} s, 8 GiB reads back-to-back) — watch for thermal sag ===", seconds);
-        println!("  {:>6}  {:>8}  {:>8}", "t(s)", "GB/s", "min-so-far");
-        let start = std::time::Instant::now();
-        let (mut peak, mut trough) = (0f64, f64::INFINITY);
-        while start.elapsed().as_secs() < seconds {
-            let w0 = std::time::Instant::now();
-            let mut iters = 0u32;
-            // run ~2s worth of back-to-back reads
-            while w0.elapsed().as_secs_f64() < 2.0 { run(); iters += 1; }
-            self.sync_stream();
-            let s = w0.elapsed().as_secs_f64();
-            let gbs = bytes * iters as f64 / s / 1e9;
-            peak = peak.max(gbs); trough = trough.min(gbs);
-            println!("  {:>6.0}  {:>8.1}  {:>8.1}", start.elapsed().as_secs_f64(), gbs, trough);
-        }
-        println!("  PEAK {:.1} GB/s  TROUGH {:.1} GB/s  SAG {:.1}%  ({})",
-                 peak, trough, 100.0*(peak-trough)/peak,
-                 if (peak-trough)/peak < 0.03 { "STABLE — no thermal derating" } else { "SAG — sustained < cold" });
-    }
-
-    pub fn probe_bandwidth(&self) {
-        let gib: usize = 8;   // large enough that no cache can hold it
-        let n4 = gib * 1024 * 1024 * 1024 / 16;            // uint4 elements
-        let buf = self.dev.alloc_zeros::<u8>(n4 * 16).expect("alloc bw buffer");
-        let sink = self.dev.alloc_zeros::<f32>(1).unwrap();
-        self.dev.synchronize().unwrap();
-        let bytes = (n4 * 16) as f64;
-
-        println!("=== pure-read bandwidth (STREAM-style, {} GiB, 16-byte vectorized loads) ===", gib);
-        let mut best = 0.0f64;
-        for blocks in [1024u32, 2048, 4096, 8192] {
-            let run = || {
-                blaunch!(self, "bw_read_b", (blocks,1,1), (256,1,1), 0,
-                    (d(&sink), *buf.device_ptr() as u64, n4 as i64));
-                self.sync_stream();
-            };
-            run();                                          // warm
-            let t0 = std::time::Instant::now();
-            for _ in 0..5 { run(); }
-            let s = t0.elapsed().as_secs_f64() / 5.0;
-            let gbs = bytes / s / 1e9;
-            if gbs > best { best = gbs; }
-            println!("  {:5} blocks x 256 thr   {:7.2} ms   {:6.1} GB/s", blocks, s * 1000.0, gbs);
-        }
-        println!("  PEAK OBSERVED: {:.0} GB/s   (GB10 LPDDR5x theoretical ~273 GB/s => {:.0}% of peak)",
-                 best, 100.0 * best / 273.0);
-        if best < 245.0 {
-            println!("  NOTE: an IDLE GB10 reads at ~255 GB/s. A lower figure means something else was");
-            println!("        using memory bandwidth (a leftover server? nsys? a build?). Unified LPDDR5x");
-            println!("        is shared with the CPU. Re-run on an idle machine before trusting it --");
-            println!("        a contended roofline once read 234 and skewed every efficiency number.");
-        }
-    }
-
     /// TP=2 half-width GEMV probe. Runs the REAL production dispatch for the decode GEMV
     /// (`launch_gemm_fp4`: `gemm_mma_fp4_b` persistent-grid, or the split-K partial+reduce where
     /// `gemm_fp4_nsplit` fires — printed as S=) at N=1 on
@@ -23452,6 +23413,7 @@ impl GpuModel {
         for v in [hd, heads, cfg.rotary_dim, ratio, cfg.indexer_budget / ratio, cfg.indexer_budget + ratio - 1, 0] {
             b.extend_from_slice(&(v as i32).to_le_bytes());
         }
+        b.extend_from_slice(&0u64.to_le_bytes()); // VIS-3 QsaParams.mr: no per-slot mrope on this engine
         dev.htod_sync_copy(&b).expect("QsaParams upload")
     }
 
@@ -23569,7 +23531,7 @@ impl GpuModel {
         } else {
             let blocks = pool.get_bf16(nblk * hdx);
             blaunch!(self, "qsa_block_keys_b", (nblk.div_ceil(8) as u32,1,1), (256,1,1), 0,
-                (d(&blocks), keys_ptr, d(&idx.params), nblk as i32));
+                (d(&blocks), keys_ptr, d(&idx.params), nblk as i32, -1i32));
             if timing { self.sync_stream(); eprintln!("[qsa-time] prefill n={n} pos_start={pos_start}: qk+keys+blocks {:.2} ms", t0.elapsed().as_secs_f32()*1e3); }
             // Scores: one tensor-core GEMM batched over the heads (A = the block keys, shared across
             // the batch via strideA = 0; B = head h of the roped q at offset h*hd, ld = qk_dim;
@@ -24854,4 +24816,79 @@ impl GpuModel {
         blaunch!(self, "igs_hist_b", grid(n.div_ceil(16)), (256,1,1), 0,
             (d(&tap.stats), d(&tap.running_max), d(x), n as i64));
     }
+}
+
+/// STREAM-style pure-read bandwidth. This is the roofline every other number is measured against,
+/// and we had been quoting two different values for it (248 GB/s vs 216 GB/s observed) — a 15%
+/// spread that decides whether the GEMMs have 10% left in them or 25%, and whether a competitor's
+/// claimed tok/s is even physically possible on this part. So measure it, don't quote it.
+///
+/// Needs no model: it loads only `bw_read_b` (build-ID checked) on a bare device. It used to load a
+/// whole NVFP4 GpuModel first, which panicked on EXL3 packs (qwen4_exp) and then hung holding the GPU.
+///
+/// `sustained = Some(seconds)` (§2.3 audit): hammer memory bandwidth CONTINUOUSLY for `seconds`,
+/// reporting achieved GB/s per ~2s window. If sustained bandwidth sags vs the cold peak, LPDDR5x is
+/// thermally derating under load — which would cap every roofline number (decode, TP2, Hy3).
+pub fn probe_bandwidth(sustained: Option<u64>) -> anyhow::Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let bptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_batch.ptx")?);
+    dev.load_ptx(bptx, "gpu_batch", &["bw_read_b", "kernel_build_id"])?;
+    GpuModel::assert_kernel_build_id(&dev, "gpu_batch")?;
+    let f = dev.get_func("gpu_batch", "bw_read_b").ok_or_else(|| anyhow::anyhow!("bw_read_b missing"))?;
+
+    let gib: usize = 8;   // large enough that no cache can hold it
+    let n4 = gib * 1024 * 1024 * 1024 / 16;            // uint4 elements
+    let buf = dev.alloc_zeros::<u8>(n4 * 16)?;
+    let sink = dev.alloc_zeros::<f32>(1)?;
+    dev.synchronize()?;
+    let bytes = (n4 * 16) as f64;
+    let run = |blocks: u32| -> anyhow::Result<()> {
+        let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { f.clone().launch(cfg, (&sink, *buf.device_ptr() as u64, n4 as i64))? };
+        Ok(())
+    };
+
+    if let Some(seconds) = sustained {
+        run(8192)?; dev.synchronize()?; // warm
+        println!("=== SUSTAINED bandwidth ({} s, 8 GiB reads back-to-back) — watch for thermal sag ===", seconds);
+        println!("  {:>6}  {:>8}  {:>8}", "t(s)", "GB/s", "min-so-far");
+        let start = std::time::Instant::now();
+        let (mut peak, mut trough) = (0f64, f64::INFINITY);
+        while start.elapsed().as_secs() < seconds {
+            let w0 = std::time::Instant::now();
+            let mut iters = 0u32;
+            // run ~2s worth of back-to-back reads
+            while w0.elapsed().as_secs_f64() < 2.0 { run(8192)?; iters += 1; }
+            dev.synchronize()?;
+            let s = w0.elapsed().as_secs_f64();
+            let gbs = bytes * iters as f64 / s / 1e9;
+            peak = peak.max(gbs); trough = trough.min(gbs);
+            println!("  {:>6.0}  {:>8.1}  {:>8.1}", start.elapsed().as_secs_f64(), gbs, trough);
+        }
+        println!("  PEAK {:.1} GB/s  TROUGH {:.1} GB/s  SAG {:.1}%  ({})",
+                 peak, trough, 100.0*(peak-trough)/peak,
+                 if (peak-trough)/peak < 0.03 { "STABLE — no thermal derating" } else { "SAG — sustained < cold" });
+        return Ok(());
+    }
+
+    println!("=== pure-read bandwidth (STREAM-style, {} GiB, 16-byte vectorized loads) ===", gib);
+    let mut best = 0.0f64;
+    for blocks in [1024u32, 2048, 4096, 8192] {
+        run(blocks)?; dev.synchronize()?;                  // warm
+        let t0 = std::time::Instant::now();
+        for _ in 0..5 { run(blocks)?; dev.synchronize()?; }
+        let s = t0.elapsed().as_secs_f64() / 5.0;
+        let gbs = bytes / s / 1e9;
+        if gbs > best { best = gbs; }
+        println!("  {:5} blocks x 256 thr   {:7.2} ms   {:6.1} GB/s", blocks, s * 1000.0, gbs);
+    }
+    println!("  PEAK OBSERVED: {:.0} GB/s   (GB10 LPDDR5x theoretical ~273 GB/s => {:.0}% of peak)",
+             best, 100.0 * best / 273.0);
+    if best < 230.0 {
+        println!("  NOTE: an IDLE GB10 reads at ~238 GB/s. A lower figure means something else was");
+        println!("        using memory bandwidth (a leftover server? nsys? a build?). Unified LPDDR5x");
+        println!("        is shared with the CPU. Re-run on an idle machine before trusting it --");
+        println!("        a contended roofline once read 234 and skewed every efficiency number.");
+    }
+    Ok(())
 }

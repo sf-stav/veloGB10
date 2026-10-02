@@ -1,11 +1,11 @@
-//! WP08 — streaming loop detector, a line-for-line port of the rival's
+//! WP08 — streaming loop detector, a line-for-line port of the reference implementation's
 //! `exllamav3/generator/loop_detect.py` (vcruz305/exllamav3 @523ecd3), including its heap wake
-//! schedule, so a stream is cut at exactly the token where the rival cuts it.
+//! schedule, so a stream is cut at exactly the token where the reference implementation cuts it.
 //!
-//! Wiring (the rival's job.py:312-318 and 1010-1013): `LoopDetector::new(window, window / min_reps)`
+//! Wiring (the reference implementation's job.py:312-318 and 1010-1013): `LoopDetector::new(window, window / min_reps)`
 //! per request, fed every emitted token that did not already end the request (stop token /
 //! max_new); a `true` from `feed` ends the response as a normal stop with reason `loop_detected`.
-//! The rival's launcher default is `stop_on_loop = (300, 3)` (chat.py -lw 300 -lmr 3).
+//! The reference implementation's launcher default is `stop_on_loop = (300, 3)` (chat.py -lw 300 -lmr 3).
 //!
 //! Condition: the WHOLE last-`W` window is periodic with some period p <= max_period
 //! (`s[i] == s[i-p]` for the newest `W - p` positions). Each period keeps a consecutive-match
@@ -14,8 +14,8 @@
 //! token: the heap pops of the detectors due at that token (amortized O(active · log P)); no
 //! allocation after construction.
 //!
-//! Cross-check: `tests/fixtures/loop_detect_ref.py` (the rival's code, torch-free; verified
-//! identical to the rival file on all its cases) generates `loop_detect_vectors.txt`, which the
+//! Cross-check: `tests/fixtures/loop_detect_ref.py` (the reference implementation's code, torch-free; verified
+//! identical to the reference implementation file on all its cases) generates `loop_detect_vectors.txt`, which the
 //! unit test below replays bit-for-bit (first detection index, count, index sum, period).
 
 use std::cmp::Reverse;
@@ -35,7 +35,7 @@ pub struct LoopDetector {
 }
 
 impl LoopDetector {
-    /// The rival's `LoopDetector(window_size, max_period)`; `max_period = None` means W / 3.
+    /// The reference implementation's `LoopDetector(window_size, max_period)`; `max_period = None` means W / 3.
     /// The period is capped at W / 2 (no longer period can repeat inside the window).
     pub fn new(window: usize, max_period: Option<usize>) -> Self {
         let w = window.max(2);
@@ -61,7 +61,7 @@ impl LoopDetector {
         Self::new(window, Some(window / min_reps.max(1)))
     }
 
-    /// The rival's `period` property: the period of the last detector that fired (not
+    /// The reference implementation's `period` property: the period of the last detector that fired (not
     /// necessarily the fundamental one; see `fundamental_period`).
     pub fn period(&self) -> Option<usize> {
         self.detected_period
@@ -102,7 +102,7 @@ impl LoopDetector {
         streak
     }
 
-    /// Feed one token; true while a loop is detected (the rival's `feed`).
+    /// Feed one token; true while a loop is detected (the reference implementation's `feed`).
     pub fn feed(&mut self, token: u32) -> bool {
         let w = self.w;
         self.buf[self.total % w] = token;
@@ -220,9 +220,9 @@ mod tests {
         (first, count, sum, period)
     }
 
-    /// Bit-for-bit replay of the rival reference (tests/fixtures/loop_detect_ref.py).
+    /// Bit-for-bit replay of the reference (tests/fixtures/loop_detect_ref.py).
     #[test]
-    fn loop_detect_matches_rival_reference() {
+    fn loop_detect_matches_reference() {
         let vectors = include_str!("../tests/fixtures/loop_detect_vectors.txt");
         let mut n = 0;
         for line in vectors.lines().filter(|l| !l.trim().is_empty()) {
