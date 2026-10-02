@@ -772,9 +772,34 @@ NetCtx* net_init(int rank, int world, const char* const* peer_ips, int n_peers,
                          fp32_capacity_bytes, payload_bytes);
 }
 
+static int get_valid_roce_gid(struct ibv_context *ctx, int port_num, int *gid_idx, union ibv_gid *out_gid) {
+    if (ibv_query_gid(ctx, port_num, *gid_idx, out_gid) == 0) {
+        static const unsigned char zero_gid[16] = {0};
+        if (memcmp(out_gid, zero_gid, 16) != 0) {
+            return 0;
+        }
+    }
+    LOGE("WARNING: GID at index %d is invalid or all-zero; auto-scanning for RoCEv2 GID...", *gid_idx);
+    for (int i = 0; i < 64; i++) {
+        union ibv_gid g;
+        if (ibv_query_gid(ctx, port_num, i, &g) == 0) {
+            static const unsigned char zero_gid[16] = {0};
+            if (memcmp(&g, zero_gid, 16) != 0 && g.raw[10] == 0xff && g.raw[11] == 0xff) {
+                *out_gid = g;
+                *gid_idx = i;
+                LOGE("Auto-selected RoCEv2 IPv4 GID at index %d", i);
+                return 0;
+            }
+        }
+    }
+    LOGE("query_gid: failed to find valid RoCEv2 GID");
+    return -1;
+}
+
 // The pre-P3 single-QP bring-up, byte-for-byte. MUST NOT change (world==2 fast path).
 static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, const char* dev_name,
                                int gid_idx, int fp32_capacity_bytes, int payload_bytes) {
+    cudaSetDevice(0);
     NetCtx* c = (NetCtx*)calloc(1, sizeof(NetCtx));
     c->port_num = 1; c->gid_idx = gid_idx; c->rank = rank; c->rng = 0x9E3779B9u ^ (unsigned)rank;
     c->payload_bytes = (unsigned)payload_bytes;
@@ -798,8 +823,9 @@ static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, cons
     c->cq_startup = ibv_create_cq(c->ctx, 256, NULL, NULL, 0);
     if (!c->ctx || !c->pd || !c->cq_send || !c->cq_startup){ LOGE("ctx/pd/cq"); return NULL; }
 
-    if (cudaHostAlloc(&c->hbuf, c->region_bytes, cudaHostAllocMapped|cudaHostAllocPortable) != cudaSuccess){
-        LOGE("cudaHostAlloc(%zu)", c->region_bytes); return NULL; }
+    cudaError_t err = cudaHostAlloc(&c->hbuf, c->region_bytes, cudaHostAllocMapped|cudaHostAllocPortable);
+    if (err != cudaSuccess){
+        LOGE("cudaHostAlloc(%zu) failed: %s (code %d)", c->region_bytes, cudaGetErrorString(err), (int)err); return NULL; }
     memset(c->hbuf, 0, c->region_bytes);
     if (cudaHostGetDevicePointer(&c->dbuf, c->hbuf, 0) != cudaSuccess){ LOGE("devptr"); return NULL; }
     // I7: NO IBV_ACCESS_RELAXED_ORDERING. The per-MR flag is the actual switch on mlx5 (PCIe DevCtl
@@ -842,7 +868,8 @@ static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, cons
     if (ibv_modify_qp(c->qp,&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS)){ LOGE("INIT"); return NULL; }
 
     union ibv_gid mygid;
-    if (ibv_query_gid(c->ctx,c->port_num,gid_idx,&mygid)){ LOGE("query_gid"); return NULL; }
+    if (get_valid_roce_gid(c->ctx, c->port_num, &gid_idx, &mygid) != 0){ LOGE("query_gid"); return NULL; }
+    c->gid_idx = gid_idx;
     Exch lo, re; memset(&lo,0,sizeof(lo));
     lo.qpn=c->qp->qp_num; lo.psn=0x1000+rank*333; lo.addr=(uint64_t)c->hbuf; lo.rkey=c->mr->rkey; lo.gid=mygid;
     // Liveness responder BEFORE the handshake: the peer can start probing the moment it connects.
@@ -887,6 +914,7 @@ static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, cons
 static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
                              int tcp_port, const char* dev_name, int gid_idx,
                              int fp32_capacity_bytes, int payload_bytes) {
+    cudaSetDevice(0);
     NetCtx* c = (NetCtx*)calloc(1, sizeof(NetCtx));
     c->port_num = 1; c->gid_idx = gid_idx; c->rank = rank; c->rng = 0x9E3779B9u ^ (unsigned)rank;
     c->payload_bytes = (unsigned)payload_bytes;
@@ -1009,7 +1037,8 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
     }
 
     union ibv_gid mygid;
-    if (ibv_query_gid(c->ctx, c->port_num, gid_idx, &mygid)){ LOGE("query_gid"); return NULL; }
+    if (get_valid_roce_gid(c->ctx, c->port_num, &gid_idx, &mygid) != 0){ LOGE("query_gid"); return NULL; }
+    c->gid_idx = gid_idx;
 
     // One QP per peer. The lower rank listens, the higher connects (deterministic, matches tcp_exchange).
     for (int p = 0; p < world; p++) {

@@ -3201,8 +3201,13 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     }
 
     let (stx, srx) = tokio::sync::mpsc::unbounded_channel::<crate::batch::BatchRequest>();
-    let model_name = std::path::Path::new(model_dir)
-        .file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "exl3-model".into());
+    let model_name = arg(args, "--served-model-name")
+        .or_else(|| arg(args, "--model-name"))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            std::path::Path::new(model_dir)
+                .file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "exl3-model".into())
+        });
     crate::metrics::set_max_batch(width);
     let state = AppState {
         sampling_defaults: crate::server::SamplingDefaults::QWEN38_CARD,

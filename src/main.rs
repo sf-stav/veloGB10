@@ -36,7 +36,7 @@ fn print_help() {
     println!("  MODEL");
     println!("    --model-dir <DIR>          Model directory (config.json + *.safetensors + tokenizer).");
     println!("                               THIS is the normal way to load.                   [required]");
-    println!("    --model-name <NAME>        Name reported by /v1/models    [derived from the dir name]");
+    println!("    --served-model-name <NAME> Name reported by /v1/models (alias: --model-name)");
     println!("    --model <FILE>             Legacy: single .safetensors file (use --model-dir instead)");
     println!("    --tokenizer <FILE>         Legacy: tokenizer.json path (implied by --model-dir)");
     println!();
@@ -15361,7 +15361,9 @@ fn run_server(args: &[String]) {
     // Model name for /v1/models: just the directory name.
     // Public model id: the model card's `base_model:` (e.g. Qwen/Qwen3.8-27B), dir name as
     // fallback — see server::model_id_from_dir. --model-name still overrides both.
-    let model_name = parse_arg(args, "--model-name").map(|s| s.to_string())
+    let model_name = parse_arg(args, "--served-model-name")
+        .or_else(|| parse_arg(args, "--model-name"))
+        .map(|s| s.to_string())
         .unwrap_or_else(|| gb10_inference::server::model_id_from_dir(&model_path));
     let default_max_tokens = parse_arg(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()).unwrap_or(8192);
     // Model-card presence-penalty default varies by model size (2B: 2.0, 4B+: 1.5). Temperature

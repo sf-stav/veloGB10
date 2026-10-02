@@ -529,6 +529,8 @@ pub const REG: &[Opt] = &[
           help: "QSA timing (syncs)" },
     Opt { flag: "rdma-dev", env: "GB10_RDMA_DEV", ty: Ty::Text, def: "rocep1s0f1", cat: Cat::Tp, scope: Scope::Local,
           help: "RDMA device(s): <rail1>[,<rail2>]" },
+    Opt { flag: "gid-idx", env: "GB10_GID_IDX", ty: Ty::Int, def: "auto", cat: Cat::Tp, scope: Scope::Local,
+          help: "RoCE GID index (default: auto-detected RoCEv2 index)" },
     Opt { flag: "reprime-xcheck", env: "GB10_REPRIME_XCHECK", ty: Ty::Flag, def: "off", cat: Cat::Diag, scope: Scope::Spmd,
           help: "re-prime eager cross-check" },
     Opt { flag: "rope-yarn-factor", env: "GB10_ROPE_YARN_FACTOR", ty: Ty::Internal("--rope-yarn-factor"), def: "1.0", cat: Cat::Nvfp4, scope: Scope::Spmd,

@@ -1095,7 +1095,7 @@ impl TpState {
                     let port = crate::tp::TP_PORT + TP_AUX_PORT_OFF;
                     if t.rank != 0 { std::thread::sleep(std::time::Duration::from_millis(300)); }
                     let l2 = crate::net::TpLink::connect(t.rank, if t.rank == 0 { "" } else { &peer_ip }, port, &dev2,
-                                                         crate::tp::GID_IDX, crate::tp::TP_SLOT_BYTES)
+                                                         crate::tp::resolve_gid_idx(&dev2), crate::tp::TP_SLOT_BYTES)
                         .with_context(|| format!("TP-F rail 2 ({dev2}, port {port}, peer {peer_ip})"))?;
                     (l2, format!("TCP {port}, peer {peer_ip}"))
                 } else {
@@ -1107,7 +1107,7 @@ impl TpState {
                     let base = rail2_nway_base(t.world)?;
                     let ips = crate::tp::resolve_topology(t.world)?;
                     let l2 = crate::net::TpLink::connect_nway(t.rank, t.world, &ips, base, &dev2,
-                                                              crate::tp::GID_IDX, crate::tp::TP_SLOT_BYTES)
+                                                              crate::tp::resolve_gid_idx(&dev2), crate::tp::TP_SLOT_BYTES)
                         .with_context(|| format!("TP-4E rail 2 N-way link ({dev2}, TCP base {base}, world {})", t.world))?;
                     (l2, format!("N-way, TCP base {base}, {} peers", t.world - 1))
                 };
