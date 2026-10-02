@@ -78,12 +78,12 @@ effort low. Decode includes MTP speculation. TP=1 and TP=2 are 2026-09-30 runs; 
 
 | | TP=1 | TP=2 | **TP=4** |
 |---|---:|---:|---:|
-| Decode median | 137 tok/s | 186 tok/s | **218 tok/s** |
-| Decode min / max | 83.1 / 144 | 122 / 199 | 138 / 231 |
-| Decode p50 / p90 / p99 | 137 / 142 / 144 | 186 / 193 / 195 | 218 / 228 / 231 |
-| Time per output token (TPOT) | 7.5 ms | **5.4 ms** | — |
-| Draft acceptance / depth | 84% / 5.7 | 85% / 6.0 | — |
-| Stability (sustain / peak) | 99% | 99% | — |
+| Decode median | 137 tok/s | 186 tok/s | **221 tok/s** |
+| Decode min / max | 83.1 / 144 | 122 / 199 | 173 / 240 |
+| Decode p50 / p90 / p99 | 137 / 142 / 144 | 186 / 193 / 195 | 221 / 234 / 237 |
+| Time per output token (TPOT) | 7.5 ms | 5.4 ms | **4.6 ms** |
+| Draft acceptance / depth | 84% / 5.7 | 85% / 6.0 | 84% / 5.6 |
+| Stability (sustain / peak) | 99% | 99% | 98% |
 
 **Prefill** — one measurement per input size:
 
@@ -116,7 +116,7 @@ Full setup (pack layout, node command, launch lines, expected output):
 ### Also in v0.7.1
 
 - **TP=4 is supported on the EXL3 path** — three peer nodes plus the head. Measured on pure code:
-  **~218 tok/s decode** and **3.2K tok/s prefill**, which is ×1.6 decode and ×2.0–2.2 prefill over a
+  **~221 tok/s decode** and **3.2K tok/s prefill**, which is ×1.6 decode and ×2.0–2.2 prefill over a
   single GB10.
 - **Image input on every topology** (TP=1/2/4): the pack's original bf16 vision tower, images
   resized so the longer side is at most `--image-max-edge` (default 1024), and images work past the
@@ -464,7 +464,7 @@ everything), then the head:
 ```
 
 **Four GB10 (TP=4)** — three peers running `./gb10_inference --node --port 29500`, then the head
-with `--tp 4 --nodes <ip1>:29500,<ip2>:29500,<ip3>:29500`. Measured: ~218 tok/s decode and 3.2K
+with `--tp 4 --nodes <ip1>:29500,<ip2>:29500,<ip3>:29500`. Measured: ~221 tok/s decode and 3.2K
 tok/s prefill on pure code (see the tables at the top).
 
 Run both from the build directory (the binary loads `src/ptx/*.ptx` relative to the working

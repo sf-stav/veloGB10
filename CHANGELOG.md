@@ -13,7 +13,7 @@ shard-level, and two defaults change that alter long-context output bytes.
 `--tp 4` now serves Qwen3.8-Flash-Next from EXL3 packs across three peer nodes plus the head:
 attention, GDN and the KV cache split by head, the routed experts dealt across the ranks, the
 vocab-parallel LM head, sharded MTP-head screening, a per-step lockstep agreement check and a
-watchdog. Measured on pure code: **~218 tok/s decode** (min/max 138/231, p50/p90/p99 218/228/231) and
+watchdog. Measured on pure code: **~221 tok/s decode** (min/max 173/240, p50/p90/p99 221/234/237) and
 **~3.2K tok/s prefill** — TTFT 0.64 s at ~2.1K input tokens, 10.9 s at ~34.9K. Against a single GB10
 that is **×1.6 decode and ×2.0–2.2 prefill**.
 

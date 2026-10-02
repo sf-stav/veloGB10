@@ -210,9 +210,9 @@ column is a 2026-10-02 run on the v0.7.1 build.
 
 | | TP=1 | TP=2 | **TP=4** |
 |---|---:|---:|---:|
-| Decode median | 137 tok/s | 186 tok/s | **218 tok/s** |
-| Decode min / max | 83.1 / 144 | 122 / 199 | 138 / 231 |
-| Decode p50 / p90 / p99 | 137 / 142 / 144 | 186 / 193 / 195 | 218 / 228 / 231 |
+| Decode median | 137 tok/s | 186 tok/s | **221 tok/s** |
+| Decode min / max | 83.1 / 144 | 122 / 199 | 173 / 240 |
+| Decode p50 / p90 / p99 | 137 / 142 / 144 | 186 / 193 / 195 | 221 / 234 / 237 |
 
 **Prefill** — one measurement per input size:
 
