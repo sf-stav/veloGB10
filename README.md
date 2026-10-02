@@ -485,8 +485,9 @@ detection; and TP=2 speed features that are on by default with an `off` value ea
 - **262,144 tokens maximum.** YaRN is not implemented, so there is no 1M context.
 - **Images yes, video not yet.** Image parts are served at every topology (TP=1/2/4); **video and
   audio parts return `400`** until video support lands.
-- `--max-batch 1` is what was tested. A second lane works and is hash-exact per lane, but lanes take
-  turns, so there is no aggregate throughput gain yet.
+- **Single-request only for now.** `--max-batch 1` is what was tested; a second lane works and is
+  hash-exact per lane, but lanes take turns, so there is no aggregate throughput gain yet.
+  Multi-request concurrency is not measured.
 - Seeded sampled requests are not byte-reproducible across runs.
 - A prefix-cache resume can word an answer differently from a cold prompt by design; pass
   `--prefix-tail-ckpt 0` for bit-identical resumes.
@@ -875,6 +876,7 @@ This project does not link extensively against any other project (other than the
 
 Areas that are in flight or planned. These are tracked openly — progress and timelines are as honest as I can make them, and this list changes as work lands.
 
+- **Concurrency.** Everything published so far is single-request (`--max-batch 1`). Multi-request serving — the tests, and the optimization those tests will drive — comes next, after the current round of path optimization. **No concurrency numbers are claimed anywhere in this README yet.**
 - **Fix Tencent Hy3 support.** Hy3 regressed over the last few weeks as the engine evolved; restoring it to a fully working, gated state is a priority.
 - **Video input.** Image input is supported on every topology, including the EXL3 / Qwen3.8-Flash-Next path. Video (and audio) parts are not served yet — they return `400` — and that is the remaining vision work, along with widening coverage across the rest of the Qwen family.
 - **Qwen3.5 397B MoE (incl. Ornith 1.5).** Large-model port; the engine already serves this architecture at 122B, so the work is the TP=2/TP=4 capacity bring-up (large weight footprint) plus the correctness gates at that size.

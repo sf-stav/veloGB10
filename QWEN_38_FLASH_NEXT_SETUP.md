@@ -235,8 +235,11 @@ TP=4 against a single GB10: **×1.6** on this decode workload and **×2.0–2.2*
   until video support lands. Images are resized so the longer side is at most `--image-max-edge`
   (default 1024); the QSA indexer follows the image positions, so images work past 2,051 tokens.
 - **262,144 tokens is the maximum.** YaRN is not implemented, so there is no 1M context.
-- **`--max-batch 1` is what was tested.** A larger batch works and is hash-exact per lane, but the
-  lanes take turns, so it does not raise aggregate throughput.
+- **Single-request only for now.** `--max-batch 1` is what was tested, and every number in §4
+  reflects it. A larger batch works and is hash-exact per lane, but the lanes take turns, so it does
+  not raise aggregate throughput. **Concurrency is not measured yet** — the tests (and the
+  optimization they will drive) come after the current round of path work, so treat multi-request
+  behaviour as unverified.
 - **The TP=2/TP=4 nodes need no pack copy** — the head ships each rank's shard through the blob cache
   at `~/.cache/gb10_tp`. The cache is safe to delete; the next run re-syncs what is missing.
 - **Prefix caching changes wording, not correctness.** A cached turn is not bit-identical to a cold
