@@ -30,6 +30,7 @@ pub mod kv_cache;
 pub mod engine;
 pub mod tokenizer;
 pub mod server;
+pub mod metrics;
 pub mod otel;
 pub mod net;
 // HOST / RO-7: big-core detection + pinning of the serving engine's critical host threads.

@@ -1955,6 +1955,12 @@ impl BatchScheduler {
         }
     }
 
+    /// True when the shared DFlash2 ring's frontier is exactly `pos` (the lane owns the ring).
+    fn df2_ring_at(&self, pos: usize) -> bool { self.df2.as_ref().map_or(false, |d| d.nprev() == pos) }
+
+    /// The DSpark twin of `df2_ring_at`.
+    fn dspark_ring_at(&self, pos: usize) -> bool { self.dspark.as_ref().map_or(false, |d| d.nprev() == pos) }
+
     fn num_active(&self) -> usize {
         self.lanes.iter().take_while(|l| l.is_some()).count()
     }
@@ -2469,6 +2475,20 @@ impl BatchScheduler {
         let mut w0 = reuse;
         // window by window (the prefill captures them into the wide prime sink; the round consumes
         // failure).
+        // Community report 2026-10-02 (27B + DFlash2, --max-batch 2: "df2 ring nprev 512 != lane
+        // pos 713", scheduler panic, exit 70): the round drafters (DFlash2 / DSpark / DFlash v1) own
+        // ONE shared ring, and the reset/rewind below hands it to THIS request. A live lane still
+        // drafting from it would read this request's prime as its own frontier; it goes stale here
+        // and takes the MTP fallback (the standing degrade path, never a panic).
+        if will_use_df2 || will_use_dspark || will_use_dflash {
+            let mut taken = 0usize;
+            for l in self.lanes.iter_mut().flatten() {
+                if l.df2_primed && !l.df2_stale { l.df2_stale = true; taken += 1; }
+            }
+            if taken > 0 {
+                eprintln!("[spec] round-drafter ring handed to the new request; {taken} live lane(s) continue on MTP");
+            }
+        }
         if will_use_df2 {
             if let Some(df2) = self.df2.as_mut() {
                 // DF2_CARRY: on a carry, move the frontier to the reuse point and KEEP the ring
@@ -2985,7 +3005,15 @@ impl BatchScheduler {
         }
         if df2_live {
             let lane = self.lanes[0].as_ref().unwrap();
-            if lane.df2_primed && !lane.df2_stale {
+            // Second line of defence for the shared-ring class (see admission): a lane whose ring
+            // frontier is not its own position never enters the round (its asserts would kill the
+            // scheduler); it takes the MTP fallback below and is marked stale there.
+            let ring_ok = self.df2_ring_at(lane.pos);
+            if lane.df2_primed && !lane.df2_stale && !ring_ok {
+                eprintln!("[df2] ring frontier {} != lane pos {}: lane continues on MTP",
+                          self.df2.as_ref().map_or(0, |d| d.nprev()), lane.pos);
+            }
+            if lane.df2_primed && !lane.df2_stale && ring_ok {
                 served[0] = true;
                 // S8F (S6F adjudication): `DFlash2Auto` resolves to the per-request lane (greedy
                 // on code, real-q on math/chat/prose); explicit sources stay explicit. The rq
@@ -3032,7 +3060,12 @@ impl BatchScheduler {
             }
         } else if dspark_live {
             let lane = self.lanes[0].as_ref().unwrap();
-            if lane.df2_primed && !lane.df2_stale {
+            let ring_ok = self.dspark_ring_at(lane.pos);
+            if lane.df2_primed && !lane.df2_stale && !ring_ok {
+                eprintln!("[dspark] ring frontier {} != lane pos {}: lane continues on MTP",
+                          self.dspark.as_ref().map_or(0, |d| d.nprev()), lane.pos);
+            }
+            if lane.df2_primed && !lane.df2_stale && ring_ok {
                 served[0] = true;
                 // WI1 v1: the greedy drafts on greedy lanes, the q=1 rejection-sampling verify on
                 // sampled lanes (the DF2 lane pair's shape; DSpark has no tree/selector variants).

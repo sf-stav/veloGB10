@@ -281,6 +281,13 @@ fn plan_exl3(dir: &Path, world: usize, rank: usize, deal: &str) -> Result<RankPl
         for p in &ps { new_map.insert(p.name.clone(), logical.clone()); }
         out.push(PlanFile { logical, src: PlanSrc::Segment(ps) });
     }
+    // CF-P1g: a by-name sidecar the index does NOT list (the 4.05 pack's index omits the 39 GB n-gram table and its aux tensors)
+    // still goes to every rank whole — each rank computes its own PLE rows; the loader finds it by name.
+    for f in crate::cluster::PACK_SIDECARS {
+        if !files.contains(f) && dir.join(f).is_file() {
+            out.push(PlanFile { logical: f.to_string(), src: PlanSrc::Whole(dir.join(f)) });
+        }
+    }
     for f in crate::cluster::PACK_READ_FILES {
         if f == "model.safetensors.index.json" { continue; }
         if dir.join(f).is_file() { out.push(PlanFile { logical: f.to_string(), src: PlanSrc::Whole(dir.join(f)) }); }

@@ -3,6 +3,102 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.7.2 — concurrent requests on the EXL3 path, Qwen3.8-Flash-Next 4.05 bpw, `/metrics`, `--host`, and the bugs you reported
+
+This release answers a community benchmark of Flash-Next as a coding-agent executor (thank you — it
+was exactly the right test), adds the higher-fidelity 4.05 bpw pack, and fixes what was found along
+the way. It adds a **fourth PTX file** to the deploy set (`src/ptx/exl3_bench_k6.ptx`); copy the whole
+`src/ptx/` directory as before — the release tarball already has it.
+
+### Concurrent requests on the EXL3 path (Qwen3.8-Flash-Next)
+
+Speculative (MTP) rounds run one request at a time, so with several busy requests the aggregate used
+to stay flat at the single-request rate. Now each scheduling round picks the better of two arms by
+estimated aggregate tokens/s: serial speculation, or **one shared batched step for every busy request**
+(`--spec-lanes-max auto`, the default; `--spec-lanes-max N` shares the step only above N busy requests,
+`0` keeps serial speculation). A single busy request always speculates exactly as before, and every
+request's greedy output is byte-identical to running it alone, at every topology.
+
+Aggregate generated tokens/s on a code workload (256-token requests, one lab box per node, untuned
+build, indicative absolute values), v0.7.1 behaviour → v0.7.2, at 4 / 8 / 16 busy requests:
+
+| | 4 requests | 8 requests | 16 requests |
+|---|---:|---:|---:|
+| TP=1 | 91 → 97 | 89 → 129 | 88 → 168 |
+| TP=2 | 130 → 135 | 125 → 202 | 124 → 249 |
+| TP=4 | 159 → 173 | 152 → 238 | 154 → 293 |
+
+Prose (lower draft acceptance) gains earlier: at TP=1, 4 requests 67 → 89 and 8 requests 68 → 119. The
+TP=2 and TP=4 figures are single passes.
+
+**Two and three concurrent requests are not faster yet:** their aggregate stays at the single-request
+rate (each request gets its turn). A packed multi-request speculative verify for that range is in
+development and is the next item on the list.
+
+- Under the hood: a K-chunked expert gate/up for 10–16-row calls, bit-identical to the paths it
+  replaces (plain batched decode at 10–16 requests is ~20–25% faster); single-request speed and output
+  are unchanged.
+- Fixed on the way: at TP=2 with `--max-batch 16` the server could stop with `TP pre-verify FAILED ...`
+  once several requests were busy (the two ranks could hold different sets of captured CUDA graphs).
+
+### New: Qwen3.8-Flash-Next at 4.05 bpw (EXL3)
+
+[`doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw`](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw)
+(turboderp's `4.05bpw_h6_ng6`: 4-bit experts, 6-bit dense layers and head, a 6-bit n-gram table;
+~108 GB) serves at **TP=1** (the n-gram table is read from SSD — see below), **TP=2 and TP=4**, with
+image input. Untuned smoke-test figures (1,000 generated tokens / 2K-token prefill, single request):
+TP=1 63 tok/s decode and 1,399 prefill; TP=2 89 and 2,612; TP=4 120 and 3,496 (the 3.05 pack measures
+~73 / 102 / 122 decode on the same test). The pack was checked against the exllamav3 reference
+implementation itself: every 4-, 5- and 6-bit weight tensor class (15.8M trellis blocks, including the
+`lm_head`) and the 6-bit n-gram path decode bit-identically to exllamav3's. The model directory needs
+`vision_tower_bf16.safetensors` for image input (it is in the Hugging Face repo).
+
+### Memory: the n-gram table can live on SSD
+
+`--ple-ram ram|ssd|auto` (default `auto`; `on`/`off` still work). `ssd` reads the n-gram table from
+disk through the page cache and frees its 30–39 GB for requests and context: identical output, decode
+~1–4% slower and cold prefill up to ~10% slower (measured on a PCIe Gen 5 drive). `auto` now decides
+**after** the boot has allocated everything else (RAM if the table plus 16 GiB stay free, otherwise
+SSD, logged with the reason), which fixes `--max-batch 8` at 131K being stopped by the memory watchdog
+at boot on one Spark. A configuration that cannot fit at all is refused **before** the load, with the
+arithmetic and the fix (`--ple-ram ssd`, a smaller `--max-batch` / `--max-seq-len`, or `--tp 2`).
+
+### New flags and endpoints
+
+- `--host <addr>` — the bind address of the HTTP API (default `0.0.0.0`; `127.0.0.1` = this machine only).
+- `GET /metrics` — Prometheus text format, on by default, no measurable cost: requests by finish
+  reason, prompt/generated tokens, requests running/waiting, time-to-first-token / request-duration /
+  prefill and decode-rate histograms, speculation totals, engine alive, build info.
+
+### Fixed
+
+- **Tool-call history** is rendered the way the model writes it: `arguments` that are a JSON object are
+  parsed before the chat template runs, even for templates with an `arguments is string` branch (they
+  used to render `{"command": ...}` inside `<function=...>`, a mixed XML/JSON history the model copied
+  in long sessions; issue #6).
+- **Tool-call parsing:** text inside a parameter value that merely looks like a function tag
+  (`<function=x>` or a bare `function=x>` line, for instance a file an agent is writing about this
+  format) is payload and no longer produces a second, phantom tool call.
+- **NVFP4 with DFlash2 or DSpark and `--max-batch 2`:** the scheduler could stop with
+  `df2 ring nprev 512 != lane pos 713` when a second request arrived while the first was decoding (the
+  drafter ring is shared). A request that loses the ring now continues on MTP.
+- **NVFP4 `--kv-cache k8v8` now serves any `--max-batch`** (it was refused above one request). Plain
+  batched decode runs the same attention kernel a lone request runs, so a request's text does not
+  depend on how many others are busy; tree verification and `--mtp-lanes` use new int8 readers. KV
+  compaction after a tree-verified step on k8v8 used the bf16 copy kernel on int8 data; fixed.
+- A missing `--model-dir` is a clear error instead of a panic; TP shard shipping includes sidecar
+  files the tensor index omits.
+
+### Known limits
+
+- Two and three concurrent requests on the EXL3 path do not scale yet (above).
+- On the NVFP4 path, above one request the lanes run as a plain batch (the MTP head holds one request's
+  state): two requests together are slower in aggregate than one speculating request, and a request
+  that shared a batched step does not speculate again for the rest of that request.
+- Seeded sampled requests are not byte-reproducible across runs. Video and audio parts return `400`.
+- 4.05 bpw is untuned (no autotune decisions were found for it; it decodes ~0.86× as fast as 3.05 on
+  one or two nodes).
+
 ## v0.7.1 — TP=4 on the EXL3 path, image input, automatic shard shipping
 
 A fast follow to v0.7.0: the EXL3 path gains a fourth node and images, the node sync becomes

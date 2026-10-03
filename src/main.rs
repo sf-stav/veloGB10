@@ -10917,8 +10917,9 @@ fn dsv4_tp_serve_server(
 
     let tok_path = format!("{}/tokenizer.json", model_dir.trim_end_matches('/'));
     let tok = QwenTokenizer::from_file(&tok_path)?;
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))?;
-    println!("[dsv4-server] listening on http://0.0.0.0:{port}/v1/chat/completions");
+    let addr = gb10_inference::server::http_bind_addr(port)?;
+    let listener = TcpListener::bind(addr).map_err(|e| anyhow::anyhow!("cannot listen on {addr}: {e}"))?;
+    println!("[dsv4-server] listening on http://{addr}/v1/chat/completions");
 
     let mut tp_attached = false;
     // R2.3 prefix-cache (+ item 2.3 LRU): snapshot/restore at 128-aligned conversation-prefix
@@ -16064,6 +16065,7 @@ fn run_server(args: &[String]) {
         // later, so retain the startup value for the server lifetime; the scheduler's own
         // `admit` re-checks per request (its clamp is authoritative).
         let decode_headroom = gb10_inference::batch::decode_headroom(mtp_active_at_start);
+        gb10_inference::metrics::set_max_batch(max_batch);
         let state = AppState {
             sampling_defaults: gb10_inference::server::SamplingDefaults::LEGACY,
             scheduler: stx,
@@ -16167,8 +16169,9 @@ fn run_server(args: &[String]) {
         }
         gb10_inference::memwatch::phase("serve:pre-bind");
         let app = create_router(state);
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
-        println!("OpenAI-compatible server running on http://0.0.0.0:{}", port);
+        let listener = gb10_inference::server::http_listen(port).await;
+        println!("OpenAI-compatible server running on http://{}",
+                 listener.local_addr().map_or_else(|_| format!("0.0.0.0:{port}"), |a| a.to_string()));
         println!("Serving model: {}  (GET /v1/models)", model_name);
         println!("POST /v1/chat/completions   max_batch={}  default max_tokens={}", max_batch, default_max_tokens);
         println!("POST /v1/tokenize           vLLM-compatible: {{tokens, count, max_model_len}} — pure tokenizer, no forward (prompt | messages)");

@@ -4,7 +4,7 @@
 
 # veloGB10
 
-**A GB10-specific inference engine for one or two GB10-based systems — NVIDIA DGX Spark and
+**A GB10-specific inference engine for one, two or four GB10-based systems — NVIDIA DGX Spark and
 compatible OEM machines built around the NVIDIA GB10 chipset.**
 
 veloGB10 (`gb10_inference`) is a from-scratch Rust + CUDA inference engine for a hand-selected
@@ -21,7 +21,7 @@ The implementation is intentionally specialized for GB10 systems:
 - **Two or four GB10 machines** — tensor-parallel inference (TP=2 / TP=4) **for performance**, not
   just capacity: multiple machines decode a single request measurably faster than one can
 - NVIDIA DGX Spark and compatible GB10 OEM systems (Grace Blackwell, sm_121)
-- 128 GB unified LPDDR5x memory, ~255 GB/s measured sustained bandwidth
+- 128 GB unified LPDDR5x memory, ~238 GB/s measured sustained bandwidth (idle)
 - ConnectX-7 networking for two-node inference
 - GB10-specific kernels, precision paths, memory management, and scheduling
 
@@ -60,10 +60,10 @@ mixture-of-experts model with ~6B active parameters, running on one, two or four
 
 | | |
 |---|---|
-| Weights | [doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw) — EXL3 3.05 bpw, ~85 GB (32.6 GB of that is the n-gram table) |
+| Weights | [doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw) — EXL3 3.05 bpw, ~85 GB (32.6 GB of that is the n-gram table); higher fidelity: [4.05 bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw), ~108 GB (v0.7.2+) |
 | Architecture | 125B total / ~6B active, 48 layers — Gated DeltaNet + Qwen Sparse Attention hybrid, **no full-attention layers** |
 | Experts | 512 routed per layer, top-10 per token, plus a shared expert |
-| Extra parameters | 51B hashed n-gram embedding table (kept in host RAM), MTP draft head |
+| Extra parameters | 51B hashed n-gram embedding table (kept in host RAM, or read from SSD with `--ple-ram ssd`), MTP draft head |
 | Context | 262,144 tokens (no YaRN, so no 1M) |
 | Speculation | built-in MTP, automatic depth — greedy output is **bitwise identical** to non-speculative decoding |
 | Modality | text only on this path |
@@ -112,6 +112,23 @@ on decode and **×2.0–2.2** on prefill.
 
 Full setup (pack layout, node command, launch lines, expected output):
 **[QWEN_38_FLASH_NEXT_SETUP.md](QWEN_38_FLASH_NEXT_SETUP.md)**.
+
+### New in v0.7.2
+
+- **Concurrent requests on the EXL3 path.** With several busy requests the engine now shares one batched
+  step across all of them (`--spec-lanes-max auto`): on one node aggregate throughput rises from about
+  4 busy requests, to roughly ×1.45 at 8 and ×1.9 at 16; TP=2 and TP=4 gain proportionally. A single
+  request is untouched, and every request's greedy output is byte-identical to running it alone. **Two
+  and three concurrent requests still take turns** (aggregate stays at the single-request rate); a packed
+  multi-request verify for that range is in development. Numbers: **[CHANGELOG.md](CHANGELOG.md)**.
+- **Qwen3.8-Flash-Next at 4.05 bpw** — [doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw)
+  (~108 GB), TP=1 (n-gram table on SSD), TP=2 and TP=4, with images. Verified bit-exact against the
+  exllamav3 reference implementation.
+- **`--ple-ram ram|ssd|auto`** puts the n-gram table on SSD when memory is short (decode ~1–4% slower),
+  and a configuration that cannot fit is refused **before** the load with the arithmetic and the fix.
+- **`GET /metrics`** (Prometheus text format, on by default) and **`--host <addr>`** (bind address).
+- **Fixes:** tool-call history rendering (issue #6) and a phantom-tool-call parsing bug, the NVFP4
+  DFlash2/DSpark two-request crash, NVFP4 `--kv-cache k8v8` with `--max-batch > 1`, TP=2 `--max-batch 16`.
 
 ### Also in v0.7.1
 
@@ -165,9 +182,9 @@ a vLLM / SGLang / ExLlamaV3 recipe has, to my knowledge.
 
 **Prefill and multi-turn**
 
-- Prefix cache with intermediate prefill checkpoints; a resume is bit-identical to a cold prefill.
+- Prefix cache with intermediate prefill checkpoints. A resume is deterministic but can word an answer differently from a cold prefill (the prefill is re-chunked); `--prefix-tail-ckpt 0` makes resumes bit-identical.
 - Message-boundary (tail) checkpoints, so follow-up turns resume near the end.
-- 2,048-token wide prefill chunks.
+- 4,095-row wide prefill chunks (default since v0.7.1; `--prefill-chunk 2048` restores the old grid).
 
 **TP=2** (with a specific goal for speed improvements, not just capacity)
 
@@ -175,7 +192,7 @@ a vLLM / SGLang / ExLlamaV3 recipe has, to my knowledge.
   - attention, GDN and the KV cache split by head;
   - experts divided between the boxes;
   - dense layers split by rows.
-- Our own GPU-direct RDMA transport over ConnectX-7, using both links for prefill.
+- Our own RDMA transport over ConnectX-7, using both links for prefill (the GB10 has no GPUDirect RDMA, so buffers are pinned host memory, staged and signalled by GPU kernels).
 - Barrier steps folded into kernel epilogues, with GPU-side receive.
 - Split draft screen for the MTP head.
 - Output head split by vocabulary, for greedy and sampled rows, with output bitwise identical to the
@@ -347,11 +364,11 @@ in **[CHANGELOG.md](CHANGELOG.md)**.
 **System prerequisites** (on the GB10 itself):
 
 - **NVIDIA DGX Spark (GB10, sm_121)** with the CUDA toolkit — `nvcc` available (`CUDA_HOME` is
-  honored). The build compiles the two kernel modules to PTX and **fails loudly** if nvcc fails;
+  honored). The build compiles all kernel modules to PTX and **fails loudly** if nvcc fails;
   on a machine without nvcc it falls back to the checked-in PTX in `src/ptx/` with a warning, so
   the Rust side can still be compiled anywhere.
 - **Rust stable toolchain** (`rustup`).
-- **libibverbs + rdma-core dev headers** (for the TP=2 transport shim):
+- **libibverbs + rdma-core dev headers** (for the TP=2/TP=4 transport shim):
   `sudo apt install libibverbs-dev rdma-core`
 
 **Build:**
@@ -360,7 +377,7 @@ in **[CHANGELOG.md](CHANGELOG.md)**.
 cargo build --release
 ```
 
-This produces `target/release/gb10_inference` plus the two PTX kernel artifacts in `src/ptx/`.
+This produces `target/release/gb10_inference` plus the PTX kernel artifacts in `src/ptx/` (the build generates all of them; the engine needs the whole set at runtime).
 **The binary is not self-contained — it loads `src/ptx/*.ptx` relative to its working directory**,
 so run it from a directory that has both (a build-fingerprint handshake refuses to run mismatched
 binary/PTX pairs, so the two never silently drift apart).
@@ -410,9 +427,8 @@ in full in [BEST_WAYS_TO_RUN.md](BEST_WAYS_TO_RUN.md).
   --max-seq-len=32768 --max-batch=4 --mtp-lanes=on --prefix-cache=on
 ```
 
-Note that `--kv-cache k8v8` cannot be combined with `--max-batch` greater than 1: the int8 K/V rows
-are read only by the single-lane attention kernel, and the engine rejects that combination before
-loading the model. Use `--kv-cache bf16` (or `k8v4`) when you want concurrency.
+`--kv-cache k8v8` works with any `--max-batch` since v0.7.2 (earlier versions rejected it above one
+lane): each request's text is the same as when it runs alone.
 
 **Two nodes, TP=2** (start the peer first — it needs no model copy and no configuration; the head
 ships weights, settings, and calibration at sync):
@@ -445,7 +461,9 @@ recipe is ~76 GB.
 **Qwen3.8-Flash-Next** — a 125B MoE with ~6B active parameters, a Gated DeltaNet + Qwen Sparse
 Attention hybrid, 512 experts (top-10), a 51B n-gram embedding table, an MTP draft head and a
 262,144-token context. Weights: **[doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw)**
-(EXL3 3.05 bpw, ~85 GB including the 32.6 GB n-gram table).
+(EXL3 3.05 bpw, ~85 GB including the 32.6 GB n-gram table). A higher-fidelity **4.05 bpw** pack is at
+**[doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw)**
+(~108 GB; needs v0.7.2 or newer; at TP=1 its n-gram table is read from SSD).
 
 **One GB10 (TP=1):**
 
@@ -476,7 +494,7 @@ nothing.
 **Supported on this path:** the OpenAI-compatible API with streaming; built-in **MTP speculative
 decoding** (auto depth — greedy output is bitwise identical to non-speculative decoding, sampled
 output is distribution-exact); prefix cache with prefill checkpoints for multi-turn; **q8 KV cache
-by default** (`--kv-cache f32|f16|fp8|q8`, about 3.4 GB at 262K); penalties and streaming loop
+by default** (`--kv-cache f32|f16|fp8|q8`; the KV itself is about 3.4 GB at 262K, ~5.6 GB per lane including the sparse-attention indexer planes); penalties and streaming loop
 detection; and TP=2 speed features that are on by default with an `off` value each
 (`--tp-seq-parallel`, `--tp-vp-sampled`, `--tp-prefill-overlap`).
 
@@ -485,9 +503,10 @@ detection; and TP=2 speed features that are on by default with an `off` value ea
 - **262,144 tokens maximum.** YaRN is not implemented, so there is no 1M context.
 - **Images yes, video not yet.** Image parts are served at every topology (TP=1/2/4); **video and
   audio parts return `400`** until video support lands.
-- **Single-request only for now.** `--max-batch 1` is what was tested; a second lane works and is
-  hash-exact per lane, but lanes take turns, so there is no aggregate throughput gain yet.
-  Multi-request concurrency is not measured.
+- **Two or three concurrent requests do not scale yet.** `--max-batch N` serves N requests; from about
+  four busy requests the engine shares one batched step (roughly ×1.45 aggregate at 8, ×1.9 at 16 on one
+  node), but with two or three the requests take turns and the aggregate stays at the single-request
+  rate. Output is byte-identical to running each request alone either way.
 - Seeded sampled requests are not byte-reproducible across runs.
 - A prefix-cache resume can word an answer differently from a cold prompt by design; pass
   `--prefix-tail-ckpt 0` for bit-identical resumes.
@@ -499,7 +518,7 @@ detection; and TP=2 speed features that are on by default with an `off` value ea
 
 ## Purpose
 
-The DGX Spark has one scarce resource: **~255 GB/s of measured, sustainable memory bandwidth**.
+The DGX Spark has one scarce resource: **~238 GB/s of measured, sustainable memory bandwidth** (idle).
 Every design decision in this engine is subordinate to spending it well. The result is an
 engine that runs large models — up to **122B on a single node, larger across two** — at speeds
 that hold up under an agentic workload, not just on a benchmark prompt.
@@ -568,8 +587,8 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
 ### Engineered to the roofline
 
 The engine is ~94% GEMM and weight-bandwidth-bound, and it is tuned as such: on 9B the LM head
-sustains **229 GB/s — 90% of the machine's measured 255 GB/s pure-read ceiling** — and the whole
-decode step runs at 72% of it. Optimization here means *fewer bytes* (NVFP4, fused projections,
+sustains **229 GB/s — 96% of the machine's measured 238 GB/s pure-read ceiling** — and the whole
+decode step runs at ~77% of it. Optimization here means *fewer bytes* (NVFP4, fused projections,
 frequency-ranked draft vocabularies), not fewer launches.
 
 ### Bitwise-lossless speculation
@@ -596,7 +615,9 @@ And it is built to be trusted, not just to run:
 - **Per-step agreement guard** — both ranks hash their state every decode step and abort loudly on
   any divergence. Silent desync is not a failure mode this system has.
 - **Deterministic everything** — auto-depth decisions are a pure function of bit-identical token
-  history; output is byte-identical to the single-node build (gated, incl. live depth switches).
+  history; output is byte-identical to the single-node build (gated, incl. live depth switches). On
+  the EXL3 path the code-class greedy bank matched across TP=1/2/4; prose and python output can differ
+  in the last bits across topologies, and each topology is deterministic.
 
 ### Hybrid-native long context
 
@@ -680,7 +701,7 @@ Complete surface of `gb10_inference` (same content as `--help`). Square brackets
 
 | Mode | What it does |
 |---|---|
-| `--server` | OpenAI-compatible HTTP server — the normal way to run (endpoints: `POST /v1/chat/completions`, `POST /v1/tokenize`, `POST /v1/detokenize`, `GET /v1/models[/:id]`, `GET /health`) |
+| `--server` | OpenAI-compatible HTTP server — the normal way to run (endpoints: `POST /v1/chat/completions`, `POST /v1/tokenize`, `POST /v1/detokenize`, `GET /v1/models[/:id]`, `GET /health`, `GET /metrics`) |
 | *(no mode)* | Interactive CLI: load model, generate from `--prompt` |
 | `--help`, `-h` | Print help |
 
@@ -709,7 +730,10 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--model <FILE>` | — | Legacy: single `.safetensors` file (use `--model-dir`) |
 | `--tokenizer <FILE>` | — | Legacy: tokenizer.json path (implied by `--model-dir`) |
 | `--port <N>` | 8000 | Listen port |
-| `--max-batch <N>` | 8 | Max concurrent sequences (lanes) |
+| `--host <ADDR>` | `0.0.0.0` | HTTP bind address (`127.0.0.1` = this machine only) |
+| `--max-batch <N>` | 8 | Max concurrent sequences (lanes). EXL3: every lane's KV is allocated up front (~5.6 GB per lane at 262K context, 2.8 GB at 131K) |
+| `--spec-lanes-max <auto\|N\|0>` | auto | EXL3 multi-request mode: pick per round between serial speculation and one shared batched step by estimated aggregate tok/s; `N` shares only above N busy requests, `0` = never |
+| `--ple-ram <auto\|ram\|ssd>` | auto | EXL3 n-gram table location: RAM, or read from SSD (frees 30–39 GB, decode ~1–4% slower); `auto` decides after the boot and refuses impossible configurations before the load |
 | `--max-tokens <N>` | 8192 | Generation cap when a request omits `max_tokens` |
 | `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
 | `--vision-cpu` | off | Force the CPU vision tower (reference path) instead of the GPU tower. Diagnostic/escape hatch |
@@ -743,7 +767,7 @@ per request.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--node [--port 29500] [--rdma-dev d1[,d2]] [--once]` | — | Run the **node** (peer) side: resident supervisor, zero configuration — model, config, cost table and stop tokens ship from the head at sync |
-| `--tp` | off | Enable TP=2 on `--server` (sync + RDMA bring-up first) |
+| `--tp [N]` | off | Enable tensor parallelism on `--server`, N = 2 or 4 (bare `--tp` = 2; sync + RDMA bring-up first) |
 | `--nodes <ip[:port],...>` | — | Explicit node address(es); skips UDP discovery |
 | `--discover-wait <S>` | 3 | Discovery broadcast window (instead of `--nodes`) |
 | `--rdma-dev <d1[,d2]>` | platform defaults | RoCE devices |
@@ -780,23 +804,23 @@ The complete table of every removed variable and its replacement flag is
 `--bench-lanes` (batched verify), `--bench-prefill` (TTFT proxy), `--probe-binv` (batch
 invariance), `--probe-state` (GDN state divergence), `--probe-reject` (rollback),
 `--probe-gemm` (cuBLAS audit), `--probe-bandwidth` / `--probe-bandwidth-sustained` (roofline;
-idle GB10 ≈ 255 GB/s), `--tp-barrier-bench` (transport gates, no model), `--net-test` (2-proc
+idle GB10 ≈ 238 GB/s), `--tp-barrier-bench` (transport gates, no model), `--net-test` (2-proc
 transport audit), `--sweep-gemm`.
 
 ## Requirements
 
-- 1–2× NVIDIA DGX Spark (GB10); TP=2 uses the ConnectX-7 interconnect between them
+- 1, 2 or 4× NVIDIA DGX Spark (GB10); TP=2/TP=4 use the ConnectX-7 interconnect between them
 - NVFP4/FP8-quantized model artifacts (offline quantizer included)
 - Rust toolchain + CUDA (sm_121a) to build; runtime is the binary plus its PTX kernel artifacts
 - To reproduce the benchmarks: [`tool-eval-bench`](https://github.com/SeraphimSerapis/tool-eval-bench/)
   with the `--perf` flag, pointed at a running veloGB10 server
 
-> **Cluster scope:** veloGB10 is designed, measured, and gated on exactly one and two GB10
-> machines — that is the hardware we have. **TP>2 work has not been done because we have no access
-> to more than two GB10 machines**: the weight sharding, the transport, and the lockstep serving
-> protocol are built for two ranks, so TP>2 is engineering work, not a configuration flag, and we
-> have had no hardware to develop or validate it on. If you have a bigger rig and want to help
-> make TP>2 (or expert/pipeline parallelism) real, open an issue — we'd like to hear from you.
+> **Cluster scope:** veloGB10 is designed, measured, and gated on one, two and four GB10
+> machines (TP=2 and TP=4) — that is the hardware we have. **Anything beyond four machines has not
+> been done because we have no access to more than four GB10 machines**: the weight sharding, the
+> transport, and the lockstep serving protocol are built for 2 and 4 ranks, so larger worlds are
+> engineering work, not a configuration flag. If you have a bigger rig and want to help make
+> TP>4 (or expert/pipeline parallelism) real, open an issue — we'd like to hear from you.
 
 ## Status
 
@@ -837,7 +861,7 @@ Beyond new models:
 veloGB10 is a **one-man project by [Stav Katsoulis](https://github.com/sf-stav)** — kernels,
 scheduler, transport, gates, docs, and releases are all done in one person's limited time. Bug reports and well-formed issues are always free and
 welcome. If you need something specific and soon — a model port, a feature, tuning for your
-workload, TP>2 — **special work requests are taken on at a price**: open an issue describing the
+workload, TP>4 — **special work requests are taken on at a price**: open an issue describing the
 work and it will be quoted. This is also the most direct way to make the "next areas of research"
 above happen faster.
 
@@ -876,7 +900,7 @@ This project does not link extensively against any other project (other than the
 
 Areas that are in flight or planned. These are tracked openly — progress and timelines are as honest as I can make them, and this list changes as work lands.
 
-- **Concurrency.** Everything published so far is single-request (`--max-batch 1`). Multi-request serving — the tests, and the optimization those tests will drive — comes next, after the current round of path optimization. **No concurrency numbers are claimed anywhere in this README yet.**
+- **Concurrency.** Shipped in v0.7.2 for the EXL3 path from about four busy requests (see the CHANGELOG for numbers). **Two and three concurrent requests do not scale yet**; a packed multi-request speculative verify for that range is the next item. The NVFP4 models run requests as a plain batch above one lane.
 - **Fix Tencent Hy3 support.** Hy3 regressed over the last few weeks as the engine evolved; restoring it to a fully working, gated state is a priority.
 - **Video input.** Image input is supported on every topology, including the EXL3 / Qwen3.8-Flash-Next path. Video (and audio) parts are not served yet — they return `400` — and that is the remaining vision work, along with widening coverage across the rest of the Qwen family.
 - **Qwen3.5 397B MoE (incl. Ornith 1.5).** Large-model port; the engine already serves this architecture at 122B, so the work is the TP=2/TP=4 capacity bring-up (large weight footprint) plus the correctness gates at that size.

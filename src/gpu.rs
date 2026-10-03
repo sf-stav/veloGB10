@@ -4757,6 +4757,7 @@ impl GpuModel {
             "write_kv_b_k8v4","write_kv_prefill_k8v4","compact_kv_k8v4","dequant_kv_k8v4",
             "gqa_attn_splitk_k8v4","gqa_attn_splitk_k8v4_gq",
             "write_kv_b_k8v8","write_kv_prefill_k8v8","compact_kv_k8v8","gqa_attn_verify_e_k8v8",
+            "gqa_attn_splitk_k8v8","gqa_attn_splitk_k8v8_gq",
             "write_kv_b_tq","write_kv_prefill_tq","rotate_q_tq","compact_kv_tq","dequant_kv_tq",
             "dequant_kv_tq_full","gqa_attn_splitk_tq","gqa_attn_splitk_tq_gq","gqa_attn_splitk_tq_dbg_scores",
             "tp_mask_rows","tp_gate_copy_signal","tp_wait_add","tp_wait_add_g","tp_wait_add_4way","tp_reduce_resnorm_b",
@@ -9882,10 +9883,19 @@ impl GpuModel {
             && (hd == 128 || hd == 256)
             && batch >= 1 && batch <= MAX_VERIFY
             && crate::opts::var(crate::opt!("no-attn-e")).is_err();
+        // k8v8 multi-lane: the `_e` tensor-core kernel addresses ONE slot for all its columns, so a call whose columns
+        // are independent sequences (plain batched decode of several lanes) cannot be ONE `_e` launch. It CAN be one
+        // batch-1 `_e` launch per column (pointer offsets, below): column j then runs the exact kernel and arithmetic
+        // a lone request runs, so a lane's bytes never depend on how many other lanes are busy. Valid for identity-path
+        // calls only (a tree column attends through `path`, which `_e` does not read); those take the int8 split-K pair.
+        let use_e_cols = !use_e && kv_mode == KVCacheMode::K8v8 && path_ptr == 0 && qsa_sel.is_none()
+            && (hd == 128 || hd == 256) && batch >= 2 && batch <= MAX_VERIFY
+            && crate::opts::var(crate::opt!("no-attn-e")).is_err();
+        let use_e_lane = use_e || use_e_cols;   // partials in the `_e` layout (ns_grid == SEG), reduced by gqa_attn_reduce_e
         if crate::opts::var(crate::opt!("attn-e-debug")).is_ok() {
-            eprintln!("[attn_e] chain_ok={chain_ok} kv={:?} hd={hd} batch={batch} ratio={ratio_now} max_pc={max_pc} use_e={use_e}", kv_mode);
+            eprintln!("[attn_e] chain_ok={chain_ok} kv={:?} hd={hd} batch={batch} ratio={ratio_now} max_pc={max_pc} use_e={use_e} use_e_cols={use_e_cols}", kv_mode);
         }
-        let seg_e: usize = if use_e {
+        let seg_e: usize = if use_e_lane {
             // grid = nkv * SEG: cover the SMs (48) with ~2 waves, then keep the per-segment
             // serial scan bounded (~8K keys) at long ctx. SEG <= 63 (bs_packed field is 6 bits).
             // F9: SEG comes from kv_stride — a per-request constant, so a decode and a verify of
@@ -9895,7 +9905,7 @@ impl GpuModel {
             let base = ((192 + nkv - 1) / nkv).max(4);
             base.max((kv_stride + 8191) / 8192).min(63)
         } else { 0 };
-        let ns_grid = if use_e { seg_e } else { (max_pc / 256).clamp(1, 32) };
+        let ns_grid = if use_e_lane { seg_e } else { (max_pc / 256).clamp(1, 32) };
         // F9: _e row groups (6 warps x 8 real rows per block); 1 for every serving width <= 8.
         let rg_e = if use_e { (batch * ratio_now).div_ceil(48).max(1) } else { 1 };
         let n_partial = batch * nh * ns_grid;
@@ -9953,16 +9963,39 @@ impl GpuModel {
             }
         }
         KVCacheMode::K8v8 => {
-            // k8v8 direct-read: the p8b verify kernel (p3 core + in-register block dequant) on
-            // the _e lane. No splitk twin — the non-e fallbacks would need their own int8 readers;
-            // use_e covers decode+verify for batch<=8 (every MTP/graph lane). A non-e dispatch
-            // here is a wiring bug, not a graceful-degradation case (a silent bf16 read of an
-            // int8 buffer is the mojibake-class hazard) — fail loud.
-            assert!(use_e,
-                "k8v8 requires the _e attention lane (batch<=8, gqa<=48, no --no-attn-e)");
-            blaunch!(self, "gqa_attn_verify_e_k8v8", (nkv as u32, seg_e as u32, rg_e as u32), (192,1,1), 0,
-                (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
-                 logical_ptr, bs_packed, nh_packed, slot_ids_ptr, col_pos_start_ptr));
+            if use_e {
+                // Single-request lane (decode b=1 / chain verify): the p8b tensor-core kernel (p3 core +
+                // in-register block dequant) reads ONE slot for every column.
+                blaunch!(self, "gqa_attn_verify_e_k8v8", (nkv as u32, seg_e as u32, rg_e as u32), (192,1,1), 0,
+                    (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
+                     logical_ptr, bs_packed, nh_packed, slot_ids_ptr, col_pos_start_ptr));
+            } else if use_e_cols {
+                // Independent columns (plain batched decode of several lanes): one batch-1 `_e` launch per
+                // column, outputs/inputs offset to the column — the same kernel a lone request runs.
+                let bs1: u64 = ((q_pitch as u64) << 31) | (1u64 << 25) | ((ns_grid as u64) << 19) | (stride as u64);
+                let (qp, pmp, plp, pap) = (d(q), d(&pm), d(&pl), d(&pa));
+                for c in 0..batch as u64 {
+                    let part = c * (nh * ns_grid) as u64;
+                    blaunch!(self, "gqa_attn_verify_e_k8v8", (nkv as u32, seg_e as u32, 1u32), (192,1,1), 0,
+                        (pmp + part * 4, plp + part * 4, pap + part * hd as u64 * 4, qp + c * q_pitch as u64 * 2,
+                         kc_ptr, vc_ptr, logical_ptr + c * 4, bs1, nh_packed, slot_ids_ptr + c * 4, col_pos_start_ptr));
+                }
+            } else {
+                // Everything the `_e` lane cannot serve — tree verify (a column attends through `path`), an
+                // `--no-attn-e` A/B, widths above MAX_VERIFY: the int8 split-K readers (the k8v4 pair's structure,
+                // V read as int8+fp16-block like K, dequant rounded to bf16 exactly like the `_e` staging). A non-e
+                // dispatch must never fall through to a bf16 reader (a silent bf16 read of an int8 buffer is the
+                // mojibake-class hazard), so this arm names its kernels explicitly.
+                if (hd == 128 || hd == 256) && (2..=8).contains(&gqa_ratio) && !no_gqpack {
+                    blaunch!(self, "gqa_attn_splitk_k8v8_gq", ((batch * nkv * ns_grid) as u32,1,1), (hd as u32,1,1), smem,
+                        (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
+                         logical_ptr, bs_packed, nh_packed, slot_ids_ptr, path_ptr, col_pos_start_ptr));
+                } else {
+                    blaunch!(self, "gqa_attn_splitk_k8v8", ((batch * nh * ns_grid) as u32,1,1), (hd as u32,1,1), smem,
+                        (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
+                         logical_ptr, bs_packed, nh_packed, slot_ids_ptr, path_ptr, col_pos_start_ptr));
+                }
+            }
         }
         KVCacheMode::Tq => {
             // TurboQuant split-K: same GQA-packed structure (one block per (kvh, split), the E1
@@ -10020,7 +10053,7 @@ impl GpuModel {
         // TRAP-2: the (Bf16|K8v4, Some) arm is the ONLY sparse arm; qsa_enabled() asserts
         // kv_quant/kv_tq/kv_k8v8 so the fallthrough (_ => logical_ptr) is unreachable for QSA.
         let reduce_pos_ptr = match (kv_mode, qsa_sel) { (KVCacheMode::Bf16 | KVCacheMode::K8v4, Some((_, p))) => p, _ => logical_ptr };
-        if use_e && qsa_sel.is_none() {
+        if use_e_lane && qsa_sel.is_none() {
             // _e twin: the partial count is ns_grid (== SEG) by construction — no sk_nsplits
             // recompute (the splitk reduce would read a different split count than we wrote).
             blaunch!(self, "gqa_attn_reduce_e", ((batch*nh) as u32,1,1), (hd as u32,1,1), 0,
@@ -15100,15 +15133,16 @@ impl GpuModel {
             }
             pool.release_bf16(scratch, len * hdx);
         }
-        if self.kv_quant || self.kv_tq || self.kv_k8v4 {
+        if self.kv_quant || self.kv_tq || self.kv_k8v4 || self.kv_k8v8 {
             // Per-channel row sizes: k8v4 is the first mode where K and V diverge (K 20 B/16,
             // V 12 B/16) — the scratch buffers are sized per channel and the k8v4 kernel's grid
             // spans K+V bytes (the shared-rb q4/TQ kernels copy both caches per element over
             // len*nkv*rb).
             let (k_rb, v_rb) = if self.kv_tq { (self.tq_row_bytes(), self.tq_row_bytes()) }
                                else if self.kv_k8v4 { (self.kv_k_row_bytes(hd), self.kvq_row_bytes(hd)) }
+                               else if self.kv_k8v8 { (self.kv_k_row_bytes(hd), self.kv_k_row_bytes(hd)) } // both channels 20 B/16
                                else { (self.kvq_row_bytes(hd), self.kvq_row_bytes(hd)) };
-            let (total, k_scratch, v_scratch) = if self.kv_k8v4 {
+            let (total, k_scratch, v_scratch) = if self.kv_k8v4 || self.kv_k8v8 {
                 (len * nkv * (k_rb + v_rb), len * nkv * k_rb / 2, len * nkv * v_rb / 2)
             } else {
                 (len * nkv * k_rb, len * nkv * k_rb / 2, len * nkv * v_rb / 2)
@@ -15127,6 +15161,10 @@ impl GpuModel {
                              slot as i32, nkv as i32, kv_stride as i32, dir));
                     } else if self.kv_k8v4 {
                         blaunch!(self, "compact_kv_k8v4", grid(total as usize), (256,1,1), 0,
+                            (kc, vc, d(&ks), d(&vs), sp_ptr, len as i32, pos_start as i32,
+                             slot as i32, nkv as i32, kv_stride as i32, hd as i32, dir));
+                    } else if self.kv_k8v8 {
+                        blaunch!(self, "compact_kv_k8v8", grid(total as usize), (256,1,1), 0,
                             (kc, vc, d(&ks), d(&vs), sp_ptr, len as i32, pos_start as i32,
                              slot as i32, nkv as i32, kv_stride as i32, hd as i32, dir));
                     } else {

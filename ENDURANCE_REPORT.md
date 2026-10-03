@@ -25,8 +25,8 @@ driven the whole time.
 | Hardware | **4 × NVIDIA GB10** (Grace Blackwell Superchip), tensor-parallel **TP=4**, unified LPDDR5X |
 | Decoding | **DFlash 2** speculative. A block is drafted, the trunk verifies it, and the longest matching prefix is accepted |
 
-The configuration is the same one described in the README's *[Update: Qwen 3.8 27B NVFP4 with
-DFlash 2](README.md#update--qwen-38-27b-nvfp4-with-dflash-2)* section, at a 256K-capable context
+The configuration is the same one described in the README's *[Qwen 3.8 27B NVFP4 with
+DFlash 2](README.md#qwen-38-27b-nvfp4-with-dflash-2)* section, at a 256K-capable context
 headroom.
 
 ## What we ran

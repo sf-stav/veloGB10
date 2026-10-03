@@ -31,10 +31,10 @@ calibration over the network at sync time, and only the shards a node actually n
 
 **Two settings shape every recipe below:**
 
-- **`--kv-cache k8v8` is single-lane.** It is rejected before the model loads unless
-  `--max-batch 1`. That is why every recipe here runs `--max-batch 1`. To serve concurrent
-  requests, switch to `--kv-cache bf16` (or `k8v4`) and raise `--max-batch` to the number of
-  concurrent requests you want.
+- **Every recipe here runs `--max-batch 1`** (one user, fastest speculation). Since v0.7.2
+  `--kv-cache k8v8` also works with `--max-batch` above 1 (earlier versions rejected it), so to serve
+  concurrent requests just raise `--max-batch` to the number of requests you want. Note that on the
+  NVFP4 models, above one request the lanes run as a plain batch (no per-request speculation).
 - **The draft model is passed with `--draft-dir`.** `--dflash-dir` still works as a deprecated
   alias, but it prints a warning on startup.
 
@@ -134,10 +134,9 @@ correctly. The draft lane is live when you see `[df2] DFlash2 round RESIDENT`.
 
 ## Tuning the launch line
 
-- **Concurrency:** `--max-batch <n>` accepts `n` concurrent requests. It requires dropping
-  `--kv-cache k8v8` (see above), since int8 K/V rows are only read by the single-lane attention
-  kernel. `--max-batch 1` with speculation is the fastest configuration for one user; above one
-  lane, batching wins over speculation.
+- **Concurrency:** `--max-batch <n>` accepts `n` concurrent requests (`--kv-cache k8v8` is fine with
+  any `n` since v0.7.2). `--max-batch 1` with speculation is the fastest configuration for one user;
+  above one lane on the NVFP4 models, batching wins over speculation.
 - **Context:** `--max-seq-len` is the KV budget. Lower it if you need the memory back; the
   recipes above use the full 256K the models advertise.
 - **Reasoning:** `--reasoning-effort` accepts `no_think | low | medium | high | xhigh`. `low`

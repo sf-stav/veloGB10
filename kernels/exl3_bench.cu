@@ -95,6 +95,15 @@ __device__ __forceinline__ uint16_t exl3_dq_t(const uint32_t* __restrict__ ring,
 // next grid becomes resident while this one's last wave drains (launch gap + tail overlap).
 // The dependent release fires only after ALL CTAs of a grid have started, so co-resident
 // grid-barrier kernels (xq_hc_fuse*) can never be starved by a waiting successor.
+// CF-P1g (4.05 bpw): the K=6 module. kernels/exl3_bench_k6.cu defines EXL3_K6_BUILD and includes this file, which adds a
+// `case 6` next to every K=5 bit-width switch below. The normal build leaves the macro empty, so the 3.05 / K <= 5
+// module is source-identical (and its PTX instruction-identical) to before; the K=6 PTX is loaded only for a pack that
+// stores a K=6 module (exl3_bench::bench_ptx_path).
+#ifdef EXL3_K6_BUILD
+#define EXL3_CASE6(...) __VA_ARGS__
+#else
+#define EXL3_CASE6(...)
+#endif
 #define XQ_PDL_ENTRY() do { asm volatile("griddepcontrol.wait;" ::: "memory"); \
                             asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); } while (0)
 
@@ -663,6 +672,7 @@ extern "C" __global__ void exl3_hmma_gemm(const uint16_t* __restrict__ trellis,
         case 3: exl3_gemm_body<3>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
         case 4: exl3_gemm_body<4>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
         case 5: exl3_gemm_body<5>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
+        EXL3_CASE6(case 6: exl3_gemm_body<6>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;)
         default: break; // loader refuses other rates before we ever get here
     }
 }
@@ -1395,6 +1405,7 @@ extern "C" __global__ void exl3_hmma_gemm_grouped(const uint16_t* __restrict__ b
             case 3: exl3_gemm_body_a1<3>(tr, xh, ye, M, K, N, tile); break;
             case 4: exl3_gemm_body_a1<4>(tr, xh, ye, M, K, N, tile); break;
             case 5: exl3_gemm_body_a1<5>(tr, xh, ye, M, K, N, tile); break;
+            EXL3_CASE6(case 6: exl3_gemm_body_a1<6>(tr, xh, ye, M, K, N, tile); break;)
             default: break;
         }
         return;
@@ -1403,6 +1414,7 @@ extern "C" __global__ void exl3_hmma_gemm_grouped(const uint16_t* __restrict__ b
         case 3: exl3_gemm_body<3>(tr, xh, ye, M, K, N, tile); break;
         case 4: exl3_gemm_body<4>(tr, xh, ye, M, K, N, tile); break;
         case 5: exl3_gemm_body<5>(tr, xh, ye, M, K, N, tile); break;
+        EXL3_CASE6(case 6: exl3_gemm_body<6>(tr, xh, ye, M, K, N, tile); break;)
         default: break;
     }
 }
@@ -5398,6 +5410,22 @@ extern "C" __global__ void xq_esel_hist(const int* __restrict__ esel, int* __res
     atomicAdd(&hist[m * w + (e < w - 1 ? e : w - 1)], 1);
 }
 
+// CF-P1e step 0 diagnostic (--exl3-route-log): append one record per decode/verify MoE call to a device ring:
+// [layer, m, ids[0..m*topk] padded with -1 to 16*16 slots]. Graph-safe (fixed pointers, an atomic counter);
+// dumped and reset at every request finish. Diagnostic only.
+#define XQ_ROUTE_REC (2 + 16 * 16)
+extern "C" __global__ void xq_route_log(const int* __restrict__ ids, int m, int topk, int layer,
+                                        int* __restrict__ buf, int cap, unsigned* __restrict__ ctr) {
+    XQ_PDL_ENTRY();
+    __shared__ unsigned r;
+    if (threadIdx.x == 0) r = atomicAdd(ctr, 1u);
+    __syncthreads();
+    if (r >= (unsigned)cap) return;
+    int* rec = buf + (size_t)r * XQ_ROUTE_REC;
+    if (threadIdx.x == 0) { rec[0] = layer; rec[1] = m; }
+    for (int t = threadIdx.x; t < 16 * 16; t += blockDim.x) rec[2 + t] = t < m * topk ? ids[t] : -1;
+}
+
 // TP-I #6 diagnostic (GB10_TP_EP_HIST): per-(layer, expert) routing histogram of every decode /
 // verify MoE call (m <= 16). hist[e] += 1 once per call when expert e is live in the call (the
 // weight-streaming unit of the expert GEMMs), hist[ne + e] += its row picks. Diagnostic only.
@@ -5463,6 +5491,7 @@ extern "C" __global__ void xq_gemm_grouped_xh(const uint16_t* __restrict__ base,
             case 3: exl3_gemm_body_a1<3>(tr, xe, ye, M, K, N, tile); break;
             case 4: exl3_gemm_body_a1<4>(tr, xe, ye, M, K, N, tile); break;
             case 5: exl3_gemm_body_a1<5>(tr, xe, ye, M, K, N, tile); break;
+            EXL3_CASE6(case 6: exl3_gemm_body_a1<6>(tr, xe, ye, M, K, N, tile); break;)
             default: break;
         }
         return;
@@ -5471,6 +5500,7 @@ extern "C" __global__ void xq_gemm_grouped_xh(const uint16_t* __restrict__ base,
         case 3: exl3_gemm_body<3>(tr, xe, ye, M, K, N, tile); break;
         case 4: exl3_gemm_body<4>(tr, xe, ye, M, K, N, tile); break;
         case 5: exl3_gemm_body<5>(tr, xe, ye, M, K, N, tile); break;
+        EXL3_CASE6(case 6: exl3_gemm_body<6>(tr, xe, ye, M, K, N, tile); break;)
         default: break;
     }
 }
@@ -5835,13 +5865,20 @@ __device__ __forceinline__ uint2 wp20_pack4(const __half o[4]) {
 // sequence on the same h2f'd halves, then xq_f2h (== the bytes xq_had_suh_multi wrote to xh_e,
 // which the FOLD = false copy stages). The expert trellis's first PF_D k16 rows are L2-prefetched
 // BEFORE the latency-bound transform (value-transparent), so the DRAM stream starts under it.
-template <int BITS, bool DIET, bool FOLD = false>
+// CF-P1e (16-row class): KCH > 1 stages A in KCH K-chunks (smem = M*(K/KCH+8)*2 instead of M*(K+8)*2), re-staging
+// between chunks behind two barriers. The k16 loop, its order, the ring decode and the mma chain are untouched, so
+// the result is bit-identical to KCH = 1; it exists so a 9..16-row gate/up (K = 2560: 51..82 KB at KCH = 1, one CTA
+// per SM) keeps two to three co-resident CTAs. KCH = 1 (every existing instantiation) compiles to the code below
+// exactly as before (the KCH > 1 statements are discarded by `if constexpr`).
+template <int BITS, bool DIET, bool FOLD = false, int KCH = 1>
 __device__ __forceinline__ void wp20_a1_mainloop(const uint16_t* __restrict__ trellis,
                                                  const __half* __restrict__ xh,
                                                  __half* a1_sa,
                                                  int M, int K, int N, int cta_tile,
                                                  float (&acc)[2][4],
                                                  const __half* __restrict__ suh = nullptr) {
+    static_assert(KCH >= 1 && !(FOLD && KCH > 1), "wp20_a1_mainloop: K-chunked staging is for the unfolded gate/up only");
+    constexpr bool CH = KCH > 1;
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -5849,7 +5886,8 @@ __device__ __forceinline__ void wp20_a1_mainloop(const uint16_t* __restrict__ tr
     const int nb_col = cta_n / 16 + warp;
     const int KB = K >> 4;
     const int nb = N >> 4;
-    const int SK = K + 8;
+    const int KCw = CH ? K / KCH : K;                 // staged K width (== K when not chunked)
+    const int SK = KCw + 8;
     // S-A3-n F4 / S-A3-o O1 L2 prefetch constants (value-transparent)
     constexpr int PF_D = 8;
     const bool pf_lane = lane * 32 < BITS * 32;
@@ -5890,7 +5928,7 @@ __device__ __forceinline__ void wp20_a1_mainloop(const uint16_t* __restrict__ tr
             }
         }
     } else {
-        const int vpr = K >> 3;
+        const int vpr = KCw >> 3;
         for (int i = tid; i < M * vpr; i += blockDim.x) {
             const int r = i / vpr, c = i - r * vpr;
             *(uint4*)&a1_sa[(size_t)r * SK + c * 8] = *(const uint4*)&xh[(size_t)r * K + c * 8];
@@ -5954,7 +5992,21 @@ __device__ __forceinline__ void wp20_a1_mainloop(const uint16_t* __restrict__ tr
         for (int d = 0; d < PF_D; ++d)
             if (d < KB) asm volatile("prefetch.global.L2 [%0];" :: "l"(p0 + (size_t)d * pf_step));
     }
+    int kb0 = 0;                                       // first k16 step of the staged chunk (KCH > 1 only)
     for (int kb = 0; kb < KB; ++kb) {
+        if constexpr (CH) {
+            if (kb - kb0 == (KCw >> 4)) {              // chunk boundary: uniform across the CTA
+                __syncthreads();                       // every warp is done reading the previous chunk
+                const int vpr2 = KCw >> 3;
+                const int koff = kb * 16;              // == chunk index * KCw
+                for (int i = tid; i < M * vpr2; i += blockDim.x) {
+                    const int r = i / vpr2, c = i - r * vpr2;
+                    *(uint4*)&a1_sa[(size_t)r * SK + c * 8] = *(const uint4*)&xh[(size_t)r * K + koff + c * 8];
+                }
+                __syncthreads();
+                kb0 = kb;
+            }
+        }
         if (pf_lane && kb + PF_D < KB)
             asm volatile("prefetch.global.L2 [%0];" :: "l"(pf_ptr));
         pf_ptr += pf_step;
@@ -6005,7 +6057,7 @@ __device__ __forceinline__ void wp20_a1_mainloop(const uint16_t* __restrict__ tr
             }
         }
         ring += ring_kstride;
-        const int col = kb * 16;
+        const int col = CH ? (kb - kb0) * 16 : kb * 16;
         const uint32_t a0 = l0 ? *(const uint32_t*)(ar0 + col) : 0u;
         const uint32_t a2 = l0 ? *(const uint32_t*)(ar0 + col + 8) : 0u;
         uint32_t a1 = 0u, a3 = 0u;
@@ -6076,7 +6128,7 @@ __device__ __forceinline__ bool wp20_arrive(unsigned* cnt, unsigned target, int*
 
 // FOLD (A5-K7, entry xq_moe_gu_epi_f): A is formed in the prologue from x and suh_gu_all[ix]
 // (wp20_a1_mainloop<.., FOLD>) — the xq_had_suh_multi launch before this kernel goes; xh unused.
-template <bool DIET, bool FOLD = false>
+template <bool DIET, bool FOLD = false, int KCH = 1, int BITS = 3>
 __device__ __forceinline__ void wp20_moe_gu(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,
                                             const __half* __restrict__ xh, __half* __restrict__ ygu,
                                             int M, int K, int N, const int* __restrict__ esel,
@@ -6096,11 +6148,11 @@ __device__ __forceinline__ void wp20_moe_gu(const uint16_t* __restrict__ base, c
     const int ix = idxmap[expert];
     float acc[2][4];
     if constexpr (FOLD)
-        wp20_a1_mainloop<3, DIET, true>(base + (size_t)offs[expert], x, a1_sa, M, K, N, tile, acc,
+        wp20_a1_mainloop<BITS, DIET, true>(base + (size_t)offs[expert], x, a1_sa, M, K, N, tile, acc,
                                         suh_gu_all + (long long)ix * K);
     else
-        wp20_a1_mainloop<3, DIET>(base + (size_t)offs[expert], xh + (long long)expert * M * K, a1_sa,
-                                  M, K, N, tile, acc);
+        wp20_a1_mainloop<BITS, DIET, false, KCH>(base + (size_t)offs[expert], xh + (long long)expert * M * K, a1_sa,
+                                              M, K, N, tile, acc);
     __syncthreads();                                   // every warp is done reading A
     __half* yt = a1_sa;                                // [M][128]
     wp20_stage_tile(yt, acc, M);
@@ -6170,7 +6222,7 @@ __device__ __forceinline__ void wp20_moe_gu(const uint16_t* __restrict__ base, c
 //   combine tables s_slot [M][TOPK] i32 + s_w [M][TOPK] f32 at byte 256*M.
 //   Need 256*M + 8*M*TOPK <= M*(K+8)*2  <=>  8*TOPK <= 2K - 240: at K = 640 any TOPK <= 130
 //   fits for EVERY M (M = 8, TOPK = 10: 2688 B of the 10368 B); the launcher re-checks.
-template <bool DIET, int TOPK>
+template <bool DIET, int TOPK, int BITS = 3>
 __device__ __forceinline__ void wp20_moe_dn(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,
                                             const __half* __restrict__ xhd, __half* __restrict__ yd,
                                             int M, int K, int N, const int* __restrict__ esel,
@@ -6190,7 +6242,7 @@ __device__ __forceinline__ void wp20_moe_dn(const uint16_t* __restrict__ base, c
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int ix = idxmap[expert];
     float acc[2][4];
-    wp20_a1_mainloop<3, DIET>(base + (size_t)offs[expert], xhd + (long long)expert * M * K, a1_sa,
+    wp20_a1_mainloop<BITS, DIET>(base + (size_t)offs[expert], xhd + (long long)expert * M * K, a1_sa,
                               M, K, N, tile, acc);
     __syncthreads();
     __half* yt = a1_sa;                                // [M][128]
@@ -6266,7 +6318,7 @@ __device__ __forceinline__ void wp20_moe_dn(const uint16_t* __restrict__ base, c
 }
 
 // Rung 1 alone (GB10_WP20_EPI=0): the diet body behind xq_gemm_grouped_a1b3's exact contract.
-template <bool DIET>
+template <bool DIET, int BITS = 3>
 __device__ __forceinline__ void wp20_grouped_plain(const uint16_t* __restrict__ base,
                                                    const uint64_t* __restrict__ offs,
                                                    const __half* __restrict__ xh,
@@ -6279,7 +6331,7 @@ __device__ __forceinline__ void wp20_grouped_plain(const uint16_t* __restrict__ 
     const int tile = blockIdx.x - expert * tiles;
     if (expert >= *esel) return;
     float acc[2][4];
-    wp20_a1_mainloop<3, DIET>(base + (size_t)offs[expert], xh + (long long)expert * M * K, a1_sa,
+    wp20_a1_mainloop<BITS, DIET>(base + (size_t)offs[expert], xh + (long long)expert * M * K, a1_sa,
                               M, K, N, tile, acc);
     __half* ye = y + (long long)expert * M * N;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -6316,6 +6368,39 @@ NAME(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,      
 }
 WP20_GU_ENTRY(xq_moe_gu_epi, true)
 WP20_GU_ENTRY(xq_moe_gu_epi_sh, false)
+// CF-P1e (16-row class): the gate/up epilogue with A staged in 2 / 4 K-chunks (9..16 rows; dynamic smem
+// M*(K/KCH+8)*2). Bit-identical to xq_moe_gu_epi (same mainloop order); the 8-row entries above are untouched.
+#define WP20_GU_ENTRY_KC(NAME, KCH)                                                                 \
+extern "C" __global__ void __launch_bounds__(256, 3)                                              \
+NAME(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,                        \
+     const __half* __restrict__ xh, __half* __restrict__ ygu, int M, int K, int N,                \
+     const int* __restrict__ esel, const int* __restrict__ idxmap,                                \
+     const __half* __restrict__ svh_all, const __half* __restrict__ suh_d_all,                    \
+     __half* __restrict__ xhd, unsigned* __restrict__ cnt, const __half* __restrict__ x,          \
+     const __half* __restrict__ sg, float* __restrict__ sgv) {                                    \
+    XQ_PDL_ENTRY();                                                                                \
+    wp20_moe_gu<true, false, KCH>(base, offs, xh, ygu, M, K, N, esel, idxmap, svh_all, suh_d_all, \
+                                  xhd, cnt, x, sg, sgv);                                           \
+}
+WP20_GU_ENTRY_KC(xq_moe_gu_epi_c2, 2)
+WP20_GU_ENTRY_KC(xq_moe_gu_epi_c4, 4)
+// CF-P1g step 2 (4.05 bpw, K = 4 experts): the same epilogue kernels instantiated for 4-bit trellis (the word diet holds for
+// b3/b4; ring = 8*BITS = 32 words, one per lane). KCH 1 = <= 9 rows, 2 / 4 = the K-chunked 10..16-row class.
+#define WP20_GU_ENTRY_B4(NAME, KCH)                                                                 \
+extern "C" __global__ void __launch_bounds__(256, 3)                                              \
+NAME(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,                        \
+     const __half* __restrict__ xh, __half* __restrict__ ygu, int M, int K, int N,                \
+     const int* __restrict__ esel, const int* __restrict__ idxmap,                                \
+     const __half* __restrict__ svh_all, const __half* __restrict__ suh_d_all,                    \
+     __half* __restrict__ xhd, unsigned* __restrict__ cnt, const __half* __restrict__ x,          \
+     const __half* __restrict__ sg, float* __restrict__ sgv) {                                    \
+    XQ_PDL_ENTRY();                                                                                \
+    wp20_moe_gu<true, false, KCH, 4>(base, offs, xh, ygu, M, K, N, esel, idxmap, svh_all, suh_d_all, \
+                                     xhd, cnt, x, sg, sgv);                                        \
+}
+WP20_GU_ENTRY_B4(xq_moe_gu_epi_b4, 1)
+WP20_GU_ENTRY_B4(xq_moe_gu_epi_b4_c2, 2)
+WP20_GU_ENTRY_B4(xq_moe_gu_epi_b4_c4, 4)
 // A5-K7 (moe.gu_fold): xq_moe_gu_epi with xq_had_suh_multi folded into the prologue. Same 16
 // params (xh ignored) + suh_gu_all (the gate/up suh table, [experts][K]). Bitwise == the
 // xq_had_suh_multi -> xq_moe_gu_epi pair (--probe-exl3-binv EXL3-MOE-EPI, "fold" rows).
@@ -6350,6 +6435,44 @@ WP20_DN_ENTRY(xq_moe_dn_epi_k8, true, 8)
 WP20_DN_ENTRY(xq_moe_dn_epi_sh_k8, false, 8)
 WP20_DN_ENTRY(xq_moe_dn_epi_k10, true, 10)
 WP20_DN_ENTRY(xq_moe_dn_epi_sh_k10, false, 10)
+// CF-P1g step 2: the 4-bit down epilogue (top-10) and the rung-1 / plain a1 entries for K = 4 experts.
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_moe_dn_epi_b4_k10(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,
+     const __half* __restrict__ xhd, __half* __restrict__ yd, int M, int K, int N,
+     const int* __restrict__ esel, const int* __restrict__ idxmap,
+     const __half* __restrict__ svh_all, unsigned* __restrict__ cnt,
+     const __half* __restrict__ ysh, const int* __restrict__ ids, const float* __restrict__ wts,
+     const int* __restrict__ slotmap, const float* __restrict__ sgv, __half* __restrict__ out,
+     int topk) {
+    XQ_PDL_ENTRY();
+    wp20_moe_dn<true, 10, 4>(base, offs, xhd, yd, M, K, N, esel, idxmap, svh_all, cnt, ysh, ids,
+                             wts, slotmap, sgv, out, topk);
+}
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_gemm_grouped_a1b4(const uint16_t* __restrict__ base,
+                     const uint64_t* __restrict__ offs,
+                     const __half* __restrict__ xh,
+                     __half* __restrict__ y,
+                     int M, int K, int N, int bits,
+                     const int* __restrict__ esel) {
+    XQ_PDL_ENTRY();
+    const int tiles = N / 128;
+    const int expert = blockIdx.x / tiles;
+    const int tile = blockIdx.x - expert * tiles;
+    if (expert >= *esel) return;
+    exl3_gemm_body_a1<4>(base + (size_t)offs[expert], xh + (long long)expert * M * K,
+                         y + (long long)expert * M * N, M, K, N, tile);
+}
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_gemm_grouped_a1b4_wd(const uint16_t* __restrict__ base,
+                        const uint64_t* __restrict__ offs,
+                        const __half* __restrict__ xh,
+                        __half* __restrict__ y,
+                        int M, int K, int N, int bits,
+                        const int* __restrict__ esel) {
+    XQ_PDL_ENTRY();
+    wp20_grouped_plain<true, 4>(base, offs, xh, y, M, K, N, esel);
+}
 
 // ===========================================================================
 // W4/MOE (decode wave 4, 2026-09-27): PERSISTENT grouped-expert kernels — the W3/LMH byte
@@ -7239,6 +7362,7 @@ xq_moe_coop_a(const uint16_t* __restrict__ base,
         case 3: xq_moe_coop_body<3>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 4: xq_moe_coop_body<4>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 5: xq_moe_coop_body<5>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
+        EXL3_CASE6(case 6: xq_moe_coop_body<6>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;)
         default: break;
     }
 }
@@ -7257,6 +7381,7 @@ xq_moe_coop_b(const uint16_t* __restrict__ base,
         case 3: xq_moe_coop_body<3>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 4: xq_moe_coop_body<4>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 5: xq_moe_coop_body<5>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
+        EXL3_CASE6(case 6: xq_moe_coop_body<6>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;)
         default: break;
     }
 }
@@ -11646,6 +11771,7 @@ extern "C" __global__ void exl3_hmma_gemm_ks(const uint16_t* __restrict__ trelli
         case 3: exl3_gemm_body_ks<3>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
         case 4: exl3_gemm_body_ks<4>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
         case 5: exl3_gemm_body_ks<5>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
         default: break;
     }
 }
@@ -11668,6 +11794,7 @@ extern "C" __global__ void exl3_hmma_gemm_ks_x2(const uint16_t* __restrict__ tr0
         case 3: exl3_gemm_body_ks<3>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
         case 4: exl3_gemm_body_ks<4>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
         case 5: exl3_gemm_body_ks<5>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
         default: break;
     }
 }
@@ -11794,6 +11921,7 @@ __device__ __forceinline__ void exl3_ks_fixup(const float* __restrict__ ws,
             case 3: exl3_gemm_body_ks<3>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
             case 4: exl3_gemm_body_ks<4>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
             case 5: exl3_gemm_body_ks<5>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
+            EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;) \
             default: break;                                                                         \
         }                                                                                           \
         exl3_ks_fixup(WS, SVH, Y, CNT, M, N);                                                       \
@@ -12115,6 +12243,7 @@ exl3_hmma_gemm_ks_p(const uint16_t* __restrict__ trellis, const __half* __restri
         case 3: exl3_ks_p_body<3>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;
         case 4: exl3_ks_p_body<4>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;
         case 5: exl3_ks_p_body<5>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;
+        EXL3_CASE6(case 6: exl3_ks_p_body<6>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;)
         default: break;
     }
 }
@@ -12130,6 +12259,7 @@ exl3_hmma_gemm_ks_p_x2(const uint16_t* __restrict__ tr0, const uint16_t* __restr
         case 3: exl3_ks_p_body<3>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;
         case 4: exl3_ks_p_body<4>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;
         case 5: exl3_ks_p_body<5>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;
+        EXL3_CASE6(case 6: exl3_ks_p_body<6>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;)
         default: break;
     }
 }

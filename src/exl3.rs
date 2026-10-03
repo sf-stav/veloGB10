@@ -295,6 +295,10 @@ impl Exl3Pack {
             mtp_bits: q["mtp_bits"].as_f64().unwrap_or(0.0),
             codebook: q["codebook"].as_str().unwrap_or("").to_string(),
         };
+        // CF-P1g: a pack with a K = 6 module needs the K = 6 kernel module (decided here, before any module loads).
+        let max_k = q["tensor_storage"].as_object()
+            .map(|o| o.values().filter_map(|v| v["bits_per_weight"].as_u64()).max().unwrap_or(0)).unwrap_or(0);
+        crate::exl3_bench::set_k6_module(max_k >= 6);
         if quant.quant_method != "exl3" {
             bail!(
                 "EXL3 pack {dir}: quant_method={:?} (wanted \"exl3\") — refusing to guess",

@@ -82,6 +82,14 @@ struct Exl3Scheduler {
     // S-A3-f-d MTP policy: depth k (--exl3-mtp-k, default MTP_MAX_K = 7 since WP23), auto-disable
     // when the measured per-token cost loses to plain (§6), control-round bookkeeping.
     mtp_k: usize,
+    /// CF-P1e `--spec-lanes-max`: when the busy lanes share one plain batched step instead of serial speculation.
+    spec_policy: SpecLanes,
+    /// CF-P1e auto policy: learned scale of the shared-step time model, the last decision (hysteresis) and the
+    /// consecutive shared-step count (stale-estimate refresh). All updated from lockstep-adopted values.
+    shared_scale: f64,
+    shared_last: bool,
+    shared_streak: usize,
+    policy_logs: usize,
     ctrl_round: usize,
     // API-parity G1: plain decode cost (ms/token at m=1), refreshed by control rounds. It is
     // a property of the ENGINE (not of the content), so it persists across requests; the
@@ -817,10 +825,30 @@ struct Wp23Lane {
     widths: [usize; crate::exl3_forward::MTP_MAX_K + 1],
 }
 
+/// `--spec-lanes-max`: never / a fixed lane threshold / cost-based (default).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SpecLanes { Never, Over(usize), Auto }
+
+impl SpecLanes {
+    pub(crate) fn parse(v: Option<&str>) -> Result<SpecLanes> {
+        match v.map(str::trim) {
+            None | Some("auto") | Some("") => Ok(SpecLanes::Auto),
+            Some("0") | Some("never") | Some("off") => Ok(SpecLanes::Never),
+            Some(n) => n.parse::<usize>().map(SpecLanes::Over)
+                .map_err(|_| anyhow::anyhow!("--spec-lanes-max must be auto, 0 or a lane count (got '{n}')")),
+        }
+    }
+}
+
+/// Model of one shared plain step over n lanes (ms, TP=1 code class, fitted on .14 2026-10-02: n=4 46.5, n=8 61.7,
+/// n=16 90): the learned `shared_scale` corrects it for the topology / content actually served.
+fn shared_step_prior_ms(n: usize) -> f64 { 31.5 + 3.6 * n as f64 }
+
 impl Lane {
     fn log_stats(&self, slot: usize, reason: &str) {
         if self.st_rounds == 0 && self.st_plain == 0 { return; }
         let r = self.st_rounds.max(1) as f64;
+        crate::tel::add_spec(self.st_rounds as u64, self.st_drafted as u64, self.st_accepted as u64);
         self.log_wp23(slot);
         eprintln!("[mtp-stats] slot={slot} finish={reason} gen={} rounds={} drafted={} accepted={} ({:.1}%) \
                    tok/round={:.2} ms/round={:.1} plain_steps={} temp={} ctrl={}",
@@ -1281,6 +1309,23 @@ impl Exl3Scheduler {
         crate::tel::note_step();
         let mtp_on = self.model.mtp.is_some()
             && !crate::exl3_forward::mtp_disabled_by_opt();
+        // CF-P1e load-adaptive batching: past `--spec-lanes-max` busy lanes, serial speculative rounds stop
+        // scaling (one lane per round), so every busy lane shares one batched plain step instead; the
+        // lanes' MTP heads stay in sync (see step_plain's `sync_head`), so speculation resumes when load drops.
+        if mtp_on && self.use_shared_plain(&slots) {
+            self.shared_streak += 1;
+            // Stale-estimate refresh: lanes' speculative-speed EMAs freeze while they ride shared steps, so every
+            // 128th shared round one lane (rotating) runs a serial speculative round instead; the others skip
+            // this iteration. ~0.5% of rounds; keeps the cost-based choice tracking the content.
+            if self.spec_policy == SpecLanes::Auto && self.shared_streak % 128 == 0 {
+                let s = slots[(self.shared_streak / 128) % slots.len()];
+                if self.lanes[s].as_ref().map_or(false, |l| l.mtp.is_some()) {
+                    return self.step_mtp(s);
+                }
+            }
+            return self.step_plain(&slots, true);
+        }
+        self.shared_streak = 0;
         let mut plain: Vec<usize> = Vec::new();
         for &s in &slots {
             let lane = self.lanes[s].as_ref().unwrap();
@@ -1291,9 +1336,51 @@ impl Exl3Scheduler {
             }
         }
         if !plain.is_empty() {
-            self.step_plain(&plain)?;
+            self.step_plain(&plain, false)?;
         }
         Ok(())
+    }
+
+    /// CF-P1e: do the busy lanes share one plain batched step this round (true) or run serial speculative rounds?
+    /// `Auto` compares the estimated aggregate tokens/ms of the two arms (4% hysteresis): serial = the busy
+    /// MTP-capable lanes' measured round speed (sum tokens / sum ms) plus one batched step for any MTP-off lanes;
+    /// shared = n tokens per modelled shared-step time. A lane without an estimate yet falls back to a lane count of 4.
+    fn use_shared_plain(&mut self, slots: &[usize]) -> bool {
+        let n = slots.len();
+        if n < 2 { return false; }
+        match self.spec_policy {
+            SpecLanes::Never => false,
+            SpecLanes::Over(k) => n > k,
+            SpecLanes::Auto => {
+                let (mut tok, mut ms, mut capable, mut known) = (0.0f64, 0.0f64, 0usize, 0usize);
+                for &s in slots {
+                    let l = self.lanes[s].as_ref().unwrap();
+                    if l.mtp.is_some() {
+                        capable += 1;
+                        if l.ema_tok > 0.0 && l.ema_ms > 0.0 { tok += l.ema_tok; ms += l.ema_ms; known += 1; }
+                    }
+                }
+                if capable == 0 { return false; }          // nothing speculates: the plain batch already runs
+                if known < capable { return n > 4; }       // an estimate is missing: the fixed threshold
+                let plain_only = n - capable;
+                let shared_ms = self.shared_scale * shared_step_prior_ms(n);
+                if plain_only > 0 {
+                    tok += plain_only as f64;
+                    ms += self.shared_scale * shared_step_prior_ms(plain_only);
+                }
+                let (serial_rate, shared_rate) = (tok / ms, n as f64 / shared_ms);
+                let pick = if shared_rate > serial_rate * 1.04 { true } else if serial_rate > shared_rate * 1.04 { false } else { self.shared_last };
+                if pick != self.shared_last && self.policy_logs < 64 {
+                    self.policy_logs += 1;
+                    eprintln!("[exl3-serve] spec-lanes auto: {} with {n} busy lanes (serial speculation {:.0} tok/s est, \
+                               one shared step {:.0} tok/s est, scale {:.2})",
+                              if pick { "SHARED plain step" } else { "serial speculation" },
+                              serial_rate * 1e3, shared_rate * 1e3, self.shared_scale);
+                }
+                self.shared_last = pick;
+                pick
+            }
+        }
     }
 
     /// WP24: this lane's real-q draft sampler for its next MTP round — Some only for a SAMPLED
@@ -1555,6 +1642,7 @@ impl Exl3Scheduler {
                     lane.log_stats(s, &reason);
                     self.model.dump_expert_hist(); // TP-I #6 diagnostic (no-op unless --tp-ep-hist)
                     self.model.dump_esel_hist(); // S-A3-o diagnostic (no-op unless --exl3-esel-hist)
+                    self.model.dump_route_log(); // CF-P1e step 0 diagnostic (no-op unless --exl3-route-log)
                     let _ = lane.tx.send(crate::batch::TokEvent::Finish { reason });
                     // after the Finish: the DHEADP line may sync the device once (penalized requests)
                     self.model.dhead_request_report(); // DHEADP fallback line (penalized requests) + DHEAD XCHECK lines (when on)
@@ -1572,7 +1660,31 @@ impl Exl3Scheduler {
     }
 
     /// Plain batched decode for the given slots (the pre-f-d step() body).
-    fn step_plain(&mut self, slots: &[usize]) -> Result<()> {
+    /// CF-P1e: fold a measured shared-round time (ms, lockstep-adopted under TP) into the model's learned scale.
+    /// The first rounds of a width can include a graph capture, so an outlier above 3x the model is ignored.
+    fn learn_shared_ms(&mut self, n: usize, ms: f64) {
+        if n < 2 { return; }
+        let r = ms / shared_step_prior_ms(n);
+        if !(0.05..3.0).contains(&r) { return; }
+        self.shared_scale = if self.shared_streak <= 1 && self.shared_scale == 1.0 { r } else { 0.9 * self.shared_scale + 0.1 * r };
+    }
+
+    /// `sync_head` (CF-P1e): the lanes are MTP-capable but this round is a shared plain step — keep each lane's draft
+    /// head exactly as a control round does (write the head's row p KV-only from the lane's saved tap BEFORE the
+    /// step; snapshot the step's tap row into the lane's window AFTER it), so its next speculative round is valid.
+    fn step_plain(&mut self, slots: &[usize], sync_head: bool) -> Result<()> {
+        if sync_head {
+            let model = self.model.clone();
+            if let Some(head) = model.mtp.as_ref() {
+                for &s in slots {
+                    let (b, p, tr) = { let l = self.lanes[s].as_ref().unwrap(); (l.last_tok as i32, l.pos, l.mtp) };
+                    if let Some(tap_row) = tr {
+                        model.mtp_plain_prime(&mut self.sc, head, s, b, p, tap_row)?;
+                    }
+                }
+            }
+        }
+        let t_round = std::time::Instant::now();   // CF-P1e: the shared round's cost = head primes + the step
         let toks: Vec<i32> = slots.iter()
             .map(|&s| self.lanes[s].as_ref().unwrap().last_tok as i32)
             .collect();
@@ -1593,9 +1705,22 @@ impl Exl3Scheduler {
         if self.tp.is_some() {
             // TP-C: lockstep on the batched plain step's emitted ids (no wall-clock decision here)
             let w: Vec<u32> = ids.iter().map(|&x| x as u32).collect();
-            self.tp_round("plain-step", 0, slots.len(), &w, 0.0, 0.0, false)?;
+            let own = t_round.elapsed().as_secs_f64() * 1e3;
+            let (ms, _, _) = self.tp_round("plain-step", 0, slots.len(), &w, own, 0.0, false)?;
+            if sync_head { self.learn_shared_ms(slots.len(), ms); }
+        } else if sync_head {
+            self.learn_shared_ms(slots.len(), t_round.elapsed().as_secs_f64() * 1e3);
         }
         if let Some(g) = self.gate.as_mut() { g.plain += slots.len() as u64; }
+        if sync_head {
+            let model = self.model.clone();
+            for (j, &s) in slots.iter().enumerate() {
+                if self.lanes[s].as_ref().map_or(false, |l| l.mtp.is_some()) {
+                    model.tap_snapshot_row(&mut self.sc, s, j)?;
+                    self.lanes[s].as_mut().unwrap().mtp = Some(0);
+                }
+            }
+        }
 
         for (j, &s) in slots.iter().enumerate() {
             let t = {
@@ -1636,6 +1761,7 @@ impl Exl3Scheduler {
                 lane.log_stats(s, reason);
                 self.model.dump_expert_hist(); // TP-I #6 diagnostic (no-op unless --tp-ep-hist)
                 self.model.dump_esel_hist(); // S-A3-o diagnostic (no-op unless --exl3-esel-hist)
+                self.model.dump_route_log(); // CF-P1e step 0 diagnostic (no-op unless --exl3-route-log)
                 let _ = lane.tx.send(TokEvent::Finish { reason: reason.to_string() });
                 self.lanes[s] = None;
                 self.model.dhead_request_report(); // DHEADP fallback line (penalized requests) + DHEAD XCHECK lines (when on)
@@ -2606,6 +2732,104 @@ pub fn parse_spec_sampling(args: &[String]) -> Result<(bool, Option<f32>)> {
     Ok((spec_ratio, draft_temp))
 }
 
+/// CF-P1d pre-load fit check: the parts of a serving footprint, in bytes (estimates; see `fit_plan`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FitParts {
+    pub weights: u64,  // device weights on this rank (model shards / world + the vision tower on the head)
+    pub table: u64,    // the PLE n-gram table (host RAM when RAM-resident)
+    pub per_lane: u64, // one lane: KV + indexer keys + MTP-head KV over max_pos, + its recurrent state (x1.15)
+    pub fixed: u64,    // scratch, prefill scratch, graphs, vendor workspaces, prefix-checkpoint cap
+    pub floor: u64,    // the memory watchdog's floor (--mem-watchdog-gb)
+}
+
+/// What a configuration needs and whether it fits: Ok(table_in_ram_possible) or Err(the refusal text).
+pub fn fit_plan(p: FitParts, lanes: usize, avail: u64, mode: &str, max_pos: usize) -> Result<bool, String> {
+    let gb = |b: u64| b as f64 / 1e9;
+    let base = p.weights + p.fixed + p.per_lane * lanes as u64 + p.floor;
+    let with_table = base + p.table;
+    let line = format!("model weights {:.1} GB + {lanes} lane(s) x {:.2} GB (KV for {max_pos} tokens) + {:.1} GB working memory \
+                        + {:.1} GB safety floor{} = {:.1} GB; this machine has {:.1} GB available",
+                       gb(p.weights), gb(p.per_lane), gb(p.fixed), gb(p.floor),
+                       if mode == "ram" { format!(" + n-gram table {:.1} GB in RAM", gb(p.table)) } else { String::new() },
+                       gb(if mode == "ram" { with_table } else { base }), gb(avail));
+    let fits_ssd = base <= avail;
+    if mode == "ram" && with_table > avail {
+        let mut msg = format!("this configuration does not fit in memory: {line}.");
+        if fits_ssd {
+            msg += " It fits with the n-gram table on SSD: use --ple-ram ssd (or leave --ple-ram at auto) — identical output, decode ~1-2% slower.";
+        }
+        return Err(msg + &suggest(p, lanes, avail, max_pos));
+    }
+    if !fits_ssd {
+        return Err(format!("this configuration does not fit in memory, even with the n-gram table on SSD: {line}.{}",
+                           suggest(p, lanes, avail, max_pos)));
+    }
+    Ok(with_table <= avail)
+}
+
+fn suggest(p: FitParts, lanes: usize, avail: u64, max_pos: usize) -> String {
+    let room = avail.saturating_sub(p.weights + p.fixed + p.floor);
+    let mut out = String::new();
+    if p.per_lane > 0 && room / p.per_lane < lanes as u64 {
+        let n = room / p.per_lane;
+        if n >= 1 { out += &format!(" At this context length, at most --max-batch {n} fits."); }
+        let per_tok = p.per_lane as f64 / max_pos.max(1) as f64;
+        let ctx = (room as f64 / lanes.max(1) as f64 / per_tok) as u64 / 1024 * 1024;
+        if ctx >= 4096 { out += &format!(" With --max-batch {lanes}, at most --max-seq-len {ctx} fits."); }
+    }
+    if room < p.per_lane {
+        out += " The model alone leaves too little memory on one box: run it over two boxes (--tp 2).";
+    }
+    out
+}
+
+/// Estimate the footprint of an EXL3 pack from its files and config (no GPU, no weight reads).
+pub fn fit_parts(model_dir: &str, max_pos: usize, world: usize, head: bool, kv_bytes: f64, ckpt_gb: f64) -> Option<FitParts> {
+    let dir = std::path::Path::new(model_dir);
+    let size = |n: &str| std::fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0);
+    let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json")).ok()?).ok()?;
+    let all: std::collections::BTreeSet<String> = idx["weight_map"].as_object()?.values()
+        .filter_map(|v| v.as_str().map(str::to_string)).collect();
+    // the n-gram table is counted as `table`, not device weights (in a shipped shard dir it sits under seg/)
+    let (ngram, files): (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>) =
+        all.into_iter().partition(|f| f.contains("ngram"));
+    let shards: u64 = files.iter().map(|f| size(f)).sum();
+    // A shipped per-rank shard dir (B32, `gb10_shard.json`) already holds this rank's share; a full pack is split by world.
+    let share = if dir.join("gb10_shard.json").is_file() { 1 } else { world.max(1) as u64 };
+    let mut weights = shards / share;
+    if head { weights += size("vision_tower_bf16.safetensors"); }
+    let mut table: u64 = ngram.iter().map(|f| size(f)).sum();
+    if table == 0 {
+        table = std::fs::read_dir(dir).ok()?.flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("ngram"))
+            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0)).sum();
+    }
+    let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
+    let t = cfg.get("text_config").unwrap_or(&cfg);
+    let g = |k: &str| t[k].as_u64().unwrap_or(0);
+    let types = t["layer_types"].as_array()?;
+    let n_full = types.iter().filter(|v| v.as_str() == Some("full_attention")).count() as u64;
+    let n_lin = types.len() as u64 - n_full;
+    let kvh_hd = g("num_key_value_heads") * g("head_dim");
+    // per token: trunk K+V (kv-cache format) + indexer keys (bf16) + the MTP head's own K+V (f16)
+    // trunk KV heads are split across ranks up to their count (2 KV heads: TP=2 and TP=4 hold one each)
+    let kv_split = (world.max(1) as u64).min(g("num_key_value_heads").max(1)) as f64;
+    let per_tok = n_full as f64 * 2.0 * kvh_hd as f64 * kv_bytes / kv_split
+        + (n_full * g("indexer_kv_heads") * g("indexer_head_dim") * 2) as f64
+        + (g("mtp_num_hidden_layers").max(1) * 2 * kvh_hd * 2) as f64;
+    // per lane fixed: GDN recurrent state (f32) + conv ring
+    let state = n_lin * g("linear_num_value_heads") * g("linear_key_head_dim") * g("linear_value_head_dim") * 4
+        + n_lin * (2 * g("linear_num_key_heads") * g("linear_key_head_dim") + g("linear_num_value_heads") * g("linear_value_head_dim"))
+            * g("linear_conv_kernel_dim").max(1) * 2;
+    let per_lane = ((per_tok * max_pos as f64 + state as f64) * 1.15) as u64;
+    // Working memory beyond weights + table + lanes, measured on .14 2026-10-02 (Flash-Next 3.05 TP=1, 131K): 14.3 GB
+    // at 1 lane and 14.8 GB at 8 lanes after the boot (scratch, prefill scratch, graphs, vendor workspaces, staging),
+    // + the prefix-checkpoint pool, which grows to its cap while serving.
+    let fixed = 15_000_000_000 + (ckpt_gb * (1u64 << 30) as f64) as u64;
+    let floor_gb: f64 = crate::opts::var(crate::opt!("mem-watchdog-gb")).ok().and_then(|v| v.parse().ok()).unwrap_or(5.0);
+    Some(FitParts { weights, table, per_lane, fixed, floor: (floor_gb * 1e9) as u64 })
+}
+
 /// The served `--prefill-chunk` default (owner 2026-10-02, v0.7.1: steady 4,095-row chunks, TP-4X1).
 pub const DEFAULT_PREFILL_CHUNK: usize = 4095;
 
@@ -2668,7 +2892,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // --ple-ram on|off|auto: where the ~30 GiB PLE n-gram table lives (RAM vs per-token pread
     // through the page cache). Output-identical either way; transported to the loader via env.
     if let Some(v) = arg(args, "--ple-ram") {
-        anyhow::ensure!(matches!(v, "on" | "off" | "auto"), "--ple-ram must be on, off or auto");
+        anyhow::ensure!(matches!(v, "auto" | "ram" | "ssd" | "on" | "off"), "--ple-ram must be auto, ram or ssd (on/off are the old spellings of ram/ssd)");
         crate::opts::set(crate::opt!("ple-ram"), v);
     }
     // --kv-cache f32|f16|fp8|q8: attention KV storage format (PLAN/KV_CACHE_FORMATS.md). Default
@@ -2727,6 +2951,25 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         };
         tune::boot(&tune::BootReq { sel, model_dir, posture, profile_mhz, draft_on,
                                     tp: tp_world });
+    }
+    // CF-P1d: refuse BEFORE a minute-long load when the configuration cannot fit (with the arithmetic and what to
+    // change), instead of a watchdog exit half-way through the boot.
+    {
+        let kvb = match kv_name { "f32" => 4.0, "f16" => 2.0, "fp8" => 1.0, _ => 1.0625 };
+        let mode = match crate::opts::var(crate::opt!("ple-ram")).as_deref() { Ok("on") | Ok("ram") => "ram", Ok("off") | Ok("ssd") => "ssd", _ => "auto" };
+        let world = tp_world.max(1) as usize;
+        if let Some(parts) = fit_parts(model_dir, max_pos, world, tp_rank.map_or(true, |r| r == 0), kvb, wp16_gb) {
+            let avail = std::fs::read_to_string("/proc/meminfo").ok()
+                .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:"))
+                    .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(0) * 1024;
+            if avail > 0 {
+                if let Err(msg) = fit_plan(parts, width, avail, mode, max_pos) {
+                    eprintln!("error: {msg}");
+                    std::process::exit(2);
+                }
+            }
+        }
     }
     println!("[exl3-serve] {who}: loading EXL3 pack {model_dir} (width {width}, max_pos {max_pos}, kv-cache {kv_name})");
     let model = FwdModel::load_tp(model_dir, width, max_pos, tp)?;
@@ -2917,10 +3160,21 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         println!("[exl3-serve] vision (node): mrope section {sec:?}; image rows arrive from the head");
         (None, None, sec)
     };
+    // CF-P1d: every lane's KV, the scratch, graphs and the vision tower now exist — `--ple-ram auto` decides RAM vs
+    // SSD for the n-gram table on the memory that is actually left (each rank for itself; identical output either way).
+    model.ple_promote_auto()?;
+    let spec_policy = SpecLanes::parse(arg(args, "--spec-lanes-max"))?;
+    if width > 1 && model.mtp.is_some() {
+        println!("[exl3-serve] load-adaptive batching (--spec-lanes-max): {} (--max-batch {width})", match spec_policy {
+            SpecLanes::Auto => "auto — each round picks serial speculation or ONE shared plain step by estimated aggregate tokens/s".to_string(),
+            SpecLanes::Over(k) => format!("one shared plain step with more than {k} busy lanes, serial speculation otherwise"),
+            SpecLanes::Never => "off — always serial speculative rounds".to_string(),
+        });
+    }
     let sched = Exl3Scheduler {
         model: model.clone(), sc, width,
         lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, psc: Some(psc0),
-        mtp_k, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
+        mtp_k, spec_policy, shared_scale: 1.0, shared_last: false, shared_streak: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
         prefix_on, cache: (0..width).map(|_| None).collect(),
         wp16, wp16_xcheck,
         loop_cfg, pen_range, spec_ratio, draft_temp, gate: None, tok: tok.clone(),
@@ -2949,6 +3203,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     let (stx, srx) = tokio::sync::mpsc::unbounded_channel::<crate::batch::BatchRequest>();
     let model_name = std::path::Path::new(model_dir)
         .file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "exl3-model".into());
+    crate::metrics::set_max_batch(width);
     let state = AppState {
         sampling_defaults: crate::server::SamplingDefaults::QWEN38_CARD,
         scheduler: stx,
@@ -3091,10 +3346,11 @@ fn serve_http(parts: ServeParts, tp_ctl: Option<Vec<std::net::TcpStream>>) -> Re
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all()
         .build().context("tokio runtime")?;
-    println!("[exl3-serve] listening on 0.0.0.0:{port} (model id: {model_name})");
     rt.block_on(async move {
         let app = create_router(state);
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
+        let listener = crate::server::http_listen(port).await;
+        println!("[exl3-serve] listening on {} (model id: {model_name})",
+                 listener.local_addr().map_or_else(|_| format!("port {port}"), |a| a.to_string()));
         // WP02: TCP_NODELAY — an SSE token event is a few dozen bytes; Nagle held them for the ACK
         axum::serve(listener, app).tcp_nodelay(true).await.unwrap();
     });
@@ -3261,7 +3517,7 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
     let mut sched = Exl3Scheduler {
         model: model.clone(), sc, width,
         lanes: (0..width).map(|_| None).collect(), eos, chunk, psc: Some(psc0),
-        mtp_k, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
+        mtp_k, spec_policy: SpecLanes::Never, shared_scale: 1.0, shared_last: false, shared_streak: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
         prefix_on: true, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: None, pen_range: 1024, spec_ratio: false, draft_temp, gate: None, tok: tok.clone(), tp: None,
@@ -3708,7 +3964,7 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
     let mut sched = Exl3Scheduler {
         model: model.clone(), sc, width,
         lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, psc: Some(psc0),
-        mtp_k, ctrl_round: 0, ema_plain: 0.0, draft_conf: 0.4, cal: DraftCal::new(),
+        mtp_k, spec_policy: SpecLanes::Never, shared_scale: 1.0, shared_last: false, shared_streak: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf: 0.4, cal: DraftCal::new(),
         prefix_on: o.prefix, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: Some((300, 3)), pen_range: 1024, spec_ratio: true, draft_temp: None, gate: None, tok: tok.clone(),
@@ -4057,5 +4313,65 @@ mod tp_hub_tests {
         skew[1][1] = 76;
         let (ok, _) = tpspec_fold(&skew, 0, 77);
         assert!(!ok, "a rank that crossed a different number of lockstep points must fail the fold");
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::{fit_parts, fit_plan, FitParts};
+    const G: u64 = 1_000_000_000;
+
+    #[test]
+    fn fit_plan_refuses_with_the_arithmetic_and_the_way_out() {
+        let p = FitParts { weights: 53 * G, table: 33 * G, per_lane: 3 * G, fixed: 19 * G, floor: 5 * G };
+        // 1 lane: fits with the table in RAM.
+        assert_eq!(fit_plan(p, 1, 124 * G, "auto", 131072), Ok(true));
+        // 8 lanes: fits only on SSD; auto serves it, ram is refused and told to use ssd.
+        assert_eq!(fit_plan(p, 8, 124 * G, "auto", 131072), Ok(false));
+        let e = fit_plan(p, 8, 124 * G, "ram", 131072).unwrap_err();
+        assert!(e.contains("--ple-ram ssd") && e.contains("does not fit"), "{e}");
+        // 20 lanes: does not fit even on SSD; names the lane and context limits.
+        let e = fit_plan(p, 20, 124 * G, "auto", 131072).unwrap_err();
+        assert!(e.contains("even with the n-gram table on SSD") && e.contains("--max-batch 15"), "{e}");
+        // the weights alone overflow: says TP=2.
+        let e = fit_plan(FitParts { weights: 110 * G, ..p }, 1, 124 * G, "ssd", 131072).unwrap_err();
+        assert!(e.contains("--tp 2"), "{e}");
+    }
+
+    /// The real Flash-Next 3.05 pack, where present: the estimate must bracket the 2026-10-02 measurement on .14
+    /// (per lane at 131K ~2.8 GB measured; device weights ~53 GB; table 32.6 GB).
+    #[test]
+    fn flash_next_305_estimate_brackets_the_measurement() {
+        let dir = std::path::Path::new(&std::env::var("HOME").unwrap_or_default()).join("models/Qwen3.8-Flash-Next-exl3-3.05bpw");
+        if !dir.is_dir() { return; }
+        let p = fit_parts(dir.to_str().unwrap(), 131073, 1, true, 1.0625, 4.0).unwrap();
+        assert!((2_600_000_000..3_300_000_000).contains(&p.per_lane), "{p:?}");
+        assert!((50 * G..56 * G).contains(&p.weights), "{p:?}");
+        assert!((32 * G..34 * G).contains(&p.table), "{p:?}");
+    }
+}
+
+#[cfg(test)]
+mod spec_lanes_tests {
+    use super::{shared_step_prior_ms, SpecLanes};
+
+    #[test]
+    fn spec_lanes_parse() {
+        assert_eq!(SpecLanes::parse(None).unwrap(), SpecLanes::Auto);
+        assert_eq!(SpecLanes::parse(Some("auto")).unwrap(), SpecLanes::Auto);
+        assert_eq!(SpecLanes::parse(Some("0")).unwrap(), SpecLanes::Never);
+        assert_eq!(SpecLanes::parse(Some("off")).unwrap(), SpecLanes::Never);
+        assert_eq!(SpecLanes::parse(Some("4")).unwrap(), SpecLanes::Over(4));
+        assert!(SpecLanes::parse(Some("many")).is_err());
+        assert!(SpecLanes::parse(Some("-1")).is_err());
+    }
+
+    /// The prior reproduces the 2026-10-02 TP=1 measurements within 5% (n = 4: 46.5, 8: 61.7, 16: 90 ms).
+    #[test]
+    fn shared_step_prior_matches_measurements() {
+        for (n, ms) in [(4usize, 46.5f64), (8, 61.7), (16, 90.0)] {
+            let p = shared_step_prior_ms(n);
+            assert!((p - ms).abs() / ms < 0.05, "n={n}: {p} vs {ms}");
+        }
     }
 }

@@ -20,7 +20,7 @@ expect. Single-node and TP=4 covers are not documented yet; Hy3 support is still
 
 The engine is **the binary + a `src/ptx/` directory of kernel artifacts**. The binary loads the PTX
 relative to its **current working directory**, so run it from a directory that contains both. The
-binary is ~16 MB; the PTX files total ~12 MB. Do not mismatch a binary with foreign PTX.
+binary is ~28 MB; the PTX files total ~63 MB. Do not mismatch a binary with foreign PTX.
 
 On every machine (nodes included), the directory must look like this:
 
@@ -29,23 +29,28 @@ On every machine (nodes included), the directory must look like this:
 ├── gb10_inference
 └── src
     └── ptx
+        ├── exl3_bench.ptx
+        ├── exl3_bench_k6.ptx
         ├── fused_decode.ptx
         ├── gemm_nvfp4.ptx
         ├── gpu_batch.ptx
         ├── gpu_batch_b3.ptx
         ├── gpu_dflash.ptx
+        ├── gpu_dspark.ptx
         ├── gpu_dsv4.ptx
         ├── gpu_dsv4_attn.ptx
         ├── gpu_dsv4_comp.ptx
         ├── gpu_kernels.ptx
         ├── gpu_mxfp4.ptx
         ├── gpu_mxfp4_moe.ptx
+        ├── gpu_vision.ptx
+        ├── gpu_w4a4.ptx
         ├── mxfp4_bench.ptx
         ├── rms_norm.ptx
         └── silu_gate.ptx
 ```
 
-**Copy the binary and the `src/ptx/` directory to each node machine.**
+**Copy the binary and the whole `src/ptx/` directory to each node machine** — the release tarball has this layout; a partial set can crash at load.
 
 ### The target model (head only)
 

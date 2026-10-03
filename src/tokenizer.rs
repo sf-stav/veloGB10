@@ -716,16 +716,21 @@ impl ChatMessage {
         }
         if let Some(tcs) = &self.tool_calls {
             let arr: Vec<serde_json::Value> = tcs.iter().map(|tc| {
-                // Froggeric-class templates render the RAW arguments string verbatim inside
-                // `<function=…>` when it is a string — exactly what the reference
-                // (transformers/vLLM) produces for the harness's canonical OpenAI form. The
-                // object form takes the template's `is mapping` branch instead and expands
-                // `<parameter=…>` blocks (RENDER_AUDIT.md 2.2).
-                let args: serde_json::Value = if raw_tool_args {
-                    serde_json::Value::String(tc.function.arguments.clone())
-                } else {
-                    serde_json::from_str(&tc.function.arguments)
-                        .unwrap_or_else(|_| serde_json::json!({}))
+                // OpenAI hands us `arguments` as a JSON STRING. The reference stacks (vLLM's chat preprocessing,
+                // dgpp) parse it into an object BEFORE rendering, so the template's `is mapping` branch expands
+                // `<parameter=…>` blocks — the format its system prompt asks for and the format the model itself
+                // generated (GitHub issue #6: passing the raw string rendered `{"command": …}` inside
+                // `<function=…>`, a mixed XML/JSON history the model copied in long agent sessions and the
+                // tool-call parser did not match). So: a JSON object is always parsed. Only when a template has a
+                // string branch (`raw_tool_args`) AND the arguments are not a JSON object (unparseable, array,
+                // scalar) is the raw string kept, because that is all the branch can show; a template without
+                // the string branch iterates `arguments | items`, so it gets `{}` there.
+                let parsed = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                    .ok().filter(|v| v.is_object());
+                let args: serde_json::Value = match parsed {
+                    Some(obj) => obj,
+                    None if raw_tool_args => serde_json::Value::String(tc.function.arguments.clone()),
+                    None => serde_json::json!({}),
                 };
                 serde_json::json!({
                     "id": tc.id,
@@ -747,6 +752,48 @@ impl ChatMessage {
 
 #[cfg(test)]
 mod tests {
+
+    /// GitHub issue #6: string `arguments` holding a JSON object are parsed before the template sees them, so a
+    /// template with an `arguments is string` branch still takes its `is mapping` (`<parameter=…>`) branch; the raw
+    /// string survives only for arguments that are not a JSON object.
+    #[test]
+    fn issue6_json_object_arguments_are_parsed_even_with_a_string_branch() {
+        let msg = |args: &str| -> ChatMessage {
+            serde_json::from_value(serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": args}}]})).unwrap()
+        };
+        for raw in [true, false] {
+            let j = msg(r#"{"command": "ls -la", "n": 3}"#).to_template_json(raw);
+            let a = &j["tool_calls"][0]["function"]["arguments"];
+            assert!(a.is_object(), "raw_tool_args={raw}: {a}");
+            assert_eq!(a["command"], "ls -la");
+        }
+        // not an object: kept verbatim for a template that can show a string, {} otherwise
+        for bad in ["not json", "[1,2]", "\"x\"", "", "{\"command\": "] {
+            let a = msg(bad).to_template_json(true)["tool_calls"][0]["function"]["arguments"].clone();
+            assert_eq!(a, serde_json::Value::String(bad.to_string()), "{bad:?}");
+            let a = msg(bad).to_template_json(false)["tool_calls"][0]["function"]["arguments"].clone();
+            assert_eq!(a, serde_json::json!({}), "{bad:?}");
+        }
+    }
+
+    /// The issue's repro, end to end through minijinja: a template with BOTH branches renders the history as
+    /// `<parameter=…>` blocks (what its system prompt asks for), never raw JSON inside `<function=…>`.
+    #[test]
+    fn issue6_history_renders_parameter_tags() {
+        let tpl = "{%- for m in messages %}{%- for tc in m.tool_calls %}<tool_call>\n<function={{ tc.function.name }}>\n\
+                   {%- if tc.function.arguments is mapping %}{%- for k, v in tc.function.arguments|items %}\n<parameter={{ k }}>\n{{ v }}\n</parameter>{%- endfor %}\n\
+                   {%- elif tc.function.arguments is string %}{{ tc.function.arguments }}{%- endif %}</function>\n</tool_call>{%- endfor %}{%- endfor %}";
+        let mut env = minijinja::Environment::new();
+        register_pycompat(&mut env);
+        env.add_template("t", tpl).unwrap();
+        let m: ChatMessage = serde_json::from_value(serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{\"command\": \"ls -la\"}"}}]})).unwrap();
+        let out = env.get_template("t").unwrap()
+            .render(minijinja::context! { messages => vec![m.to_template_json(true)] }).unwrap();
+        assert!(out.contains("<parameter=command>\nls -la\n</parameter>"), "{out}");
+        assert!(!out.contains("{\"command\""), "{out}");
+    }
 
     /// VIS-5: image and text parts render in the client's order; VID-0: unknown part types are captured.
     #[test]
@@ -1245,8 +1292,8 @@ fn load_chat_env(tokenizer_path: &str) -> Option<(minijinja::Environment<'static
         h.update(source.as_bytes());
         format!("{:x}", h.finalize())
     };
-    // Only Froggeric-class templates have a string-arguments branch; for those the raw OpenAI
-    // arguments string is the reference-faithful history form (see to_template_json).
+    // Froggeric-class templates have a string-arguments branch. Valid JSON-object arguments are still parsed
+    // into an object (issue #6); the flag only keeps the raw string for arguments that are not an object.
     let raw_tool_args = source.contains("arguments is string");
     // The template source must outlive the environment. The server is a long-running
     // process that loads each model exactly once, so a one-time leak of a few KB is

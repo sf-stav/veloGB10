@@ -2856,16 +2856,16 @@ extern "C" __global__ void write_kv_prefill_k8v8(unsigned char* k_cache, unsigne
 }
 
 // compact_kv_k8v8 — verbatim copy of packed rows between the cache and a snapshot buffer
-// (rollback / prefix-cache paths; the packed form is position-local, so a byte copy suffices).
-// The K and V caches diverge in row size for the first time: K rows are (hd/16)*20 B, V rows
-// stay (hd/16)*12 B. Each byte of the combined grid belongs to exactly one cache: the first
-// k_rb bytes of a (k, h) row's scratch are the K row, the remaining v_rb the V row. The host
-// sizes the two scratch buffers separately (len*nkv*k_rb and len*nkv*v_rb bytes).
+// (tree-path compaction; the packed form is position-local, so a byte copy suffices).
+// K AND V rows are both (hd/16)*20 B in k8v8 (the V cache has the K layout). Each byte of the
+// combined grid belongs to exactly one cache: the first k_rb bytes of a (k, h) row's scratch
+// are the K row, the remaining v_rb the V row. The host sizes the two scratch buffers
+// separately (len*nkv*k_rb and len*nkv*v_rb bytes).
 extern "C" __global__ void compact_kv_k8v8(unsigned char* k_cache, unsigned char* v_cache,
     unsigned char* ks, unsigned char* vs, const int* src_pos, int len, int pos_start,
     int slot, int nkv, int stride, int hd, int dir) {
     const int k_rb = KV8_ROW_BYTES(hd);
-    const int v_rb = KVQ_ROW_BYTES(hd);
+    const int v_rb = KV8_ROW_BYTES(hd);
     const int row_b = k_rb + v_rb;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = len * nkv * row_b;
@@ -5333,6 +5333,376 @@ extern "C" __global__ void gqa_attn_splitk_k8v4_gq(
                                    pos, bs_packed, nh_packed, slot_ids, path, col_pos_start);
     } else if (hd == 256) {
         gqa_splitk_k8v4_gq_impl<8>(out_m, out_l, out_acc, q, k_cache, v_cache,
+                                   pos, bs_packed, nh_packed, slot_ids, path, col_pos_start);
+    }
+    // other hd: never launched — attn_dispatch falls back to the per-head kernel.
+}
+
+// k8v8 reader dequant, the contract EVERY k8v8 reader shares (the `_e` tensor-core kernel stages bf16(code*scale)
+// into its tiles; the prefill dequant writes the same): ONE bf16 rounding of fp32(int8 code) * fp32(fp16 scale), then
+// back to fp32 for the FMA. Skipping the rounding made a lane's bytes depend on which kernel class served it.
+__device__ __forceinline__ float kv8_dq(int8_t code, float sc) {
+    return __bfloat162float(__float2bfloat16_rn((float)code * sc));
+}
+
+// ===================================================================================================
+// gqa_attn_splitk_k8v8 — the k8v8 twin of gqa_attn_splitk_k8v4 (the multi-lane / tree reader of the int8 K+V
+// cache): SAME split structure (sk_nsplits on the column's own pc), SAME reduction order, SAME merge; per-column
+// slot_ids[b] and pos[b], so lanes at different slots/positions share one launch. The `_e` tensor-core kernel
+// (gqa_attn_verify_e_k8v8) stays the single-request lane (it reads ONE slot for every column); this kernel serves
+// every dispatch that lane is not host-gated to — plain batched decode of several lanes, FOREST / tree verify.
+// Only the V source differs from k8v4: V rows are the K layout (20 B/16: 16 B int8 codes + fp16 scale), read as one
+// aligned u32 per 4 codes and multiplied by fp32(fp16 scale) — the same dequant formula as K, both upcasts exact.
+extern "C" __global__ void gqa_attn_splitk_k8v8(
+    float* out_m, float* out_l, float* out_acc,
+    const __nv_bfloat16* q, const unsigned char* k_cache, const unsigned char* v_cache,
+    const int* pos, long long bs_packed, int nh_packed, const int* slot_ids,
+    const unsigned char* path, const int* col_pos_start) {
+    const int nh  = nh_packed >> 20;
+    const int hd  = (nh_packed >> 10) & 0x3FF;
+    const int nkv = nh_packed & 0x3FF;
+    const float scale = 1.0f / sqrtf((float)hd);
+    const int gqa_ratio = nh / nkv;
+    const int stride  = (int)(bs_packed & 0x7FFFF);
+    const int ns_grid = (int)((bs_packed >> 19) & 0x3F);
+    const int B       = (int)((bs_packed >> 25) & 0x3F);
+    const long long q_pitch = (bs_packed >> 31) & 0x7FFFF;   // F0: q row pitch (mtot fused view / nh*hd split)
+
+    const int blk = blockIdx.x;
+    // R2.1: b INNERMOST => the B verify columns of one (qh, split) are co-scheduled and share the
+    // L2 read of the same K/V chunk (was: b-major, re-reading the chunk from DRAM B times). Arithmetic
+    // and reduction order unchanged => bit-identical. Bijection over the exact nh*ns_grid*B grid.
+    const int qh = blk / (ns_grid * B);
+    const int rem = blk % (ns_grid * B);
+    const int split = rem / B;
+    const int b = rem % B;
+    const int kvh = qh / gqa_ratio;
+    const int pc = pos[b] + 1;
+    const int pos_start = col_pos_start ? col_pos_start[b] : pos[0];
+    const int slot = slot_ids[b];
+
+    const int ns = sk_nsplits(pc);
+    if (split >= ns) return;
+    const int split_size = (pc + ns - 1) / ns;
+    const int start = split * split_size;
+    const int end = min(start + split_size, pc);
+
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int NW = blockDim.x >> 5;
+    const int DPL = hd >> 5;
+
+    const long long idx = ((long long)b * nh + qh) * ns_grid + split;
+    if (start >= pc) {
+        if (threadIdx.x == 0) { out_m[idx] = -1e30f; out_l[idx] = 0.0f; }
+        if (threadIdx.x < hd) out_acc[idx * hd + threadIdx.x] = 0.0f;
+        return;
+    }
+
+    const __nv_bfloat16* qrow = q + (long long)b * q_pitch + (long long)qh * hd + lane * DPL;
+    float qv[SK_DPL_MAX];
+    #pragma unroll
+    for (int i = 0; i < SK_DPL_MAX; i++) qv[i] = (i < DPL) ? b2f(qrow[i]) : 0.0f;
+
+    float m = -1e30f, l = 0.0f;
+    float acc[SK_DPL_MAX];
+    #pragma unroll
+    for (int i = 0; i < SK_DPL_MAX; i++) acc[i] = 0.0f;
+
+    const int k_rb = KV8_ROW_BYTES(hd);              // K rows diverged: 20 B/16
+    const int v_rb = KV8_ROW_BYTES(hd);              // V rows: the K layout, 20 B/16
+    const int lane_blk = (lane * DPL) / KVQ_BLK;     // the 16-block holding this lane's slice
+    const int lane_off = (lane * DPL) % KVQ_BLK;     // its first code within the block (4-aligned)
+    const long long kvbase = ((long long)slot * nkv + kvh) * (long long)stride;
+    const unsigned char* kb = k_cache + kvbase * k_rb + lane_blk * 20;
+    const unsigned char* vb = v_cache + kvbase * v_rb + lane_blk * 20;
+    for (int r = start + warp; r < end; r += NW) {
+        const int dd = r - pos_start;
+        const int t = (!path || dd < 0) ? r : pos_start + (int)path[b * MAX_VERIFY + dd];
+        const unsigned char* krow = kb + (long long)t * k_rb;
+        const float ksc = __half2float(__ushort_as_half(*(const unsigned short*)(krow + KVQ_BLK)));
+        const uint32_t* kcodes = (const uint32_t*)(krow + lane_off);   // 4 aligned int8 codes
+        float kdq[SK_DPL_MAX];
+        #pragma unroll
+        for (int i = 0; i < SK_DPL_MAX; i++) kdq[i] = 0.0f;
+        #pragma unroll
+        for (int u = 0; u < SK_DPL_MAX / 4; u++) {
+            if (u >= DPL / 4) break;
+            const uint32_t codes = kcodes[u];
+            kdq[u * 4 + 0] = kv8_dq((int8_t)(codes >> 0), ksc);
+            kdq[u * 4 + 1] = kv8_dq((int8_t)(codes >> 8), ksc);
+            kdq[u * 4 + 2] = kv8_dq((int8_t)(codes >> 16), ksc);
+            kdq[u * 4 + 3] = kv8_dq((int8_t)(codes >> 24), ksc);
+        }
+        float s = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < SK_DPL_MAX; i++) s += qv[i] * kdq[i];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
+        s *= scale;
+
+        const float m_new = fmaxf(m, s);
+        const float a_old = __expf(m - m_new), a_cur = __expf(s - m_new);
+        const unsigned char* vrow = vb + (long long)t * v_rb;
+        const float vsc = __half2float(__ushort_as_half(*(const unsigned short*)(vrow + KVQ_BLK)));
+        const uint32_t* vcodes = (const uint32_t*)(vrow + lane_off);   // 4 aligned int8 codes
+        float vdq[SK_DPL_MAX];
+        #pragma unroll
+        for (int i = 0; i < SK_DPL_MAX; i++) vdq[i] = 0.0f;
+        #pragma unroll
+        for (int u = 0; u < SK_DPL_MAX / 4; u++) {
+            if (u >= DPL / 4) break;
+            const uint32_t codes = vcodes[u];
+            vdq[u * 4 + 0] = kv8_dq((int8_t)(codes >> 0), vsc);
+            vdq[u * 4 + 1] = kv8_dq((int8_t)(codes >> 8), vsc);
+            vdq[u * 4 + 2] = kv8_dq((int8_t)(codes >> 16), vsc);
+            vdq[u * 4 + 3] = kv8_dq((int8_t)(codes >> 24), vsc);
+        }
+        #pragma unroll
+        for (int i = 0; i < SK_DPL_MAX; i++) acc[i] = acc[i] * a_old + a_cur * vdq[i];
+        m = m_new;
+        l = l * a_old + a_cur;
+    }
+
+    extern __shared__ float sh[];
+    float* sacc = sh;
+    float* sm   = sh + NW * hd;
+    float* sl   = sm + NW;
+    #pragma unroll
+    for (int i = 0; i < SK_DPL_MAX; i++) if (i < DPL) sacc[warp * hd + lane * DPL + i] = acc[i];
+    if (lane == 0) { sm[warp] = m; sl[warp] = l; }
+    __syncthreads();
+
+    if (threadIdx.x < hd) {
+        const int d = threadIdx.x;
+        float mg = -1e30f;
+        for (int w = 0; w < NW; w++) mg = fmaxf(mg, sm[w]);
+        float num = 0.0f, den = 0.0f;
+        for (int w = 0; w < NW; w++) {
+            const float a = __expf(sm[w] - mg);
+            num += sacc[w * hd + d] * a;
+            den += sl[w] * a;
+        }
+        out_acc[idx * hd + d] = num;
+        if (d == 0) { out_m[idx] = mg; out_l[idx] = den; }
+    }
+}
+
+// ===================================================================================================
+// gqa_attn_splitk_k8v8_gq — the GQA-packed twin of gqa_attn_splitk_k8v8: one block per (kv head, split, column)
+// reads the K/V chunk ONCE for the whole GQA group, with the same 2-row software pipeline. BIT-IDENTICAL to
+// gqa_attn_splitk_k8v8 per head by the same construction argument as the k8v4 pair. V is read exactly like K
+// (20 B/16, aligned u32 codes + fp16 scale); the launch contract is the k8v4 pair's (hd 128|256, ratio 2..8).
+template<int DPL_T>
+__device__ __forceinline__ void gqa_splitk_k8v8_gq_impl(
+    float* out_m, float* out_l, float* out_acc,
+    const __nv_bfloat16* q, const unsigned char* k_cache, const unsigned char* v_cache,
+    const int* pos, long long bs_packed, int nh_packed, const int* slot_ids,
+    const unsigned char* path, const int* col_pos_start) {
+    const int nh  = nh_packed >> 20;
+    const int hd  = (nh_packed >> 10) & 0x3FF;   // == DPL_T*32 by launch contract
+    const int nkv = nh_packed & 0x3FF;
+    const float scale = 1.0f / sqrtf((float)hd);
+    const int gqa_ratio = nh / nkv;
+    const int stride  = (int)(bs_packed & 0x7FFFF);
+    const int ns_grid = (int)((bs_packed >> 19) & 0x3F);
+    const int B       = (int)((bs_packed >> 25) & 0x3F);
+    const long long q_pitch = (bs_packed >> 31) & 0x7FFFF;   // F0: q row pitch (mtot fused view / nh*hd split)
+
+    const int blk = blockIdx.x;
+    // R2.1: b INNERMOST => the B verify columns of one (kvh, split) are co-scheduled and share the
+    // L2 read of the same K/V chunk (was: b-major, re-reading the chunk from DRAM B times). Arithmetic
+    // and reduction order unchanged => bit-identical. Bijection over the exact nkv*ns_grid*B grid.
+    const int kvh = blk / (ns_grid * B);
+    const int rem = blk % (ns_grid * B);
+    const int split = rem / B;
+    const int b = rem % B;
+    const int pc = pos[b] + 1;
+    const int pos_start = col_pos_start ? col_pos_start[b] : pos[0];
+    const int slot = slot_ids[b];
+
+    const int ns = sk_nsplits(pc);
+    if (split >= ns) return;
+    const int split_size = (pc + ns - 1) / ns;
+    const int start = split * split_size;
+    const int end = min(start + split_size, pc);
+
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int NW = blockDim.x >> 5;
+
+    if (start >= pc) {                          // empty split: zero partials for the whole group
+        #pragma unroll
+        for (int g = 0; g < SK_GQA_MAX; g++) {
+            if (g >= gqa_ratio) break;
+            const long long idx = ((long long)b * nh + (kvh * gqa_ratio + g)) * ns_grid + split;
+            if (threadIdx.x == 0) { out_m[idx] = -1e30f; out_l[idx] = 0.0f; }
+            if (threadIdx.x < hd) out_acc[idx * hd + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
+
+    // Per-lane q slices for the whole group, in registers. g >= gqa_ratio is clamped to a valid
+    // (duplicated) row and predicated to exact +0.0f — its outputs are never read.
+    float qv[SK_GQA_MAX][DPL_T];
+    #pragma unroll
+    for (int g = 0; g < SK_GQA_MAX; g++) {
+        const int gs = min(g, gqa_ratio - 1);
+        const __nv_bfloat16* qrow = q + (long long)b * q_pitch + (long long)(kvh * gqa_ratio + gs) * hd + lane * DPL_T;
+        #pragma unroll
+        for (int i = 0; i < DPL_T; i++) qv[g][i] = (g < gqa_ratio) ? b2f(qrow[i]) : 0.0f;
+    }
+
+    float m[SK_GQA_MAX], l[SK_GQA_MAX];
+    float acc[SK_GQA_MAX][DPL_T];
+    #pragma unroll
+    for (int g = 0; g < SK_GQA_MAX; g++) {
+        m[g] = -1e30f; l[g] = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < DPL_T; i++) acc[g][i] = 0.0f;
+    }
+
+    const int k_rb = KV8_ROW_BYTES(hd);              // K rows diverged: 20 B/16
+    const int v_rb = KV8_ROW_BYTES(hd);              // V rows: the K layout, 20 B/16
+    const int lane_blk = (lane * DPL_T) / KVQ_BLK;
+    const int lane_off = (lane * DPL_T) % KVQ_BLK;   // 4-aligned (DPL_T divides 16)
+    const long long kvbase = ((long long)slot * nkv + kvh) * (long long)stride;
+    const unsigned char* kb = k_cache + kvbase * k_rb + lane_blk * 20;
+    const unsigned char* vb = v_cache + kvbase * v_rb + lane_blk * 20;
+    // E1b 2-row software pipeline: at long context this loop is LATENCY-bound (each row's K-then-V
+    // dependent loads ~1.9K cycles back-to-back, only 4 warps/SM to hide them). Process rows in
+    // pairs with ALL loads issued up front — one memory round-trip per pair instead of two —
+    // then apply the two online-softmax updates sequentially in the same ascending order as
+    // before. Every per-head FP expression keeps its exact form and order (dot, tree, scale,
+    // m/a, acc), so the result is BIT-IDENTICAL to the unpipelined loop (and to gqa_attn_splitk_k8v4).
+    for (int r = start + warp; r < end; r += 2 * NW) {
+        const int r2 = r + NW;
+        const bool has2 = r2 < end;
+        const int dd = r - pos_start;
+        const int t  = (!path || dd < 0) ? r  : pos_start + (int)path[b * MAX_VERIFY + dd];
+        const int t2 = has2 ? ((!path || (r2 - pos_start) < 0) ? r2 : pos_start + (int)path[b * MAX_VERIFY + (r2 - pos_start)]) : 0;
+        // up-front loads for BOTH rows (independent — latency paid once)
+        const unsigned char* krow  = kb + (long long)t * k_rb;
+        const unsigned char* krow2 = kb + (long long)t2 * k_rb;
+        const unsigned char* vrow  = vb + (long long)t * v_rb;
+        const unsigned char* vrow2 = vb + (long long)t2 * v_rb;
+        const float ksc  = __half2float(__ushort_as_half(*(const unsigned short*)(krow  + KVQ_BLK)));
+        const float ksc2 = has2 ? __half2float(__ushort_as_half(*(const unsigned short*)(krow2 + KVQ_BLK))) : 0.0f;
+        const float vsc  = __half2float(__ushort_as_half(*(const unsigned short*)(vrow  + KVQ_BLK)));
+        const float vsc2 = has2 ? __half2float(__ushort_as_half(*(const unsigned short*)(vrow2 + KVQ_BLK))) : 0.0f;
+        const uint32_t* kcodes  = (const uint32_t*)(krow  + lane_off);
+        const uint32_t* kcodes2 = (const uint32_t*)(krow2 + lane_off);
+        const uint32_t* vcodes  = (const uint32_t*)(vrow  + lane_off);
+        const uint32_t* vcodes2 = (const uint32_t*)(vrow2 + lane_off);
+        float kdq[DPL_T], kdq2[DPL_T], vdq[DPL_T], vdq2[DPL_T];
+        #pragma unroll
+        for (int u = 0; u < DPL_T / 4; u++) {
+            const uint32_t w  = kcodes[u];     // 4 aligned int8 codes, element j at byte j (LE)
+            const uint32_t w2 = has2 ? kcodes2[u] : 0;
+            const uint32_t pv  = vcodes[u];    // 4 aligned int8 codes, element j at byte j (LE)
+            const uint32_t pv2 = has2 ? vcodes2[u] : 0;
+            kdq[u * 4 + 0]  = kv8_dq((int8_t)(w >> 0), ksc);
+            kdq[u * 4 + 1]  = kv8_dq((int8_t)(w >> 8), ksc);
+            kdq[u * 4 + 2]  = kv8_dq((int8_t)(w >> 16), ksc);
+            kdq[u * 4 + 3]  = kv8_dq((int8_t)(w >> 24), ksc);
+            kdq2[u * 4 + 0] = kv8_dq((int8_t)(w2 >> 0), ksc2);
+            kdq2[u * 4 + 1] = kv8_dq((int8_t)(w2 >> 8), ksc2);
+            kdq2[u * 4 + 2] = kv8_dq((int8_t)(w2 >> 16), ksc2);
+            kdq2[u * 4 + 3] = kv8_dq((int8_t)(w2 >> 24), ksc2);
+            vdq[u * 4 + 0]  = kv8_dq((int8_t)(pv >> 0), vsc);
+            vdq[u * 4 + 1]  = kv8_dq((int8_t)(pv >> 8), vsc);
+            vdq[u * 4 + 2]  = kv8_dq((int8_t)(pv >> 16), vsc);
+            vdq[u * 4 + 3]  = kv8_dq((int8_t)(pv >> 24), vsc);
+            vdq2[u * 4 + 0] = kv8_dq((int8_t)(pv2 >> 0), vsc2);
+            vdq2[u * 4 + 1] = kv8_dq((int8_t)(pv2 >> 8), vsc2);
+            vdq2[u * 4 + 2] = kv8_dq((int8_t)(pv2 >> 16), vsc2);
+            vdq2[u * 4 + 3] = kv8_dq((int8_t)(pv2 >> 24), vsc2);
+        }
+        // dots for both rows (independent of the running softmax state)
+        float s[SK_GQA_MAX], s2[SK_GQA_MAX];
+        #pragma unroll
+        for (int g = 0; g < SK_GQA_MAX; g++) {
+            s[g] = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < DPL_T; i++) s[g] += qv[g][i] * kdq[i];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) s[g] += __shfl_xor_sync(0xffffffffu, s[g], off);
+            s[g] *= scale;
+        }
+        #pragma unroll
+        for (int g = 0; g < SK_GQA_MAX; g++) {
+            s2[g] = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < DPL_T; i++) s2[g] += qv[g][i] * kdq2[i];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) s2[g] += __shfl_xor_sync(0xffffffffu, s2[g], off);
+            s2[g] *= scale;
+        }
+        // then the two state updates, ascending — identical sequence to the unpipelined loop.
+        #pragma unroll
+        for (int g = 0; g < SK_GQA_MAX; g++) {
+            if (g >= gqa_ratio) break;
+            const float m_new = fmaxf(m[g], s[g]);
+            const float a_old = __expf(m[g] - m_new), a_cur = __expf(s[g] - m_new);
+            #pragma unroll
+            for (int i = 0; i < DPL_T; i++) acc[g][i] = acc[g][i] * a_old + a_cur * vdq[i];
+            m[g] = m_new;
+            l[g] = l[g] * a_old + a_cur;
+        }
+        if (has2) {
+            #pragma unroll
+            for (int g = 0; g < SK_GQA_MAX; g++) {
+                if (g >= gqa_ratio) break;
+                const float m_new = fmaxf(m[g], s2[g]);
+                const float a_old = __expf(m[g] - m_new), a_cur = __expf(s2[g] - m_new);
+                #pragma unroll
+                for (int i = 0; i < DPL_T; i++) acc[g][i] = acc[g][i] * a_old + a_cur * vdq2[i];
+                m[g] = m_new;
+                l[g] = l[g] * a_old + a_cur;
+            }
+        }
+    }
+
+    // Merge per head into one smem buffer, sequentially — each head's merge is the per-head
+    // kernel's exact fixed-warp-order one.
+    extern __shared__ float sh[];
+    float* sacc = sh;                     // NW * hd
+    float* sm   = sh + NW * hd;           // NW
+    float* sl   = sm + NW;                // NW
+    #pragma unroll
+    for (int g = 0; g < SK_GQA_MAX; g++) {
+        if (g >= gqa_ratio) break;
+        #pragma unroll
+        for (int i = 0; i < DPL_T; i++) sacc[warp * hd + lane * DPL_T + i] = acc[g][i];
+        if (lane == 0) { sm[warp] = m[g]; sl[warp] = l[g]; }
+        __syncthreads();
+        const long long idx = ((long long)b * nh + (kvh * gqa_ratio + g)) * ns_grid + split;
+        if (threadIdx.x < hd) {
+            const int d = threadIdx.x;
+            float mg = -1e30f;
+            for (int w = 0; w < NW; w++) mg = fmaxf(mg, sm[w]);
+            float num = 0.0f, den = 0.0f;
+            for (int w = 0; w < NW; w++) {
+                const float a = __expf(sm[w] - mg);
+                num += sacc[w * hd + d] * a;
+                den += sl[w] * a;
+            }
+            out_acc[idx * hd + d] = num;
+            if (d == 0) { out_m[idx] = mg; out_l[idx] = den; }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void gqa_attn_splitk_k8v8_gq(
+    float* out_m, float* out_l, float* out_acc,
+    const __nv_bfloat16* q, const unsigned char* k_cache, const unsigned char* v_cache,
+    const int* pos, long long bs_packed, int nh_packed, const int* slot_ids,
+    const unsigned char* path, const int* col_pos_start) {
+    const int hd = (nh_packed >> 10) & 0x3FF;
+    if (hd == 128) {
+        gqa_splitk_k8v8_gq_impl<4>(out_m, out_l, out_acc, q, k_cache, v_cache,
+                                   pos, bs_packed, nh_packed, slot_ids, path, col_pos_start);
+    } else if (hd == 256) {
+        gqa_splitk_k8v8_gq_impl<8>(out_m, out_l, out_acc, q, k_cache, v_cache,
                                    pos, bs_packed, nh_packed, slot_ids, path, col_pos_start);
     }
     // other hd: never launched — attn_dispatch falls back to the per-head kernel.

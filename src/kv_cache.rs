@@ -74,17 +74,16 @@ impl KVCache {
 // W3 (Phase 13): kv-mode x lane-width compatibility, evaluated at ARG PARSE time.
 // =================================================================================================
 //
-// The owner's TP4 repro (`--kv-cache k8v8 ... --tp 4 --max-batch 4 --spec-source dflash2`) used to
-// load the whole model and then die inside the attention dispatch: k8v8 reads its int8 K/V rows
-// ONLY on the `_e` attention lane (`gqa_attn_verify_e_k8v8`), and that lane's contract is
-// `batch <= MAX_VERIFY (16)` with `chain_ok` (gpu.rs:9261). A multi-lane serve whose packed
-// verify/step width leaves that envelope hits
-//     assert!(use_e, "k8v8 requires the _e attention lane (batch<=8, gqa<=48, no --no-attn-e)")
-// — a runtime panic AFTER a full model load, with no hint of the remedy.
+// History: k8v8 used to be a SINGLE-LANE cache. It reads its int8 K/V rows on the `_e` tensor-core attention
+// lane (`gqa_attn_verify_e_k8v8`), which addresses ONE slot for every column, and no other reader existed, so a
+// multi-lane serve (`--kv-cache k8v8 --max-batch 4`) loaded the whole model and then died in the dispatch
+// (`k8v8 requires the _e attention lane`). The check below rejected it BEFORE the load.
 //
-// The check below is the host-side predicate, evaluated BEFORE the model load and BEFORE any node
-// contact, so the same mistake fails in milliseconds with the conflict and the remedy named.
-// `--kv-cache bf16` (or `--max-batch 1`) are the two supported escapes.
+// Since the community report (GitHub, "k8v8 with --max-batch > 1") the dispatch has an int8 split-K reader pair
+// (`gqa_attn_splitk_k8v8` / `_gq`: per-column slot and position, the k8v4 pair's structure) for every attention
+// call the `_e` lane is not host-gated to — plain batched decode of several lanes, FOREST / tree verify — so
+// k8v8 serves any lane count. The predicate stays (one place that answers "does this kv mode support this lane
+// width?" at parse time, and the table test pins the answer) and today it accepts every cell.
 
 /// The verdict for one (kv-cache, max-batch, tp) configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,21 +93,9 @@ pub enum KvLaneVerdict {
     Reject(String),
 }
 
-/// W3 (Phase 13): does this kv-cache mode support this many serving lanes?
-///
-/// k8v8 is a SINGLE-LANE cache by construction (one kernel, the `_e` attention lane, whose
-/// contract is `batch <= MAX_VERIFY`): multi-lane serving packs more columns than the kernel's
-/// row-group grid covers, and the dispatch panics instead of degrading (deliberately — a silent
-/// bf16 read of an int8 buffer is the mojibake hazard). Every other mode is unconstrained.
-pub fn kv_lane_check(kv_cache: Option<&str>, max_batch: usize, tp: usize) -> KvLaneVerdict {
-    let k8v8 = matches!(kv_cache, Some("k8v8")) || crate::opts::var(crate::opt!("kv-k8v8")).ok().as_deref() == Some("1");
-    if k8v8 && max_batch > 1 {
-        return KvLaneVerdict::Reject(format!(
-            "k8v8 KV does not support multi-lane serving (max-batch {max_batch} > 1, tp {tp}): the \
-             int8 K/V rows are read only by the single-lane `_e` attention kernel. Use \
-             --kv-cache bf16 (or k8v4) or --max-batch 1."
-        ));
-    }
+/// W3 (Phase 13): does this kv-cache mode support this many serving lanes? Every NVFP4 mode does (k8v8 since
+/// the int8 split-K readers landed); kept as the single parse-time gate for any future mode that does not.
+pub fn kv_lane_check(_kv_cache: Option<&str>, _max_batch: usize, _tp: usize) -> KvLaneVerdict {
     KvLaneVerdict::Ok
 }
 
@@ -123,34 +110,15 @@ fn verdict_of(kv: &str, mb: usize, tp: usize) -> bool {
 mod kv_lane_tests {
     use super::*;
 
-    /// W3's table: k8v8 × {mb1, mb4} and bf16 × {mb1, mb4}, each at tp {1, 2, 4}.
+    /// Every NVFP4 KV mode accepts every lane width at every topology (k8v8 included since its multi-lane readers).
     #[test]
     fn kv_lane_table() {
         for tp in [1usize, 2, 4] {
-            // bf16 is unconstrained at every lane width and topology.
-            assert!(verdict_of("bf16", 1, tp), "bf16 mb1 tp{tp}");
-            assert!(verdict_of("bf16", 4, tp), "bf16 mb4 tp{tp}");
-            // k8v8 is single-lane: mb1 passes, mb4 is rejected BEFORE the load.
-            assert!(verdict_of("k8v8", 1, tp), "k8v8 mb1 tp{tp}");
-            assert!(!verdict_of("k8v8", 4, tp), "k8v8 mb4 tp{tp} must fail fast");
-            // The other modes keep their standing behaviour (not part of the W3 conflict).
-            assert!(verdict_of("q4", 4, tp), "q4 mb4 tp{tp}");
-            assert!(verdict_of("tq", 4, tp), "tq mb4 tp{tp}");
-        }
-    }
-
-    /// The rejection text names the conflict AND both remedies (the F6 lesson: an error a user
-    /// cannot act on is a silent failure with extra steps).
-    #[test]
-    fn kv_lane_reject_message_is_actionable() {
-        match kv_lane_check(Some("k8v8"), 4, 4) {
-            KvLaneVerdict::Reject(m) => {
-                assert!(m.contains("k8v8"), "{m}");
-                assert!(m.contains("max-batch 4 > 1"), "{m}");
-                assert!(m.contains("--kv-cache bf16"), "{m}");
-                assert!(m.contains("--max-batch 1"), "{m}");
+            for kv in ["bf16", "q4", "tq", "tq3", "k8v4", "k8v8"] {
+                for mb in [1usize, 2, 4, 8, 16] {
+                    assert!(verdict_of(kv, mb, tp), "{kv} mb{mb} tp{tp}");
+                }
             }
-            KvLaneVerdict::Ok => panic!("k8v8 x mb4 must be rejected"),
         }
     }
 

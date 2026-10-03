@@ -177,6 +177,29 @@ fn ring_pct(v: &mut [u32], p: f64) -> Option<f64> {
     Some(v[lo] as f64 + (v[hi] as f64 - v[lo] as f64) * (k - lo as f64))
 }
 
+// EXL3 engine: per-request speculation totals, added when a request's [mtp-stats] line prints.
+static X_ROUNDS: AtomicU64 = AtomicU64::new(0);
+static X_DRAFTS: AtomicU64 = AtomicU64::new(0);
+static X_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+
+/// EXL3: add one finished request's speculation counts (rounds, drafted, accepted).
+pub fn add_spec(rounds: u64, drafted: u64, accepted: u64) {
+    X_ROUNDS.fetch_add(rounds, Relaxed);
+    X_DRAFTS.fetch_add(drafted, Relaxed);
+    X_ACCEPTED.fetch_add(accepted, Relaxed);
+}
+
+/// Cumulative speculation totals across every source (MTP, DFlash2, DFlash v1, EXL3 MTP):
+/// (rounds, drafted, accepted, emitted). Feeds `/metrics`.
+pub fn spec_totals() -> (u64, u64, u64, u64) {
+    let rounds = M_VERIFY.load(Relaxed) + D_STEPS.load(Relaxed) + DF_STEPS.load(Relaxed) + X_ROUNDS.load(Relaxed);
+    let drafts = M_DRAFTS.load(Relaxed) + D_DRAFTS.load(Relaxed) + DF_DRAFTS.load(Relaxed) + X_DRAFTS.load(Relaxed);
+    let accepted = M_ACCEPTED.load(Relaxed) + D_ACCEPTED.load(Relaxed) + DF_ACCEPTED.load(Relaxed) + X_ACCEPTED.load(Relaxed);
+    let emitted = M_EMITTED.load(Relaxed) + D_EMITTED.load(Relaxed) + DF_EMITTED.load(Relaxed)
+        + X_ACCEPTED.load(Relaxed) + X_ROUNDS.load(Relaxed);
+    (rounds, drafts, accepted, emitted)
+}
+
 /// Read-side snapshot for the status route. Never blocks a decode step.
 pub fn snapshot_json() -> serde_json::Value {
     let n = (RING_N.load(Relaxed) as usize).min(RING);

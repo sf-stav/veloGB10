@@ -137,6 +137,35 @@ async fn get_model(State(state): State<AppState>, axum::extract::Path(id): axum:
 /// falling back to the directory name when the card or the line is absent. Before this, the
 /// server reported the lab directory fragment (`"model": "3.8-27b-nvfp4-full-all"`) — an
 /// internal path name that no client or catalog can resolve. `--model-name` still overrides.
+/// The HTTP API listen address: `--host` (default 0.0.0.0, every interface) + the port. Every server
+/// (NVFP4, EXL3, DSV4) binds through this, so `--host` means the same thing everywhere.
+pub fn http_bind_addr(port: u16) -> anyhow::Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let host = crate::opts::var(crate::opt!("host")).unwrap_or_else(|_| "0.0.0.0".to_string());
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']').to_string();
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
+    (host.as_str(), port).to_socket_addrs().ok().and_then(|mut a| a.next()).ok_or_else(|| anyhow::anyhow!(
+        "--host '{host}' is neither an IP address nor a resolvable host name (e.g. 127.0.0.1, 0.0.0.0, ::1)"))
+}
+
+/// Bind the HTTP API or exit 2 with a plain message (port in use, address not on this machine, ...),
+/// instead of a panic backtrace.
+pub async fn http_listen(port: u16) -> tokio::net::TcpListener {
+    let addr = match http_bind_addr(port) {
+        Ok(a) => a,
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+    };
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: cannot listen on {addr}: {e} (another server on this port? --host not an address of this machine?)");
+            std::process::exit(2);
+        }
+    }
+}
+
 pub fn model_id_from_dir(model_path: &str) -> String {
     let dir = std::path::Path::new(model_path.trim_end_matches('/'));
     if let Ok(card) = std::fs::read_to_string(dir.join("README.md")) {
@@ -969,6 +998,7 @@ async fn chat_completions(
     if !engine_ok() || state.scheduler.send(request).is_err() {
         return engine_unavailable();
     }
+    let mut mt = crate::metrics::Req::start(prompt_len); // /metrics (recorded when the response ends)
 
     // SESSION identity for the OTel generation-telemetry (crate::otel::SessionRegistry). One
     // resolution per REQUEST, only when the emitter is on (off = no session work at all):
@@ -1087,6 +1117,7 @@ async fn chat_completions(
                 match ev {
                     TokEvent::Tok(t) => {
                         n += 1;
+                        mt.tok();
                         last_tok = Some(t);
                         if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                         let text = stream_dec.push(t);
@@ -1228,6 +1259,7 @@ async fn chat_completions(
                 eprintln!("[tool-args-alarm] {a}");
             }
             let (_, tool_calls, fin) = crate::tools::finalize_parsed(&done_content, parsed, &finish);
+            mt.finish(if finish.starts_with("error") { finish.as_str() } else { fin.as_str() });
             if !tool_calls.is_empty() {
                 // Log the ARGUMENTS, not just the names — see the note on the non-streaming path.
                 // Agent harnesses stream, so this is the branch that actually gets used, and it was the
@@ -1298,6 +1330,7 @@ async fn chat_completions(
             match ev {
                 TokEvent::Tok(t) => {
                     tokens.push(t);
+                    mt.tok();
                     if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                     // Apply stop strings LIVE, not just post-hoc: on a hit, break AND let rx drop —
                     // the scheduler sees the closed channel and cancels the lane instead of decoding
@@ -1327,6 +1360,7 @@ async fn chat_completions(
         // An engine error is an HTTP error, never a 200 that a client (or a benchmark) would read
         // as an answer. WP02: also when some tokens came first (the text is incomplete).
         if finish.starts_with("error") {
+            mt.finish(&finish);
             return (engine_error_status(&finish), Json(serde_json::json!({"error": {
                 "message": finish, "type": "server_error", "completion_tokens": tokens.len(),
             }}))).into_response();
@@ -1360,6 +1394,7 @@ async fn chat_completions(
             eprintln!("[tool-args-alarm] {a}");
         }
         let (content, tool_calls, finish) = crate::tools::finalize_parsed(&content, parsed, &finish);
+        mt.finish(&finish);
         if !tool_calls.is_empty() {
             // Log the ARGUMENTS, not just the names. When opencode reported a write as successful and
             // no file appeared, the log said `tool_calls 1: ["write"]` — which is exactly enough to
@@ -1447,6 +1482,12 @@ fn log_generation(tok: &QwenTokenizer, stop_ids: &[u32], id: &str, finish: &str,
 /// (tokens per verify forward), step p50/p90. Lock-free read; it never touches a decode step.
 /// Clients (owner harness, accept_gate.py) use it to see TRUE alpha instead of inferring it
 /// from wall-clock tokens. `status` stays "ok" so existing liveness probes are unaffected.
+/// Prometheus text exposition (CF-P1b). Cheap to scrape: atomics read, one string built.
+async fn metrics() -> Response {
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+     crate::metrics::render(engine_ok())).into_response()
+}
+
 async fn health() -> Response {
     // WP02: a DEAD engine answers 503 (a supervisor / load balancer acts on it)
     if !engine_ok() {
@@ -1775,6 +1816,7 @@ async fn completions(
     if !engine_ok() || state.scheduler.send(request).is_err() {
         return engine_unavailable(); // WP02
     }
+    let mut mt = crate::metrics::Req::start(prompt_len); // /metrics
     eprintln!("[req] completions prompt_tokens={} max_tokens={} min_tokens={} ignore_eos={} stream={}",
               prompt_len, req_max, _mn, _ie, req.stream);
     let model_name = req.model.clone().unwrap_or_else(|| state.model_name.clone());
@@ -1793,6 +1835,7 @@ async fn completions(
                     TokEvent::Tok(t) => {
                         if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                         ntok += 1;
+                        mt.tok();
                         let text = state.tokenizer.decode(&[t], true).unwrap_or_default();
                         let chunk = serde_json::json!({
                             "id": cid, "object": "text_completion.chunk", "created": created,
@@ -1809,6 +1852,7 @@ async fn completions(
                 eprintln!("[req] completions stream ended in an engine error after {ntok} tokens: {finish}");
                 yield Ok::<_, std::convert::Infallible>(Event::default().data(sse_error_event(&finish)));
             }
+            mt.finish(&finish);
             let fr = if finish == "length" { "length" } else { "stop" };
             let mut chunk = serde_json::json!({
                 "id": cid, "object": "text_completion.chunk", "created": created,
@@ -1832,7 +1876,7 @@ async fn completions(
     let mut stop_reason: Option<String> = None;
     while let Some(ev) = rx.recv().await {
         match ev {
-            TokEvent::Tok(t) => toks.push(t),
+            TokEvent::Tok(t) => { toks.push(t); mt.tok(); }
             TokEvent::Finish { reason } => {
                 stop_reason = stop_reason_of(&reason); // WP08
                 finish = reason;
@@ -1842,10 +1886,12 @@ async fn completions(
     }
     drop(rx);
     if finish.starts_with("error") {
+        mt.finish(&finish);
         return (engine_error_status(&finish), Json(serde_json::json!({"error": {
             "message": finish, "type": "server_error", "completion_tokens": toks.len(),
         }}))).into_response();
     }
+    mt.finish(&finish);
     let finish = if finish == "length" { "length".to_string() } else { "stop".to_string() };
     let text = state.tokenizer.decode(&toks, true).unwrap_or_default();
     dump_tokens(&cid, &toks);
@@ -1870,6 +1916,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/models/:id", get(get_model))
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         // Base64 image bodies inflate ~4/3x; a high-res PNG at ~2-4 MB exceeds axum's 2 MB default
         // (""Failed to buffer the request body: length limit exceeded"" on image requests). Raise it
@@ -1998,5 +2045,28 @@ mod grow_find_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::http_bind_addr;
+
+    /// `--host`: default every interface; IPv4, bracketed/unbracketed IPv6 and `localhost` resolve; junk is refused
+    /// with a message naming the flag (one test, so the shared option store is not raced).
+    #[test]
+    fn host_flag_resolves_and_refuses() {
+        let o = crate::opt!("host");
+        crate::opts::unset(o);
+        assert_eq!(http_bind_addr(9000).unwrap().to_string(), "0.0.0.0:9000");
+        crate::opts::set(o, "127.0.0.1");
+        assert_eq!(http_bind_addr(9000).unwrap().to_string(), "127.0.0.1:9000");
+        crate::opts::set(o, "[::1]");
+        assert_eq!(http_bind_addr(9000).unwrap().to_string(), "[::1]:9000");
+        crate::opts::set(o, "localhost");
+        assert!(http_bind_addr(9000).unwrap().ip().is_loopback());
+        crate::opts::set(o, "not a host!");
+        assert!(http_bind_addr(9000).unwrap_err().to_string().contains("--host"));
+        crate::opts::unset(o);
     }
 }

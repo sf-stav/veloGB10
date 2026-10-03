@@ -161,11 +161,19 @@ fn parse_one_hy3(body: &str, tools: Option<&[Value]>) -> Option<ToolCall> {
 /// at the start of a line is unambiguous, so accept the bare form as a repair — the well-formed
 /// match always wins when both are present. Returns `(byte offset, tag length)`.
 fn find_function_tag(body: &str) -> Option<(usize, usize)> {
+    find_function_tag_mode(body, false)
+}
+
+/// `wf_only`: the whole `<tool_call>` body contains a well-formed `<function=` somewhere, so a bare `function=NAME>` is never a
+/// repair candidate in it (the well-formed form always wins — also AFTER the first call, where a bare-looking line inside a
+/// parameter value used to be taken for a second call).
+fn find_function_tag_mode(body: &str, wf_only: bool) -> Option<(usize, usize)> {
     const WF: &str = "<function=";
     const BARE: &str = "function=";
     if let Some(i) = body.find(WF) {
         return Some((i, WF.len()));
     }
+    if wf_only { return None; }
     let mut from = 0usize;
     while let Some(rel) = body[from..].find(BARE) {
         let i = from + rel;
@@ -205,25 +213,31 @@ fn parse_block(body: &str, tools: Option<&[Value]>, idx: usize) -> Vec<ToolCall>
 /// template's string-arguments history form) when no `<parameter=` pair is present.
 fn parse_xml_calls(body: &str, tools: Option<&[Value]>) -> Vec<ToolCall> {
     let mut calls = Vec::new();
-    let mut tags: Vec<(usize, usize)> = Vec::new();
+    // A body with any well-formed tag takes no bare repairs at all (see find_function_tag_mode).
+    let wf_only = body.contains("<function=");
+    // The scan is SEQUENTIAL: a call owns its `<parameter=…>…</parameter>` spans, and a function tag is only a tag when it sits
+    // OUTSIDE every value span consumed so far. A parameter value that merely contains the text `function=x>` or `<function=x>`
+    // (a coding agent writing a file about this very format) stays payload and never becomes a second call.
     let mut from = 0usize;
-    while let Some((i, tlen)) = find_function_tag(&body[from..]) {
-        tags.push((from + i, tlen));
-        from += i + tlen;
-    }
-    for (n, &(start, tlen)) in tags.iter().enumerate() {
-        let end = tags.get(n + 1).map(|&(s, _)| s).unwrap_or(body.len());
-        let after = &body[start + tlen..end];
-        let Some(gt) = after.find('>') else { continue };
-        let name = after[..gt].trim().to_string();
-        if name.is_empty() { continue; }
+    while let Some((i, tlen)) = find_function_tag_mode(&body[from..], wf_only) {
+        let start = from + i;
+        let name_from = start + tlen;
+        let Some(gt) = body[name_from..].find('>') else { from = name_from; continue };
+        let name = body[name_from..name_from + gt].trim().to_string();
+        let after_name = name_from + gt + 1;
+        if name.is_empty() { from = after_name; continue; }
 
         let schema = tools.and_then(|ts| param_schema(ts, &name));
-
         let mut args = serde_json::Map::new();
-        let mut rest = &after[gt + 1..];
-        while let Some(popen) = rest.find("<parameter=") {
-            let a = &rest[popen + "<parameter=".len()..];
+        // `cursor` is always outside a value span. The next `<parameter=` belongs to THIS call unless the next function tag comes
+        // first (then it is that call's); the end of this call's text is the next tag after the last consumed span.
+        let mut cursor = after_name;
+        loop {
+            let next_tag = find_function_tag_mode(&body[cursor..], wf_only).map(|(ti, _)| cursor + ti);
+            let next_param = body[cursor..].find("<parameter=").map(|pi| cursor + pi);
+            let Some(popen) = next_param else { break };
+            if next_tag.map_or(false, |t| t < popen) { break; }
+            let a = &body[popen + "<parameter=".len()..];
             let Some(gt2) = a.find('>') else { break };
             let key = a[..gt2].trim().to_string();
             let vstart = &a[gt2 + 1..];
@@ -233,8 +247,11 @@ fn parse_xml_calls(body: &str, tools: Option<&[Value]>) -> Vec<ToolCall> {
             // survives.
             let raw = vstart[..pclose].trim_matches('\n');
             args.insert(key.clone(), coerce(raw, schema.and_then(|s| s.get(&key))));
-            rest = &vstart[pclose + "</parameter>".len()..];
+            cursor = body.len() - vstart.len() + pclose + "</parameter>".len();
         }
+        // This call's text runs to the next function tag after the last consumed value span (or the end of the block).
+        let end = find_function_tag_mode(&body[cursor..], wf_only).map(|(ti, _)| cursor + ti).unwrap_or(body.len());
+        let after = &body[start + tlen..end];
         if args.is_empty() {
             let jb = after[gt + 1..].trim();
             let jb = jb.strip_suffix("</function>").unwrap_or(jb).trim();
@@ -269,6 +286,7 @@ fn parse_xml_calls(body: &str, tools: Option<&[Value]>) -> Vec<ToolCall> {
                 arguments: serde_json::to_string(&Value::Object(args)).unwrap_or_else(|_| "{}".into()),
             },
         });
+        from = end;
     }
     calls
 }
@@ -665,6 +683,40 @@ mod tests {
         // that re-emits `call_0` every turn attaches results to the wrong call.
         let again = parse("<tool_call>\n<function=a>\n</function>\n</tool_call>", None);
         assert_ne!(again.tool_calls[0].id, out.tool_calls[0].id);
+    }
+
+    /// A parameter value is payload: text in it that LOOKS like a function tag (a coding agent writing a file about this very
+    /// format) must never become a second tool call — well-formed or bare, on its own line or not.
+    #[test]
+    fn function_looking_text_inside_a_value_is_payload() {
+        let file = "# notes\n<function=decoy>\nfunction=other>\n<parameter=q>\nnot a param\n";
+        let wf = format!("<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/a.md\n</parameter>\n<parameter=content>\n{file}</parameter>\n</function>\n</tool_call>");
+        let out = parse(&wf, None);
+        assert_eq!(out.tool_calls.len(), 1, "{:?}", out.tool_calls);
+        assert_eq!(out.tool_calls[0].function.name, "write_file");
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["path"], "/tmp/a.md");
+        assert_eq!(a["content"], file.trim_matches('\n'), "the whole value survives verbatim");
+        // bare form (the model dropped the `<`): the in-value lines are still payload
+        let bare = "<tool_call>\nfunction=write_file>\n<parameter=content>\nfunction=decoy>\nx\n</parameter>\n</tool_call>";
+        let out = parse(bare, None);
+        assert_eq!(out.tool_calls.len(), 1, "{:?}", out.tool_calls);
+        assert_eq!(out.tool_calls[0].function.name, "write_file");
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["content"], "function=decoy>\nx");
+    }
+
+    /// Several real calls in ONE block still split, each owning only its own parameters.
+    #[test]
+    fn several_functions_in_one_block_keep_their_own_parameters() {
+        let out = parse("<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n</function>\n\
+                          <function=b>\n<parameter=x>\n2\n</parameter>\n<parameter=y>\nz\n</parameter>\n</function>\n</tool_call>", None);
+        assert_eq!(out.tool_calls.len(), 2);
+        let (a, b): (Value, Value) = (serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap(),
+                                       serde_json::from_str(&out.tool_calls[1].function.arguments).unwrap());
+        assert_eq!((out.tool_calls[0].function.name.as_str(), out.tool_calls[1].function.name.as_str()), ("a", "b"));
+        assert_eq!(a, serde_json::json!({"x": "1"}));   // no schema: values stay strings
+        assert_eq!(b, serde_json::json!({"x": "2", "y": "z"}));
     }
 
     #[test]

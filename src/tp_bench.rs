@@ -549,7 +549,7 @@ fn run_reduce_dec(a: &ReduceArgs, dev: &std::sync::Arc<CudaDevice>, kern: &crate
                   link: &TpLink) -> anyhow::Result<()> {
     const NB: usize = 96;
     let names = ["xq_ks_combine_f32", "xq_ks_combine_f32_k1l", "xq_tp_wait_add_dec", "xq_cvt_f32_f16"];
-    let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/exl3_bench.ptx")?);
+    let ptx = Ptx::from_src(std::fs::read_to_string(crate::exl3_bench::bench_ptx_path())?);
     dev.load_ptx(ptx, "tpgx", &names)?;
     let f = |n: &str| dev.get_func("tpgx", n).ok_or_else(|| anyhow::anyhow!("{n} missing"));
     let (kc, kcl, k2d, kcv) = (f(names[0])?, f(names[1])?, f(names[2])?, f(names[3])?);
@@ -718,7 +718,7 @@ pub fn run_reduce_dec_nway(a: DecWorldArgs) -> anyhow::Result<()> {
     let dev = CudaDevice::new(0)?;
     let kern = crate::tp_xport::Kernels::load(&dev, "tprb")?;
     let names = ["xq_ks_combine_f32", "xq_ks_combine_f32_k1l", "xq_tp_wait_add_dec", "xq_cvt_f32_f16", "xq_tp_wait_keys"];
-    let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/exl3_bench.ptx")?);
+    let ptx = Ptx::from_src(std::fs::read_to_string(crate::exl3_bench::bench_ptx_path())?);
     dev.load_ptx(ptx, "tpgw", &names)?;
     let f = |nm: &str| dev.get_func("tpgw", nm).ok_or_else(|| anyhow::anyhow!("{nm} missing"));
     let (kc, kcl, k2d, kcv, kkeys) = (f(names[0])?, f(names[1])?, f(names[2])?, f(names[3])?, f(names[4])?);
@@ -964,7 +964,7 @@ fn run_reduce_single_nway(a: DecWorldArgs) -> anyhow::Result<()> {
     let dev = CudaDevice::new(0)?;
     let kern = crate::tp_xport::Kernels::load(&dev, "tprb")?;
     let names = ["xq_ks_combine_f32_k1l", "xq_tp_wait_add_dec", "xq_tp_wait_add_dec_single"];
-    let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/exl3_bench.ptx")?);
+    let ptx = Ptx::from_src(std::fs::read_to_string(crate::exl3_bench::bench_ptx_path())?);
     dev.load_ptx(ptx, "tpsw", &names)?;
     let f = |nm: &str| dev.get_func("tpsw", nm).ok_or_else(|| anyhow::anyhow!("{nm} missing"));
     let (kcl, k2d, k2s) = (f(names[0])?, f(names[1])?, f(names[2])?);
@@ -1140,7 +1140,7 @@ pub fn run_vp_gather_nway(a: DecWorldArgs) -> anyhow::Result<()> {
     let dev = CudaDevice::new(0)?;
     let kern = crate::tp_xport::Kernels::load(&dev, "tprb")?;
     let names = ["xq_vp_gather4_k1", "xq_vp_gather4_k2"];
-    let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/exl3_bench.ptx")?);
+    let ptx = Ptx::from_src(std::fs::read_to_string(crate::exl3_bench::bench_ptx_path())?);
     dev.load_ptx(ptx, "tpvg", &names)?;
     let f = |nm: &str| dev.get_func("tpvg", nm).ok_or_else(|| anyhow::anyhow!("{nm} missing"));
     let (k1, k2) = (f(names[0])?, f(names[1])?);

@@ -27,7 +27,7 @@ log lines you should expect, and the measured performance.
 
 The engine is **the binary + a `src/ptx/` directory of kernel artifacts**. The binary loads the PTX
 relative to its **current working directory**, so run it from a directory that contains both. The
-binary is ~27 MB; the PTX files total ~38 MB. Do not mismatch a binary with foreign PTX — the engine
+binary is ~28 MB; the PTX files total ~63 MB. Do not mismatch a binary with foreign PTX — the engine
 refuses to start on a build-id mismatch.
 
 On every machine (nodes included), the directory must look like this:
@@ -38,6 +38,7 @@ On every machine (nodes included), the directory must look like this:
 └── src
     └── ptx
         ├── exl3_bench.ptx
+        ├── exl3_bench_k6.ptx
         ├── fused_decode.ptx
         ├── gemm_nvfp4.ptx
         ├── gpu_batch.ptx
@@ -74,7 +75,8 @@ Qwen3.8-Flash-Next-EXL3-3.05bpw/
 ├── ...
 ├── ngram_embedding.safetensors          (32.6 GB — the n-gram table)
 ├── mtp_hyper_connection_mixer_patch.safetensors
-├── vision_tower_bf16.safetensors        (the vision tower — required for images)
+├── vision_tower_bf16.safetensors        (the original bf16 vision tower — used for images when present;
+│                                         the 5-bit tower inside the shards is the fallback)
 ├── quantization_config.json
 ├── chat_template.jinja
 ├── tokenizer.json, tokenizer_config.json, vocab.json, merges.txt
@@ -235,11 +237,26 @@ TP=4 against a single GB10: **×1.6** on this decode workload and **×2.0–2.2*
   until video support lands. Images are resized so the longer side is at most `--image-max-edge`
   (default 1024); the QSA indexer follows the image positions, so images work past 2,051 tokens.
 - **262,144 tokens is the maximum.** YaRN is not implemented, so there is no 1M context.
-- **Single-request only for now.** `--max-batch 1` is what was tested, and every number in §4
-  reflects it. A larger batch works and is hash-exact per lane, but the lanes take turns, so it does
-  not raise aggregate throughput. **Concurrency is not measured yet** — the tests (and the
-  optimization they will drive) come after the current round of path work, so treat multi-request
-  behaviour as unverified.
+- **Concurrency.** Every number in §4 is `--max-batch 1` (one request). `--max-batch N` serves N
+  requests at once (every lane's KV is allocated up front: about 5.6 GB per lane at the full 262,144-token
+  context with the default q8 KV cache, 2.8 GB at 131K). With one busy request the engine speculates
+  exactly as before. From about four busy requests (earlier on low-acceptance prose) it shares one batched
+  step across all of them (`--spec-lanes-max auto`, the default): on one node roughly ×1.45 aggregate at 8
+  requests and ×1.9 at 16, with TP=2 and TP=4 gaining proportionally (numbers in the CHANGELOG). **Two or
+  three concurrent requests still take turns** — the aggregate stays at the single-request rate — and a
+  packed multi-request verify for that range is in development. Each request's greedy output is
+  byte-identical to running it alone. `--spec-lanes-max N` shares the step only above N busy requests; `0`
+  keeps serial speculation.
+- **Memory and lane count.** The weights, the n-gram table and every lane's KV share the same unified
+  memory. `--ple-ram auto` (the default) keeps the n-gram table in RAM when it fits with 16 GiB to spare
+  after everything else is allocated, and otherwise reads it from SSD (identical output, decode ~1–4%
+  slower). If a configuration cannot fit even then, the server refuses to start **before loading** and
+  prints the arithmetic and the fix (`--ple-ram ssd`, a smaller `--max-batch` or `--max-seq-len`, or
+  `--tp 2`). Rule of thumb on one 128 GB Spark at `--max-seq-len 131072`: one lane with the table in RAM;
+  up to about 16 lanes with the table on SSD.
+- **Monitoring and binding.** `GET /metrics` serves Prometheus text format (requests, tokens, requests
+  running/waiting, time-to-first-token and decode-rate histograms, speculation, engine health).
+  `--host 127.0.0.1` binds the API to the local machine only (default: all interfaces).
 - **The TP=2/TP=4 nodes need no pack copy** — the head ships each rank's shard through the blob cache
   at `~/.cache/gb10_tp`. The cache is safe to delete; the next run re-syncs what is missing.
 - **Prefix caching changes wording, not correctness.** A cached turn is not bit-identical to a cold
@@ -254,3 +271,25 @@ TP=4 against a single GB10: **×1.6** on this decode workload and **×2.0–2.2*
   2048` restores the previous grid) and `--qsa-key-rope full` (the indexer's pooled keys carry their
   full rotary dimensions; `half` keeps the old bytes for A/B only). Both change long-context output
   bytes versus v0.7.0.
+
+---
+
+## 6. The 4.05 bpw pack
+
+A higher-fidelity pack — turboderp's `4.05bpw_h6_ng6`: 4-bit experts, 6-bit dense layers and head, a
+6-bit n-gram table — is at
+[doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw)
+(~108 GB; **needs v0.7.2 or newer**, which adds `src/ptx/exl3_bench_k6.ptx` to the deploy set — copy the
+whole `src/ptx/` directory as always). Download it like the 3.05 pack and use **the same launch commands**
+with `--model-dir` pointing at it.
+
+- **TP=1:** the weights (~68 GB) plus the 39 GB n-gram table do not fit one GB10 together, so the table
+  is read from SSD — `--ple-ram auto` chooses that by itself (you can force `--ple-ram ssd`).
+- **TP=2 / TP=4:** each node receives about 71 GiB / 57 GiB (the n-gram table goes to every rank); the
+  head ships it through the blob cache as for 3.05.
+- **Images** work at every topology; keep `vision_tower_bf16.safetensors` in the model directory (it is in
+  the Hugging Face repo) — without it the server runs text-only.
+- **Untuned smoke-test figures** (1,000 generated tokens, 2K prefill, single request): TP=1 63 tok/s decode
+  and 1,399 prefill; TP=2 89 and 2,612; TP=4 120 and 3,496. Decode is about 0.86× the 3.05 pack on one or
+  two nodes. VeloBenchmark figures will follow.
+

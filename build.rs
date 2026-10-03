@@ -69,6 +69,8 @@ fn main() {
         // --bench-exl3-gemm (mxfp4_bench precedent); NOT in the serving manifest.
         // sm_121: fp16 mma.m16n8k16 + dp4a are baseline CC 12.1.
         ("exl3_bench.cu", "exl3_bench.ptx", "sm_121"),
+        // CF-P1g (4.05 bpw): the same source with a `case 6` in every bit-width switch (see the file).
+        ("exl3_bench_k6.cu", "exl3_bench_k6.ptx", "sm_121"),
     ];
 
     for (src_name, _, _) in &kernels {

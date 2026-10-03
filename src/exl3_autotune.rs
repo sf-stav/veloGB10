@@ -3224,6 +3224,7 @@ fn tune_cli(args: &[String]) -> Result<bool> {
     // healthy box — the survivability floor is Linux MemAvailable, which counts that cache.
     let mem_after = cudarc::driver::result::mem_get_info().ok();
     let avail_after = crate::memwatch::mem_available_bytes();
+    model.ple_promote_auto()?; // the served residency (CF-P1d: auto decides after the load)
     let (ple_b, ple_mode) = (model.ple_ram_bytes(), model.ple_residency());
     let avail_s = match (avail_base, avail_after) {
         (Some(a0), Some(a1)) => format!("MemAvailable {:.0} -> {:.0} GiB", gib(a0), gib(a1)),

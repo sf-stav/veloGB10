@@ -1852,7 +1852,7 @@ pub fn identity_line(role: &str) -> String {
     let short = |h: String| h.chars().take(16).collect::<String>();
     format!("TP-IDENT role={role} host={} bin={} exl3_bench.ptx={} gpu_batch.ptx={} kernel_build_id={} source_build_id={}",
             std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
-            short(sha256_hex(&exe)), short(sha256_hex("src/ptx/exl3_bench.ptx")), short(sha256_hex("src/ptx/gpu_batch.ptx")),
+            short(sha256_hex(&exe)), short(sha256_hex(crate::exl3_bench::bench_ptx_path())), short(sha256_hex("src/ptx/gpu_batch.ptx")),
             env!("KERNEL_BUILD_ID"), env!("SOURCE_BUILD_ID"))
 }
 

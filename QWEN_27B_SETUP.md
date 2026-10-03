@@ -235,15 +235,15 @@ simultaneous requests you want to handle, e.g.:
   --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
 ```
 
-> The concurrency example deliberately leaves `--kv-cache` at its default: `k8v8` (used in the
-> single-request examples) is a **single-lane** format and the engine refuses it when
-> `--max-batch` is greater than 1.
+> The concurrency example leaves `--kv-cache` at its default. Since v0.7.2 `k8v8` (used in the
+> single-request examples) also works with `--max-batch` greater than 1 — earlier versions refused it.
 
 - `--max-batch N` is the max concurrent sequences (lanes) the server will run. With `N > 1` the
   scheduler batches the concurrent greedy lanes into a single verify forward, so you trade a little
   per-request latency for much higher aggregate throughput across clients.
-- With DFlash 2 the drafter runs per request; a larger batch packs those lanes together rather than
-  running them one at a time.
+- With DFlash 2 the drafter serves one request at a time: above one lane the requests run as a plain
+  batch (no per-request speculation), and a request that shared a batched step does not resume
+  speculating for the rest of that request.
 - Memory scales with the batch: the KV cache is allocated per-lane, so `--max-batch 8` costs roughly
   8× the KV memory of `--max-batch 1` at the same `--max-seq-len`.
 

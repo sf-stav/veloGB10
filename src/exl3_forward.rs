@@ -215,7 +215,7 @@ fn router_ks(k: i32, ne: i32) -> u32 {
 // 3-kernel path runs consistently (batch invariance never splits across paths).
 fn hc_fuse_co_residency(_dev: &Arc<CudaDevice>) -> u32 {
     use cudarc::driver::sys;
-    let Ok(ptx) = std::fs::read_to_string("src/ptx/exl3_bench.ptx") else { return 0; };
+    let Ok(ptx) = std::fs::read_to_string(crate::exl3_bench::bench_ptx_path()) else { return 0; };
     let Ok(ptx_c) = std::ffi::CString::new(ptx) else { return 0; };
     let mut module: sys::CUmodule = std::ptr::null_mut();
     let r = unsafe {
@@ -272,7 +272,7 @@ fn gdn_chunk_tc_fn(v2: bool) -> Option<cudarc::driver::sys::CUfunction> {
             Ok("0") => "xq_gdn_chunk_tc_s0", Ok("1") => "xq_gdn_chunk_tc_s1",
             Ok("3") => "xq_gdn_chunk_tc_s3", _ => if v2 { "xq_gdn_chunk_tc2" } else { "xq_gdn_chunk_tc" },
         };
-        let ptx = std::fs::read_to_string("src/ptx/exl3_bench.ptx").ok()?;
+        let ptx = std::fs::read_to_string(crate::exl3_bench::bench_ptx_path()).ok()?;
         let ptx_c = std::ffi::CString::new(ptx).ok()?;
         let mut module: sys::CUmodule = std::ptr::null_mut();
         let r = unsafe {
@@ -310,7 +310,7 @@ pub(crate) fn xq_raw_fn(name: &str) -> Option<cudarc::driver::sys::CUfunction> {
     static FNS: std::sync::Mutex<Vec<(String, FnH)>> = std::sync::Mutex::new(Vec::new());
     if let Some((_, f)) = FNS.lock().ok()?.iter().find(|(n, _)| n == name) { return Some(f.0); }
     let module = MODULE.get_or_init(|| {
-        let ptx = std::fs::read_to_string("src/ptx/exl3_bench.ptx").ok()?;
+        let ptx = std::fs::read_to_string(crate::exl3_bench::bench_ptx_path()).ok()?;
         let ptx_c = std::ffi::CString::new(ptx).ok()?;
         let mut m: sys::CUmodule = std::ptr::null_mut();
         let r = unsafe { sys::cuModuleLoadDataEx(&mut m, ptx_c.as_ptr() as *const std::ffi::c_void,
@@ -520,6 +520,9 @@ struct MoeLayer {
     sh_down: Quad,
     gu_words: u64,
     d_words: u64,
+    /// CF-P1g: the experts' trellis bit width K (3 = the 3.05 pack, 4 = the 4.05 pack). The WP20 / A-once fast paths are
+    /// K = 3 only so far; every other width runs the K-generic kernels (xq_gemm_grouped_xh, the pf entries).
+    bits: usize,
     /// TP-A: expert-parallel shard of this layer's ROUTED experts (None = all experts resident,
     /// the TP=1 layout and the replicated T1 MTP head). Sharding is a tensor property: the forward
     /// keys the EP route filter + partial combine + all-reduce off THIS field, never off `world`.
@@ -546,9 +549,15 @@ struct PleDev {
     // shard's data section read once at load. None = per-token pread through the page cache —
     // measured 0.35 ms/round host when the cache holds the working set, 2.0-2.7 ms when GPU
     // allocations crowd it out (262K window: 1% of the 30 GiB table resident).
-    ram: Option<Vec<Vec<u8>>>,
+    // CF-P1d: a OnceLock so `auto` can promote the table to RAM AFTER the boot has allocated every lane's KV,
+    // scratch, graphs and the vision tower (FwdModel::ple_promote_auto) — deciding at weight-load time,
+    // before any of that exists, let `--max-batch 8` at 131K exhaust the box (mem watchdog at boot).
+    ram: std::sync::OnceLock<Vec<Vec<u8>>>,
     shard_data_off: Vec<u64>,   // absolute byte offset of each shard's data section
     rows_per_shard: i64,
+    /// CF-P1g: group width K of the n-gram rows (5 = 3.05 pack, 6 = 4.05 pack) and the row size in bytes.
+    row_k: usize,
+    row_bytes: usize,
     head_offsets: Vec<i64>,     // [16]
     head_vocab_sizes: Vec<i64>, // [16]
     layer_multipliers: [i64; 3],
@@ -644,6 +653,59 @@ fn ple_decode_row_fast(raw: &[u8; 102], bias: &[f32], codebook: &[f32], out: &mu
         let st = g[i + 3] | (g[i + 2] << 5) | (g[i + 1] << 10) | ((g[i] & 1) << 15);
         let v = codebook[st as usize] * scale + bias[i];
         out[i] = half::f16::from_f32(v).to_bits();
+    }
+}
+
+/// CF-P1g (4.05 bpw): n-gram row geometry. A row is `10*K + 1` u16 words (f16 scale | 160 groups of K bits): K = 5 -> 102 B
+/// (the 3.05 pack), K = 6 -> 122 B (the 4.05 pack). `PLE_ROW_MAX` bounds every row buffer.
+pub(crate) const PLE_ROW_MAX: usize = 128;
+pub(crate) fn ple_row_bytes(k: usize) -> usize { (10 * k + 1) * 2 }
+
+/// K-generic per-bit reference decode (the formula of `ple_decode_row_ref` with the group width K): output i's 16-bit
+/// codebook index takes bit mm from group (i - mm / K) mod 160, bit mm % K. For K = 5 this IS `ple_decode_row_ref`.
+fn ple_decode_row_ref_k(raw: &[u8], k: usize, bias: &[u16], codebook: &[f32], out: &mut [u16]) {
+    let nw = 10 * k + 1;
+    let mut words = [0u16; 64];
+    for (w_i, c) in raw[..nw * 2].chunks_exact(2).enumerate() {
+        words[w_i] = u16::from_le_bytes([c[0], c[1]]);
+    }
+    let scale = half::f16::from_bits(words[0]).to_f32();
+    for i in 0..160usize {
+        let mut st: u32 = 0;
+        for mm in 0..16usize {
+            let src = ((i as i64 - (mm / k) as i64).rem_euclid(160) as usize) * k + mm % k;
+            let bit = (words[1 + src / 16] >> (src % 16)) & 1;
+            st |= (bit as u32) << mm;
+        }
+        let b = half::f16::from_bits(bias[i]).to_f32();
+        out[i] = half::f16::from_f32(codebook[st as usize] * scale + b).to_bits();
+    }
+}
+
+/// K-generic group decode (the structure of `ple_decode_row_fast`): cut the 160 K-bit groups once (8 per K-byte window),
+/// then each output is one codebook lookup over a 16-bit window of groups i, i-1, ... — bit-identical to the reference.
+fn ple_decode_row_fast_k(raw: &[u8], k: usize, bias: &[f32], codebook: &[f32], out: &mut [u16]) {
+    debug_assert!((1..=8).contains(&k));
+    let scale = half::f16::from_bits(u16::from_le_bytes([raw[0], raw[1]])).to_f32();
+    let mask = (1u64 << k) - 1;
+    let mut g = [0u32; 163];                 // g[3 + j] = group j; g[0..3] = groups 157..159 (the mod-160 wrap)
+    for blk in 0..20usize {
+        let o = 2 + k * blk;
+        let mut x = 0u64;
+        for b in 0..k { x |= (raw[o + b] as u64) << (8 * b); }
+        for t in 0..8usize { g[3 + 8 * blk + t] = ((x >> (k * t)) & mask) as u32; }
+    }
+    g[0] = g[160]; g[1] = g[161]; g[2] = g[162];
+    for i in 0..160usize {
+        let mut st = g[i + 3];
+        let (mut shift, mut j) = (k, 1usize);
+        while shift < 16 {
+            let take = k.min(16 - shift);
+            st |= (g[i + 3 - j] & ((1u32 << take) - 1)) << shift;
+            shift += take;
+            j += 1;
+        }
+        out[i] = half::f16::from_f32(codebook[st as usize] * scale + bias[i]).to_bits();
     }
 }
 
@@ -865,6 +927,12 @@ pub(crate) struct SpecPass {
     /// --spec-pass-xcheck: (position, device slot_ids[0], host snapshot of the rows) taken
     /// before the pass
     xsnap: Option<(usize, i32, Vec<u8>)>,
+    /// TP only: pass-graph keys the NORMAL (non-speculative) path has already run. Speculation is eligible only for
+    /// keys in this set. The set is a function of the lockstep round sequence, so it is identical on every rank;
+    /// the rank-local "is this graph captured" state is NOT (boot precapture stops at a per-rank memory cap, and graph
+    /// bytes differ per rank), which let one rank speculate a pass its peer did not: "TP pre-verify FAILED: ranks chose
+    /// different ... speculative head-pass launches" at --max-batch 16 (found 2026-10-03; the old build was fine at 8).
+    seen: std::collections::HashSet<usize>,
     dev: Arc<CudaDevice>,
 }
 // Raw CUevent handles; all use is on the owning scheduler thread through &mut self.
@@ -883,7 +951,7 @@ impl SpecPass {
         // never read before the save kernel writes it (alloc_zeros is async; content irrelevant)
         let save = dev.alloc_zeros::<u8>(save_bytes.max(16))?;
         Ok(Self { ev: [e0, e1], save, ema: vec![[1.0; MTP_MAX_K]; slots.max(1)],
-                  next_p: vec![usize::MAX; slots.max(1)], xsnap: None, dev: dev.clone() })
+                  next_p: vec![usize::MAX; slots.max(1)], xsnap: None, seen: Default::default(), dev: dev.clone() })
     }
     /// Record readback slot `s`'s event on the NULL stream (after its two dtoh copies).
     fn record(&self, s: usize) -> Result<()> {
@@ -1296,32 +1364,28 @@ fn prefill_cossin_host(theta: f32, rdim: usize, pos0: usize, c: usize) -> Vec<f3
     cossin
 }
 
-/// PLE table residency policy: [ple-ram] = on | off | auto (default auto; the server's
-/// --ple-ram sets it). auto loads the table into RAM when MemAvailable keeps >= 16 GiB free
-/// after it (the AGENTS §5 headroom rule), else stays on pread and SAYS so.
-fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64) -> Result<Option<Vec<Vec<u8>>>> {
-    use std::os::unix::fs::FileExt;
-    let mode = crate::opts::var(crate::opt!("ple-ram")).unwrap_or_else(|_| "auto".into());
-    let per = rows as usize * 102;
-    let need = per as u64 * shards.len() as u64;
-    let avail_kb: u64 = std::fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:"))
-            .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()))
-        .unwrap_or(0);
-    let avail = avail_kb * 1024;
-    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-    let go = match mode.as_str() {
-        "on" => true,
-        "off" => false,
-        _ => avail >= need + (16u64 << 30),
-    };
-    if !go {
-        println!("  PLE n-gram table: pread through the page cache ([ple-ram]={mode}; table {:.1} GiB, MemAvailable {:.1} GiB{})",
-                 gib(need), gib(avail),
-                 if mode == "auto" { " — auto needs table + 16 GiB free; expect ~2 ms/round host PLE if the cache is crowded" } else { "" });
-        return Ok(None);
+/// The n-gram table location: `--ple-ram ram|ssd|auto` (`on`/`off` are the older spellings of ram/ssd).
+fn ple_mode() -> &'static str {
+    match crate::opts::var(crate::opt!("ple-ram")).as_deref().map(str::trim) {
+        Ok("on") | Ok("ram") => "ram",
+        Ok("off") | Ok("ssd") => "ssd",
+        _ => "auto",
     }
-    let t0 = std::time::Instant::now();
+}
+
+fn mem_available_bytes() -> u64 {
+    std::fs::read_to_string("/proc/meminfo").ok()
+        .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:"))
+            .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()))
+        .unwrap_or(0) * 1024
+}
+
+/// Headroom `auto` keeps free after a RAM-resident table (the AGENTS §5 rule).
+const PLE_AUTO_HEADROOM: u64 = 16 << 30;
+
+/// Read every shard's data section into host memory (8 threads).
+fn ple_read_table(shards: &[std::fs::File], data_off: &[u64], per: usize) -> Result<Vec<Vec<u8>>> {
+    use std::os::unix::fs::FileExt;
     let n = shards.len();
     let mut out: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
     let chunks: Vec<(usize, &mut Vec<u8>)> = out.iter_mut().enumerate().collect();
@@ -1340,9 +1404,35 @@ fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64) -> Result
         hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("ple ram thread panicked")))).collect()
     });
     for r in res { r?; }
-    println!("  PLE n-gram table RAM-resident: {:.1} GiB in {:.1}s ([ple-ram]={mode}; MemAvailable was {:.1} GiB)",
-             gib(need), t0.elapsed().as_secs_f32(), gib(avail));
-    Ok(Some(out))
+    Ok(out)
+}
+
+/// PLE n-gram table location at weight-load time. `ram`: read into host memory now. `ssd`: per-token pread
+/// through the page cache (identical bytes; ~1-2% decode, a few % prefill). `auto` (default): start on ssd and let
+/// `FwdModel::ple_promote_auto` decide once the whole boot has allocated (CF-P1d).
+fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64, row_bytes: usize) -> Result<Option<Vec<Vec<u8>>>> {
+    let mode = ple_mode();
+    let per = rows as usize * row_bytes;
+    let need = per as u64 * shards.len() as u64;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    match mode {
+        "ssd" => {
+            println!("  PLE n-gram table: on SSD, read through the page cache (--ple-ram ssd; table {:.1} GiB stays out of RAM)", gib(need));
+            Ok(None)
+        }
+        "auto" => {
+            println!("  PLE n-gram table: on SSD until the boot has allocated everything else; then RAM iff table {:.1} GiB + 16 GiB stay free (--ple-ram auto)", gib(need));
+            Ok(None)
+        }
+        _ => {
+            let avail = mem_available_bytes();
+            let t0 = std::time::Instant::now();
+            let out = ple_read_table(shards, data_off, per)?;
+            println!("  PLE n-gram table RAM-resident: {:.1} GiB in {:.1}s (--ple-ram ram; MemAvailable was {:.1} GiB)",
+                     gib(need), t0.elapsed().as_secs_f32(), gib(avail));
+            Ok(Some(out))
+        }
+    }
 }
 
 impl PleDev {
@@ -1388,26 +1478,53 @@ impl PleDev {
             return self.embed_row_ref(uids, out);
         }
         assert_eq!(out.len(), 2560);
-        let mut raw = [0u8; 102];
+        let mut raw = [0u8; PLE_ROW_MAX];
         for (hh, &uid) in uids.iter().enumerate() {
             self.fetch_row(uid, &mut raw)?;
-            ple_decode_row_fast(&raw, &self.head_bias_f32[hh * 160..(hh + 1) * 160], &self.codebook,
-                                &mut out[hh * 160..(hh + 1) * 160]);
+            let (bias, o) = (&self.head_bias_f32[hh * 160..(hh + 1) * 160], &mut out[hh * 160..(hh + 1) * 160]);
+            if self.row_k == 5 {
+                ple_decode_row_fast(<&[u8; 102]>::try_from(&raw[..102]).unwrap(), bias, &self.codebook, o);
+            } else {
+                ple_decode_row_fast_k(&raw, self.row_k, bias, &self.codebook, o);
+            }
         }
         Ok(())
     }
 
+    /// CF-P1g oracle (--exl3-ple-dump): the production-path embeddings (ngram_uids + the threaded `rows_par` fetch/decode)
+    /// of 1,536 deterministic token positions, 1/29 of the tokens eos (segmentation), for scripts/ple_oracle.py.
+    /// File: "PLEO", n, row_k, eos (u32 each); tokens (n+2) i32; row ids n*16 i64; values n*2560 u16 (fp16 bits).
+    fn dump_oracle(&self, path: &str) -> Result<()> {
+        use std::io::Write;
+        let n = 1536usize;
+        let mut s = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let toks: Vec<i32> = (0..n + 2).map(|_| { let r = next(); if r % 29 == 0 { self.eos as i32 } else { ((r >> 8) % 248_320) as i32 } }).collect();
+        let h3s: Vec<[i32; 3]> = (2..n + 2).map(|t| [toks[t - 2], toks[t - 1], toks[t]]).collect();
+        let mut out = vec![0u16; n * 2560];
+        self.rows_par(&h3s, &mut out, false)?;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path).with_context(|| format!("--exl3-ple-dump {path}"))?);
+        f.write_all(b"PLEO")?;
+        for v in [n as u32, self.row_k as u32, self.eos as u32] { f.write_all(&v.to_le_bytes())?; }
+        for t in &toks { f.write_all(&t.to_le_bytes())?; }
+        for h in &h3s { for u in self.ngram_uids(h) { f.write_all(&u.to_le_bytes())?; } }
+        for v in &out { f.write_all(&v.to_le_bytes())?; }
+        f.flush()?;
+        Ok(())
+    }
+
     /// One 102-byte trellis row (RAM table or pread) — the pre-WP05 fetch, unchanged.
-    fn fetch_row(&self, uid: i64, raw: &mut [u8; 102]) -> Result<()> {
+    fn fetch_row(&self, uid: i64, raw: &mut [u8; PLE_ROW_MAX]) -> Result<()> {
         use std::os::unix::fs::FileExt;
+        let rb = self.row_bytes;
         let shard = (uid / self.rows_per_shard) as usize;
         let local = (uid - shard as i64 * self.rows_per_shard) as u64;
-        if let Some(ram) = self.ram.as_ref() {
-            let o = (local * 102) as usize;
-            raw.copy_from_slice(&ram[shard][o..o + 102]);
+        if let Some(ram) = self.ram.get() {
+            let o = (local * rb as u64) as usize;
+            raw[..rb].copy_from_slice(&ram[shard][o..o + rb]);
         } else {
-            let off = self.shard_data_off[shard] + local * 51 * 2;
-            self.shards[shard].read_exact_at(raw, off)
+            let off = self.shard_data_off[shard] + local * rb as u64;
+            self.shards[shard].read_exact_at(&mut raw[..rb], off)
                 .with_context(|| format!("ple read shard {shard} row {uid}"))?;
         }
         Ok(())
@@ -1446,11 +1563,15 @@ impl PleDev {
     /// and ple_decode_row_ref is the old inner loop verbatim.
     fn embed_row_ref(&self, uids: &[i64; 16], out: &mut [u16]) -> Result<()> {
         assert_eq!(out.len(), 2560);
-        let mut raw = [0u8; 102];
+        let mut raw = [0u8; PLE_ROW_MAX];
         for (hh, &uid) in uids.iter().enumerate() {
             self.fetch_row(uid, &mut raw)?;
-            ple_decode_row_ref(&raw, &self.head_bias_bits[hh * 160..(hh + 1) * 160], &self.codebook,
-                               &mut out[hh * 160..(hh + 1) * 160]);
+            let (bias, o) = (&self.head_bias_bits[hh * 160..(hh + 1) * 160], &mut out[hh * 160..(hh + 1) * 160]);
+            if self.row_k == 5 {
+                ple_decode_row_ref(<&[u8; 102]>::try_from(&raw[..102]).unwrap(), bias, &self.codebook, o);
+            } else {
+                ple_decode_row_ref_k(&raw, self.row_k, bias, &self.codebook, o);
+            }
         }
         Ok(())
     }
@@ -1487,6 +1608,46 @@ mod wp05_tests {
             }
         }
         assert_eq!(bad, 0, "ple_decode_row_fast differs from the reference on {bad} non-NaN outputs");
+    }
+}
+
+#[cfg(test)]
+mod ple_k_tests {
+    use super::*;
+
+    /// CF-P1g: the K-generic decoders. K = 5 must reproduce the existing 102-byte reference/fast decoders exactly, and
+    /// the K = 6 group decode must equal the K = 6 per-bit reference on every non-NaN output.
+    #[test]
+    fn ple_decode_k_generic_matches() {
+        let cb = PleDev::mul1_codebook();
+        let mut s = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let isnan = |b: u16| (b & 0x7c00) == 0x7c00 && (b & 0x03ff) != 0;
+        let (mut bb, mut bf) = ([0u16; 160], [0f32; 160]);
+        for k in [5usize, 6] {
+            let rb = ple_row_bytes(k);
+            assert_eq!(rb, if k == 5 { 102 } else { 122 });
+            let mut raw = [0u8; PLE_ROW_MAX];
+            let (mut o1, mut o2, mut o3) = ([0u16; 160], [0u16; 160], [0u16; 160]);
+            let mut bad = 0usize;
+            for r in 0..6_000usize {
+                for b in raw[..rb].iter_mut() { *b = next() as u8; }
+                let sc: u16 = match r % 8 { 0 => next() as u16, 1 => next() as u16 & 0x03ff, _ => 0x2000 | (next() as u16 & 0x0fff) };
+                raw[0] = sc as u8; raw[1] = (sc >> 8) as u8;
+                for i in 0..160 {
+                    bb[i] = if r % 5 == 0 { next() as u16 } else { 0x1000 | (next() as u16 & 0x8fff) };
+                    bf[i] = half::f16::from_bits(bb[i]).to_f32();
+                }
+                ple_decode_row_ref_k(&raw, k, &bb, &cb, &mut o1);
+                ple_decode_row_fast_k(&raw, k, &bf, &cb, &mut o2);
+                if k == 5 {
+                    ple_decode_row_ref(<&[u8; 102]>::try_from(&raw[..102]).unwrap(), &bb, &cb, &mut o3);
+                    for i in 0..160 { if o1[i] != o3[i] && !(isnan(o1[i]) && isnan(o3[i])) { bad += 1; } }
+                }
+                for i in 0..160 { if o1[i] != o2[i] && !(isnan(o1[i]) && isnan(o2[i])) { bad += 1; } }
+            }
+            assert_eq!(bad, 0, "K={k}: generic ple decoders disagree on {bad} non-NaN outputs");
+        }
     }
 }
 
@@ -1643,6 +1804,8 @@ pub struct FwdModel {
     // decode/verify MoE call, [layers][2][ne] (live-per-call, row picks); dumped as JSON to <path>
     // by the scheduler at every request finish (cumulative). Off by default (no launch, no buffer).
     expert_hist: Option<(CudaSlice<i32>, String)>,
+    /// CF-P1e step 0 diagnostic (--exl3-route-log): (record ring, counter, dir, file sequence).
+    route_log: Option<(CudaSlice<i32>, CudaSlice<u32>, String, std::sync::atomic::AtomicUsize)>,
     // S-A3-r diagnostic (--qsa-dump-layer=k): selection lists + block scores of QSA layer k,
     // decode ([sel_max] + [nblk]) and prefill (all chunk rows), copied after each top-k.
     qsa_dbg: Option<(usize, CudaSlice<i32>, CudaSlice<f32>, CudaSlice<i32>, CudaSlice<f32>)>,
@@ -3784,12 +3947,31 @@ pub(crate) const T_CHAIN_PAIR: tune::TunableDef = tune::TunableDef {
     env: "--exl3-chain-pair", env_parse: || tune::env_on_unless_0(crate::opt!("exl3-chain-pair")), rev: 1, wp: "S-A3-o",
 };
 
+/// CF-P1e (16-row class): a 10..16-row gate/up (K = hidden) whose A-once smem exceeds the 48 KiB static cap is
+/// staged in K-chunks by the `xq_moe_gu_epi_c<N>` entries (bit-identical to `xq_moe_gu_epi`: same mainloop order).
+/// Returns (entry, dynamic smem bytes) for the epilogue path, or None (rows <= 9 keep the existing entry; `--exl3-gu-kch 0`
+/// or an unsupported shape keeps the legacy barrier body at those widths, as before).
+pub(crate) fn gu_chunk(m: usize, k: usize, diet: bool, bits: usize) -> Option<(&'static str, u32)> {
+    if !diet || m < 10 || m > 16 || a1_smem(m, k) > 0 || tune::get_cur(&T_MOE_A1B3) == 0 { return None; }
+    let kch = crate::opts::var(crate::opt!("exl3-gu-kch")).ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2);
+    let name = match (bits, kch) {
+        (3, 2) => "xq_moe_gu_epi_c2", (3, 4) => "xq_moe_gu_epi_c4",
+        (4, 2) => "xq_moe_gu_epi_b4_c2", (4, 4) => "xq_moe_gu_epi_b4_c4",
+        _ => return None,
+    };
+    if k % (kch * 16) != 0 { return None; }
+    let smem = m * (k / kch + 8) * 2;
+    if smem > 48 * 1024 { return None; }
+    Some((name, smem as u32))
+}
+
 /// S-A3-o O3: the grouped expert entry. The A-once 3-bit body runs in its own kernel
 /// (`xq_gemm_grouped_a1b3`, 3 CTAs/SM) — bitwise identical to xq_gemm_grouped_xh, which
 /// keeps every other (m, K, bits). --exl3-a1b3=0 = A/B diagnostic (old entry).
 fn grouped_fn(m: usize, k: usize, bits: usize) -> &'static str {
     let off = tune::get_cur(&T_MOE_A1B3) == 0;
-    if !off && bits == 3 && a1_smem(m, k) > 0 { "xq_gemm_grouped_a1b3" } else { "xq_gemm_grouped_xh" }
+    if off || a1_smem(m, k) == 0 { return "xq_gemm_grouped_xh"; }
+    match bits { 3 => "xq_gemm_grouped_a1b3", 4 => "xq_gemm_grouped_a1b4", _ => "xq_gemm_grouped_xh" }
 }
 
 /// A5 WP20 (PLAN/SURPASS_PLAN_2026-09-26.md): 0 = off (--wp20-off=1 — the pre-WP20 expert
@@ -3885,7 +4067,11 @@ fn wp20_log_once(key: (u8, usize, usize), msg: impl FnOnce() -> String) {
 /// Logs which body each (m, K) actually runs, and why not when the twin cannot apply.
 fn wp20_grouped(name: &'static str, rung1: bool, m: usize, k: usize) -> &'static str {
     if !rung1 { return name; }
-    if name == "xq_gemm_grouped_a1b3" {
+    if name == "xq_gemm_grouped_a1b4" {
+        wp20_log_once((3, m, k), || format!(
+            "WP20 rung 1 ACTIVE m={m} K={k}: xq_gemm_grouped_a1b4_wd (4-bit word diet) in the pre-WP20 launch sequence"));
+        "xq_gemm_grouped_a1b4_wd"
+    } else if name == "xq_gemm_grouped_a1b3" {
         wp20_log_once((3, m, k), || format!(
             "WP20 rung 1 ACTIVE m={m} K={k}: xq_gemm_grouped_a1b3_wd (word diet: 2 ring words/lane/k16 step, no SHFL) \
              in the pre-WP20 launch sequence"));
@@ -5741,6 +5927,17 @@ impl FwdModel {
                 plain.entry(k).or_insert(v);
             }
         }
+        // CF-P1g: the n-gram sidecar by name (the 4.05 pack's index lists neither its trellis nor its aux tensors; the
+        // 3.05 index lists them, so `or_insert` keeps those entries as they are).
+        {
+            let ng = format!("{}/ngram_embedding.safetensors", pack_dir.trim_end_matches('/'));
+            if std::path::Path::new(&ng).is_file() {
+                for (k, mut v) in read_hdr(&ng)? {
+                    v.shard = "ngram_embedding.safetensors".to_string();
+                    plain.entry(k).or_insert(v);
+                }
+            }
+        }
         let modules: BTreeMap<&str, &ModuleMeta> =
             pack.modules.iter().map(|m| (m.name.as_str(), m)).collect();
 
@@ -5876,6 +6073,7 @@ impl FwdModel {
             };
             let mut gu_words = 0u64;
             let mut d_words = 0u64;
+            let mut ebits = 0usize;
             let mut gu_tr_h: Vec<u16> = Vec::new();
             let mut d_tr_h: Vec<u16> = Vec::new();
             let mut suh_gu_h: Vec<u16> = Vec::with_capacity(ne * 2560);
@@ -5926,6 +6124,8 @@ impl FwdModel {
                 svh_d_h.extend(le_f16_bits(&d.svh.read_bytes(pack_dir)?));
                 gu_words = (kb * gnb * 2 * gw) as u64;
                 d_words = ((d.k / 16) * (d.n / 16) * 16 * d.bits) as u64;
+                if ebits != 0 && (ebits != g.bits || ebits != d.bits) { bail!("expert bit widths differ within a layer @{tag} e{e}"); }
+                ebits = g.bits;
             }
             Ok(MoeLayer {
                 router: get_plain_f16(&format!("{p}.gate.weight"))?,
@@ -5948,6 +6148,7 @@ impl FwdModel {
                                           None => get_quad(&format!("{p}.shared_expert.down_proj"))? },
                 gu_words,
                 d_words,
+                bits: ebits,
                 li,
                 ep: match ep_rank {
                     Some((r, w)) => {
@@ -6353,7 +6554,32 @@ impl FwdModel {
                     let mut shards = Vec::new();
                     let mut shard_data_off = Vec::new();
                     let mut rows_per_shard = 0i64;
-                    for snum in 0..128usize {
+                    let mut row_words = 51usize;
+                    // CF-P1g: ONE trellis tensor [rows, 10K+1] (4.05 pack) = the 128 shards concatenated: modelled as 128
+                    // virtual shards of the one file, so everything downstream (RAM/SSD placement, row fetch) is unchanged.
+                    let single_name = format!("{PLE_KEY}.ple_embedding.ngram_embedding.trellis");
+                    let single_loaded = if let Some(t) = plain.get(&single_name) {
+                        let fpath = format!("{}/{}", pack_dir.trim_end_matches('/'), t.shard);
+                        let mut f = std::fs::File::open(&fpath).with_context(|| format!("ple open {fpath}"))?;
+                        let mut lb = [0u8; 8];
+                        f.read_exact(&mut lb)?;
+                        let mut hb = vec![0u8; u64::from_le_bytes(lb) as usize];
+                        f.read_exact(&mut hb)?;
+                        let hdr: serde_json::Value = serde_json::from_slice(&hb)?;
+                        let shape: Vec<i64> = hdr[single_name.as_str()]["shape"].as_array().context("ple trellis shape")?
+                            .iter().map(|v| v.as_i64().unwrap_or(0)).collect();
+                        anyhow::ensure!(shape.len() == 2 && (shape[1] - 1) % 10 == 0 && matches!((shape[1] - 1) / 10, 5 | 6),
+                                        "ple trellis shape {shape:?}: rows must be 10*K+1 words with K = 5 or 6");
+                        anyhow::ensure!(shape[0] % 128 == 0, "ple trellis rows {} not a multiple of 128", shape[0]);
+                        row_words = shape[1] as usize;
+                        rows_per_shard = shape[0] / 128;
+                        for vs in 0..128i64 {
+                            shard_data_off.push(t.offset as u64 + (vs * rows_per_shard) as u64 * row_words as u64 * 2);
+                            shards.push(f.try_clone()?);
+                        }
+                        true
+                    } else { false };
+                    for snum in 0..(if single_loaded { 0usize } else { 128usize }) {
                         let name = format!("{PLE_KEY}.ple_embedding.ngram_embedding.shard_{snum}.trellis");
                         let fname = wmap.get(&name).and_then(|v| v.as_str())
                             .with_context(|| format!("ple shard {snum} not in index"))?.to_string();
@@ -6371,13 +6597,16 @@ impl FwdModel {
                         if snum == 0 {
                             rows_per_shard = shape[0];
                             anyhow::ensure!(shape[1] == 51, "ple shard row width");
+                            row_words = 51;
                         }
                         let off0 = ent["data_offsets"][0].as_u64().context("ple shard offset")?;
                         shard_data_off.push(8 + hlen as u64 + off0);
                         shards.push(f);
                     }
-                    let ram = ple_ram_load(&shards, &shard_data_off, rows_per_shard)?;
-                    Some(PleDev {
+                    let ram = std::sync::OnceLock::new();
+                    let row_bytes = row_words * 2;
+                    if let Some(t) = ple_ram_load(&shards, &shard_data_off, rows_per_shard, row_bytes)? { let _ = ram.set(t); }
+                    let pd = PleDev {
                         key_w,
                         value_w,
                         key_km,
@@ -6390,6 +6619,8 @@ impl FwdModel {
                         ram,
                         shard_data_off,
                         rows_per_shard,
+                        row_k: (row_words - 1) / 10,
+                        row_bytes,
                         head_offsets,
                         head_vocab_sizes,
                         layer_multipliers: [lm[0], lm[1], lm[2]],
@@ -6397,7 +6628,13 @@ impl FwdModel {
                         head_bias_bits,
                         codebook: PleDev::mul1_codebook(),
                         eos: 248046,
-                    })
+                    };
+                    if let Ok(path) = crate::opts::var(crate::opt!("exl3-ple-dump")) {
+                        pd.dump_oracle(&path)?;
+                        println!("[exl3] --exl3-ple-dump: wrote {path}; exiting");
+                        std::process::exit(0);
+                    }
+                    Some(pd)
                 }
             }
         };
@@ -6589,6 +6826,15 @@ impl FwdModel {
         let esel_hist = if crate::opts::var(crate::opt!("exl3-esel-hist")).is_ok() {
             Some(dev.htod_sync_copy(&vec![0i32; 17 * ESEL_HIST_W])?)
         } else { None };
+        let route_log = match crate::opts::var(crate::opt!("exl3-route-log")) {
+            Ok(dir) if !dir.is_empty() && dir != "0" => {
+                std::fs::create_dir_all(&dir).with_context(|| format!("--exl3-route-log {dir}"))?;
+                println!("[exl3] --exl3-route-log diagnostic: per-call expert ids -> {dir}/route_NNNN.bin (one file per request)");
+                Some((dev.alloc_zeros::<i32>(ROUTE_LOG_CAP * ROUTE_REC)?, dev.htod_sync_copy(&[0u32])?, dir,
+                      std::sync::atomic::AtomicUsize::new(0)))
+            }
+            _ => None,
+        };
         let expert_hist = match crate::opts::var(crate::opt!("tp-ep-hist")) {
             Ok(path) if !path.is_empty() && path != "0" => {
                 println!("[exl3] --tp-ep-hist diagnostic: per-(layer, expert) routing histogram -> {path} (cumulative, at every request finish)");
@@ -6841,6 +7087,7 @@ impl FwdModel {
             rc_lut,
             esel_hist,
             expert_hist,
+            route_log,
             qsa_dbg,
             qsa_rowdbg,
             tp: tp_state,
@@ -7836,6 +8083,11 @@ impl FwdModel {
             let p = *hb.device_ptr() as u64 + (moe.li * 2 * ne * 4) as u64;
             xqlaunch_raw!(l, "xq_expert_hist", (1u32, 1, 1), (256, 1, 1), 0, (&sc.ids, m as i32, topk as i32, ne as i32, p))?;
         }
+        if let Some((buf, ctr, _, _)) = self.route_log.as_ref().filter(|_| m <= 16) {
+            let (pb, pc) = (*buf.device_ptr() as u64, *ctr.device_ptr() as u64);
+            xqlaunch_raw!(l, "xq_route_log", (1u32, 1, 1), (256, 1, 1), 0,
+                          (&sc.ids, m as i32, topk as i32, moe.li as i32, pb, ROUTE_LOG_CAP as i32, pc))?;
+        }
         let emax = sc.idxmap.len() as i32; // w*topk — the padded per-step expert cap
         // A5 WP20: expert word diet + MoE glue as last-arrival epilogues (default on, bitwise):
         // xq_had_suh_multi -> xq_moe_gu_epi -> shared expert -> xq_moe_dn_epi_k<topk>. The code
@@ -7846,7 +8098,7 @@ impl FwdModel {
         // wherever the a1b3 entry does, except on the xcheck's reference pass.
         // --exl3-moe-epi-check=1 runs the old path first (no diet: the true pre-WP20
         // reference), then the WP20 path, and diffs xhd / yd / moe_out bitwise (eager passes).
-        let (wp20, rung1_sel) = self.wp20_select(l, sc, m, emax as usize, moe_coop);
+        let (wp20, rung1_sel) = self.wp20_select(l, sc, m, emax as usize, moe_coop, moe.bits);
         let wp20_chk = wp20.is_some() && wp20_check_on() && !stream_capturing(l);
         if let Some(sel) = wp20 {
             if !wp20_chk { return self.moe_wp20(l, sc, moe, m, emax, sel, &mut wp27); }
@@ -7857,7 +8109,7 @@ impl FwdModel {
         let rung1 = rung1_sel && !wp20_chk;
         // Fused per-expert Hadamards (A5 D3 experts, bitwise): suh + a1b3 + svh in ONE launch per GEMM.
         let fh = !moe_coop && moe_fh_on()
-            && grouped_fn(m, 2560, 3) == "xq_gemm_grouped_a1b3" && grouped_fn(m, mi, 3) == "xq_gemm_grouped_a1b3"
+            && grouped_fn(m, 2560, moe.bits) == "xq_gemm_grouped_a1b3" && grouped_fn(m, mi, moe.bits) == "xq_gemm_grouped_a1b3"
             && 2560 % 128 == 0 && mi % 128 == 0 && (mi * 2) % 128 == 0 && h % 128 == 0;
         if fh {
             xqlaunch!(l, "xq_gemm_grouped_a1b3_fh", ((emax * ((mi * 2) as i32 / 128)) as u32, 1, 1), (256, 1, 1), a1_smem(m, 2560),
@@ -7873,10 +8125,10 @@ impl FwdModel {
                  (&sc.x, &moe.suh_gu, &sc.idxmap, &mut sc.xh_e, m as i32, 2560i32, &sc.esel, 0i32))?;
         if moe_coop {
             xqlaunch!(l, "xq_moe_coop_a", ((emax * (((mi * 2) as i32) / 32)) as u32, 1, 1), (256, 1, 1), 0,
-                     (&moe.gu_tr, &sc.offs_gu, &sc.xh_e, &mut sc.ygu_raw, m as i32, 2560i32, (mi * 2) as i32, 3i32, &sc.esel))?;
+                     (&moe.gu_tr, &sc.offs_gu, &sc.xh_e, &mut sc.ygu_raw, m as i32, 2560i32, (mi * 2) as i32, moe.bits as i32, &sc.esel))?;
         } else {
-            xqlaunch!(l, wp20_grouped(grouped_fn(m, 2560, 3), rung1, m, 2560), ((emax * 10) as u32, 1, 1), (256, 1, 1), a1_smem(m, 2560),
-                     (&moe.gu_tr, &sc.offs_gu, &sc.xh_e, &mut sc.ygu_raw, m as i32, 2560i32, (mi * 2) as i32, 3i32, &sc.esel))?;
+            xqlaunch!(l, wp20_grouped(grouped_fn(m, 2560, moe.bits), rung1, m, 2560), ((emax * 10) as u32, 1, 1), (256, 1, 1), a1_smem(m, 2560),
+                     (&moe.gu_tr, &sc.offs_gu, &sc.xh_e, &mut sc.ygu_raw, m as i32, 2560i32, (mi * 2) as i32, moe.bits as i32, &sc.esel))?;
         }
         xqlaunch!(l, "xq_had_svh_multi", ((emax * m as i32 * 10) as u32, 1, 1), (32, 1, 1), 0,
                  (&sc.ygu_raw, &moe.svh_gu, &sc.idxmap, &mut sc.ygu, m as i32, (mi * 2) as i32, &sc.esel))?;
@@ -7886,10 +8138,10 @@ impl FwdModel {
                  (&sc.din, &moe.suh_d, &sc.idxmap, &mut sc.xhd, m as i32, mi as i32, &sc.esel, 1i32))?;
         if moe_coop {
             xqlaunch!(l, "xq_moe_coop_b", ((emax * (h as i32 / 32)) as u32, 1, 1), (256, 1, 1), 0,
-                     (&moe.d_tr, &sc.offs_d, &sc.xhd, &mut sc.yd_raw, m as i32, mi as i32, h as i32, 3i32, &sc.esel))?;
+                     (&moe.d_tr, &sc.offs_d, &sc.xhd, &mut sc.yd_raw, m as i32, mi as i32, h as i32, moe.bits as i32, &sc.esel))?;
         } else {
-            xqlaunch!(l, wp20_grouped(grouped_fn(m, mi, 3), rung1, m, mi), ((emax * (h as i32 / 128)) as u32, 1, 1), (256, 1, 1), a1_smem(m, mi as usize),
-                     (&moe.d_tr, &sc.offs_d, &sc.xhd, &mut sc.yd_raw, m as i32, mi as i32, h as i32, 3i32, &sc.esel))?;
+            xqlaunch!(l, wp20_grouped(grouped_fn(m, mi, moe.bits), rung1, m, mi), ((emax * (h as i32 / 128)) as u32, 1, 1), (256, 1, 1), a1_smem(m, mi as usize),
+                     (&moe.d_tr, &sc.offs_d, &sc.xhd, &mut sc.yd_raw, m as i32, mi as i32, h as i32, moe.bits as i32, &sc.esel))?;
         }
         xqlaunch!(l, "xq_had_svh_multi", ((emax * m as i32 * (h as i32 / 128)) as u32, 1, 1), (32, 1, 1), 0,
                  (&sc.yd_raw, &moe.svh_d, &sc.idxmap, &mut sc.yd, m as i32, h as i32, &sc.esel))?;
@@ -7924,7 +8176,14 @@ impl FwdModel {
     /// it eagerly; a capture never verifies). EVERY outcome is logged once per (width, reason):
     /// "WP20 ACTIVE m=.." or "WP20 FALLBACK m=..: <reason>" — the package can never be silently
     /// inert again (v1 was, for the whole top-10 model).
-    fn wp20_select(&self, l: &Launcher, sc: &Scratch, m: usize, emax: usize, moe_coop: bool) -> (Option<Wp20Sel>, bool) {
+    fn wp20_select(&self, l: &Launcher, sc: &Scratch, m: usize, emax: usize, moe_coop: bool, bits: usize) -> (Option<Wp20Sel>, bool) {
+        if bits != 3 && bits != 4 {
+            // CF-P1g: the WP20 rung-1/2 kernels (word diet + MoE epilogues) are instantiated for K = 3 (3.05 pack) and
+            // K = 4 (4.05 pack, diet + top-10 only); any other width runs the K-generic chain (never a silent mis-decode).
+            wp20_log_once((11, bits, 0), || format!("WP20 OFF for {bits}-bit experts: the epilogue kernels exist for K = 3 / 4 only — \
+                                                    running the K-generic grouped chain (xq_gemm_grouped_xh)"));
+            return (None, false);
+        }
         let mode = wp20_mode();
         let diet = wp20_diet_on();
         if mode == 0 {
@@ -7945,9 +8204,18 @@ impl FwdModel {
             return (None, diet);
         }
         let (h, mi, topk) = (self.cfg.hidden_size, self.cfg.moe_intermediate_size, self.cfg.num_experts_per_tok);
-        let gu = wp20_gu_fn(diet);
-        let dn = wp20_dn_fn(topk, diet);
-        let (sgu, sdn) = (a1_smem(m, h) as usize, a1_smem(m, mi) as usize);
+        let (gu, dn) = if bits == 3 {
+            (wp20_gu_fn(diet), wp20_dn_fn(topk, diet))
+        } else {
+            // K = 4: the diet entries only (no SHFL twin), top-10 only
+            ("xq_moe_gu_epi_b4", if diet && topk == 10 { Some("xq_moe_dn_epi_b4_k10") } else { None })
+        };
+        let a1n = if bits == 3 { "xq_gemm_grouped_a1b3" } else { "xq_gemm_grouped_a1b4" };
+        // CF-P1e: 10..16 rows take the K-chunked gate/up entry (smem from the chunk plan, not the A-once cap)
+        let a1_ok = grouped_fn(m, h, bits) == a1n;
+        let chunk = if a1_ok { None } else { gu_chunk(m, h, diet, bits) };
+        let gu = chunk.map_or(gu, |c| c.0);
+        let (sgu, sdn) = (chunk.map_or(a1_smem(m, h), |c| c.1) as usize, a1_smem(m, mi) as usize);
         let (need_gu, need_dn) = ((m * 256).max(4096), m * 256 + m * topk * 8);
         let why: Option<(usize, String)> = if let Some(p) = preempt {
             Some((1, p.to_string()))
@@ -7955,10 +8223,10 @@ impl FwdModel {
             Some((2, format!("top-k {topk} has no down-epilogue instance (compiled: {WP20_TOPKS:?})")))
         } else if m == 0 || h % 128 != 0 || mi % 128 != 0 {
             Some((3, format!("shape m={m} hidden={h} moe_intermediate={mi} (need m >= 1, both multiples of 128)")))
-        } else if grouped_fn(m, h, 3) != "xq_gemm_grouped_a1b3" {
+        } else if !a1_ok && chunk.is_none() {
             Some((4, format!("gate/up GEMM (K={h}) is off the a1b3 entry at this width: A-once smem m*(K+8)*2 = {} B \
                               (> 48 KiB?) or --exl3-a1b3=0", m * (h + 8) * 2)))
-        } else if grouped_fn(m, mi, 3) != "xq_gemm_grouped_a1b3" {
+        } else if grouped_fn(m, mi, bits) != a1n {
             Some((5, format!("down GEMM (K={mi}) is off the a1b3 entry at this width: A-once smem m*(K+8)*2 = {} B \
                               (> 48 KiB?) or --exl3-a1b3=0", m * (mi + 8) * 2)))
         } else if sgu < need_gu || sdn < need_dn {
@@ -8017,7 +8285,7 @@ impl FwdModel {
         // p5e: DEFAULT OFF (opt-in --w4moe=1) — parts == 0 => no plan, no log, fold_live false:
         // xq_had_suh_multi + the WP20 gate/up + the shared expert + the WP20 down, the p3 sequence.
         let parts = w4moe_parts();
-        let (gu_pk, dn_pk, fold_live) = self.w4moe_plans(m, emax, sel.topk);
+        let (gu_pk, dn_pk, fold_live) = self.w4moe_plans(m, emax, sel.topk, moe.bits);
         let il = if w4moe_order_il() { MPK_FLAG_IL } else { 0 };
         if parts & (MPK_GU | MPK_DN) != 0 {
             wp20_log_once((7, m, sel.topk), || {
@@ -8075,7 +8343,8 @@ impl FwdModel {
                 &mut b[8] as *mut u64 as *mut _, &mut b[9] as *mut u64 as *mut _,
             ];
             let (gfn, np) = if gu_fold { (WP20_GU_FOLD_FN, 17) } else { (sel.gu, 16) };
-            unsafe { wp20_launch(l.stream.stream, gfn, emax as u32 * (2 * mi as u32 / 128), a1_smem(m, h), &mut p[..np])?; }
+            let gsm = gu_chunk(m, h, true, moe.bits).filter(|c| c.0 == gfn).map_or(a1_smem(m, h), |c| c.1);
+            unsafe { wp20_launch(l.stream.stream, gfn, emax as u32 * (2 * mi as u32 / 128), gsm, &mut p[..np])?; }
         }
         // Shared expert AHEAD of the routed down (its ysh feeds the down's combine epilogue) —
         // the old path's gate|up pair + silu + down (W4/DENSE: two DENSE launches, the silu folded
@@ -8140,7 +8409,12 @@ impl FwdModel {
 
     /// W4/MOE plans for one MoE call at width m: (gate/up, down, A-fold live). A side without a
     /// plan (--w4moe-off part, or not launchable) keeps its WP20 rung-2 kernel.
-    fn w4moe_plans(&self, m: usize, emax: i32, topk: usize) -> (Option<MpkPlan>, Option<MpkPlan>, bool) {
+    fn w4moe_plans(&self, m: usize, emax: i32, topk: usize, bits: usize) -> (Option<MpkPlan>, Option<MpkPlan>, bool) {
+        // The persistent grouped-expert kernels are 3-bit-only (xq_moe_coop_body<3>). Until CF-P1g gave K=4 experts the WP20
+        // epilogue path, WP20 itself declined every other width so this was unreachable for them; now it is reachable, and a
+        // forced --w4moe (or a tuner arm) on a K=4 pack ran the 3-bit kernels over 4-bit trellises (found by the 4.05
+        // autotune XCHECK). Any other expert width keeps its WP20 kernels.
+        if bits != 3 { return (None, None, false); }
         let (h, mi) = (self.cfg.hidden_size, self.cfg.moe_intermediate_size);
         let parts = w4moe_parts();
         let fold = parts & MPK_FOLD != 0;
@@ -8175,7 +8449,7 @@ impl FwdModel {
         let nsg = sc.moe_sgv.len();
         self.dev.htod_sync_copy_into(&vec![f32::NAN; nsg], &mut sc.moe_sgv)?;
         self.dev.synchronize()?;
-        let (gu_pk, dn_pk, fold_live) = self.w4moe_plans(m, emax, sel.topk);
+        let (gu_pk, dn_pk, fold_live) = self.w4moe_plans(m, emax, sel.topk, moe.bits);
         self.moe_wp20(l, sc, moe, m, emax, sel, &mut crate::exl3_wp27::Cap::none())?;
         self.dev.synchronize()?;
         let x1 = self.dev.dtoh_sync_copy(&sc.xhd)?;
@@ -8240,6 +8514,27 @@ impl FwdModel {
             }
             Err(e) => eprintln!("[exl3] --exl3-esel-hist dtoh: {e}"),
         }
+    }
+
+    /// CF-P1e step 0 diagnostic: write this request's --exl3-route-log records to DIR/route_NNNN.bin and reset the ring.
+    /// File: i32 LE [0x524C4F47, n_records, ROUTE_REC, topk] then n_records x ROUTE_REC ints
+    /// ([layer, m, ids[0..m*topk], -1 padding]).
+    pub fn dump_route_log(&self) {
+        let Some((buf, ctr, dir, seq)) = self.route_log.as_ref() else { return };
+        let res = (|| -> Result<()> {
+            let n = (self.dev.dtoh_sync_copy(ctr)?[0] as usize).min(ROUTE_LOG_CAP);
+            let v = self.dev.dtoh_sync_copy(buf)?;
+            let mut out: Vec<u8> = Vec::with_capacity(16 + n * ROUTE_REC * 4);
+            for x in [0x524C4F47i32, n as i32, ROUTE_REC as i32, self.cfg.num_experts_per_tok as i32] { out.extend(x.to_le_bytes()); }
+            for x in &v[..n * ROUTE_REC] { out.extend(x.to_le_bytes()); }
+            let k = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::fs::write(format!("{dir}/route_{k:04}.bin"), out)?;
+            self.dev.bind_to_thread()?;
+            let rc = unsafe { cudarc::driver::sys::cuMemsetD32_v2(*ctr.device_ptr(), 0, 1) };
+            anyhow::ensure!(rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "route-log counter reset ({rc:?})");
+            Ok(())
+        })();
+        if let Err(e) = res { eprintln!("[exl3] --exl3-route-log dump: {e}"); }
     }
 
     /// TP-I #6 diagnostic: write the cumulative --tp-ep-hist routing histogram (no-op when off).
@@ -11296,15 +11591,39 @@ impl FwdModel {
     /// ordinary host Vec pages — invisible to nvidia-smi — but on GB10 they come out of the same
     /// unified pool cuMemGetInfo reports, so they are part of a load's measured footprint.
     pub fn ple_ram_bytes(&self) -> u64 {
-        self.ple.as_ref().and_then(|p| p.ram.as_ref())
+        self.ple.as_ref().and_then(|p| p.ram.get())
             .map(|r| r.iter().map(|v| v.len() as u64).sum()).unwrap_or(0)
     }
+    /// CF-P1d `--ple-ram auto`: called once the boot has allocated every lane's KV, scratch, graphs and the vision
+    /// tower. Moves the n-gram table into RAM iff it fits with 16 GiB to spare, measured now; otherwise it stays on
+    /// SSD (identical output, ~1-2% decode) and the log says why. No-op for ram / ssd or a model without PLE.
+    pub fn ple_promote_auto(&self) -> Result<()> {
+        let Some(p) = self.ple.as_ref() else { return Ok(()) };
+        if ple_mode() != "auto" || p.ram.get().is_some() { return Ok(()); }
+        let per = p.rows_per_shard as usize * p.row_bytes;
+        let need = per as u64 * p.shards.len() as u64;
+        let avail = mem_available_bytes();
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        if avail < need + PLE_AUTO_HEADROOM {
+            println!("  PLE n-gram table: stays on SSD (--ple-ram auto: after the boot {:.1} GiB are free, the table needs {:.1} GiB + 16 GiB headroom; \
+                      output is identical, decode ~1-2% slower; fewer lanes / a shorter --max-seq-len would let it move to RAM)",
+                     gib(avail), gib(need));
+            return Ok(());
+        }
+        let t0 = std::time::Instant::now();
+        let t = ple_read_table(&p.shards, &p.shard_data_off, per)?;
+        let _ = p.ram.set(t);
+        println!("  PLE n-gram table moved to RAM: {:.1} GiB in {:.1}s (--ple-ram auto; {:.1} GiB were free after the boot)",
+                 gib(need), t0.elapsed().as_secs_f32(), gib(avail));
+        Ok(())
+    }
+
     /// PLE n-gram table residency label for receipts: "on" (RAM-resident), "pread" (page cache),
     /// or "none" (the model has no PLE).
     pub fn ple_residency(&self) -> &'static str {
         match self.ple.as_ref() {
             None => "none",
-            Some(p) if p.ram.is_some() => "on",
+            Some(p) if p.ram.get().is_some() => "on",
             Some(_) => "pread",
         }
     }
@@ -11998,19 +12317,19 @@ impl FwdModel {
                                           *moe.svh_d.device_ptr() as u64);
             for &(gmt, tp, np, cap) in &groups {
                 if fold {
-                    let (f, sm, nt) = moe_pf_pick('g', gmt, pf2, 3);
+                    let (f, sm, nt) = moe_pf_pick('g', gmt, pf2, moe.bits);
                     xqlaunch!(l, f, ((mi as u32) * 2 / 256, cap, 1), (nt, 1, 1), sm,
                              (&moe.gu_tr, &psc.pf_offs_gu, &psc.xh_e, &mut psc.xhd, tp, np,
-                              &psc.offs_row, &psc.cnt, kn_gu, 3i32, svh_gu, suh_d))?;
+                              &psc.offs_row, &psc.cnt, kn_gu, moe.bits as i32, svh_gu, suh_d))?;
                 } else if pk {
-                    let (f, sm, _) = moe_pf_pick('t', gmt, pf2, 3);
+                    let (f, sm, _) = moe_pf_pick('t', gmt, pf2, moe.bits);
                     xqlaunch!(l, f, ((mi as u32) * 2 / 128, cap, 1), (256, 1, 1), sm,
                              (&moe.gu_tr, &psc.pf_offs_gu, &psc.xh_e, &mut psc.ygu_raw, tp, np,
-                              &psc.offs_row, &psc.cnt, kn_gu, 3i32, 0u64, 0u64))?;
+                              &psc.offs_row, &psc.cnt, kn_gu, moe.bits as i32, 0u64, 0u64))?;
                 } else {
                     xqlaunch!(l, "exl3_hmma_gemm_wide_tiles", ((mi as u32) * 2 / 128, cap, 1), (256, 1, 1), 0,
                              (&moe.gu_tr, &psc.pf_offs_gu, &psc.xh_e, &mut psc.ygu_raw, tp, np,
-                              &psc.offs_row, &psc.cnt, 2560i32, (mi * 2) as i32, 3i32, gmt as i32))?;
+                              &psc.offs_row, &psc.cnt, 2560i32, (mi * 2) as i32, moe.bits as i32, gmt as i32))?;
                 }
             }
             if !fold {
@@ -12023,19 +12342,19 @@ impl FwdModel {
             }
             for &(gmt, tp, np, cap) in &groups {
                 if fold {
-                    let (f, sm, _) = moe_pf_pick('s', gmt, pf2, 3);
+                    let (f, sm, _) = moe_pf_pick('s', gmt, pf2, moe.bits);
                     xqlaunch!(l, f, ((h as u32) / 128, cap, 1), (256, 1, 1), sm,
                              (&moe.d_tr, &psc.pf_offs_d, &psc.xhd, &mut psc.yd, tp, np,
-                              &psc.offs_row, &psc.cnt, kn_d, 3i32, svh_d, 0u64))?;
+                              &psc.offs_row, &psc.cnt, kn_d, moe.bits as i32, svh_d, 0u64))?;
                 } else if pk {
-                    let (f, sm, _) = moe_pf_pick('t', gmt, pf2, 3);
+                    let (f, sm, _) = moe_pf_pick('t', gmt, pf2, moe.bits);
                     xqlaunch!(l, f, ((h as u32) / 128, cap, 1), (256, 1, 1), sm,
                              (&moe.d_tr, &psc.pf_offs_d, &psc.xhd, &mut psc.yd_raw, tp, np,
-                              &psc.offs_row, &psc.cnt, kn_d, 3i32, 0u64, 0u64))?;
+                              &psc.offs_row, &psc.cnt, kn_d, moe.bits as i32, 0u64, 0u64))?;
                 } else {
                     xqlaunch!(l, "exl3_hmma_gemm_wide_tiles", ((h as u32) / 128, cap, 1), (256, 1, 1), 0,
                              (&moe.d_tr, &psc.pf_offs_d, &psc.xhd, &mut psc.yd_raw, tp, np,
-                              &psc.offs_row, &psc.cnt, mi as i32, h as i32, 3i32, gmt as i32))?;
+                              &psc.offs_row, &psc.cnt, mi as i32, h as i32, moe.bits as i32, gmt as i32))?;
                 }
             }
             if !fold {
@@ -12149,7 +12468,7 @@ impl FwdModel {
                     // matrix is what its mma consumes); fp32-accumulate reduction
                     // order differs — the drift class pre-authorized by the brief.
                     exl3_reconstruct(l, gu_base + eb * moe.gu_words * 2, rb.rc, rb.ws,
-                                     2560, (mi * 2) as i32, 3i32)?;
+                                     2560, (mi * 2) as i32, moe.bits as i32)?;
                     exl3_lt_matmul(l, rb.ws, xh_base + row0 * xh_stride,
                                    yg_base + row0 * yg_stride, 2560, (mi * 2) as usize,
                                    ce as usize, false, rb.ltws, rb.ltws_len)?;
@@ -12157,13 +12476,13 @@ impl FwdModel {
                     let ms_e = ((ce as u64) + (16 * mt - 1) as u64) / (16 * mt) as u64;
                     xqlaunch!(l, "exl3_hmma_gemm_wide", (ms_e as u32, (mi as u32) * 2 / 128, 1), (256, 1, 1), 0,
                          (gu_base + eb * moe.gu_words * 2, xh_base + row0 * xh_stride,
-                          yg_base + row0 * yg_stride, ce as i32, 2560i32, (mi * 2) as i32, 3i32, mt as i32))?;
+                          yg_base + row0 * yg_stride, ce as i32, 2560i32, (mi * 2) as i32, moe.bits as i32, mt as i32))?;
                 }
             }
             if grouped && wide_msup > 0 {
                 xqlaunch!(l, "exl3_hmma_gemm_wide_grouped", (wide_msup, (mi as u32) * 2 / 128, esel as u32), (256, 1, 1), 0,
                          (&moe.gu_tr, &psc.offs_gu, &psc.xh_e, &mut psc.ygu_raw, &psc.offs_row, &psc.cnt,
-                          2560i32, (mi * 2) as i32, 3i32, mt as i32, rmin as i32))?;
+                          2560i32, (mi * 2) as i32, moe.bits as i32, mt as i32, rmin as i32))?;
             }
         }
         xqlaunch!(l, "xq_had_svh_rows", ((r * 10) as u32, 1, 1), (32, 1, 1), 0,
@@ -12204,7 +12523,7 @@ impl FwdModel {
                     // S-A3-f-g: reconstruct this expert's down projection
                     // ([K=mi, N=2560]) once, then the vendor GEMM per row block.
                     exl3_reconstruct(l, d_base + eb * moe.d_words * 2, rb.rc, rb.ws,
-                                     mi as i32, 2560i32, 3i32)?;
+                                     mi as i32, 2560i32, moe.bits as i32)?;
                     exl3_lt_matmul(l, rb.ws, xhd_base + row0 * d_xh_stride,
                                    yd_base + row0 * yd_stride, mi as usize, 2560usize,
                                    ce as usize, false, rb.ltws, rb.ltws_len)?;
@@ -12212,13 +12531,13 @@ impl FwdModel {
                     let ms_e = ((ce as u64) + (16 * mt - 1) as u64) / (16 * mt) as u64;
                     xqlaunch!(l, "exl3_hmma_gemm_wide", (ms_e as u32, (h as u32) / 128, 1), (256, 1, 1), 0,
                          (d_base + eb * moe.d_words * 2, xhd_base + row0 * d_xh_stride,
-                          yd_base + row0 * yd_stride, ce as i32, mi as i32, h as i32, 3i32, mt as i32))?;
+                          yd_base + row0 * yd_stride, ce as i32, mi as i32, h as i32, moe.bits as i32, mt as i32))?;
                 }
             }
             if grouped && wide_msup > 0 {
                 xqlaunch!(l, "exl3_hmma_gemm_wide_grouped", (wide_msup, (h as u32) / 128, esel as u32), (256, 1, 1), 0,
                          (&moe.d_tr, &psc.offs_d, &psc.xhd, &mut psc.yd_raw, &psc.offs_row, &psc.cnt,
-                          mi as i32, h as i32, 3i32, mt as i32, rmin as i32))?;
+                          mi as i32, h as i32, moe.bits as i32, mt as i32, rmin as i32))?;
             }
         }
         xqlaunch!(l, "xq_had_svh_rows", ((r * (h / 128)) as u32, 1, 1), (32, 1, 1), 0,
@@ -13435,7 +13754,9 @@ impl FwdModel {
         // (and no lazy kernel load) happens inside a capture.)
         for f in ["xq_router_fold", "xq_router_fold_m0", "xq_router_fold_c", "xq_router_fold_c_ep", 
                   "xq_ks_combine_f32_k1l", "xq_moe_combine_ep_k1l", "xq_cvt_f16_f32_k1l", "xq_tp_wait_add_dec", "xq_tp_wait_add_dec_single", "xq_argmax_rows_vp", "xq_tp_wait_keys", "xq_vp_gather_k1", "xq_vp_gather_k2", "xq_vp_gather4_k1", "xq_vp_gather4_k2", "xq_dh_screen_k1", "xq_moe_gu_epi", "xq_moe_gu_epi_sh",
-                  WP20_GU_FOLD_FN, "xq_moe_dn_epi_k8", "xq_moe_dn_epi_sh_k8", "xq_moe_dn_epi_k10", "xq_moe_dn_epi_sh_k10"] {
+                  WP20_GU_FOLD_FN, "xq_moe_dn_epi_k8", "xq_moe_dn_epi_sh_k8", "xq_moe_dn_epi_k10", "xq_moe_dn_epi_sh_k10",
+                  "xq_moe_gu_epi_c2", "xq_moe_gu_epi_c4", "xq_moe_gu_epi_b4", "xq_moe_gu_epi_b4_c2", "xq_moe_gu_epi_b4_c4",
+                  "xq_moe_dn_epi_b4_k10"] {
             let _ = xq_raw_fn(f);
         }
         let _ = qsa_mr_ctas();
@@ -13971,6 +14292,9 @@ fn pen_draft_on() -> bool {
 /// gdn_ring planes), and so does the ring-commit gate (MTP_MAX_K+1 <= GDN_RING_CMAX = 8, the
 /// xq_gdn_commit_ring smem extent). The SERVED depth is the runtime cap --exl3-mtp-k
 /// (mtp_depth_default, default = this); --exl3-mtp-k=5 reproduces the K5 build's rounds.
+/// CF-P1e step 0 route log: record width (= XQ_ROUTE_REC in exl3_bench.cu) and ring capacity (~270 MB).
+pub const ROUTE_REC: usize = 2 + 16 * 16;
+pub const ROUTE_LOG_CAP: usize = 1 << 18;
 pub const MTP_MAX_K: usize = 7;
 /// WP23: max rows xq_gdn_commit_ring commits (its kr_sh/g_sh extent + device guard; exl3_bench.cu).
 const GDN_RING_CMAX: usize = 8;
@@ -15029,6 +15353,16 @@ impl FwdModel {
         let base = self.tap_base(sc, slot)?;
         xqlaunch!(l, "xq_copy_f32", ((((he as i64) + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
                   (&mut sc.taps_keep, &sc.resid, he as i64, base as i64, 0i64))?;
+        Ok(())
+    }
+
+    /// CF-P1e load-adaptive batching: `tap_snapshot` for row `row` of a batched plain step's resid (m rows, one per lane).
+    pub fn tap_snapshot_row(&self, sc: &mut Scratch, slot: usize, row: usize) -> Result<()> {
+        let l = Launcher { dev: &self.dev, stream: &self.stream };
+        let he = self.cfg.hc_count.max(1) * self.cfg.hidden_size;
+        let base = self.tap_base(sc, slot)?;
+        xqlaunch!(l, "xq_copy_f32", ((((he as i64) + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
+                  (&mut sc.taps_keep, &sc.resid, he as i64, base as i64, (row * he) as i64))?;
         Ok(())
     }
 
@@ -16820,6 +17154,10 @@ impl FwdModel {
         if !go { return Ok(None); }
         let key = self.dds_pass_key(sc, slot, p, j);
         if !self.graphs.lock().unwrap().contains_key(&key) { return Ok(None); }
+        // TP: only a pass the normal path has already run (identical on every rank — see SpecPass::seen)
+        if self.tp.is_some() && !sc.wp05.as_ref().and_then(|s| s.spec.as_ref()).map_or(false, |sp| sp.seen.contains(&key)) {
+            return Ok(None);
+        }
         let (d_conf, d_d) = (*sc.dconf.device_ptr() as u64, *sc.d_dev.device_ptr() as u64);
         let d_sids = *sc.slot_ids.device_ptr() as u64;
         // pass i may refresh the same pooled block: snapshot once it has finished
@@ -16983,7 +17321,11 @@ impl FwdModel {
                 if spec { st.spec.as_ref().unwrap().record(i)?; }
             }
             // HOST: launch pass i+1 BEFORE pass i's confidence is read, when it will very likely run
-            let next = if spec && graphed && i + 1 < kmax { self.spec_pass_next(&l, sc, head, slot, p, i)? } else { None };
+            // TP: pass i itself must be an already-seen key too, or one rank could skip speculating where its peer
+            // (that precaptured this key) would not — the rank-local `graphed` alone is not symmetric.
+            let sym_ok = self.tp.is_none()
+                || sc.wp05.as_ref().and_then(|s| s.spec.as_ref()).map_or(false, |sp| sp.seen.contains(&key));
+            let next = if spec && graphed && sym_ok && i + 1 < kmax { self.spec_pass_next(&l, sc, head, slot, p, i)? } else { None };
             if next.is_some() { launched += 1; }
             if stage {
                 let st = sc.wp05.as_mut().unwrap();
@@ -16997,6 +17339,9 @@ impl FwdModel {
             }
             if want_graph && !graphed {
                 self.capture_pass_graph(&l, sc, head, i, pq, key);
+            }
+            if self.tp.is_some() {
+                if let Some(sp) = sc.wp05.as_mut().and_then(|s| s.spec.as_mut()) { sp.seen.insert(key); }
             }
             let c = if stage {
                 let st = sc.wp05.as_mut().unwrap();
