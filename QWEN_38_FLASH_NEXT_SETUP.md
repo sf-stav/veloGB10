@@ -4,8 +4,16 @@ This guide walks through bringing up **Qwen3.8-Flash-Next** from an **EXL3 pack*
 **TP=1, TP=2 and TP=4**. It covers the required files on each machine, the exact launch commands, the
 log lines you should expect, and the measured performance.
 
-- **Target model:** `doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw` — https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw
-- **Format:** EXL3 (ExLlamaV3 trellis), 3.05 bpw. About 85 GB, including a 32.6 GB n-gram table.
+- **Target model:** two EXL3 packs of the same model — **use either one**, they differ only in
+  precision (and therefore in speed and in how much disk they need):
+  - **[doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw)**
+    — 3.05 bpw, ~86 GB. The smaller and faster of the two; the examples below use it.
+  - **[doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw)**
+    — 4.05 bpw (turboderp's `4.05bpw_h6_ng6`: 4-bit experts, 6-bit dense layers and head, 6-bit
+    n-gram table), ~108 GB. Higher fidelity, roughly 0.86× the decode rate of 3.05 and not yet
+    autotuned.
+- **Format:** EXL3 (ExLlamaV3 trellis). Everything else in this guide is identical for both packs —
+  only the directory changes.
 - **Full context:** launch with `--max-seq-len 262144` (the model's full 256K).
 
 > **The head ships the weights each node needs — you do not copy the pack to the node machines.**
@@ -63,25 +71,30 @@ has this layout.
 
 ### The EXL3 pack (head only)
 
-Download the pack from `doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw` **onto the head**. The nodes get
-their rank's shard from the head at sync time (§2), so they do not need the pack:
+Download **one** of the two packs **onto the head** — 3.05 bpw (~86 GB) or 4.05 bpw (~108 GB). The
+launch commands are identical apart from `--model-dir`. The nodes get their rank's shard from the head
+at sync time (§2), so they do not need the pack:
 
 ```
-Qwen3.8-Flash-Next-EXL3-3.05bpw/
+Qwen3.8-Flash-Next-EXL3-3.05bpw/          (or Qwen3.8-Flash-Next-EXL3-4.05bpw/)
 ├── config.json
 ├── config.json.native
 ├── model.safetensors.index.json
 ├── model-00001-of-00007.safetensors
 ├── ...
-├── ngram_embedding.safetensors          (32.6 GB — the n-gram table)
+├── ngram_embedding.safetensors          (32.6 GB at 3.05, 39.0 GB at 4.05 — the n-gram table)
 ├── mtp_hyper_connection_mixer_patch.safetensors
-├── vision_tower_bf16.safetensors        (the original bf16 vision tower — used for images when present;
-│                                         the 5-bit tower inside the shards is the fallback)
+├── vision_tower_bf16.safetensors        (the vision tower — see below)
 ├── quantization_config.json
 ├── chat_template.jinja
 ├── tokenizer.json, tokenizer_config.json, vocab.json, merges.txt
 └── generation_config.json
 ```
+
+**The vision tower matters more on 4.05.** On **3.05** `vision_tower_bf16.safetensors` is preferred,
+with a fallback to the 5-bit tower inside the shards. On **4.05** it is **required for image input**:
+that pack's tensor index lists no vision tensors, so without the file the server runs text-only. Both
+Hugging Face repositories include it.
 
 There is no drafter to download: **MTP speculative decoding is built into this model** and enabled
 automatically.
@@ -228,6 +241,24 @@ column is a 2026-10-02 run on the v0.7.1 build.
 | ~34.9K | 1,525 | 2,432 | 3,197 | 10.90 s |
 
 TP=4 against a single GB10: **×1.6** on this decode workload and **×2.0–2.2** on prefill.
+
+### Running the 4.05 bpw pack instead
+
+The commands above are identical for the other pack — point `--model-dir` at
+`Qwen3.8-Flash-Next-EXL3-4.05bpw`. It is higher fidelity and slower, and it is **not autotuned yet**.
+Untuned smoke figures (1,000 generated tokens / 2K-token prefill, single request), against the 3.05
+numbers in the tables above on the same test:
+
+| | TP=1 | TP=2 | TP=4 |
+|---|---:|---:|---:|
+| 3.05 bpw — decode | ~73 tok/s | ~102 tok/s | ~122 tok/s |
+| **4.05 bpw — decode** | 63 tok/s | 89 tok/s | 120 tok/s |
+| **4.05 bpw — prefill** | 1,399 tok/s | 2,612 tok/s | 3,496 tok/s |
+
+Decode is about **0.86×** the 3.05 rate at TP=1 and TP=2. Two things to keep in mind with this pack:
+its n-gram table is 39 GB rather than 32.6 GB, so `--ple-ram auto` is more likely to place it on SSD
+(see §5), and on 4.05 `vision_tower_bf16.safetensors` is **required** for image input (§1). The 3.05
+tables above stay the measured reference; the 4.05 rows are untuned smoke tests, not a matched run.
 
 ---
 
