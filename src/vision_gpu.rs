@@ -72,6 +72,7 @@ impl GpuVisualTower {
     pub fn new(dev: Arc<CudaDevice>, tower: &VisualTower) -> Result<Self> {
         let stream = fork_blocking_stream(&dev);
         let blas = CudaBlas::new(dev.clone())?;
+        unsafe { blas.set_stream(Some(&stream))?; }
         let pool = Pool::new(dev.clone());
 
         // Load the FP32 vision kernels.
@@ -109,13 +110,13 @@ impl GpuVisualTower {
     }
 
     /// Batched FP32 GEMM: `out[N,outn] = x[N,inn] @ w[outn,inn]^T` (row-major activations / weights).
-    fn gemm(&self, w: &S, x: &S, out: &mut S, inn: usize, outn: usize, n: usize) {
+    fn gemm(&self, w: &S, x: &S, out: &mut S, inn: usize, outn: usize, n: usize) -> Result<()> {
         let cfg = GemmConfig::<f32> {
             transa: OP::CUBLAS_OP_T, transb: OP::CUBLAS_OP_N,
             m: outn as i32, n: n as i32, k: inn as i32,
             alpha: 1.0, lda: inn as i32, ldb: inn as i32, beta: 0.0, ldc: outn as i32,
         };
-        unsafe { self.blas.gemm(cfg, w, x, out).expect("vision gemm f32"); }
+        unsafe { self.blas.gemm(cfg, w, x, out).map_err(|e| anyhow::anyhow!("vision gemm f32: {e:?}")) }
     }
 
     fn layernorm(&self, out: &mut S, x: &S, w: &S, b: &S, n: usize, dim: usize) {
@@ -149,7 +150,7 @@ impl GpuVisualTower {
     /// math on the tensor/FP32 path far faster. Confined to the vision tower (AGENTS §2 — the text
     /// prefill/decode attention path is untouched).
     fn attention(&self, qkv: &S, cos: &S, sin: &S, out: &mut S, n: usize,
-                 qo: &S, ko: &S, vo: &S, s: &mut S, o: &mut S) {
+                 qo: &S, ko: &S, vo: &S, s: &mut S, o: &mut S) -> Result<()> {
         let (heads, hd, hidden) = (self.host.dims.heads, self.host.dims.head_dim(), self.host.dims.hidden);
         let scale = (hd as f32).powf(-0.5);
         let nhd = n * hd;          // per-head elems
@@ -172,7 +173,7 @@ impl GpuVisualTower {
                 m: n as i32, n: n as i32, k: hd as i32,
                 alpha: scale, lda: hd as i32, ldb: hd as i32, beta: 0.0, ldc: n as i32,
             };
-            unsafe { self.blas.gemm(cfg, &q_view, &k_view, s).expect("vision QK gemm"); }
+            unsafe { self.blas.gemm(cfg, &q_view, &k_view, s).map_err(|e| anyhow::anyhow!("vision QK gemm: {e:?}"))?; }
             // softmax over the key dim (in place S -> P). Coalesced N-thread-per-query kernel.
             vlaunch!(self, "vision_softmax_rows", grid(n), (256, 1, 1), 0, (d(s), n as i32));
             // O = P @ V: P [N,N] col-major, V [N, hd] row-major -> transb=T. C is [N, hd]
@@ -182,16 +183,18 @@ impl GpuVisualTower {
                 m: n as i32, n: hd as i32, k: n as i32,
                 alpha: 1.0, lda: n as i32, ldb: hd as i32, beta: 0.0, ldc: n as i32,
             };
-            unsafe { self.blas.gemm(cfg2, s, &v_view, o).expect("vision PV gemm"); }
+            unsafe { self.blas.gemm(cfg2, s, &v_view, o).map_err(|e| anyhow::anyhow!("vision PV gemm: {e:?}"))?; }
             vlaunch!(self, "vision_o_write", grid(n_o), (256, 1, 1), 0,
                 (d(o), d(out), n as i32, hidden as i32, hd as i32, h as i32));
         }
+        Ok(())
     }
 
     /// Forward the vision tower. Returns the merged image embeddings `[N/merge^2, OUT_HIDDEN]` as f32.
     /// When `trace` is set, also returns the oracle-ordered hidden states: states[0] = pre_blocks
     /// (post patch_embed + pos_embed), states[1+k] = block_k (k = 0..26).
     pub fn forward(&mut self, pixel_values: &[f32], gh: usize, gw: usize, trace: bool) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        self.dev.bind_to_thread()?;
         let d = self.host.dims;
         let (hidden, inter, merge) = (d.hidden, d.inter, d.merge);
         let (hd, mi) = (d.head_dim(), d.merge_inter());
@@ -211,13 +214,13 @@ impl GpuVisualTower {
         let sin_g = self.dev.htod_sync_copy(&sin)?;
 
         let mut h = self.pool.get(n * hidden);
-        self.gemm(&self.patch_w, &pv, &mut h, wpv, hidden, n);
+        self.gemm(&self.patch_w, &pv, &mut h, wpv, hidden, n)?;
         self.bias_add(&mut h, &self.patch_b, n, hidden);
         // pos-embed
         self.add_inplace(&mut h, &pe_g, n * hidden);
 
         let mut states = Vec::new();
-        if trace { states.push(self.to_host(&h, n * hidden)); }   // pre_blocks
+        if trace { states.push(self.to_host(&h, n * hidden)?); }   // pre_blocks
 
         // cuBLAS-attention scratch (reused across blocks). Sized for the current N.
         let (nhd_s, nhead_s, nn_s, n_o_s) = (n * hd, d.heads * n * hd, n * n, n * hd);
@@ -231,12 +234,13 @@ impl GpuVisualTower {
             let mut norm1 = self.pool.get(n * hidden);
             self.layernorm(&mut norm1, &h, &blk.norm1_w, &blk.norm1_b, n, hidden);
             let mut qkv = self.pool.get(n * 3 * hidden);
-            self.gemm(&blk.qkv_w, &norm1, &mut qkv, hidden, 3 * hidden, n);
+            self.gemm(&blk.qkv_w, &norm1, &mut qkv, hidden, 3 * hidden, n)?;
             self.bias_add(&mut qkv, &blk.qkv_b, n, 3 * hidden);
             let mut attn = self.pool.get(n * hidden);
-            self.attention(&qkv, &cos_g, &sin_g, &mut attn, n, &aq, &ak, &av, &mut as_, &mut ao);
+            self.attention(&qkv, &cos_g, &sin_g, &mut attn, n, &aq, &ak, &av, &mut as_, &mut ao)?;
+            self.pool.release(qkv, n * 3 * hidden);
             let mut proj = self.pool.get(n * hidden);
-            self.gemm(&blk.proj_w, &attn, &mut proj, hidden, hidden, n);
+            self.gemm(&blk.proj_w, &attn, &mut proj, hidden, hidden, n)?;
             self.bias_add(&mut proj, &blk.proj_b, n, hidden);
             self.pool.release(attn, n * hidden);
             self.add_inplace(&mut h, &proj, n * hidden);
@@ -245,18 +249,18 @@ impl GpuVisualTower {
             let mut norm2 = self.pool.get(n * hidden);
             self.layernorm(&mut norm2, &h, &blk.norm2_w, &blk.norm2_b, n, hidden);
             let mut fc1 = self.pool.get(n * inter);
-            self.gemm(&blk.fc1_w, &norm2, &mut fc1, hidden, inter, n);
+            self.gemm(&blk.fc1_w, &norm2, &mut fc1, hidden, inter, n)?;
             self.bias_add(&mut fc1, &blk.fc1_b, n, inter);
             self.gelu_tanh(&mut fc1, n * inter);
             let mut fc2 = self.pool.get(n * hidden);
-            self.gemm(&blk.fc2_w, &fc1, &mut fc2, inter, hidden, n);
+            self.gemm(&blk.fc2_w, &fc1, &mut fc2, inter, hidden, n)?;
             self.bias_add(&mut fc2, &blk.fc2_b, n, hidden);
             self.pool.release(fc1, n * inter);
             self.add_inplace(&mut h, &fc2, n * hidden);
             self.pool.release(fc2, n * hidden);
             self.pool.release(norm1, n * hidden);
             self.pool.release(norm2, n * hidden);
-            if trace { states.push(self.to_host(&h, n * hidden)); }
+            if trace { states.push(self.to_host(&h, n * hidden)?); }
         }
         self.pool.release(aq, nhead_s); self.pool.release(ak, nhead_s); self.pool.release(av, nhead_s);
         self.pool.release(as_, nn_s); self.pool.release(ao, n_o_s);
@@ -264,29 +268,34 @@ impl GpuVisualTower {
         // merger: layernorm -> view [N,hidden] as [tn,mi] -> fc1 -> gelu -> fc2
         let mut ln = self.pool.get(n * hidden);
         self.layernorm(&mut ln, &h, &self.merger_norm_w, &self.merger_norm_b, n, hidden);
+        self.pool.release(h, n * hidden);
         let mut mfc1 = self.pool.get(tn * mi);
-        self.gemm(&self.merger_fc1_w, &ln, &mut mfc1, mi, mi, tn);
+        self.gemm(&self.merger_fc1_w, &ln, &mut mfc1, mi, mi, tn)?;
+        self.pool.release(ln, n * hidden);
         self.bias_add(&mut mfc1, &self.merger_fc1_b, tn, mi);
         self.gelu(&mut mfc1, tn * mi);
         let mut out = self.pool.get(tn * d.out_hidden);
-        self.gemm(&self.merger_fc2_w, &mfc1, &mut out, mi, d.out_hidden, tn);
+        self.gemm(&self.merger_fc2_w, &mfc1, &mut out, mi, d.out_hidden, tn)?;
+        self.pool.release(mfc1, tn * mi);
         self.bias_add(&mut out, &self.merger_fc2_b, tn, d.out_hidden);
 
-        let merged = self.to_host(&out, tn * d.out_hidden);
-        self.dev.synchronize().unwrap();
+        let merged = self.to_host(&out, tn * d.out_hidden)?;
+        self.pool.release(out, tn * d.out_hidden);
+        self.sync()?;
         Ok((merged, states))
     }
 
-    fn to_host(&self, buf: &S, n: usize) -> Vec<f32> {
-        self.sync();
-        let mut v = self.dev.dtoh_sync_copy(buf).unwrap();
+    fn to_host(&self, buf: &S, n: usize) -> Result<Vec<f32>> {
+        self.sync()?;
+        let mut v = self.dev.dtoh_sync_copy(buf).map_err(|e| anyhow::anyhow!("dtoh_sync_copy: {e:?}"))?;
         debug_assert!(v.len() >= n);
         v.truncate(n);
-        v
+        Ok(v)
     }
 
-    fn sync(&self) {
-        self.dev.synchronize().unwrap();
+    fn sync(&self) -> Result<()> {
+        unsafe { cudarc::driver::result::stream::synchronize(self.stream.stream) }
+            .map_err(|e| anyhow::anyhow!("stream sync: {e:?}"))
     }
 
     /// The host-side tower (dims + CPU weights retained for pos-embed / rotary tables / preproc).
