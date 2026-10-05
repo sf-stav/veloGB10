@@ -521,6 +521,30 @@ pub fn rdma_dev() -> String {
         .unwrap_or_else(|| DEFAULT_RDMA_DEV.to_string())
 }
 
+pub fn resolve_gid_idx(dev: &str) -> i32 {
+    if let Ok(s) = crate::opts::var(crate::opt!("gid-idx")) {
+        if let Ok(v) = s.trim().parse::<i32>() {
+            return v;
+        }
+    }
+    // Scan sysfs to find the RoCE v2 IPv4 GID index for this device
+    let base = format!("/sys/class/infiniband/{dev}/ports/1");
+    let types_dir = format!("{base}/gid_attrs/types");
+    let gids_dir = format!("{base}/gids");
+    for idx in 0..64 {
+        let type_path = format!("{types_dir}/{idx}");
+        let gid_path = format!("{gids_dir}/{idx}");
+        if let (Ok(t), Ok(g)) = (std::fs::read_to_string(&type_path), std::fs::read_to_string(&gid_path)) {
+            let t = t.trim();
+            let g = g.trim();
+            if t == "RoCE v2" && g.starts_with("0000:0000:0000:0000:0000:ffff:") {
+                return idx as i32;
+            }
+        }
+    }
+    GID_IDX
+}
+
 pub struct TpContext {
     pub rank: i32,
     pub world: i32,
@@ -537,12 +561,14 @@ impl TpContext {
 
     /// Head side (rank 0): listen for the node's QP handshake on the RoCE device.
     pub fn bring_up_head(world: i32) -> Result<Self> {
-        eprintln!("[tp] rank 0/{} — bringing up RDMA data-plane link on {} (listening) ...", world, rdma_dev());
+        let dev = rdma_dev();
+        let gid = resolve_gid_idx(&dev);
+        eprintln!("[tp] rank 0/{} — bringing up RDMA data-plane link on {} (gid_idx={}) (listening) ...", world, dev, gid);
         let link = if world == 2 {
-            TpLink::connect(0, "", TP_PORT, &rdma_dev(), GID_IDX, TP_SLOT_BYTES)?
+            TpLink::connect(0, "", TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         } else {
             let ips = resolve_topology(world)?;
-            TpLink::connect_nway(0, world, &ips, TP_PORT, &rdma_dev(), GID_IDX, TP_SLOT_BYTES)?
+            TpLink::connect_nway(0, world, &ips, TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         };
         eprintln!("[tp] rank 0/{} — link UP", world);
         Ok(TpContext { rank: 0, world, link })
@@ -550,12 +576,14 @@ impl TpContext {
 
     /// Node side: connect the QP to the head's RoCE IP (seen during the cluster sync).
     pub fn bring_up_node(head_ip: IpAddr, rank: i32, world: i32) -> Result<Self> {
-        eprintln!("[tp] rank {}/{} — connecting RDMA data-plane link to head {head_ip} on {} ...", rank, world, rdma_dev());
+        let dev = rdma_dev();
+        let gid = resolve_gid_idx(&dev);
+        eprintln!("[tp] rank {}/{} — connecting RDMA data-plane link to head {head_ip} on {} (gid_idx={}) ...", rank, world, dev, gid);
         let link = if world == 2 {
-            TpLink::connect(rank, &head_ip.to_string(), TP_PORT, &rdma_dev(), GID_IDX, TP_SLOT_BYTES)?
+            TpLink::connect(rank, &head_ip.to_string(), TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         } else {
             let ips = resolve_topology(world)?;
-            TpLink::connect_nway(rank, world, &ips, TP_PORT, &rdma_dev(), GID_IDX, TP_SLOT_BYTES)?
+            TpLink::connect_nway(rank, world, &ips, TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         };
         eprintln!("[tp] rank {}/{} — link UP", rank, world);
         Ok(TpContext { rank, world, link })
