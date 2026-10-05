@@ -862,14 +862,37 @@ async fn chat_completions(
         let urls_w = urls.clone();
         let prep = tokio::task::spawn_blocking(move || {
             if let Some(g) = gpu.filter(|_| !force_cpu) {
-                let mut gvt = g.lock().expect("vision_gpu lock");
-                crate::vision_encoder::prepare_vision_request_gpu(&mut gvt, &urls_w, &toks)
-            } else if let Some(tower) = cpu_tower {
-                crate::vision_encoder::prepare_vision_request(&tower, &urls_w, &toks)
+                let mut gvt = match g.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        eprintln!("[vision] vision_gpu lock was poisoned, recovering inner tower");
+                        poisoned.into_inner()
+                    }
+                };
+                match crate::vision_encoder::prepare_vision_request_gpu(&mut gvt, &urls_w, &toks) {
+                    Ok(p) => Ok(p),
+                    Err(e) => {
+                        if let Some(tower) = &cpu_tower {
+                            eprintln!("[vision] GPU tower failed ({e:#}), falling back to CPU tower");
+                            crate::vision_encoder::prepare_vision_request(tower, &urls_w, &toks)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            } else if let Some(tower) = &cpu_tower {
+                crate::vision_encoder::prepare_vision_request(tower, &urls_w, &toks)
             } else {
                 Err(anyhow::anyhow!("no vision tower loaded"))
             }
-        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("vision worker failed: {e}")));
+        }).await.unwrap_or_else(|e| {
+            if let Some(tower) = &state.vision_tower {
+                eprintln!("[vision] GPU worker panicked ({e}), falling back to CPU tower");
+                crate::vision_encoder::prepare_vision_request(tower, &urls, &prompt_tokens)
+            } else {
+                Err(anyhow::anyhow!("vision worker failed: {e}"))
+            }
+        });
         eprintln!("[vision] dispatch {} images, prepare took {} ms, len={}",
             urls.len(), vt0.elapsed().as_millis(), prep.as_ref().map(|p| p.image_embeds.len()).unwrap_or(0));
         match prep {
