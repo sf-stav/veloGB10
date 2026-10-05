@@ -1380,8 +1380,13 @@ fn mem_available_bytes() -> u64 {
         .unwrap_or(0) * 1024
 }
 
-/// Headroom `auto` keeps free after a RAM-resident table (the AGENTS §5 rule).
+/// Headroom `auto` keeps free after a RAM-resident table (the AGENTS §5 rule):
+/// 16 GiB base + 2 GiB per additional decode lane.
 const PLE_AUTO_HEADROOM: u64 = 16 << 30;
+
+fn ple_auto_headroom(width: usize) -> u64 {
+    PLE_AUTO_HEADROOM + (width.saturating_sub(1) as u64 * (2u64 << 30))
+}
 
 /// Read every shard's data section into host memory (8 threads).
 fn ple_read_table(shards: &[std::fs::File], data_off: &[u64], per: usize) -> Result<Vec<Vec<u8>>> {
@@ -1410,7 +1415,7 @@ fn ple_read_table(shards: &[std::fs::File], data_off: &[u64], per: usize) -> Res
 /// PLE n-gram table location at weight-load time. `ram`: read into host memory now. `ssd`: per-token pread
 /// through the page cache (identical bytes; ~1-2% decode, a few % prefill). `auto` (default): start on ssd and let
 /// `FwdModel::ple_promote_auto` decide once the whole boot has allocated (CF-P1d).
-fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64, row_bytes: usize) -> Result<Option<Vec<Vec<u8>>>> {
+fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64, row_bytes: usize, width: usize) -> Result<Option<Vec<Vec<u8>>>> {
     let mode = ple_mode();
     let per = rows as usize * row_bytes;
     let need = per as u64 * shards.len() as u64;
@@ -1421,7 +1426,8 @@ fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64, row_bytes
             Ok(None)
         }
         "auto" => {
-            println!("  PLE n-gram table: on SSD until the boot has allocated everything else; then RAM iff table {:.1} GiB + 16 GiB stay free (--ple-ram auto)", gib(need));
+            println!("  PLE n-gram table: on SSD until the boot has allocated everything else; then RAM iff table {:.1} GiB + {:.1} GiB headroom stay free \
+                      (--ple-ram auto; 16 GiB base + 2 GiB per additional lane)", gib(need), gib(ple_auto_headroom(width)));
             Ok(None)
         }
         _ => {
@@ -6605,7 +6611,7 @@ impl FwdModel {
                     }
                     let ram = std::sync::OnceLock::new();
                     let row_bytes = row_words * 2;
-                    if let Some(t) = ple_ram_load(&shards, &shard_data_off, rows_per_shard, row_bytes)? { let _ = ram.set(t); }
+                    if let Some(t) = ple_ram_load(&shards, &shard_data_off, rows_per_shard, row_bytes, width)? { let _ = ram.set(t); }
                     let pd = PleDev {
                         key_w,
                         value_w,
@@ -11595,7 +11601,8 @@ impl FwdModel {
             .map(|r| r.iter().map(|v| v.len() as u64).sum()).unwrap_or(0)
     }
     /// CF-P1d `--ple-ram auto`: called once the boot has allocated every lane's KV, scratch, graphs and the vision
-    /// tower. Moves the n-gram table into RAM iff it fits with 16 GiB to spare, measured now; otherwise it stays on
+    /// tower. Moves the n-gram table into RAM iff it fits with headroom to spare (16 GiB base + 2 GiB per additional
+    /// lane, the AGENTS §5 rule), measured now; otherwise it stays on
     /// SSD (identical output, ~1-2% decode) and the log says why. No-op for ram / ssd or a model without PLE.
     pub fn ple_promote_auto(&self) -> Result<()> {
         let Some(p) = self.ple.as_ref() else { return Ok(()) };
@@ -11604,10 +11611,12 @@ impl FwdModel {
         let need = per as u64 * p.shards.len() as u64;
         let avail = mem_available_bytes();
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-        if avail < need + PLE_AUTO_HEADROOM {
-            println!("  PLE n-gram table: stays on SSD (--ple-ram auto: after the boot {:.1} GiB are free, the table needs {:.1} GiB + 16 GiB headroom; \
+        let headroom = ple_auto_headroom(self.width);
+        if avail < need + headroom {
+            println!("  PLE n-gram table: stays on SSD (--ple-ram auto: after the boot {:.1} GiB are free, the table needs {:.1} GiB + {:.1} GiB headroom \
+                      (16 GiB base + 2 GiB per additional lane); \
                       output is identical, decode ~1-2% slower; fewer lanes / a shorter --max-seq-len would let it move to RAM)",
-                     gib(avail), gib(need));
+                     gib(avail), gib(need), gib(headroom));
             return Ok(());
         }
         let t0 = std::time::Instant::now();
