@@ -135,6 +135,11 @@ pub const REG: &[Opt] = &[
           help: "E9 escape: no programmatic dependent-launch overlap" },
     Opt { flag: "exact-gemm", env: "GB10_EXACT_GEMM", ty: Ty::Flag, def: "off", cat: Cat::Dsv4, scope: Scope::Spmd,
           help: "select the locked bit-exact GEMM kernels (tolerance-class fast paths are the default)" },
+    // v0.7.3 (owner decision 2026-10-06): default ON - a DEAD-but-listening server answers 503
+    // forever unless someone restarts it; the supervisor restart is the shipping posture. Head
+    // scope, as used today: parsed in the exl3 head process; no node-side reader exists.
+    Opt { flag: "exit-on-fatal", env: "", ty: Ty::Bool, def: "on", cat: Cat::Serve, scope: Scope::Head,
+          help: "sticky CUDA error / scheduler panic: exit 70 so a supervisor restarts (default; off = engine DEAD, /health 503)" },
     Opt { flag: "exl3-a1b3", env: "GB10_EXL3_A1B3", ty: Ty::Bool, def: "on", cat: Cat::Exl3, scope: Scope::Spmd,
           help: "A-once 3-bit expert entry (tunable moe.a1b3 override)" },
     Opt { flag: "exl3-chain-pair", env: "GB10_EXL3_CHAIN_PAIR", ty: Ty::Bool, def: "on", cat: Cat::Exl3, scope: Scope::Spmd,
@@ -537,6 +542,8 @@ pub const REG: &[Opt] = &[
           help: "DFlash2 round trace" },
     Opt { flag: "router-coal", env: "GB10_ROUTER_COAL", ty: Ty::Bool, def: "on", cat: Cat::Exl3, scope: Scope::Spmd,
           help: "router fold with coalesced weight staging (tunable override)" },
+    Opt { flag: "exl3-r16", env: "", ty: Ty::Bool, def: "on", cat: Cat::Exl3, scope: Scope::Spmd,
+          help: "router fold + HC row-batched mixer at 9..16 rows (m <= 8 unaffected)" },
     Opt { flag: "spec-pass", env: "GB10_SPEC_PASS", ty: Ty::Text, def: "default", cat: Cat::Spec, scope: Scope::Spmd,
           help: "spec-pass mode (diagnostic)" },
     Opt { flag: "spec-pass-q", env: "GB10_SPEC_PASS_Q", ty: Ty::Float, def: "built-in", cat: Cat::Spec, scope: Scope::Spmd,
@@ -591,6 +598,10 @@ pub const REG: &[Opt] = &[
           help: "--ep-deal freq: an alternative deal table" },
     Opt { flag: "spec-lanes-max", env: "", ty: Ty::Text, def: "auto", cat: Cat::Spec, scope: Scope::Spmd,
           help: "EXL3 load-adaptive batching (CF-P1e): speculative (MTP) rounds run one lane at a time, so aggregate speed stops scaling past one lane, while ONE plain batched step serves every busy lane. auto (default) = each round picks the arm with the higher estimated aggregate tokens/s (measured per-lane speculative speed vs the measured shared-step time; speculation pays more on high-acceptance content, batching wins as lanes grow); N = share one plain step only with MORE than N busy lanes; 0 = never (always serial speculation). The lanes' MTP heads stay in sync across shared steps, so speculation resumes as load drops; a single busy lane always speculates (single-stream path unchanged). Greedy output is identical in every mode" },
+    Opt { flag: "lane-order", env: "", ty: Ty::Choice(&["rr", "fcfs"]), def: "rr", cat: Cat::Spec, scope: Scope::Spmd,
+          help: "Order of the SERIAL speculative rounds (CF-FCFS): rr (default) = today, every scheduler step gives each busy MTP-capable lane one round in slot order, so n concurrent requests each run at 1/n of the single-lane speed and all of them finish late; fcfs = run to completion, one lane at a time, first come first served by admission order, with a --lane-quantum cap. Aggregate throughput is unchanged (the same serial rounds run); fcfs cuts the MEAN turn-completion time (about 25% at 2 concurrent, about 33% at 3, for equal-length turns) at the cost of the waiting lanes' time-to-first-token. Applies ONLY to the serial-speculation arm: MTP-off lanes still batch together, and when the policy picks the shared plain step (--spec-lanes-max) every lane rides that step, so fcfs has no effect there. Greedy output is byte-identical in both orders (it changes only WHICH lane steps when, never a lane's own computation)" },
+    Opt { flag: "lane-quantum", env: "", ty: Ty::Int, def: "256", cat: Cat::Spec, scope: Scope::Spmd,
+          help: "The --lane-order=fcfs quantum in generated tokens: a front lane runs speculative rounds alone until it has generated this many tokens since it became front, then it rotates to the back and the next-oldest lane runs to completion (a lane that stops, hits its length or is cancelled before that frees its turn at once). Only bounds a pathologically long turn; 256 tokens is far longer than a coding agent's tool call. No effect with --lane-order=rr" },
     Opt { flag: "exl3-gu-kch", env: "", ty: Ty::Int, def: "2", cat: Cat::Exl3, scope: Scope::Spmd,
           help: "EXL3 MoE 10..16-row calls (packed verify / >8 lanes): K-chunks the gate/up A-once staging (CF-P1e 16-row class; bit-identical, keeps 2-3 CTAs per SM): 2 (default) | 4 | 0 = off (the legacy barrier body at those widths). Rows <= 9 are unaffected" },
     Opt { flag: "exl3-route-log", env: "", ty: Ty::Path, def: "unset", cat: Cat::Diag, scope: Scope::Spmd,
@@ -621,6 +632,8 @@ pub const REG: &[Opt] = &[
           help: "NVFP4 TP prefill all-reduce chunk cap (bytes)" },
     Opt { flag: "tp-prefill-xport", env: "GB10_TP_PREFILL_XPORT", ty: Ty::Choice(&["off", "0", "false", "single", "on", "1", "dual"]), def: "dual", cat: Cat::Tp, scope: Scope::Spmd,
           help: "EXL3 TP prefill transport (off = serial pair, single = one rail, dual = both rails; dual is the default at every world, at --tp 4 the second rail is a full N-way link; single/off are loud perf opt-outs)" },
+    Opt { flag: "tp-race-probe", env: "", ty: Ty::Int, def: "off", cat: Cat::Diag, scope: Scope::Spmd,
+          help: "test drill (issue #10): world-2 race probe — rank 1 holds every epoch release by <ms> and watches the withheld slot; the head aligns its pre-verify exchange onto that slot (must CLOBBER-detect on the old hot-ring exchange transport, stay clean on the dedicated ctrl slots)" },
     Opt { flag: "tp-reduce-fuse", env: "GB10_TP_REDUCE_FUSE", ty: Ty::Bool, def: "auto (TpConfig)", cat: Cat::Tp, scope: Scope::Spmd,
           help: "NVFP4 TP fused reduce+residual+norm epilogue (on / off; unset = the shipped config)" },
     Opt { flag: "tp-route-fold", env: "GB10_TP_ROUTE_FOLD", ty: Ty::Bool, def: "on", cat: Cat::Tp, scope: Scope::Spmd,
@@ -865,6 +878,16 @@ pub const REG: &[Opt] = &[
           help: "HTTP API bind address: an IPv4/IPv6 address or a host name (e.g. 127.0.0.1 = this machine only). 0.0.0.0 (default) = every interface" },
     Opt { flag: "image-max-edge", env: "", ty: Ty::Int, def: "1024", cat: Cat::Serve, scope: Scope::Head,
           help: "vision (D-VIS-RESIZE, owner 2026-09-30): every input image is resized so its LONGER side is at most N px, aspect ratio kept, before the model's own 32-px grid snap; never a size 400. 0 = no cap (the preprocessor's 16.7 MP limit still applies)" },
+    Opt { flag: "pack3-graphs", env: "", ty: Ty::Flag, def: "off", cat: Cat::Diag, scope: Scope::Spmd,
+          help: "PACK3: --probe-exl3-packstate replays the packed verify through the R_pad CUDA-graph family (probe-only; default boot unchanged)" },
+    Opt { flag: "pack3-family", env: "", ty: Ty::Flag, def: "off", cat: Cat::Diag, scope: Scope::Spmd,
+          help: "PACK3: --probe-exl3-pack3 also captures + gates the R_pad {2..16} packed graph family with 1-GB-cap accounting" },
+    Opt { flag: "max-waiting", env: "", ty: Ty::Int, def: "256", cat: Cat::Serve, scope: Scope::Head,
+          help: "LR-4: refuse with 503 + Retry-After at N or more requests waiting beyond the lanes (counts handler lifetime via the in-flight guard, not just queue wait; a burst can overshoot by the requests admitted between check and send; 0 = unlimited)" },
+    Opt { flag: "keep-tools-when-tool-choice-none", env: "", ty: Ty::Flag, def: "off", cat: Cat::Serve, scope: Scope::Head,
+          help: "vLLM-compatible tool_choice:\"none\": keep the tool definitions in the prompt (the same tools block a normal request renders, so the prefix cache / WP16 checkpoints survive a compaction/summary turn), append a do-not-call instruction to the last message, and return the reply as plain content (never parsed into tool_calls; a stray <tool_call> stays text). Default off = legacy behaviour (tools removed from the prompt for \"none\"), byte-identical. Changes the prompt of tool_choice:\"none\" requests only" },
+    Opt { flag: "stream-backlog-events", env: "", ty: Ty::Int, def: "65536", cat: Cat::Serve, scope: Scope::Head,
+          help: "LR-5: cancel a stream whose unconsumed event backlog reaches N (fires at >= N; ~11 min at 100 tok/s; 0 = unlimited)" },
 ];
 
 /// Environment variables that were read once and are gone (merged into an existing flag, or dead):

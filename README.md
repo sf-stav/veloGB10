@@ -749,7 +749,7 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--host <ADDR>` | `0.0.0.0` | HTTP bind address (`127.0.0.1` = this machine only) |
 | `--max-batch <N>` | 8 | Max concurrent sequences (lanes). EXL3: every lane's KV is allocated up front (~5.6 GB per lane at 262K context, 2.8 GB at 131K) |
 | `--spec-lanes-max <auto\|N\|0>` | auto | EXL3 multi-request mode: pick per round between serial speculation and one shared batched step by estimated aggregate tok/s; `N` shares only above N busy requests, `0` = never |
-| `--lane-order <rr\|fcfs>` | rr | Order of serial speculative rounds with several busy requests: `rr` = a round per lane per step (all finish late); `fcfs` = run one lane to completion at a time (≈25%/33% lower mean completion at 2/3 equal-length concurrent, worse TTFT for later lanes; aggregate unchanged; greedy output identical) |
+| `--lane-order <rr\|fcfs>` | rr | Order of serial speculative rounds with several busy requests: `rr` = a round per lane per step (all finish late); `fcfs` = run one lane to completion at a time (measured: −23%/−30% mean completion at 2/3 equal-length concurrent; two 512-token turns at quantum 1024: −20–24%; worse TTFT for later lanes; aggregate unchanged; `rr` wins the mean on mixed lengths; greedy output identical) |
 | `--lane-quantum <N>` | 256 | The `--lane-order=fcfs` turn cap in generated tokens (bounds a pathologically long turn) |
 | `--ple-ram <auto\|ram\|ssd>` | auto | EXL3 n-gram table location: RAM, or read from SSD (frees 30–39 GB, decode ~1–4% slower); `auto` decides after the boot and refuses impossible configurations before the load |
 | `--max-tokens <N>` | 8192 | Generation cap when a request omits `max_tokens` |
@@ -778,7 +778,7 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--max-waiting <N>` | 256 | Refuse (503 + `Retry-After: 5`) at N or more requests waiting beyond the lanes; 0 = unlimited. Counts the whole handler lifetime |
 | `--stream-backlog-events <N>` | 65536 | Cancel a stream whose unconsumed event backlog reaches N (≈ 11 min at 100 tok/s; 0 = unlimited) — a client that stopped reading frees the lane instead of stalling it |
 | `--keep-tools-when-tool-choice-none` | off | vLLM-compatible `tool_choice:"none"`: keep the tools in the prompt (prefix cache survives compaction turns), append a do-not-call instruction, return plain content |
-| `--exit-on-fatal` | off | EXL3: on a fatal CUDA error / scheduler panic, finish the in-flight request with an error and exit 70 for a supervisor (see docs/OPERATIONS.md) instead of serving 503s from a DEAD engine |
+| `--exit-on-fatal <on\|off>` | on | EXL3: on a fatal CUDA error / scheduler panic, finish the in-flight request with an error and exit 70 for a supervisor (see docs/OPERATIONS.md) instead of serving 503s from a DEAD engine; `off` keeps the DEAD/503 behaviour (default flipped ON in v0.7.3) |
 
 `temperature` / `top_p` / `top_k` / `seed` are **per-request** only (defaults 0.7 / 0.8 / 20) —
 every request may override in its JSON body. There are no MTP env vars; speculation is auto-tuned

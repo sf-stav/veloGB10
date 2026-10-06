@@ -153,7 +153,7 @@ impl WireRequest {
     /// Rebuild a `BatchRequest` on the mirror. `tx` is a dummy channel whose receiver is held by
     /// the mirror forever — the node's `tx.is_closed()` must NEVER fire on its own, so cancels
     /// arrive exclusively as wire events.
-    pub fn into_request(self, tx: mpsc::UnboundedSender<TokEvent>) -> BatchRequest {
+    pub fn into_request(self, tx: crate::server::TokTx) -> BatchRequest {
         BatchRequest {
             prompt: self.prompt,
             max_new: self.max_new,

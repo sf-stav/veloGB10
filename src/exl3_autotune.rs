@@ -881,7 +881,7 @@ fn run_unit(model: &FwdModel, l: &Launcher, sc: &mut Scratch, head: Option<&Draf
             let he = model.cfg.hc_count.max(1) * model.cfg.hidden_size;
             // verify_block minus verify_commit (the live state never moves in a replay)
             model.verify_shadow(l, sc, slot)?;
-            model.verify_kernels(l, sc, m, qsa, slot)?;
+            model.verify_kernels(l, sc, m, qsa, slot, 0)?;
             // taps rows 0..m-1 into THIS slot's window (WP03 tap_base, as verify_block)
             let tb = model.tap_base(sc, slot)?;
             xqlaunch!(l, "xq_copy_f32", (((((he * m) as i64) + 255) / 256).max(1) as u32, 1, 1), (256, 1, 1), 0,

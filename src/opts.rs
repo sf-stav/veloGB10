@@ -518,6 +518,38 @@ mod tests {
         assert!(bad.is_empty(), "environment reads outside the registry (AGENTS §7 / CLI-1):\n{}", bad.join("\n"));
     }
 
+    /// rel/cutb (v0.7.3): --exit-on-fatal became a default-ON registered Bool (owner decision
+    /// 2026-10-06). Pins the registry row (env slot empty, def "on") and the parse semantics the
+    /// serve path relies on: bare flag = on, `on|1` = on, `off|0` = off; the reader
+    /// `var(opt).map_or(true, |v| v != "0")` makes an unset value ON (the flipped default).
+    #[test]
+    fn exit_on_fatal_default_on() {
+        let o = &REG[idx("exit-on-fatal")];
+        assert_eq!(o.env, "");
+        assert_eq!(o.def, "on");
+        assert_eq!(canon(o, None).unwrap().as_deref(), Some("1")); // bare --exit-on-fatal
+        assert_eq!(canon(o, Some("on")).unwrap().as_deref(), Some("1"));
+        assert_eq!(canon(o, Some("1")).unwrap().as_deref(), Some("1"));
+        assert_eq!(canon(o, Some("off")).unwrap().as_deref(), Some("0"));
+        assert_eq!(canon(o, Some("0")).unwrap().as_deref(), Some("0"));
+        assert!(canon(o, Some("bogus")).is_err());
+        // the exact read exl3_serve.rs performs, through the real store + parser:
+        let id = crate::opt!("exit-on-fatal");
+        let read = || crate::opts::var(id).map_or(true, |v| v != "0");
+        crate::opts::test_set(id, None);        assert!(read(),  "unset must mean ON (the flipped default)");
+        crate::opts::test_set(id, Some("0"));   assert!(!read(), "--exit-on-fatal off must disable");
+        crate::opts::test_set(id, Some("1"));   assert!(read(),  "--exit-on-fatal on must exit");
+        crate::opts::test_set(id, None);        // leave the store as found
+        // the shipped CLI surface end-to-end: bare flag and value form both parse
+        let a = "--exit-on-fatal".to_string();
+        assert!(parse_cli(&[a.clone()]).is_ok());
+        assert!(read(), "bare --exit-on-fatal must mean ON");
+        let off = "off".to_string();
+        assert!(parse_cli(&[a, off]).is_ok());
+        assert!(!read(), "--exit-on-fatal off must disable");
+        crate::opts::test_set(id, None);        // restore
+    }
+
     #[test]
     fn canon_rules() {
         let f = &REG[idx("exl3-round-prof")];

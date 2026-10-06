@@ -24,8 +24,14 @@ instance). The bug was confirmed with a deterministic fault-injection probe that
 v0.7.2 and passes on v0.7.3; outputs are bit-identical to the previous build
 (`--exl3-tp-ident` hashes unchanged at TP=2 and TP=1), and decode speed is unchanged within
 measurement noise. The `--tp-dh-shard 0` workaround is no longer needed. Cost: ~11.5 MB of
-pinned host memory per rank. <<TP2RACE2: 2 h c=1 stress at 16K prompts, temperature 1 — abort
-count on v0.7.2 vs v0.7.3, pending the running verification session>>
+pinned host memory per rank. Verified on the release candidate: the fault-injection probe logs
+0 clobbered slots over 142 aligned rounds (v0.7.2: 14), and a 30-minute stress checkpoint
+(c=1, ~16K-prompt sampled requests, temperature 1) logged 38,273 pre-verify rounds with 0 aborts
+and 0 clobbered slots on both ranks — that configuration runs ~1,270 rounds/min, so the longer
+(~2 h / ~200,000-round) soak runs after this release and was not waited for. TP=2 output identity:
+IDENT_ALL 871f083d58a54281 (code) / 38458d4ce6310c6f (prose) at 10/12/16 lanes, with r16 on,
+`--exl3-r16 off` and `--router-coal 0` alike; decode medians unchanged (c=1 82.07 vs 82.10 tok/s,
+4 concurrent 127.57 vs 127.60).
 
 ### Fixed — packs from exllamav3 1.5.x with the sharded n-gram sidecar (issue #9)
 
@@ -93,24 +99,34 @@ async: a slow or absent receiver delays nothing but itself.
   exit-path log flushing, plus `=`-form flag parsing on both servers.
 - New `docs/OPERATIONS.md`: supervisor rationale, systemd units, log handling, the gauge and
   alert table (alert on `scheduler_busy == 1 AND age > 120` only), exit codes, soak watch-list.
+- `--exit-on-fatal` is now the default on the EXL3 server (it was opt-in): on a sticky CUDA
+  error or a scheduler-thread panic the in-flight request finishes with an error and the process
+  exits 70 for a supervisor to restart, instead of staying up as a DEAD engine answering 503.
+  `--exit-on-fatal off` restores the old behaviour; the systemd examples in docs/OPERATIONS.md
+  assume the default. The NVFP4 server is unchanged (it never had the option).
 
 ### Kernels
 
-The 9–16-row router fold and HC fast paths are now actually live at default flags (they were
-dead code at those widths in v0.7.2): bit-identical output, 8/8 identity suite. In isolation
-the kernels measure hc ~7.2 → ~6 ms and router ~4.8 → ~1.3 ms at 10 rows; end-to-end aggregate
-throughput at c=1 and c=10 is unchanged within the run-to-run band — claim no app-level win
-from this. At TP ≥ 2 with expert parallelism, 9–16-row forwards deliberately keep the legacy
-router chain, so nothing TP-related changed there.
+New in v0.7.3: fast paths for 9–16-row router folds and HC mixes (v0.7.2 ran the legacy
+kernel chain at those widths), live at default flags: bit-identical output, 8/8 identity suite.
+In isolation the kernels measure hc ~7.2 → ~6 ms and router ~4.8 → ~1.3 ms at 10 rows. Measured
+end to end on one box (TP=1, alternating boots): decode at c=1 is unchanged (91.2/90.1/92.0 vs
+91.7/91.4/91.3 tok/s, inside the 1.9 tok/s run-to-run spread), and aggregate throughput at
+`--max-batch 16` with 10 concurrent requests measures 145.4/148.8 vs 139.3/141.2 tok/s
+(2 reps per side, +4.4 % / +5.4 %, beyond the spread) — the expected effect of the row-batched
+router/HC kernels on that workload; no claim is made for TP ≥ 2 (expert-parallel ranks keep
+the legacy router at 9–16 rows) or for other workloads.
 
 ### `--lane-order fcfs` / `--lane-quantum` (opt-in; default `rr` unchanged)
 
 For several concurrent requests in the serial-speculation arm: `rr` (today's behaviour) gives
 every busy lane a round per scheduler step — n requests each run at 1/n speed and all finish
 late; `fcfs` runs one lane to completion at a time (first-come-first-served, bounded by
-`--lane-quantum`, default 256 generated tokens). Aggregate throughput is unchanged; with
-equal-length turns, mean completion time drops ~25% at 2 and ~33% at 3 concurrent requests, at
-the cost of the later lanes' time-to-first-token. With mixed lengths, `rr` wins the mean.
+`--lane-quantum`, default 256 generated tokens). Aggregate throughput is unchanged. Measured:
+with equal-length turns at TP=1, mean completion time drops 23% at 2 and 30% at 3 concurrent
+requests; two 512-token turns at `--lane-quantum 1024` finish 20–24% sooner on the mean
+(8.2–8.5 s vs 10.4–10.8 s). The cost is the later lanes' time-to-first-token, and with mixed
+lengths `rr` wins the mean (4.24 s vs 4.72 s at quantum 256).
 Greedy output is byte-identical in both orders; TP=2 output identity verified.
 
 ### Launcher interface changed (tarball scripts)

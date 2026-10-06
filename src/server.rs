@@ -15,7 +15,7 @@ use chrono;
 
 use crate::batch::{BatchRequest, TokEvent};
 use crate::tokenizer::{QwenTokenizer, ChatMessage, ToolCall, ThinkingMode};
-use crate::{Usage, Timings, make_timings};
+use crate::{Usage, Timings, make_timings, PromptTokensDetails};
 
 /// Sampling values used for the parameters a request leaves out, per thinking mode.
 #[derive(Clone, Copy, Debug)]
@@ -93,6 +93,10 @@ struct ModelInfo {
     object: String,
     created: i64,
     owned_by: String,
+    /// v0.7.3 (issue #8.1): the served context length — the engine-clamped
+    /// `--max-seq-len`, the vLLM convention — so clients stop guessing. Additive:
+    /// the pre-existing fields are unchanged.
+    max_model_len: usize,
 }
 
 #[derive(Serialize)]
@@ -107,6 +111,7 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         object: "model".to_string(),
         created: chrono::Utc::now().timestamp(),
         owned_by: "rust_infer".to_string(),
+        max_model_len: state.max_seq_len,
     };
     Json(ModelList {
         object: "list".to_string(),
@@ -121,6 +126,7 @@ async fn get_model(State(state): State<AppState>, axum::extract::Path(id): axum:
             object: "model".to_string(),
             created: chrono::Utc::now().timestamp(),
             owned_by: "rust_infer".to_string(),
+            max_model_len: state.max_seq_len,
         })
         .into_response()
     } else {
@@ -132,11 +138,6 @@ async fn get_model(State(state): State<AppState>, axum::extract::Path(id): axum:
     }
 }
 
-/// The model's PUBLIC id for /v1/models and response `model` fields: the model card's
-/// frontmatter `base_model:` line (every model dir ships one, e.g. `base_model: Qwen/Qwen3.8-27B`),
-/// falling back to the directory name when the card or the line is absent. Before this, the
-/// server reported the lab directory fragment (`"model": "3.8-27b-nvfp4-full-all"`) — an
-/// internal path name that no client or catalog can resolve. `--model-name` still overrides.
 /// The HTTP API listen address: `--host` (default 0.0.0.0, every interface) + the port. Every server
 /// (NVFP4, EXL3, DSV4) binds through this, so `--host` means the same thing everywhere.
 pub fn http_bind_addr(port: u16) -> anyhow::Result<std::net::SocketAddr> {
@@ -155,17 +156,31 @@ pub fn http_bind_addr(port: u16) -> anyhow::Result<std::net::SocketAddr> {
 pub async fn http_listen(port: u16) -> tokio::net::TcpListener {
     let addr = match http_bind_addr(port) {
         Ok(a) => a,
-        Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+        Err(e) => { eprintln!("error: {e}"); crate::logq::flush_and_exit(std::time::Duration::from_millis(300), 2); } // H7
     };
     match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("error: cannot listen on {addr}: {e} (another server on this port? --host not an address of this machine?)");
-            std::process::exit(2);
+            crate::logq::flush_and_exit(std::time::Duration::from_millis(300), 2); // H7
         }
     }
 }
 
+/// The public model id resolution order (v0.7.3, issue #8.3): `--model-name` >
+/// `--served-model-name` (vLLM-spelled alias) > the model card's `base_model:` line
+/// > the directory name. Flags are honored verbatim; a blank value falls through.
+pub fn resolve_model_name(model_name: Option<&str>, served_model_name: Option<&str>, model_path: &str) -> String {
+    fn flag(v: Option<&str>) -> Option<&str> { v.map(str::trim).filter(|s| !s.is_empty()) }
+    flag(model_name).or(flag(served_model_name)).map(|s| s.to_string())
+        .unwrap_or_else(|| model_id_from_dir(model_path))
+}
+
+/// The model's PUBLIC id for /v1/models and response `model` fields: the model card's
+/// frontmatter `base_model:` line (every model dir ships one, e.g. `base_model: Qwen/Qwen3.8-27B`),
+/// falling back to the directory name when the card or the line is absent. Before this, the
+/// server reported the lab directory fragment (`"model": "3.8-27b-nvfp4-full-all"`) — an
+/// internal path name that no client or catalog can resolve. `--model-name` still overrides.
 pub fn model_id_from_dir(model_path: &str) -> String {
     let dir = std::path::Path::new(model_path.trim_end_matches('/'));
     if let Ok(card) = std::fs::read_to_string(dir.join("README.md")) {
@@ -180,6 +195,31 @@ pub fn model_id_from_dir(model_path: &str) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// S8 (REL_V0_7_3 review): the hand-built SSE chunk builders, module-level so the escaping
+/// is unit-testable. The MODEL ID is escaped exactly like the text: --model-name is honoured
+/// verbatim now, and a quote or backslash in it would break every chunk.
+fn role_chunk(cid: &str, created: i64, model: &str) -> String {
+    format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}",
+        esc(cid), created, esc(model))
+}
+
+fn content_chunk(cid: &str, created: i64, model: &str, text: &str) -> String {
+    format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}",
+        esc(cid), created, esc(model), esc(text))
+}
+
+fn reasoning_chunk(cid: &str, created: i64, model: &str, text: &str) -> String {
+    format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":\"{}\"}},\"finish_reason\":null}}]}}",
+        esc(cid), created, esc(model), esc(text))
+}
+
+/// finish is the spec finish-reason; stop_field is the pre-rendered stop_reason JSON field
+/// suffix (empty when the loop detector did not end the stream) — WP08.
+fn final_chunk(cid: &str, created: i64, model: &str, finish: &str, stop_field: &str) -> String {
+    format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"{}}}]}}",
+        esc(cid), created, esc(model), esc(finish), stop_field)
 }
 
 fn esc(t: &str) -> String {
@@ -275,6 +315,33 @@ fn partial_overlap(s: &str, marker: &str) -> usize {
 
 fn partial_think_overlap(s: &str, marker: &str) -> usize { partial_overlap(s, marker) }
 
+/// S3+S4 (REL_V0_7_3 review): the ONE hold-back decision, called by EVERY SSE emit site
+/// (the same-chunk think-close branch, the steady-state content split, the reasoning split).
+/// `tool_hold` is None exactly when tool-call parsing is off (a keep-tools "none" request):
+/// a stray `<tool_call` then streams as plain content — nothing is held back for tools.
+/// `tool_hit` is the caller's scanner result for the tool marker (a GrowFind hit, or a plain
+/// `str::find` made absolute; None both when the scanner found nothing and when tools are
+/// off). `emit_limit` is the buffer end (`acc.len()`, or `safe` for the reasoning region);
+/// `region` is the un-emitted tail the partial-marker checks run over; `partial_markers`
+/// lists markers whose SPLIT tail must not leak across an emit boundary (the think-open tag
+/// for the content sites; none for reasoning).
+fn hold_back_end(
+    tool_hold: Option<&'static str>,
+    tool_hit: Option<usize>,
+    emit_limit: usize,
+    region: &str,
+    partial_markers: &[&str],
+) -> usize {
+    let partial = partial_markers.iter().map(|&m| partial_overlap(region, m)).max().unwrap_or(0);
+    match tool_hold {
+        None => emit_limit - partial,
+        Some(m) => match tool_hit {
+            Some(i) => i, // a call has started: emit nothing more
+            None => emit_limit - partial_overlap(region, m).max(partial),
+        },
+    }
+}
+
 /// WP02: incremental first-occurrence search over a buffer that only GROWS (the streaming `acc`).
 /// `find(hay, base, needle)` returns exactly `hay[base..].find(needle).map(|i| base + i)` as long as
 /// every `hay` is a prefix of the same growing buffer and `base` never decreases (a decrease falls
@@ -323,6 +390,126 @@ pub fn engine_ok() -> bool {
 pub fn set_engine_dead(why: &str) {
     ENGINE_STATE.store(ENGINE_DEAD, std::sync::atomic::Ordering::Release);
     eprintln!("[engine] state DEAD: {why} (/health and new requests answer 503)");
+}
+
+/// LR-4 (REL_LONGRUN): `--max-waiting N` (default 256, 0 = unlimited). The HTTP handlers push
+/// every accepted request into an UNBOUNDED scheduler channel; once N or more requests wait
+/// beyond the lanes, refuse instead of queueing. H8 (REL_V0_7_3): the counter is the Req
+/// guard's IN-FLIGHT count — a request counts for its WHOLE handler lifetime (a stalled
+/// reader's request stays counted, not just its queue wait), and a burst can overshoot by the
+/// requests admitted between the check and the send. Each queued request pins its prompt and
+/// messages until a lane frees; the only other guard is the memwatch kill-switch.
+pub fn max_waiting() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::opts::var(crate::opt!("max-waiting")).ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(256))
+}
+
+/// Pure bound arithmetic (unit-tested): `inflight` counts running + waiting (the exact Req-guard
+/// counter); with all lanes busy, waiting = inflight - cap.
+fn over_wait_limit(inflight: u64, cap: u64, max_waiting: usize) -> bool {
+    max_waiting > 0 && inflight >= cap + max_waiting as u64
+}
+
+fn admit_gate_busy() -> bool {
+    over_wait_limit(crate::metrics::inflight(), crate::metrics::max_batch(), max_waiting())
+}
+
+/// The LR-4 refusal: 503 in the engine's existing error shape plus `Retry-After: 5`.
+fn server_busy() -> Response {
+    crate::metrics::reject_request();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "5")],
+        Json(serde_json::json!({"error": {
+            "message": "server busy: too many requests are waiting for a lane; retry shortly",
+            "type": "server_error", "code": "server_busy",
+        }})),
+    ).into_response()
+}
+
+/// LR-5 mechanism: the per-request event sender with an UNCONSUMED-EVENT counter. Every `send`
+/// increments, the HTTP handler's receive loops decrement, and the scheduler's cancel sweeps
+/// read `len()`. (tokio 1.52 exposes `len()` only on the RECEIVER, which lives inside the
+/// handler task — exactly the task that is blocked when a stream reader stalls — so the count
+/// rides with the sender.) Drop-in for `UnboundedSender<TokEvent>` at every existing call site.
+#[derive(Clone)]
+pub struct TokTx {
+    tx: tokio::sync::mpsc::UnboundedSender<TokEvent>,
+    backlog: std::sync::Arc<std::sync::atomic::AtomicIsize>,
+}
+
+impl TokTx {
+    pub fn send(&self, ev: TokEvent) -> Result<(), tokio::sync::mpsc::error::SendError<TokEvent>> {
+        let r = self.tx.send(ev);
+        if r.is_ok() { self.backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        r
+    }
+    pub fn is_closed(&self) -> bool { self.tx.is_closed() }
+    /// Unconsumed events (events sent minus events received by the handler).
+    pub fn len(&self) -> usize {
+        self.backlog.load(std::sync::atomic::Ordering::Relaxed).max(0) as usize
+    }
+}
+
+/// The handler-side counter handle (decrement once per received event).
+pub type TokBacklog = std::sync::Arc<std::sync::atomic::AtomicIsize>;
+
+pub fn tok_channel()
+    -> (TokTx, tokio::sync::mpsc::UnboundedReceiver<TokEvent>, TokBacklog) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TokEvent>();
+    let backlog: TokBacklog = std::sync::Arc::new(std::sync::atomic::AtomicIsize::new(0));
+    (TokTx { tx, backlog: std::sync::Arc::clone(&backlog) }, rx, backlog)
+}
+
+/// THE single LR-5 receive mechanism (REL_V0_7_3 review H0/H2/H6): receive the next event and
+/// decrement the per-request UNCONSUMED-event counter exactly once. Every handler receive loop
+/// goes through this helper (the sync bench/gate drains use `try_recv_counted`) — a loop that
+/// forgets the decrement makes a HEALTHY long generation look stalled (the scheduler sweep
+/// cancels it at `--stream-backlog-events`), and a loop that decrements twice cancels it at
+/// half the limit. Exactly one `fetch_sub` on the backlog may exist in the tree: here.
+pub async fn recv_counted(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<TokEvent>,
+    bl: &TokBacklog,
+) -> Option<TokEvent> {
+    counted_event(rx.recv().await, bl)
+}
+
+/// Sync twin of `recv_counted` for the bench/gate drains (`run_spec_bench`, `wp24_gate_arm`,
+/// `spec_arm`): the same single decrement, `try_recv`-based, so a healthy drain cannot be
+/// cancelled by the backlog sweep either.
+pub fn try_recv_counted(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<TokEvent>,
+    bl: &TokBacklog,
+) -> Option<TokEvent> {
+    counted_event(rx.try_recv().ok(), bl)
+}
+
+fn counted_event(ev: Option<TokEvent>, bl: &TokBacklog) -> Option<TokEvent> {
+    if ev.is_some() {
+        bl.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    ev
+}
+
+/// LR-5 (REL_LONGRUN): `--stream-backlog-events N` (default 65536, 0 = unlimited). A stream
+/// client that stops reading makes its per-request channel grow for the whole generation; past
+/// this many UNCONSUMED events the scheduler cancels the request exactly like a client
+/// disconnect (the lane sweep / wire Cancel), freeing the GPU lane.
+pub fn stream_backlog_events() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::opts::var(crate::opt!("stream-backlog-events")).ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(65_536))
+}
+
+/// Pure predicate (unit-tested); `len` is the TokTx send-minus-receive counter (unconsumed
+/// events) — tokio's UnboundedSender exposes no len(); ours rides with the sender.
+fn over_backlog(len: usize, limit: usize) -> bool {
+    limit > 0 && len >= limit
+}
+
+pub fn stream_backlog_exceeded(len: usize) -> bool {
+    over_backlog(len, stream_backlog_events())
 }
 
 /// WP02: 503 for a request the engine cannot take (DEAD, or its scheduler channel is gone).
@@ -630,7 +817,7 @@ fn resolve_reasoning_effort(tokenizer: &QwenTokenizer, req_effort: Option<&str>,
             (other, _) => other,
         };
         if n != e {
-            eprintln!("[req] reasoning_effort '{e}' normalized to '{n}' for this model family");
+            crate::reprintln!("[req] reasoning_effort '{e}' normalized to '{n}' for this model family");
         }
         n.to_string()
     })
@@ -644,13 +831,54 @@ fn resolve_reasoning_effort(tokenizer: &QwenTokenizer, req_effort: Option<&str>,
 /// → 400; 88 → 85). The honest form is to SERVE the request and ADVERTISE that it is
 /// unconstrained: every reply carries `x-json-schema-enforced: none`, and the reason is logged
 /// loudly once per distinct reason. A client that needs the guarantee checks the header.
+/// LR-8 (REL_LONGRUN): the dedup set is CAPPED so a client sending endless distinct invalid
+/// tool schemas cannot grow host memory. Under the cap: warn once per distinct reason (the
+/// original behaviour). At/over the cap: never warn, never grow, and say so exactly once.
+const SCHEMA_SEEN_CAP: usize = 1024;
+
+/// Pure decision core (unit-tested): returns Some(true) to warn (new reason), Some(false) to
+/// stay silent (duplicate), None once the cap is hit ("further warnings suppressed").
+fn schema_seen_note(
+    seen: &mut std::collections::HashSet<String>,
+    suppressed: &std::sync::atomic::AtomicBool,
+    why: &str,
+) -> Option<bool> {
+    use std::sync::atomic::Ordering;
+    if seen.contains(why) { return Some(false); }
+    if seen.len() >= SCHEMA_SEEN_CAP {
+        if !suppressed.swap(true, Ordering::Relaxed) { return None; }
+        return Some(false);
+    }
+    seen.insert(why.to_string());
+    Some(true)
+}
+
 fn warn_unenforced_schema_once(why: &str) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    static SUPPRESSED: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    let first = seen.lock().map(|mut g| g.insert(why.to_string())).unwrap_or(true);
-    if first {
+    let suppressed = SUPPRESSED.get_or_init(|| std::sync::atomic::AtomicBool::new(false));
+    // H10 (REL_V0_7_3): a POISONED mutex used to fall into the None arm and print the
+    // cap-suppression notice on EVERY call. Recover the inner set and keep the normal
+    // decision (warn once per distinct reason) instead.
+    let verdict = {
+        let mut g = seen.lock().unwrap_or_else(|p| p.into_inner());
+        schema_seen_note(&mut g, suppressed, why)
+    };
+    match verdict {
+        Some(true) => {}                 // new reason: warn below
+        Some(false) => return,           // duplicate: silent
+        None => {                        // cap reached, first time: the suppression notice
+            eprintln!(
+                "[schema] {} distinct unenforced-schema reasons recorded — further first-warnings suppressed (set capped at {SCHEMA_SEEN_CAP}; memory bounded)",
+                SCHEMA_SEEN_CAP
+            );
+            return;
+        }
+    }
+    {
         eprintln!(
             "[schema] WARNING: response_format is NOT enforced by this build — the reply is \
              unconstrained and may not match the requested schema (responses carry \
@@ -667,6 +895,62 @@ fn attach_schema_unenforced_header(resp: &mut Response, unenforced: bool) {
     }
 }
 
+/// S-B9-REL-NONETOOLS: the tool_choice render/parse decision, extracted pure so the
+/// OFF-byte-identity and ON-prefix-sharing contracts are unit-testable without a model.
+/// Returns (tools_for_template, force_line_on_last_message, parse_reply_as_tool_calls).
+///
+/// Flag off (the default) this is EXACTLY the historical decision: "none" drops the tools from
+/// the template and forces nothing; "required"/a named function append their forcing line; auto
+/// forces nothing. Flag on, a "none" request that carries tools keeps the IDENTICAL tools block
+/// (the same slice — nothing reordered or re-serialized), gets a do-not-call line on the last
+/// message, and its reply is NEVER parsed into tool_calls. `parse_as_tool_calls == false` is the
+/// single value both response modes and the streaming hold-back follow; parse() alone cannot
+/// express it (it still extracts an XML call at tools=None — only the JSON form checks the
+/// offered list), so the callers skip parse entirely.
+/// S4 (REL_V0_7_3 review): the server's ONE force-line append, extracted from the handler
+/// so the test drives the REAL code (the old test re-implemented the append, so it could not
+/// fail). Appends to the LAST message: recency dominates instruction-following; a system-
+/// level line is routinely outweighed by the turn's own phrasing.
+fn apply_force_line(messages: &mut [crate::tokenizer::ChatMessage], line: &str) {
+    if let Some(last) = messages.last_mut() {
+        match &mut last.content {
+            Some(c) => { c.push_str("\n\n"); c.push_str(line); }
+            None => { last.content = Some(line.to_string()); }
+        }
+    }
+}
+
+fn tool_choice_decision<'a>(
+    tool_choice: Option<&serde_json::Value>,
+    tools: Option<&'a [serde_json::Value]>,
+    keep_tools_when_none: bool,
+) -> (Option<&'a [serde_json::Value]>, Option<String>, bool) {
+    let forced_fn: Option<String> = match tool_choice {
+        Some(v) => {
+            let s = v.as_str().unwrap_or("");
+            if s == "none" { Some("__none__".to_string()) }
+            else if s == "required" || s == "auto" { None }  // auto = no forcing
+            else { v.pointer("/function/name").and_then(|n| n.as_str()).map(|n| n.to_string()) }
+        }
+        None => None,
+    };
+    let none_keeps_tools = forced_fn.as_deref() == Some("__none__") && tools.is_some() && keep_tools_when_none;
+    let tools_for_template = if forced_fn.as_deref() == Some("__none__") && !none_keeps_tools { None } else { tools };
+    let force_line = match forced_fn.as_deref() {
+        Some("__none__") => if none_keeps_tools {
+            // The tools stay in the prompt (prefix reuse); forbid them explicitly instead.
+            Some("IMPORTANT: Do not call any tools. Answer in plain text only.".to_string())
+        } else {
+            None // tools already removed; nothing to force (legacy default)
+        },
+        Some(name) => Some(format!("IMPORTANT: You MUST call the function `{name}` with appropriate arguments before answering. Do not answer in plain text.")),
+        None if tool_choice.and_then(|v| v.as_str()) == Some("required") =>
+            Some("IMPORTANT: You MUST use one of the provided tools to answer. Do not answer in plain text.".to_string()),
+        None => None,
+    };
+    (tools_for_template, force_line, !none_keeps_tools)
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -674,7 +958,7 @@ async fn chat_completions(
 ) -> Response {
     let Json(mut req) = match payload { Ok(j) => j, Err(e) => return bad_json(e) };
     // Log the request parameters the client sent (useful for debugging OpenWebUI behavior)
-    eprintln!(
+    crate::reprintln!(
         "[req] params  temp={:?} top_p={:?} top_k={:?} max_tok={:?} max_completion_tok={:?} rep_pen={:?} presence={:?} freq={:?} stream={} effort={:?} ctk={}",
         req.temperature, req.top_p, req.top_k,
         req.max_tokens, req.max_completion_tokens, req.repetition_penalty, req.presence_penalty, req.frequency_penalty,
@@ -683,7 +967,7 @@ async fn chat_completions(
     );
     if !req.unused_fields.is_empty() {
         let names: Vec<&str> = req.unused_fields.keys().map(|k| k.as_str()).collect();
-        eprintln!("[req] fields not used by this server: {names:?}");
+        crate::reprintln!("[req] fields not used by this server: {names:?}");
     }
     if let Err(msg) = validate_penalties(req.repetition_penalty, req.presence_penalty,
                                          req.frequency_penalty, req.min_p) {
@@ -695,7 +979,7 @@ async fn chat_completions(
     if let Some(t) = &req.tools {
         let names: Vec<&str> = t.iter()
             .filter_map(|x| x.pointer("/function/name").and_then(|v| v.as_str())).collect();
-        eprintln!("[req] tools   {} offered: {:?} tool_choice={:?}", t.len(), names, req.tool_choice);
+        crate::reprintln!("[req] tools   {} offered: {:?} tool_choice={:?}", t.len(), names, req.tool_choice);
     }
     // Resolve the effective reasoning effort. Two families, two vocabularies:
     //   - hy_v3's template accepts `no_think|low|high` (default low), and its Rust dsv4 path treats
@@ -735,7 +1019,7 @@ async fn chat_completions(
             Ok(None) => {}
             Ok(Some(mut m)) if JSON_SCHEMA_ENFORCEMENT_ENABLED => {
                 m.set_vocab(state.tokenizer.vocab_pieces());
-                eprintln!("[req] response_format: constrained decoding armed ({})", m.summary());
+                crate::reprintln!("[req] response_format: constrained decoding armed ({})", m.summary());
                 schema_mask = Some(std::sync::Arc::new(m));
             }
             Ok(Some(m)) => {
@@ -771,39 +1055,24 @@ async fn chat_completions(
                                                 state.reasoning_effort.as_deref());
     let effort: Option<&str> = effort_owned.as_deref();
     // OpenAI/vLLM tool_choice contract. The engine has no guided-decode forcing, so the
-    // semantics are implemented at the prompt level (the same approach llama.cpp's server
-    // takes): "none" removes the tools entirely (the model cannot call what it cannot see);
-    // "required" / a specific function append an explicit forcing instruction naming the
-    // constraint. Scoring harnesses (tool-eval-bench) drive scenarios through these modes.
-    let forced_fn: Option<String> = match req.tool_choice.as_ref() {
-        Some(v) => {
-            let s = v.as_str().unwrap_or("");
-            if s == "none" { Some("__none__".to_string()) }
-            else if s == "required" || s == "auto" { None }  // auto = no forcing
-            else { v.pointer("/function/name").and_then(|n| n.as_str()).map(|n| n.to_string()) }
-        }
-        None => None,
-    };
-    let tools_for_template = if forced_fn.as_deref() == Some("__none__") { None } else { req.tools.as_deref() };
+    // semantics are implemented at the prompt level: "required" / a specific function append an
+    // explicit forcing instruction naming the constraint; the "none" render/parse DECISION lives
+    // in tool_choice_decision() below. Scoring harnesses (tool-eval-bench) drive scenarios
+    // through these modes.
+    //
+    // S-B9-REL-NONETOOLS: with --keep-tools-when-tool-choice-none (default off) a "none"
+    // request keeps the tools in the prompt (vLLM's default contract; our legacy default is the
+    // llama.cpp approach — tools removed, "the model cannot call what it cannot see"). The
+    // prompt then shares its long prefix with the conversation's normal requests, so the prefix
+    // cache / WP16 checkpoints survive a compaction/summary turn (the Qwen template renders the
+    // tools inside the system block, so removing them invalidates the cache from token 0).
+    let (tools_for_template, force_line, parse_as_tool_calls) = tool_choice_decision(
+        req.tool_choice.as_ref(), req.tools.as_deref(),
+        crate::opts::var(crate::opt!("keep-tools-when-tool-choice-none")).is_ok(),
+    );
     let mut messages = req.messages.clone();
-    {
-        let force_line: Option<String> = match forced_fn.as_deref() {
-            Some("__none__") => None, // tools already removed; nothing to force
-            Some(name) => Some(format!("IMPORTANT: You MUST call the function `{name}` with appropriate arguments before answering. Do not answer in plain text.")),
-            None if req.tool_choice.as_ref().and_then(|v| v.as_str()) == Some("required") =>
-                Some("IMPORTANT: You MUST use one of the provided tools to answer. Do not answer in plain text.".to_string()),
-            None => None,
-        };
-        if let Some(line) = force_line {
-            // Append to the LAST message: recency dominates instruction-following; a
-            // system-level line is routinely outweighed by the turn's own phrasing.
-            if let Some(last) = messages.last_mut() {
-                match &mut last.content {
-                    Some(c) => { c.push_str("\n\n"); c.push_str(&line); }
-                    None => { last.content = Some(line); }
-                }
-            }
-        }
+    if let Some(line) = force_line {
+        apply_force_line(&mut messages, &line); // S4: the ONE append (unit-tested)
     }
     let t_render = std::time::Instant::now();
     let prompt = match state.tokenizer.apply_chat_template(&messages, tools_for_template, effort,
@@ -822,7 +1091,7 @@ async fn chat_completions(
         let n = DUMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dump_path = format!("/tmp/rust_infer_prompt_{}.txt", n);
         if std::fs::write(&dump_path, &prompt).is_ok() {
-            eprintln!("[req] dumped prompt ({} chars) -> {}", prompt.chars().count(), dump_path);
+            crate::reprintln!("[req] dumped prompt ({} chars) -> {}", prompt.chars().count(), dump_path);
         }
     }
 
@@ -834,7 +1103,7 @@ async fn chat_completions(
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
     // TTFT fix 0 attribution (--prefill-trace): the request-path pre-model costs.
     if crate::opts::var(crate::opt!("prefill-trace")).ok().is_some() {
-        eprintln!("[pf] server render={render_ms:.3}ms encode={encode_ms:.3}ms");
+        crate::reprintln!("[pf] server render={render_ms:.3}ms encode={encode_ms:.3}ms");
     }
 
     // V3 vision dispatch: if any message carries images (and the server has a vision tower),
@@ -870,7 +1139,7 @@ async fn chat_completions(
                 Err(anyhow::anyhow!("no vision tower loaded"))
             }
         }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("vision worker failed: {e}")));
-        eprintln!("[vision] dispatch {} images, prepare took {} ms, len={}",
+        crate::reprintln!("[vision] dispatch {} images, prepare took {} ms, len={}",
             urls.len(), vt0.elapsed().as_millis(), prep.as_ref().map(|p| p.image_embeds.len()).unwrap_or(0));
         match prep {
             Ok(prep) => {
@@ -903,7 +1172,7 @@ async fn chat_completions(
         if prompt_tokens.len() > n {
             let dropped = prompt_tokens.len() - n;
             prompt_tokens.drain(..dropped); // keep the LAST n — vLLM's left-truncation convention
-            eprintln!("[req] truncate_prompt_tokens: dropped the OLDEST {dropped} of {} prompt \
+            crate::reprintln!("[req] truncate_prompt_tokens: dropped the OLDEST {dropped} of {} prompt \
                        tokens (kept the last {n})", dropped + n);
         }
     }
@@ -951,7 +1220,7 @@ async fn chat_completions(
     // reasoning" as a conversation grows — which is exactly how this surfaced in the wild. Raise
     // --max-seq-len (graphs cost ~nothing here; KV is ~64 KB/token) to give multi-turn room.
     if req_max < asked && req.max_tokens.is_some() {
-        eprintln!("[req] max_tokens clamped {} -> {} (KV cache: {}-token prompt + {} reserved decode positions of {}; \
+        crate::reprintln!("[req] max_tokens clamped {} -> {} (KV cache: {}-token prompt + {} reserved decode positions of {}; \
                    raise --max-seq-len)", asked, req_max, prompt_len, state.decode_headroom, state.max_seq_len);
     }
     // Sampling: explicit request values win; anything left out takes the server's default for
@@ -962,7 +1231,7 @@ async fn chat_completions(
     let temperature = req.temperature.unwrap_or(d_temp);
     let top_p = req.top_p.unwrap_or(d_top_p).max(0.01);
     let top_k = req.top_k.unwrap_or(d_top_k);
-    eprintln!("[req] sampling temp={temperature} top_p={top_p} top_k={top_k} (thinking={thinking_on}; \
+    crate::reprintln!("[req] sampling temp={temperature} top_p={top_p} top_k={top_k} (thinking={thinking_on}; \
                sent: temp={:?} top_p={:?} top_k={:?})", req.temperature, req.top_p, req.top_k);
 
     // Submit to the batching scheduler and receive tokens on a channel.
@@ -972,7 +1241,7 @@ async fn chat_completions(
     let pp_source = if req.presence_penalty.is_some() { "request" } else { "server-default" };
     let frequency_penalty = req.frequency_penalty.unwrap_or(state.default_frequency_penalty);
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<TokEvent>();
+    let (tx, mut rx, bl) = tok_channel(); // LR-5: `bl` counts consumed events in the loops below
     let request = BatchRequest {
         prompt: prompt_tokens.clone(),
         max_new: req_max,
@@ -994,6 +1263,7 @@ async fn chat_completions(
         image_spans,
         schema: schema_mask.clone(),
     };
+    if admit_gate_busy() { return server_busy(); } // LR-4: --max-waiting
     // WP02: a DEAD engine or a gone scheduler is a 503, never a request that hangs or reads "length"
     if !engine_ok() || state.scheduler.send(request).is_err() {
         return engine_unavailable();
@@ -1017,14 +1287,10 @@ async fn chat_completions(
         let per_msg: Vec<String> = req.messages.iter()
             .map(|m| serde_json::to_string(m).unwrap_or_default()).collect();
         let sess = s.resolve_session(explicit, &per_msg);
-        eprintln!("[req] session {sess} (turn of {} message(s))", req.messages.len());
+        crate::reprintln!("[req] session {sess} (turn of {} message(s))", req.messages.len());
         sess
     });
 
-    let content_chunk = |cid: &str, created: i64, model: &str, text: &str| {
-        format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}",
-            cid, created, model, esc(text))
-    };
     let tool_calls_chunk = |cid: &str, created: i64, model: &str, calls: &[ToolCall]| {
         let arr: Vec<serde_json::Value> = calls.iter().enumerate().map(|(i, c)| serde_json::json!({
             "index": i, "id": c.id, "type": c.kind,
@@ -1035,13 +1301,9 @@ async fn chat_completions(
             "choices": [{"index": 0, "delta": {"tool_calls": arr}, "finish_reason": null}],
         }).to_string()
     };
-    let reasoning_chunk = |cid: &str, created: i64, model: &str, text: &str| {
-        format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":\"{}\"}},\"finish_reason\":null}}]}}",
-            cid, created, model, esc(text))
-    };
 
     if req.stream {
-        eprintln!("[req] stream  prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
+        crate::reprintln!("[req] stream  prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
         let tokenizer = Arc::clone(&state.tokenizer);
         let model_name = req.model.clone().unwrap_or_else(|| state.model_name.clone());
         let stops = req.stop.clone();
@@ -1049,6 +1311,10 @@ async fn chat_completions(
         let created = chrono::Utc::now().timestamp();
         let t0 = std::time::Instant::now();
         let req_tools = req.tools.clone();
+        // S-B9-REL-NONETOOLS: the parse decision for this request. `tool_hold` is the
+        // <tool_call hold-back needle — None for a keep-tools "none" request, whose stray
+        // call streams through as plain content instead of being buffered for a tool_calls delta.
+        let tool_hold: Option<&'static str> = if parse_as_tool_calls { Some(TOOL_OPEN) } else { None };
         let include_usage = req.stream_options.as_ref().map(|o| o.include_usage).unwrap_or(true);
         // Owned copy: the SSE generator is 'static, so it cannot capture the `&str` that borrows
         // effort_owned (A3 log line only; the render/ckpt calls above still use `effort`).
@@ -1084,8 +1350,7 @@ async fn chat_completions(
         };
 
         let stream = async_stream::stream! {
-            let role_chunk = format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}",
-                completion_id, created, model_name);
+            let role_chunk = role_chunk(&completion_id, created, &model_name); // S8: esc(model)
             if let Some(r) = &otel_req { r.start(&role_chunk); }   // event=stream_start, token.index 0
             yield Ok::<Event, axum::Error>(Event::default().data(role_chunk));
             // Byte-level stream decoder: the per-token decode path above would mangle every
@@ -1094,6 +1359,7 @@ async fn chat_completions(
             let mut stream_dec = tokenizer.stream_decoder();
             let mut acc = String::new();
             let mut n = 0usize;
+            let mut cached = 0usize; // v0.7.3 (#8.2): prefix-cache-served prompt tokens
             let mut last_tok: Option<u32> = None;
             let mut stop_hit = false;
             // WP02: a channel closed without a Finish is an engine failure, not "length"
@@ -1113,8 +1379,12 @@ async fn chat_completions(
             let mut content_start: Option<usize> = if starts_in_reasoning { None } else { Some(0) };
             let mut reason_emitted: usize = 0;
             let mut content_emitted: usize = 0;
-            while let Some(ev) = rx.recv().await {
+            while let Some(ev) = recv_counted(&mut rx, &bl).await { // LR-5: the one decrement (H0)
                 match ev {
+                    TokEvent::Admitted { cached_tokens } => {
+                        cached = cached_tokens as usize;
+                        mt.cached(cached_tokens as u64); // /metrics counter
+                    }
                     TokEvent::Tok(t) => {
                         n += 1;
                         mt.tok();
@@ -1142,11 +1412,14 @@ async fn chat_completions(
                                             // decode chunk as the think close, it must NOT be
                                             // forwarded as content.
                                             let region = &acc[lead..];
-                                            let safe_end = match region.find(TOOL_OPEN) {
-                                                Some(i) => lead + i,
-                                                None => acc.len() - partial_overlap(region, TOOL_OPEN)
-                                                    .max(partial_overlap(region, think_open)),
-                                            };
+                                            // S3: the SAME decision as the other emit sites
+                                            // (gated on tool_hold) — a stray <tool_call> in
+                                            // the close chunk streams as content when tool
+                                            // parsing is off (keep-tools "none").
+                                            let safe_end = hold_back_end(
+                                                tool_hold,
+                                                tool_hold.and_then(|_| region.find(TOOL_OPEN).map(|i| lead + i)),
+                                                acc.len(), region, &[think_open]);
                                             if safe_end > lead {
                                                 let c = content_chunk(&completion_id, created, &model_name, &acc[lead..safe_end]);
                                                 if let Some(r) = &otel_req { r.delta(&c); }
@@ -1171,10 +1444,10 @@ async fn chat_completions(
                                             // parsed into the tool_calls delta or surfaced
                                             // post-loop by held_back_remainder.
                                             let region = &acc[reason_emitted..safe];
-                                            let safe_end = match f_tool_r.find(&acc[..safe], reason_emitted, TOOL_OPEN) {
-                                                Some(i) => i,
-                                                None => safe - partial_overlap(region, TOOL_OPEN),
-                                            };
+                                            let safe_end = hold_back_end(
+                                                tool_hold,
+                                                tool_hold.and_then(|m| f_tool_r.find(&acc[..safe], reason_emitted, m)),
+                                                safe, region, &[]);
                                             if safe_end > reason_emitted {
                                                 let c = reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..safe_end]);
                                                 if let Some(r) = &otel_req { r.delta(&c); }
@@ -1203,11 +1476,10 @@ async fn chat_completions(
                                         // Forwarding `<tool_call>` as content makes the harness render
                                         // XML in the chat and never invoke the tool. Same hold-back
                                         // for a think-open prefix spanning decode chunks.
-                                        let safe_end = match f_tool_c.find(&acc, cs, TOOL_OPEN) {
-                                            Some(i) => i,               // a call has started: emit nothing more
-                                            None => acc.len() - partial_overlap(region, TOOL_OPEN)
-                                                .max(partial_overlap(region, think_open)),
-                                        };
+                                        let safe_end = hold_back_end(
+                                            tool_hold,
+                                            tool_hold.and_then(|m| f_tool_c.find(&acc, cs, m)),
+                                            acc.len(), region, &[think_open]);
                                         if safe_end > content_emitted {
                                             let c = content_chunk(&completion_id, created, &model_name, &acc[content_emitted..safe_end]);
                                             if let Some(r) = &otel_req { r.delta(&c); }
@@ -1235,7 +1507,7 @@ async fn chat_completions(
             drop(rx);
             if finish.starts_with("error") {
                 // WP02: a mid-stream engine error is an SSE error event (+ a spec finish_reason below)
-                eprintln!("[req] stream ended in an engine error after {n} tokens: {finish}");
+                crate::reprintln!("[req] stream ended in an engine error after {n} tokens: {finish}");
                 yield Ok(Event::default().data(sse_error_event(&finish)));
             }
             // The call was buffered, not streamed (see the hold-back above). The DECISION is
@@ -1245,18 +1517,24 @@ async fn chat_completions(
             // mode returns (2026-08-27 user report: a malformed `function=NAME>` block with the
             // `<` missing vanished from the SSE stream while the JSON response leaked it).
             let (_, done_content) = split_think(&acc, think_open, think_close);
-            let parsed = crate::tools::parse(&done_content, req_tools.as_deref());
+            // parse_as_tool_calls == false (keep-tools "none"): never parse — the reply is plain
+            // content; finalize_parsed then returns the raw text with finish stop/length.
+            let parsed = if parse_as_tool_calls {
+                crate::tools::parse(&done_content, req_tools.as_deref())
+            } else {
+                crate::tools::ParsedOutput { content: done_content.trim().to_string(), tool_calls: Vec::new() }
+            };
             if req_tools.is_some() {
                 let dump = crate::opts::var(crate::opt!("dump-tools")).is_ok();
                 if dump || parsed.tool_calls.is_empty() {
-                    eprintln!("[req] raw model output ({} chars): {:?}", done_content.chars().count(),
+                    crate::reprintln!("[req] raw model output ({} chars): {:?}", done_content.chars().count(),
                               done_content.chars().take(1200).collect::<String>());
                 }
             }
             // Phase-4 A2: same empty-argument alarm as the non-streaming path — an agent harness
             // streams, so this branch is the one that actually gets used.
             for a in crate::tools::empty_arg_alarms(&done_content, req_tools.as_deref(), &parsed.tool_calls) {
-                eprintln!("[tool-args-alarm] {a}");
+                crate::reprintln!("[tool-args-alarm] {a}");
             }
             let (_, tool_calls, fin) = crate::tools::finalize_parsed(&done_content, parsed, &finish);
             mt.finish(if finish.starts_with("error") { finish.as_str() } else { fin.as_str() });
@@ -1265,7 +1543,7 @@ async fn chat_completions(
                 // Agent harnesses stream, so this is the branch that actually gets used, and it was the
                 // one printing a bare `tool_calls 1: ["write"]` while a file silently failed to appear.
                 for t in &tool_calls {
-                    eprintln!("[req] tool_call  {} {}({})", t.id, t.function.name, t.function.arguments);
+                    crate::reprintln!("[req] tool_call  {} {}({})", t.id, t.function.name, t.function.arguments);
                 }
                 let tc = tool_calls_chunk(&completion_id, created, &model_name, &tool_calls);
                 if let Some(r) = &otel_req { r.delta(&tc); }
@@ -1292,8 +1570,8 @@ async fn chat_completions(
             // WP08: `stop_reason` only when the loop detector ended the stream (else unchanged).
             let stop_reason_field = stop_reason_of(&finish)
                 .map(|r| format!(",\"stop_reason\":\"{r}\"")).unwrap_or_default();
-            let final_chunk = format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"{}}}]}}",
-                completion_id, created, model_name, spec_finish_reason(&finish), stop_reason_field);
+            let final_chunk = final_chunk(&completion_id, created, &model_name,
+                spec_finish_reason(&finish), &stop_reason_field); // S8: esc(model)
             if let Some(r) = &otel_req { r.end(&final_chunk); }   // event=stream_end (carries finish_reason)
             yield Ok(Event::default().data(final_chunk));
             if include_usage {
@@ -1304,7 +1582,8 @@ async fn chat_completions(
                     "id": completion_id, "object": "chat.completion.chunk",
                     "created": created, "model": model_name, "choices": [],
                     "usage": {"prompt_tokens": prompt_len, "completion_tokens": n,
-                              "total_tokens": prompt_len + n},
+                              "total_tokens": prompt_len + n,
+                              "prompt_tokens_details": {"cached_tokens": cached}},
                     "timings": make_timings(t0, first_tok, prompt_len, n),
                 });
                 if let Some(s) = &otel_session { usage_chunk["session_id"] = serde_json::json!(s); }
@@ -1314,20 +1593,25 @@ async fn chat_completions(
             // waiting for more events after the finish chunk.
             yield Ok(Event::default().data("[DONE]"));
             let dt = t0.elapsed().as_secs_f32();
-            eprintln!("[req] done   tok={} ({:.1} tok/s wall) finish={} stop_hit={}", n, if dt>1e-6 {n as f32/dt} else {0.0}, finish, stop_hit);
+            crate::reprintln!("[req] done   tok={} ({:.1} tok/s wall) finish={} stop_hit={}", n, if dt>1e-6 {n as f32/dt} else {0.0}, finish, stop_hit);
         };
         let mut resp = Sse::new(stream).into_response();
         attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some());
         resp
     } else {
-        eprintln!("[req] sync   prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
+        crate::reprintln!("[req] sync   prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
         let t0 = std::time::Instant::now();
         let mut tokens = Vec::new();
         // WP02: a channel closed without a Finish is an engine failure, not "length"
         let mut finish = "error: engine stopped".to_string();
         let mut first_tok: Option<std::time::Instant> = None;
-        while let Some(ev) = rx.recv().await {
+        let mut cached = 0usize; // v0.7.3 (#8.2): prefix-cache-served prompt tokens
+        while let Some(ev) = recv_counted(&mut rx, &bl).await { // LR-5: the one decrement
             match ev {
+                TokEvent::Admitted { cached_tokens } => {
+                    cached = cached_tokens as usize;
+                    mt.cached(cached_tokens as u64); // /metrics counter
+                }
                 TokEvent::Tok(t) => {
                     tokens.push(t);
                     mt.tok();
@@ -1356,7 +1640,7 @@ async fn chat_completions(
                 text.truncate(p); finish = "stop".to_string();
             }
         }
-        eprintln!("[req] done   tok={} ({:.1} tok/s wall) finish={}", tokens.len(), if dt>1e-6 {tokens.len() as f32/dt} else {0.0}, finish);
+        crate::reprintln!("[req] done   tok={} ({:.1} tok/s wall) finish={}", tokens.len(), if dt>1e-6 {tokens.len() as f32/dt} else {0.0}, finish);
         // An engine error is an HTTP error, never a 200 that a client (or a benchmark) would read
         // as an answer. WP02: also when some tokens came first (the text is incomplete).
         if finish.starts_with("error") {
@@ -1379,11 +1663,17 @@ async fn chat_completions(
         // ran but nothing happened" report. Log it when asked (--dump-tools=1), and ALWAYS log
         // it when tools were offered and we parsed nothing — that combination means either the model
         // declined, or it emitted a call we failed to understand, and those need very different fixes.
-        let parsed = crate::tools::parse(&content, req.tools.as_deref());
+        // parse_as_tool_calls == false (keep-tools "none"): never parse — the reply is plain
+        // content; finalize_parsed then returns the raw text with finish stop/length.
+        let parsed = if parse_as_tool_calls {
+            crate::tools::parse(&content, req.tools.as_deref())
+        } else {
+            crate::tools::ParsedOutput { content: content.trim().to_string(), tool_calls: Vec::new() }
+        };
         if req.tools.is_some() {
             let dump = crate::opts::var(crate::opt!("dump-tools")).is_ok();
             if dump || parsed.tool_calls.is_empty() {
-                eprintln!("[req] raw model output ({} chars): {:?}", content.chars().count(),
+                crate::reprintln!("[req] raw model output ({} chars): {:?}", content.chars().count(),
                           content.chars().take(1200).collect::<String>());
             }
         }
@@ -1391,7 +1681,7 @@ async fn chat_completions(
         // arguments while the model emitted a NON-EMPTY body is an argument drop, not a quiet
         // success. Log the raw body so the class can never regress unseen again.
         for a in crate::tools::empty_arg_alarms(&content, req.tools.as_deref(), &parsed.tool_calls) {
-            eprintln!("[tool-args-alarm] {a}");
+            crate::reprintln!("[tool-args-alarm] {a}");
         }
         let (content, tool_calls, finish) = crate::tools::finalize_parsed(&content, parsed, &finish);
         mt.finish(&finish);
@@ -1401,7 +1691,7 @@ async fn chat_completions(
             // know a tool was called and not nearly enough to know what it was told to do. The path the
             // model chose is the whole question.
             for t in &tool_calls {
-                eprintln!("[req] tool_call  {} {}({})", t.id, t.function.name, t.function.arguments);
+                crate::reprintln!("[req] tool_call  {} {}({})", t.id, t.function.name, t.function.arguments);
             }
         }
         let tool_calls = if tool_calls.is_empty() { None } else { Some(tool_calls) };
@@ -1431,6 +1721,7 @@ async fn chat_completions(
                 prompt_tokens: prompt_len,
                 completion_tokens: tokens.len(),
                 total_tokens: prompt_len + tokens.len(),
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: cached },
             },
             timings: make_timings(t0, first_tok, prompt_len, tokens.len()),
             session_id: otel_session,
@@ -1449,7 +1740,7 @@ async fn chat_completions(
 fn dump_tokens(id: &str, tokens: &[u32]) {
     if crate::opts::var(crate::opt!("dump-tokens")).is_err() { return; }
     let ids: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
-    eprintln!("[gen-ids] id={id} n={} ids=[{}]", tokens.len(), ids.join(","));
+    crate::reprintln!("[gen-ids] id={id} n={} ids=[{}]", tokens.len(), ids.join(","));
 }
 
 /// Phase-2 A3 observability: ONE line per generation carrying exactly the fields the Phase-1
@@ -1469,7 +1760,7 @@ fn log_generation(tok: &QwenTokenizer, stop_ids: &[u32], id: &str, finish: &str,
     let r_tok = count(reasoning);
     let c_tok = count(Some(content));
     let is_stop = terminal.map(|t| stop_ids.contains(&t)).unwrap_or(false);
-    eprintln!("[gen] id={} finish={} terminal_tok={} is_stop_tok={} reasoning_tokens={} \
+    crate::reprintln!("[gen] id={} finish={} terminal_tok={} is_stop_tok={} reasoning_tokens={} \
                content_tokens={} completion_tokens={} prompt_tokens={} tool_calls={} \
                tools_offered={} effort={} presence_penalty={} pp_source={}",
         id, finish, terminal.map(|t| t.to_string()).unwrap_or_else(|| "none".into()), is_stop,
@@ -1651,7 +1942,7 @@ async fn tokenize(State(state): State<AppState>, Json(body): Json<serde_json::Va
         }}))).into_response();
     }
     let count = tokens.len();
-    eprintln!("[tokenize] model={model} n={count} add_special={add_special} truncate={truncate:?}");
+    crate::reprintln!("[tokenize] model={model} n={count} add_special={add_special} truncate={truncate:?}");
     Json(serde_json::json!({
         "tokens": tokens,
         "count": count,
@@ -1716,7 +2007,7 @@ async fn detokenize(State(state): State<AppState>, Json(body): Json<serde_json::
         Ok(p) => p,
         Err(e) => return bad(format!("detokenization failed: {e}")),
     };
-    eprintln!("[detokenize] model={model} n={} skip_special={skip_special}", ids.len());
+    crate::reprintln!("[detokenize] model={model} n={} skip_special={skip_special}", ids.len());
     Json(serde_json::json!({
         "model": model,
         "prompt": prompt,
@@ -1790,7 +2081,7 @@ async fn completions(
             "prompt {} tokens leaves no room within max_seq_len {}", prompt_len, state.max_seq_len)).into_response();
     }
     let req_max = req.max_tokens.unwrap_or(16).min(room.unwrap_or(0));
-    let (tx, mut rx) = mpsc::unbounded_channel::<TokEvent>();
+    let (tx, mut rx, bl) = tok_channel(); // LR-5: `bl` counts consumed events in the loops below
     let request = BatchRequest {
         prompt: prompt_tokens.clone(),
         max_new: req_max,
@@ -1812,12 +2103,13 @@ async fn completions(
         image_spans: Vec::new(),
         schema: None,
     };
+    if admit_gate_busy() { return server_busy(); } // LR-4: --max-waiting
     let (_mn, _ie) = (request.min_new, request.ignore_eos);
     if !engine_ok() || state.scheduler.send(request).is_err() {
         return engine_unavailable(); // WP02
     }
     let mut mt = crate::metrics::Req::start(prompt_len); // /metrics
-    eprintln!("[req] completions prompt_tokens={} max_tokens={} min_tokens={} ignore_eos={} stream={}",
+    crate::reprintln!("[req] completions prompt_tokens={} max_tokens={} min_tokens={} ignore_eos={} stream={}",
               prompt_len, req_max, _mn, _ie, req.stream);
     let model_name = req.model.clone().unwrap_or_else(|| state.model_name.clone());
     let cid = format!("cmpl-{}", uuid::Uuid::new_v4());
@@ -1830,8 +2122,11 @@ async fn completions(
             let mut first_tok: Option<std::time::Instant> = None;
             // WP02: closed without a Finish = engine failure; errors are an SSE error event + "stop"
             let mut finish = "error: engine stopped".to_string();
-            while let Some(ev) = rx.recv().await {
+            while let Some(ev) = recv_counted(&mut rx, &bl).await { // LR-5: the one decrement (H0)
                 match ev {
+                    // v0.7.3 (#8.2): counted for /metrics; this SSE path emits no usage
+                    // chunk today, so no response byte changes here.
+                    TokEvent::Admitted { cached_tokens } => { mt.cached(cached_tokens as u64); }
                     TokEvent::Tok(t) => {
                         if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                         ntok += 1;
@@ -1849,7 +2144,7 @@ async fn completions(
             }
             drop(rx);
             if finish.starts_with("error") {
-                eprintln!("[req] completions stream ended in an engine error after {ntok} tokens: {finish}");
+                crate::reprintln!("[req] completions stream ended in an engine error after {ntok} tokens: {finish}");
                 yield Ok::<_, std::convert::Infallible>(Event::default().data(sse_error_event(&finish)));
             }
             mt.finish(&finish);
@@ -1865,7 +2160,7 @@ async fn completions(
             yield Ok::<_, std::convert::Infallible>(Event::default().data(chunk.to_string()));
             yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
             let dt = t0.elapsed().as_secs_f32();
-            eprintln!("[req] done   completions tok={} ({:.1} tok/s wall) finish={}", ntok, if dt>1e-6 {ntok as f32/dt} else {0.0}, fr);
+            crate::reprintln!("[req] done   completions tok={} ({:.1} tok/s wall) finish={}", ntok, if dt>1e-6 {ntok as f32/dt} else {0.0}, fr);
         };
         return Sse::new(stream).into_response();
     }
@@ -1874,8 +2169,13 @@ async fn completions(
     // WP02: an engine error (or a channel closed without a Finish) is an HTTP error, not 200 "stop"
     let mut finish = "error: engine stopped".to_string();
     let mut stop_reason: Option<String> = None;
-    while let Some(ev) = rx.recv().await {
+    let mut cached = 0usize; // v0.7.3 (#8.2): prefix-cache-served prompt tokens
+    while let Some(ev) = recv_counted(&mut rx, &bl).await { // LR-5: the one decrement (H2: this loop never decremented)
         match ev {
+            TokEvent::Admitted { cached_tokens } => {
+                cached = cached_tokens as usize;
+                mt.cached(cached_tokens as u64); // /metrics counter
+            }
             TokEvent::Tok(t) => { toks.push(t); mt.tok(); }
             TokEvent::Finish { reason } => {
                 stop_reason = stop_reason_of(&reason); // WP08
@@ -1899,7 +2199,8 @@ async fn completions(
         "id": cid, "object": "text_completion", "created": created, "model": model_name,
         "choices": [{"index": 0, "text": text, "finish_reason": finish, "logprobs": null}],
         "usage": {"prompt_tokens": prompt_len, "completion_tokens": toks.len(),
-                  "total_tokens": prompt_len + toks.len()},
+                  "total_tokens": prompt_len + toks.len(),
+                  "prompt_tokens_details": {"cached_tokens": cached}},
     });
     if let Some(r) = stop_reason {
         json["choices"][0]["stop_reason"] = serde_json::json!(r); // WP08
@@ -1914,7 +2215,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/tokenize", post(tokenize))
         .route("/v1/detokenize", post(detokenize))
         .route("/v1/models", get(list_models))
-        .route("/v1/models/:id", get(get_model))
+        // S10 (REL_V0_7_3): the served id contains a slash (base_model, e.g.
+        // Qwen/Qwen3.8-Flash-Next); a :id param matched only the %2F form. The wildcard
+        // serves the raw-slash spelling AND the %2F form (decoded after routing); the
+        // handler id comparison is unchanged. :id + *id cannot coexist in matchit.
+        .route("/v1/models/*id", get(get_model))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
@@ -2049,6 +2354,39 @@ mod grow_find_tests {
 }
 
 #[cfg(test)]
+mod model_id_tests {
+    use super::{resolve_model_name, model_id_from_dir};
+
+    fn temp_model_dir(tag: &str, readme: Option<&str>) -> String {
+        let d = std::env::temp_dir().join(format!("velogb10-mid-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        if let Some(r) = readme { std::fs::write(d.join("README.md"), r).unwrap(); }
+        d.to_string_lossy().to_string()
+    }
+
+    /// v0.7.3 (#8.3): the public model id resolves as flag > alias > base_model > dir name.
+    #[test]
+    fn model_id_resolution_order() {
+        let card = "---\nbase_model: Qwen/Qwen3.8-27B\n---\nsome card\n";
+        let dir = temp_model_dir("order", Some(card));
+        assert_eq!(resolve_model_name(Some("flag-id"), Some("alias-id"), &dir), "flag-id");
+        assert_eq!(resolve_model_name(None, Some("alias-id"), &dir), "alias-id");
+        assert_eq!(resolve_model_name(Some("  flag-id  "), None, &dir), "flag-id", "verbatim + trimmed");
+        assert_eq!(resolve_model_name(Some(""), Some("alias-id"), &dir), "alias-id",
+                   "an empty flag value falls through to the alias");
+        assert_eq!(resolve_model_name(None, None, &dir), "Qwen/Qwen3.8-27B",
+                   "no flag: the model card base_model: line");
+        let bare = temp_model_dir("bare", None);
+        let dirname = std::path::Path::new(&bare).file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(resolve_model_name(None, None, &bare), dirname, "no card: the directory name");
+        assert_eq!(model_id_from_dir(&bare), dirname);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+}
+
+#[cfg(test)]
 mod host_tests {
     use super::http_bind_addr;
 
@@ -2068,5 +2406,442 @@ mod host_tests {
         crate::opts::set(o, "not a host!");
         assert!(http_bind_addr(9000).unwrap_err().to_string().contains("--host"));
         crate::opts::unset(o);
+    }
+}
+
+#[cfg(test)]
+mod harden_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicBool;
+
+    /// LR-8 proof: first N distinct reasons warn (Some(true)); duplicates never re-warn
+    /// (Some(false)); past the cap nothing grows and exactly one suppression verdict (None)
+    /// is returned, then silence.
+    #[test]
+    fn schema_seen_cap_bounds_the_set() {
+        let mut seen = HashSet::new();
+        let suppressed = AtomicBool::new(false);
+        for i in 0..SCHEMA_SEEN_CAP {
+            assert_eq!(schema_seen_note(&mut seen, &suppressed, &format!("reason {i}")), Some(true));
+        }
+        assert_eq!(seen.len(), SCHEMA_SEEN_CAP);
+        // A repeat is still a duplicate.
+        assert_eq!(schema_seen_note(&mut seen, &suppressed, "reason 0"), Some(false));
+        // The first NEW reason past the cap yields the one-time suppression verdict...
+        assert_eq!(schema_seen_note(&mut seen, &suppressed, "brand new"), None);
+        // ...and the set did not grow.
+        assert_eq!(seen.len(), SCHEMA_SEEN_CAP);
+        // Every later new reason is silent (Some(false)) and still does not grow the set.
+        for i in 0..50 {
+            assert_eq!(schema_seen_note(&mut seen, &suppressed, &format!("over {i}")), Some(false));
+        }
+        assert_eq!(seen.len(), SCHEMA_SEEN_CAP);
+    }
+}
+
+#[cfg(test)]
+mod harden_lr5_toktx_tests {
+    use super::*;
+
+    /// LR-5 proof: the wrapper's unconsumed-event count is exact across sends, consumes and
+    /// disconnect — this is the number the scheduler's cancel sweep compares against
+    /// `--stream-backlog-events`.
+    #[test]
+    fn toktx_counts_unconsumed_backlog() {
+        let (tx, mut rx, bl) = tok_channel();
+        assert_eq!(tx.len(), 0);
+        for i in 0..5u32 { tx.send(TokEvent::Tok(i)).unwrap(); }
+        assert_eq!(tx.len(), 5, "5 sent, none consumed");
+        try_recv_counted(&mut rx, &bl).unwrap();
+        try_recv_counted(&mut rx, &bl).unwrap();
+        assert_eq!(tx.len(), 3, "3 unconsumed after the handler read 2 via try_recv_counted");
+        let clone = tx.clone();
+        assert_eq!(clone.len(), 3, "clones share the count");
+        drop(rx);
+        assert!(tx.is_closed(), "a dropped receiver closes the sender");
+    }
+}
+
+#[cfg(test)]
+mod nonetools_tests {
+    //! S-B9-REL-NONETOOLS: the --keep-tools-when-tool-choice-none contracts.
+    //!  * OFF — the decision is the historical one for EVERY input (prompts byte-identical).
+    //!  * ON  — a "none" request renders the SAME tools block as auto (same slice), differs
+    //!          only by the appended do-not-call instruction (asserted on a Qwen-shaped
+    //!          template: the common prefix is the whole conversation, the only difference is
+    //!          the inserted line), and its reply is never parsed into tool_calls.
+    use super::{tool_choice_decision, partial_overlap, GrowFind, TOOL_OPEN, hold_back_end, apply_force_line};
+
+    fn tools_json() -> serde_json::Value {
+        serde_json::json!([
+            {"type": "function", "function": {"name": "get_weather",
+             "description": "Get the weather for a city",
+             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}},
+            {"type": "function", "function": {"name": "read_file",
+             "description": "Read a file from disk",
+             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+        ])
+    }
+
+    const DO_NOT_CALL: &str = "IMPORTANT: Do not call any tools. Answer in plain text only.";
+
+    /// Flag OFF: the decision matches the legacy one for every tool_choice mode.
+    #[test]
+    fn off_flag_decision_matches_legacy_for_every_mode() {
+        let tools = tools_json();
+        let ts = tools.as_array().unwrap();
+        for mode in ["none", "auto", "required"] {
+            let v = serde_json::json!(mode);
+            let (tft, line, parse) = tool_choice_decision(Some(&v), Some(ts.as_slice()), false);
+            match mode {
+                "none"     => { assert!(tft.is_none(), "legacy none removes the tools");
+                                assert!(line.is_none(), "legacy none forces nothing"); }
+                "auto"     => { assert!(tft.is_some()); assert!(line.is_none()); }
+                "required" => { assert!(tft.is_some());
+                                assert_eq!(line.as_deref(),
+                                    Some("IMPORTANT: You MUST use one of the provided tools to answer. Do not answer in plain text.")); }
+                _ => unreachable!(),
+            }
+            assert!(parse, "{mode}: reply parsing stays on with the flag off");
+        }
+        // named function
+        let named = serde_json::json!({"type": "function", "function": {"name": "get_weather"}});
+        let (tft, line, parse) = tool_choice_decision(Some(&named), Some(ts.as_slice()), false);
+        assert!(tft.is_some());
+        assert_eq!(line.as_deref(),
+            Some("IMPORTANT: You MUST call the function `get_weather` with appropriate arguments before answering. Do not answer in plain text."));
+        assert!(parse);
+        // no tool_choice at all
+        let (tft, line, parse) = tool_choice_decision(None, Some(ts.as_slice()), false);
+        assert!(tft.is_some() && line.is_none() && parse);
+        // flag ON but the request is not "none": decision unchanged
+        let v = serde_json::json!("auto");
+        let (tft, line, parse) = tool_choice_decision(Some(&v), Some(ts.as_slice()), true);
+        assert!(tft.is_some() && line.is_none() && parse);
+        let v = serde_json::json!("required");
+        let (tft, line, parse) = tool_choice_decision(Some(&v), Some(ts.as_slice()), true);
+        assert!(tft.is_some() && line.is_some() && parse);
+    }
+
+    /// Flag ON + "none" + tools: the tools slice is kept IDENTICAL and the do-not-call line
+    /// is the only forcing; the reply is never parsed. "none" WITHOUT tools: unchanged.
+    #[test]
+    fn on_flag_none_keeps_identical_tools_slice_and_forbids() {
+        let tools = tools_json();
+        let ts = tools.as_array().unwrap();
+        let v = serde_json::json!("none");
+        let (tft, line, parse) = tool_choice_decision(Some(&v), Some(ts.as_slice()), true);
+        let kept = tft.expect("the tools stay in the template");
+        assert!(std::ptr::eq(kept.as_ptr(), ts.as_slice().as_ptr()),
+                "the SAME tools slice — nothing reordered or re-serialized");
+        assert_eq!(line.as_deref(), Some(DO_NOT_CALL));
+        assert!(!parse, "the reply is never parsed into tool_calls");
+        // "none" without tools on the request: nothing to keep, nothing to forbid
+        let (tft, line, parse) = tool_choice_decision(Some(&v), None, true);
+        assert!(tft.is_none() && line.is_none() && parse);
+    }
+
+    /// The prefix contract, end to end at the template level: a Qwen-shaped template (the
+    /// structural skeleton of the real one — tools render inside the system block at the START)
+    /// is fed exactly what the server feeds it (decision outputs + the last-message append).
+    /// ON: the none-prompt shares the auto-prompt's whole prefix; removing the single inserted
+    /// instruction makes them byte-equal. OFF: the none-prompt diverges at the tools block.
+    #[test]
+    fn on_flag_none_prompt_shares_the_auto_prefix() {
+        let tpl = concat!(
+            "{%- if tools %}{{ '<|im_start|>system\\n# Tools\\nYou can call: ' }}",
+            "{%- for t in tools %}{{ t.function.name }} {% endfor %}{{ '<|im_end|>\\n' }}{%- endif %}",
+            "{%- for m in messages %}{{ '<|im_start|>' }}{{ m.role }}\\n{{ m.content }}{{ '<|im_end|>\\n' }}{%- endfor %}",
+            "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{%- endif %}",
+        );
+        let mut env = minijinja::Environment::new();
+        env.add_template("t", tpl).unwrap();
+        let render = |messages: &serde_json::Value, tools: Option<&serde_json::Value>| -> String {
+            env.get_template("t").unwrap().render(minijinja::context! {
+                messages => messages, tools => tools, add_generation_prompt => true,
+            }).unwrap()
+        };
+        let tools = tools_json();
+        let ts = tools.as_array().unwrap();
+        let mut messages: Vec<serde_json::Value> = vec![
+            serde_json::json!({"role": "user", "content": "What is the weather in Paris?"}),
+            serde_json::json!({"role": "assistant", "content": "I will check.",
+                "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}),
+            serde_json::json!({"role": "tool", "content": "18C, clear"}),
+            serde_json::json!({"role": "user", "content": "Summarize the conversation so far."}),
+        ];
+
+        // AUTO request: tools in the template, no forcing line.
+        let prompt_auto = render(&serde_json::json!(messages), Some(&tools));
+
+        // NONE + flag ON: tools stay (decision), the do-not-call line is appended to the LAST
+        // message exactly as the server appends it.
+        let v_none = serde_json::json!("none");
+        let (tft, line, parse) = tool_choice_decision(Some(&v_none), Some(ts.as_slice()), true);
+        let tft = tft.expect("tools kept");
+        assert_eq!(tft.len(), ts.len());
+        assert_eq!(line.as_deref(), Some(DO_NOT_CALL));
+        assert!(!parse);
+        // S4: drive the SERVER's append (apply_force_line), not a re-implementation — the
+        // old body re-implemented the splice, so a handler change could not fail this test.
+        let mut typed: Vec<crate::tokenizer::ChatMessage> =
+            serde_json::from_value(serde_json::json!(messages)).unwrap();
+        apply_force_line(&mut typed, DO_NOT_CALL);
+        let prompt_none_on = render(&serde_json::to_value(&typed).unwrap(), Some(&tools));
+
+        // The common prefix is everything up to the inserted instruction, and removing the
+        // single inserted segment makes the prompts byte-equal.
+        let cp = prompt_none_on.bytes().zip(prompt_auto.bytes())
+            .take_while(|(a, b)| a == b).count();
+        assert!(cp > prompt_auto.find("Summarize").unwrap(),
+                "the shared prefix covers the system block AND the earlier messages");
+        let inserted = format!("\n\n{DO_NOT_CALL}");
+        assert_eq!(&prompt_none_on[..cp], &prompt_auto[..cp]);
+        assert!(prompt_none_on[cp..].starts_with(&inserted),
+                "the only difference at the split is the inserted instruction");
+        let stripped = format!("{}{}", &prompt_none_on[..cp], &prompt_none_on[cp + inserted.len()..]);
+        assert_eq!(stripped, prompt_auto,
+                   "removing the single inserted instruction makes the none-prompt byte-equal to auto");
+
+        // NONE + flag OFF (legacy): the tools vanish from the system block, so the divergence
+        // starts inside the system head — long before any conversation content.
+        let (tft, line, parse) = tool_choice_decision(Some(&v_none), Some(ts.as_slice()), false);
+        assert!(tft.is_none() && line.is_none() && parse);
+        let messages: Vec<serde_json::Value> = vec![
+            serde_json::json!({"role": "user", "content": "What is the weather in Paris?"}),
+            serde_json::json!({"role": "assistant", "content": "I will check.",
+                "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}),
+            serde_json::json!({"role": "tool", "content": "18C, clear"}),
+            serde_json::json!({"role": "user", "content": "Summarize the conversation so far."}),
+        ];
+        let prompt_none_off = render(&serde_json::json!(messages), None);
+        assert!(!prompt_none_off.contains("You can call:"),
+                "legacy none renders NO tools block");
+        let cp_off = prompt_none_off.bytes().zip(prompt_auto.bytes())
+            .take_while(|(a, b)| a == b).count();
+        assert!(cp_off < prompt_auto.find("You can call:").unwrap(),
+                "the legacy none-prompt diverges inside the system head (cache miss from token 0)");
+        assert!(cp_off < cp, "flag ON shares a far longer prefix than flag OFF");
+    }
+
+    /// The reply contract: a <tool_call> the model emits anyway is a tool call under auto,
+    /// and plain content for a keep-tools "none" request (the server skips parse entirely).
+    #[test]
+    fn on_flag_none_reply_with_tool_call_stays_plain_content() {
+        let raw = "Let me check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        let tools = tools_json();
+        let ts = tools.as_array().unwrap();
+        // auto: the call is extracted and finish becomes tool_calls
+        let parsed = crate::tools::parse(raw, Some(ts.as_slice()));
+        assert_eq!(parsed.tool_calls.len(), 1, "auto parses the call");
+        let (content, calls, finish) = crate::tools::finalize_parsed(raw, parsed, "stop");
+        assert_eq!(content.as_deref(), Some("Let me check."), "prose before the call stays content");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(finish, "tool_calls");
+        // keep-tools "none": the server constructs the empty ParsedOutput — the raw text is
+        // returned unchanged as content and the finish stays the plain stop/length.
+        let parsed = crate::tools::ParsedOutput { content: raw.trim().to_string(), tool_calls: Vec::new() };
+        let (content, calls, finish) = crate::tools::finalize_parsed(raw, parsed, "stop");
+        assert_eq!(content.as_deref(), Some(raw), "the stray call stays plain content");
+        assert!(calls.is_empty());
+        assert_eq!(finish, "stop");
+    }
+
+    /// The streaming hold-back: the needle is None for a keep-tools "none" request, so a
+    /// stray <tool_call> streams through as content; legacy keeps the hold-back.
+    #[test]
+    fn hold_back_disabled_for_keep_tools_none() {
+        // S4 rewrite: drives the REAL hold_back_end (the old body asserted
+        // `None.and_then(..)`, which cannot fail).
+        let acc = "answer text <tool_call>\n<function=x>\n</function>\n</tool_call>";
+        // keep-tools "none": tool_hold = None — the stray call streams through as content
+        let none: Option<&'static str> = None;
+        assert_eq!(hold_back_end(none, none.and_then(|_| acc.find(TOOL_OPEN)), acc.len(), acc, &["<think"]),
+                   acc.len(), "with tool parsing off NOTHING is held back for tools");
+        // legacy: tool_hold = Some(TOOL_OPEN) — emission stops AT the marker
+        let legacy: Option<&'static str> = Some(TOOL_OPEN);
+        assert_eq!(hold_back_end(legacy, legacy.and_then(|_| acc.find(TOOL_OPEN)), acc.len(), acc, &["<think"]),
+                   "answer text ".len(), "legacy stops at the call");
+        // a partial marker at the tail is held back so a split <tool_c cannot leak
+        let tail = "answer <tool_c";
+        assert_eq!(hold_back_end(legacy, legacy.and_then(|_| tail.find(TOOL_OPEN)), tail.len(), tail, &["<think"]),
+                   "answer ".len(), "the partial marker prefix is not emitted");
+    }
+
+    /// S3: the same-chunk think-close decision — with the flag ON (tool_hold None) a stray
+    /// `<tool_call>` arriving in the same chunk as `</think>` is NOT held back (was: held).
+    #[test]
+    fn think_close_same_chunk_uses_the_hold_back_decision() {
+        let acc = "</think> sure, calling <tool_call>\n<function=x>";
+        let lead = "</think> ".len(); // what the branch computes: past the close tag + lead ws
+        let region = &acc[lead..];
+        let hit = |hold: Option<&'static str>| hold.and_then(|_| region.find(TOOL_OPEN).map(|i| lead + i));
+        // keep-tools "none": the whole chunk streams as content
+        assert_eq!(hold_back_end(None, hit(None), acc.len(), region, &["<think"]), acc.len(),
+                   "S3: with tool parsing off the same-chunk call is plain content");
+        // legacy: held at the call, exactly like the steady-state content branch
+        let legacy: Option<&'static str> = Some(TOOL_OPEN);
+        assert_eq!(hold_back_end(legacy, hit(legacy), acc.len(), region, &["<think"]),
+                   lead + "sure, calling ".len(), "legacy holds at the call");
+    }
+}
+
+#[cfg(test)]
+/// REL_V0_7_3 review H1: the tests the HARDEN report CLAIMED but never wrote, now real.
+/// Every test below drives the actual production functions (`over_wait_limit`, `server_busy`,
+/// `over_backlog`, `tok_channel` + `recv_counted`/`try_recv_counted`) — no hand-simulated
+/// counters, no re-implemented predicates. Listed by name in the dated note in
+/// PLAN/REL_HARDEN_REPORT.md.
+mod harden_review_h1_tests {
+    use super::*;
+
+    /// LR-4 admit-bound arithmetic: unlimited at 0, refusal starts exactly at cap + max_waiting.
+    #[test]
+    fn wait_limit_arithmetic_is_exact() {
+        assert!(!over_wait_limit(4, 4, 256), "all lanes busy, nobody waiting");
+        assert!(!over_wait_limit(4 + 255, 4, 256), "max_waiting-1 waiting is still admissible");
+        assert!(over_wait_limit(4 + 256, 4, 256), "the boundary fires: inflight == cap + max_waiting");
+        assert!(over_wait_limit(10_000, 4, 256), "far beyond the bound still fires");
+        assert!(!over_wait_limit(u64::MAX, 4, 0), "0 = unlimited: never over");
+        assert!(!over_wait_limit(0, 0, 0), "0 = unlimited holds at zero inflight too");
+    }
+
+    /// LR-4 refusal shape: 503 + `Retry-After: 5` + the engine's error JSON with code
+    /// `server_busy`, and the rejection is COUNTED (velogb10_requests_rejected_total).
+    #[tokio::test]
+    async fn server_busy_response_shape() {
+        let before = crate::metrics::render(true);
+        let resp = server_busy();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(), "5");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "server_busy", "body: {v}");
+        assert_eq!(v["error"]["type"], "server_error");
+        assert!(v["error"]["message"].as_str().unwrap().contains("server busy"));
+        let after = crate::metrics::render(true);
+        let cnt = |s: &str| s.lines().find(|l| l.starts_with("velogb10_requests_rejected_total"))
+            .unwrap().split_whitespace().last().unwrap().parse::<u64>().unwrap();
+        assert!(cnt(&after) > cnt(&before), "server_busy must count the rejection");
+    }
+
+    /// LR-5 backlog predicate: fires AT the limit (>=), never below it; 0 = unlimited.
+    #[test]
+    fn backlog_predicate_fires_at_limit_only() {
+        assert!(!over_backlog(0, 8192));
+        assert!(!over_backlog(8191, 8192), "one below the limit is admissible");
+        assert!(over_backlog(8192, 8192), "AT the limit the sweep fires");
+        assert!(over_backlog(99_999, 8192));
+        assert!(!over_backlog(99_999, 0), "0 = unlimited");
+        assert!(!over_backlog(0, 0));
+    }
+
+    /// Handler-level (a): the REAL helper moves the unconsumed counter by exactly ONE per
+    /// received event (H0: the double decrement left N-2K).
+    #[tokio::test]
+    async fn recv_counted_moves_backlog_exactly_once() {
+        let (tx, mut rx, bl) = tok_channel();
+        for i in 0..10u32 { tx.send(TokEvent::Tok(i)).unwrap(); }
+        assert_eq!(tx.len(), 10, "N sent, none consumed");
+        for k in 0..3u32 {
+            assert!(matches!(recv_counted(&mut rx, &bl).await, Some(TokEvent::Tok(t)) if t == k));
+        }
+        assert_eq!(tx.len(), 7, "N-K after the handler read K via recv_counted");
+        // the sync twin agrees (the bench/gate drains' path)
+        assert!(matches!(try_recv_counted(&mut rx, &bl), Some(TokEvent::Tok(_))));
+        assert_eq!(tx.len(), 6, "try_recv_counted decrements exactly once too");
+    }
+
+    /// Handler-level (b): a reader that consumed 20,000 events and THEN stalls trips the
+    /// predicate only when UNCONSUMED events reach the limit — the test that would have
+    /// caught both the H0 double decrement and the H2 missing decrement.
+    #[tokio::test]
+    async fn stalled_reader_trips_only_on_unconsumed_events() {
+        let (tx, mut rx, bl) = tok_channel();
+        let limit = 8192usize;
+        for i in 0..20_000u32 { tx.send(TokEvent::Tok(i)).unwrap(); }
+        for _ in 0..20_000 { recv_counted(&mut rx, &bl).await.unwrap(); }
+        assert_eq!(tx.len(), 0, "a healthy reader leaves zero unconsumed events");
+        assert!(!over_backlog(tx.len(), limit), "consumed history must not count");
+        // ...then the reader stalls: 8191 unread are admissible, the 8192nd trips.
+        for i in 0..8191u32 { tx.send(TokEvent::Tok(i)).unwrap(); }
+        assert!(!over_backlog(tx.len(), limit), "8191 unconsumed < 8192");
+        tx.send(TokEvent::Tok(0)).unwrap();
+        assert!(over_backlog(tx.len(), limit), "8192 unconsumed trips the sweep");
+    }
+
+    /// Handler-level (c): a 70,000-event generation consumed by a healthy reader never trips
+    /// even the default limit (65536) — the H2 bug cancelled exactly this non-streaming run.
+    #[tokio::test]
+    async fn healthy_70k_event_generation_never_trips_default_limit() {
+        let (tx, mut rx, bl) = tok_channel();
+        for i in 0..70_000u32 { tx.send(TokEvent::Tok(i)).unwrap(); }
+        for _ in 0..70_000 { recv_counted(&mut rx, &bl).await.unwrap(); }
+        assert_eq!(tx.len(), 0, "70,000 events, all consumed by the helper");
+        assert!(!stream_backlog_exceeded(tx.len()),
+            "a healthy 70k-token completion must never be cancelled by the sweep");
+    }
+}
+
+#[cfg(test)]
+/// S8 (REL_V0_7_3 review): the model id is escaped in every hand-built SSE chunk — a quote or
+/// backslash in `--model-name` (honoured verbatim since v0.7.3) used to break every chunk.
+mod s8_sse_escape_tests {
+    use super::*;
+
+    #[test]
+    fn sse_chunks_escape_the_model_id() {
+        let evil = "Qwen/Qwen3.8\"Flash\\Next";
+        for chunk in [
+            role_chunk("chatcmpl-1", 1, evil),
+            content_chunk("chatcmpl-1", 1, evil, "answer"),
+            reasoning_chunk("chatcmpl-1", 1, evil, "thinking"),
+            final_chunk("chatcmpl-1", 1, evil, "stop", ""),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(&chunk)
+                .unwrap_or_else(|e| panic!("chunk with an evil model id must stay valid JSON ({e}): {chunk}"));
+            assert_eq!(v["model"].as_str(), Some(evil), "the id round-trips verbatim: {chunk}");
+        }
+        // and the text field stays escaped too (regression guard on the extraction)
+        let c = content_chunk("chatcmpl-1", 1, "m", "line1\nline2\"q");
+        let v: serde_json::Value = serde_json::from_str(&c).unwrap();
+        assert_eq!(v["choices"][0]["delta"]["content"].as_str(), Some("line1\nline2\"q"));
+    }
+}
+
+#[cfg(test)]
+/// S10 (REL_V0_7_3 review): GET /v1/models/<id-with-slash> — both the raw-slash spelling and
+/// the %2F form must route to the handler. Drives a real TCP listener (no tower test-util in
+/// the tree) with the SAME two route patterns create_router registers.
+mod s10_models_route_tests {
+    #[tokio::test]
+    async fn models_route_accepts_raw_slash_and_encoded_ids() {
+        use axum::routing::get;
+        async fn echo_id(axum::extract::Path(id): axum::extract::Path<String>) -> String { id }
+        let app = axum::Router::new()
+            .route("/v1/models/*id", get(echo_id));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let fetch = |path: String| async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!("GET {path} HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n");
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).await.unwrap();
+            buf
+        };
+        // raw slash (the EXL3 default id is slashed now): 200 + the full id extracts
+        let r = fetch("/v1/models/Qwen/Qwen3.8-Flash-Next".into()).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "raw slash must route (S10): {r}");
+        assert!(r.ends_with("Qwen/Qwen3.8-Flash-Next"), "body: {r}");
+        // the percent-encoded form keeps working exactly as before
+        let r = fetch("/v1/models/Qwen%2FQwen3.8-Flash-Next".into()).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "encoded form must keep routing: {r}");
+        assert!(r.ends_with("Qwen/Qwen3.8-Flash-Next"), "body: {r}");
     }
 }

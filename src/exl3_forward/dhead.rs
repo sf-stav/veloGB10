@@ -794,26 +794,26 @@ impl FwdModel {
                         let d: Vec<u32> = (0..8).map(|j| now[j].wrapping_sub(s0[j])).collect();
                         *s0 = now;
                         if d[0] > 0 {
-                            println!("DHEADP request: penalized draft passes {} | expanded {} (+{:.2} blocks/expansion) | \
+                            crate::rprintln!("DHEADP request: penalized draft passes {} | expanded {} (+{:.2} blocks/expansion) | \
                                       FALLBACKS {} (all-block rescore: over-cap {}, non-monotone {}, degenerate {}; {} blocks) | \
                                       unpenalized-row passes {}",
                                      d[0], d[1], d[2] as f64 / d[1].max(1) as f64, d[3] + d[4] + d[5], d[3], d[4], d[5],
                                      d[6], d[7]);
                         }
                     }
-                    Err(e) => println!("DHEADP request: counter readback failed ({e})"),
+                    Err(e) => crate::rprintln!("DHEADP request: counter readback failed ({e})"),
                 }
             }
         }
         if !dhead_xcheck() { return; }
         if let Some(st) = XSTATS.lock().unwrap().take() {
-            if st.passes > 0 { println!("DHEAD_XCHECK request: {}", st.line()); }
+            if st.passes > 0 { crate::rprintln!("DHEAD_XCHECK request: {}", st.line()); }
         }
         if let Some(st) = PSTATS.lock().unwrap().take() {
-            if st.passes > 0 { println!("DHEADP_XCHECK request: {}", st.line()); }
+            if st.passes > 0 { crate::rprintln!("DHEADP_XCHECK request: {}", st.line()); }
         }
         if let Some(st) = RQSTATS.lock().unwrap().take() {
-            if st.passes > 0 { println!("RQDH_XCHECK request: {}", st.line()); }
+            if st.passes > 0 { crate::rprintln!("RQDH_XCHECK request: {}", st.line()); }
         }
     }
 }

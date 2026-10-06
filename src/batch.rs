@@ -50,6 +50,12 @@ pub struct SpecBenchJob {
 pub enum TokEvent {
     Tok(u32),
     Finish { reason: String },
+    /// v0.7.3 (issue #8.2): sent ONCE per request, right after admission, carrying the
+    /// number of prompt tokens the scheduler's prefix cache served (prefill skipped).
+    /// Engines without a prefix cache never send it - handlers default the request's
+    /// cached count to 0. Feeds `usage.prompt_tokens_details.cached_tokens` and
+    /// `velogb10_prompt_tokens_cached_total`.
+    Admitted { cached_tokens: u32 },
 }
 
 /// A request submitted to the scheduler.
@@ -67,7 +73,7 @@ pub struct BatchRequest {
     pub min_p: f32,
     pub min_new: usize,
     pub ignore_eos: bool,
-    pub tx: mpsc::UnboundedSender<TokEvent>,
+    pub tx: crate::server::TokTx,
     pub seed: Option<u64>,
     /// Token index of the MESSAGE BOUNDARY — the prompt as rendered without the generation prompt.
     /// The scheduler snapshots the GDN recurrent state here, because this is the longest prefix of this
@@ -114,7 +120,7 @@ struct Lane {
     /// machine's CURRENT state, advanced once per COMMITTED token.
     schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
     schema_state: u32,
-    tx: mpsc::UnboundedSender<TokEvent>,
+    tx: crate::server::TokTx,
     /// MTP KV cursor: the main-model position of the last committed token = next MTP write pos - 1.
     /// Only meaningful when this lane is served via the MTP path.
     mtp_pos: usize,
@@ -216,7 +222,7 @@ struct PfCursor {
     df2_primed_ok: bool,
     dspark_primed_ok: bool,
     /// Lane-install payload — `admit()`'s post-loop tail.
-    tx: mpsc::UnboundedSender<TokEvent>,
+    tx: crate::server::TokTx,
     greedy: bool,
     domain: Domain,
     temperature: f32,
@@ -711,13 +717,13 @@ impl MtpPolicy {
         // lines must be byte-identical across ranks — and a gate that only diffed switch events
         // could pass vacuously on a no-decision run (AGENTS.md §4.12). All values are pure
         // functions of the deterministic hazard curve and the shipped table.
-        eprintln!("[mtp] window: d={} yield {:.2} acc {:.1}% | ctx {} | cur {:.2}x best d={} {:.2}x",
+        crate::reprintln!("[mtp] window: d={} yield {:.2} acc {:.1}% | ctx {} | cur {:.2}x best d={} {:.2}x",
                   self.depth, observed, acc * 100.0, ctx, cur, best_d, best);
 
         if best < 1.0 {
             self.active = false;
             self.retry_at = self.decode_steps + MTP_RETRY_AFTER;
-            eprintln!("[mtp] DISABLED: acceptance {:.1}% gives {:.2} tok/step, and no depth beats a \
+            crate::reprintln!("[mtp] DISABLED: acceptance {:.1}% gives {:.2} tok/step, and no depth beats a \
                        plain decode (best {:.2}x). Re-probing in {} steps.",
                       acc * 100.0, observed, best, MTP_RETRY_AFTER);
             return;
@@ -1326,7 +1332,7 @@ impl BatchScheduler {
         // bool. TP>1 refuses the audit — see the field doc above.
         let audit_on = crate::opts::var(crate::opt!("mtp-lossless-audit")).is_ok();
         let audit_on = if audit_on && gpu.tp_world() > 1 {
-            eprintln!("[lossless-audit] REFUSED under TP={} — the shadow decode is single-node SPMD; run the audit at TP=1",
+            crate::reprintln!("[lossless-audit] REFUSED under TP={} — the shadow decode is single-node SPMD; run the audit at TP=1",
                       gpu.tp_world());
             false
         } else { audit_on };
@@ -1355,7 +1361,7 @@ impl BatchScheduler {
         let audit_bufs = if audit_on {
             let mut ab = gpu.new_decode_buffers(2);
             gpu.dev().htod_sync_copy_into(&[audit_slot as i32, 0i32], &mut ab.slot_ids_dev).unwrap();
-            eprintln!("[lossless-audit] ARMED slot={audit_slot} — one shadow decode per emitted token (throughput halves)");
+            crate::reprintln!("[lossless-audit] ARMED slot={audit_slot} — one shadow decode per emitted token (throughput halves)");
             Some(ab)
         } else {
             None
@@ -1641,9 +1647,9 @@ impl BatchScheduler {
         if crate::opts::var(crate::opt!("no-df2-graph")).is_err() {
             if let Some(df2) = s.df2.as_mut() {
                 if df2.capture_round_graph() {
-                    eprintln!("[df2] draft-round CUDA graph captured (eager fallback via --no-df2-graph)");
+                    crate::reprintln!("[df2] draft-round CUDA graph captured (eager fallback via --no-df2-graph)");
                 } else {
-                    eprintln!("[df2] draft-round graph capture unsupported — staying eager");
+                    crate::reprintln!("[df2] draft-round graph capture unsupported — staying eager");
                 }
             }
         }
@@ -1686,6 +1692,7 @@ impl BatchScheduler {
                 }
             }
             if self.num_active() == 0 && self.pf.is_none() {
+                crate::metrics::sched_idle(); // v0.7.3 gauge: about to block for work
                 match self.rx.recv().await {
                     Some(req) => self.admit(req),
                     // Fall THROUGH (no `continue`): the cursor just created must get its first
@@ -1837,6 +1844,7 @@ impl BatchScheduler {
                 // Idle: block for the next request, exactly like run() — the mirror blocks on the
                 // session stream meanwhile, so both ranks sleep in step.
                 if self.num_active() == 0 && pending.is_empty() && self.pf.is_none() && !closed {
+                    crate::metrics::sched_idle(); // H3: about to block for work (busy must not stick at 1)
                     match self.rx.recv().await {
                         Some(req) => pending.push(req),
                         None => closed = true,
@@ -1859,7 +1867,13 @@ impl BatchScheduler {
             }
             for i in 0..self.num_active() {
                 if self.lanes[i].as_ref()
-                    .map_or(false, |l| l.tx.is_closed() && !l.tp_cancelled) {
+                    .map_or(false, |l| !l.tp_cancelled
+                        && (l.tx.is_closed()
+                            || crate::server::stream_backlog_exceeded(l.tx.len()))) { // LR-5
+                    if !self.lanes[i].as_ref().map_or(false, |l| l.tx.is_closed()) {
+                        crate::metrics::stream_backlog_cancel();
+                        crate::reprintln!("[req] lane {i}: stream cancelled — unconsumed event backlog at the --stream-backlog-events limit (reader stalled; LR-5; Cancel shipped to the mirrors)");
+                    }
                     self.lanes[i].as_mut().unwrap().tp_cancelled = true;
                     events.push(crate::tp_serve::TpEvent::Cancel { lane: i });
                 }
@@ -1928,7 +1942,7 @@ impl BatchScheduler {
                     for ev in se.events {
                         match ev {
                             crate::tp_serve::TpEvent::Admit(w) => {
-                                let (tx, rx) = mpsc::unbounded_channel::<TokEvent>();
+                                let (tx, rx, _bl) = crate::server::tok_channel(); // mirror keepalive; LR-5 gated off under TP
                                 keepalive.push(rx);
                                 self.admit(w.into_request(tx));
                             }
@@ -1994,7 +2008,7 @@ impl BatchScheduler {
             if let Some(d) = self.step_dump.as_mut() {
                 d.job_start(&dump_tags[k], &job.prompt, self.gpu.dev());
             }
-            let (tx, mut rx) = mpsc::unbounded_channel::<TokEvent>();
+            let (tx, mut rx, bl) = crate::server::tok_channel(); // LR-5 (H6): drained counted below
             let job_t0 = std::time::Instant::now();
             let job_plen = job.prompt.len();
             self.admit(BatchRequest {
@@ -2035,10 +2049,12 @@ impl BatchScheduler {
                 tokio::task::yield_now().await;
             }
             let mut toks = Vec::new();
-            while let Ok(ev) = rx.try_recv() {
+            while let Some(ev) = crate::server::try_recv_counted(&mut rx, &bl) { // LR-5 (H6)
                 match ev {
                     TokEvent::Tok(t) => toks.push(t),
                     TokEvent::Finish { .. } => {}
+                    // #8.2: admission telemetry — no action for a bench drain.
+                    TokEvent::Admitted { .. } => {}
                 }
             }
             // Keep the source set for the next job's ADMIT (the lane priming consults it).
@@ -2145,7 +2161,7 @@ impl BatchScheduler {
                     // client-visible symptom as the pf8 OOB class. Capacity is the CALLER's job, so
                     // reaching here means the caller's accounting and the slot table disagree;
                     // say so, and tell the client instead of hanging it.
-                    eprintln!("[req] DROPPED: no free physical slot (free_slots=0) — caller capacity                                accounting disagrees with the slot table");
+                    crate::reprintln!("[req] DROPPED: no free physical slot (free_slots=0) — caller capacity                                accounting disagrees with the slot table");
                     let _ = req.tx.send(TokEvent::Finish { reason: "capacity".to_string() });
                     return;
                 }
@@ -2206,7 +2222,7 @@ impl BatchScheduler {
                                  (common_prefix_len(&self.slot_ckpt_seq[sl], &req.prompt), self.slot_ckpt_seq[sl].len())])
                 .max_by_key(|&(l, _)| l) {
                 if best > 64 {
-                    eprintln!("[req] prefix MISS: {} of {} prompt tokens match a cached sequence of {} \
+                    crate::reprintln!("[req] prefix MISS: {} of {} prompt tokens match a cached sequence of {} \
                                — unusable, the GDN recurrent state only exists at token {}",
                               best, req.prompt.len(), cached, cached);
                 }
@@ -2230,7 +2246,7 @@ impl BatchScheduler {
         let _has_penalty = rep_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
         let will_use_mtp = self.mtp.active();
         if mtp_dispatch_trace() {
-            eprintln!("[b31-trace] admit: active={} depth={} src={:?} reuse={} plen={}",
+            crate::reprintln!("[b31-trace] admit: active={} depth={} src={:?} reuse={} plen={}",
                       will_use_mtp, self.mtp.depth(), self.mtp.spec_source(), reuse, plen);
         }
         // S5F: does THIS lane take the DFlash2 path? Requires the source + a resident round + a
@@ -2277,11 +2293,16 @@ impl BatchScheduler {
             // DF2_CARRY telemetry (spec §6.7): print the guard's own INPUTS, so a refusal is
             // diagnosable rather than inferred. `ring_len` is the frontier N that `N <= plen`
             // bounds. All four booleans are what `df2_carry_ok` actually evaluated.
-            eprintln!("[req] prefix HIT: reuse={reuse} of plen={plen} ({kind}, dspark_carry={dspark_carry}, blind={dspark_ring_blind}, \
+            crate::reprintln!("[req] prefix HIT: reuse={reuse} of plen={plen} ({kind}, dspark_carry={dspark_carry}, blind={dspark_ring_blind}, \
                        df2_carry={df2_carry} [enabled={} df2_src={} ring_slot={ring_slot_in:?} phys={phys} \
                        ring_len={ring_len_in} reuse<=len={} len<=plen={} live={live_at_admit} claim_kept={}])",
                       self.df2_carry_enabled, is_df2_src(src),
                       ring_len_in >= reuse, ring_len_in <= plen, ring_claim_survives);
+            // S2 (REL_V0_7_3): tell the HANDLER too, not just the log — `cached_tokens` was
+            // always 0 on the NVFP4 server because this event was never sent from this HIT
+            // path (EXL3 sends it at its admit; see exl3_serve.rs `Admitted`). Once, right
+            // here at admission, before any token is generated.
+            let _ = tx.send(TokEvent::Admitted { cached_tokens: reuse as u32 });
         }
         // W2: the DFlash2 round is not schema-masked in this release — a schema request keeps the
         // plain decode path instead of an unmasked draft/verify round.
@@ -2315,13 +2336,13 @@ impl BatchScheduler {
             && self.dspark.is_some() && self.dspark_prime.is_some() && (reuse == 0 || dspark_carry)
             && req_schema.is_none();
         if src == SpecSource::Dspark && self.dspark.is_none() && !self.dspark_fallback_logged {
-            eprintln!("[dspark] SpecSource=dspark but the DSpark round is NOT resident — serving via \
+            crate::reprintln!("[dspark] SpecSource=dspark but the DSpark round is NOT resident — serving via \
                        MTP per the standing-directive fallback (absent/failed artifact is never a \
                        hard failure)");
             self.dspark_fallback_logged = true;
         }
         if is_df2_src(src) && self.df2.is_none() && !self.df2_fallback_logged {
-            eprintln!("[df2] SpecSource=DFlash2 but the DFlash2 round is NOT resident — serving via \
+            crate::reprintln!("[df2] SpecSource=DFlash2 but the DFlash2 round is NOT resident — serving via \
                        MTP per the standing-directive fallback (absent/failed artifact is never a \
                        hard failure)");
             self.df2_fallback_logged = true;
@@ -2366,7 +2387,7 @@ impl BatchScheduler {
         let asked_max_new = max_new;
         let max_new = max_new.min(self.kv_stride.saturating_sub(plen + mtp_headroom));
         if max_new < asked_max_new {
-            eprintln!("[req] max_tokens clamped {} -> {} (KV stride {} − plen {plen} − spec headroom \
+            crate::reprintln!("[req] max_tokens clamped {} -> {} (KV stride {} − plen {plen} − spec headroom \
                        {mtp_headroom}; finish=length if generation runs out)",
                       asked_max_new, max_new, self.kv_stride);
         }
@@ -2381,7 +2402,7 @@ impl BatchScheduler {
             None
         };
         if let Some(msg) = reject_msg {
-            eprintln!("[req] REJECTED: {msg}");
+            crate::reprintln!("[req] REJECTED: {msg}");
             // Return the physical slot — it was popped above and losing it here permanently shrinks
             // capacity (handoff 6.10). Two consistency rules: (1) the push-back is deterministic, so
             // both TP ranks make the same next pick; (2) if the CKPT restore already ran, the slot's
@@ -2414,7 +2435,7 @@ impl BatchScheduler {
         }
         let suffix = &prompt[reuse..];
         if reuse > 0 {
-            eprintln!("[req] prefix hit ({}): {}/{} tokens cached, prefilling {} ({:.0}% skipped)",
+            crate::reprintln!("[req] prefix hit ({}): {}/{} tokens cached, prefilling {} ({:.0}% skipped)",
                       match from { Some(From_::Ckpt) => "prompt checkpoint",
                                    Some(From_::Ring(_)) => "ring grid",
                                    _ => "live state" },
@@ -2486,7 +2507,7 @@ impl BatchScheduler {
                 if l.df2_primed && !l.df2_stale { l.df2_stale = true; taken += 1; }
             }
             if taken > 0 {
-                eprintln!("[spec] round-drafter ring handed to the new request; {taken} live lane(s) continue on MTP");
+                crate::reprintln!("[spec] round-drafter ring handed to the new request; {taken} live lane(s) continue on MTP");
             }
         }
         if will_use_df2 {
@@ -2675,7 +2696,7 @@ impl BatchScheduler {
             // the head's line is the measurement's signal. (tp_serving is true on BOTH ranks
             // in TP serving mode, so it cannot gate this — only rank selection could, and
             // the two lines are harmless in separate logs.)
-            eprintln!("[req] ttft={:.1}ms plen={}",
+            crate::reprintln!("[req] ttft={:.1}ms plen={}",
                       c.received_at.elapsed().as_secs_f64() * 1000.0, plen);
         }
 
@@ -2702,7 +2723,7 @@ impl BatchScheduler {
             // same large-M gemm_tiled path, same fail-soft contract.
             if let (Some(ds), Some(ps)) = (self.dspark.as_mut(), self.dspark_prime.as_ref()) {
                 if let Err(e) = ds.prime_window(&ps.taps, w1 - w0, w0) {
-                    eprintln!("[dspark] prompt prime window {w0}..{w1} FAILED ({e:#}) — this lane \
+                    crate::reprintln!("[dspark] prompt prime window {w0}..{w1} FAILED ({e:#}) — this lane \
                                will NOT take the DSpark path (falls back to MTP/batched)");
                     c.dspark_primed_ok = false;
                 }
@@ -2713,7 +2734,7 @@ impl BatchScheduler {
             // tail, so the window's capture D2Ds are complete before the round reads them.
             if let (Some(df2), Some(ps)) = (self.df2.as_mut(), self.df2_prime.as_ref()) {
                 if let Err(e) = df2.prime_window(&ps.taps, w1 - w0, w0) {
-                    eprintln!("[df2] prompt prime window {w0}..{w1} FAILED ({e:#}) — this lane \
+                    crate::reprintln!("[df2] prompt prime window {w0}..{w1} FAILED ({e:#}) — this lane \
                                will NOT take the DFlash2 path (falls back to MTP/batched)");
                     c.df2_primed_ok = false;
                     // DF2_CARRY: a failed prime can leave the ring half-overwritten, so the
@@ -2744,11 +2765,12 @@ impl BatchScheduler {
             if crate::opts::var(crate::opt!("dump-pfhash")).is_ok() && (w1 % 1024 == 0 || w1 >= plen - 512) {
                 // Phase-8 [pfhash]: what the ring entry ACTUALLY holds at snapshot time, plus
                 // the live slot state it was copied from — both hashed after the copy lands.
-                eprintln!("[ring-hash] w1={} j={} src{} ring{}",
+                crate::reprintln!("[ring-hash] w1={} j={} src{} ring{}",
                           w1, j, self.gpu.pf_hash(&self.state, phys, None),
                           self.gpu.pf_hash(&self.state, self.ring_ckpt_slot + phys * RING_CKPT_K + j, None));
             }
         }
+        crate::metrics::sched_touch(); // H3: prefill chunk COMPLETE (long prefill stays live)
         c.w0 = w1;
         if c.w0 >= plen {   // the last window completed: the lane becomes visible NOW (§3.4)
             self.pf_finish(*c);
@@ -2770,7 +2792,7 @@ impl BatchScheduler {
         self.state.vision_spans.clear();
 
         if !c.pf_hash_str.is_empty() {
-            eprintln!("[pfhash] plen={} reuse={} phys={} a0={}{}",
+            crate::reprintln!("[pfhash] plen={} reuse={} phys={} a0={}{}",
                       c.plen, c.reuse, phys, c.first_tok, c.pf_hash_str);
         }
 
@@ -2800,12 +2822,12 @@ impl BatchScheduler {
             } else {
                 let _ = c.tx.send(TokEvent::Tok(c.first_tok));
             }
-            eprintln!("[req] ttft={:.1}ms plen={}",
+            crate::reprintln!("[req] ttft={:.1}ms plen={}",
                       c.received_at.elapsed().as_secs_f64() * 1000.0, c.plen);
         }
         if c.trace_pf {
             let other = c.admit_t0.elapsed().as_secs_f64() - c.t_memsets - c.t_prefill - c.t_prime;
-            eprintln!("[pf-admit] plen={} memsets={:.2}ms prefill={:.2}ms prime={:.2}ms other={:.2}ms",
+            crate::reprintln!("[pf-admit] plen={} memsets={:.2}ms prefill={:.2}ms prime={:.2}ms other={:.2}ms",
                       c.plen, c.t_memsets * 1000.0, c.t_prefill * 1000.0, c.t_prime * 1000.0,
                       other * 1000.0);
         }
@@ -2840,7 +2862,7 @@ impl BatchScheduler {
             tp_cancelled: false,
         });
         if mtp_dispatch_trace() {
-            eprintln!("[b31-trace] lane install: slot={} pos={} mtp_primed={} df2_primed={} greedy={} schema={}",
+            crate::reprintln!("[b31-trace] lane install: slot={} pos={} mtp_primed={} df2_primed={} greedy={} schema={}",
                       slot, c.plen, c.will_use_mtp,
                       (c.will_use_df2 && c.df2_primed_ok) || (c.will_use_dspark && c.dspark_primed_ok),
                       c.greedy, c.schema.is_some());
@@ -2864,7 +2886,7 @@ impl BatchScheduler {
             let mw = self.gpu.mtp_hidden_width();
             self.pool.release_bf16(hs, mw * c.plen);
             if a0s != c.first_tok {
-                eprintln!("[lossless-audit] WARN req={} shadow prefill a0={} != lane a0={}",
+                crate::reprintln!("[lossless-audit] WARN req={} shadow prefill a0={} != lane a0={}",
                           self.audit_req_n, a0s, c.first_tok);
             }
             // The cursor's FIRST prediction must be real: with pred left at 0 the request's first
@@ -2913,7 +2935,7 @@ impl BatchScheduler {
             lane.schema_state = match sm.step(lane.schema_state, t) {
                 Some(ns) => ns,
                 None => {
-                    eprintln!("[schema] lane {i}: token {t} is invalid in the current schema state \
+                    crate::reprintln!("[schema] lane {i}: token {t} is invalid in the current schema state \
                                — finishing the turn (this must not happen with the mask armed)");
                     return true;
                 }
@@ -2928,6 +2950,7 @@ impl BatchScheduler {
     ///   B. All remaining lanes are served by a single batched decode (one shared weight read),
     ///      each emitting exactly one token.
     fn decode_step(&mut self, b: usize) {
+        crate::metrics::sched_step(); // v0.7.3 gauge: rounds + busy
         let mut finished = vec![false; b];
         // Cancel lanes whose client is gone (disconnect, or the SSE generator dropped the receiver
         // on a stop-string hit): every send would silently fail and the lane would otherwise decode
@@ -2939,7 +2962,15 @@ impl BatchScheduler {
             // would otherwise finish the lane a step early on the head only. Single-node is exactly
             // as before (`is_closed()` alone); the mirror's dummy txs never close on their own.
             if self.lanes[i].as_ref()
-                .map_or(false, |l| l.tp_cancelled || (!self.tp_serving && l.tx.is_closed())) {
+                .map_or(false, |l| l.tp_cancelled
+                    || (!self.tp_serving
+                        && (l.tx.is_closed()
+                            || crate::server::stream_backlog_exceeded(l.tx.len())))) { // LR-5
+                if !self.tp_serving
+                    && !self.lanes[i].as_ref().map_or(false, |l| l.tp_cancelled || l.tx.is_closed()) {
+                    crate::metrics::stream_backlog_cancel();
+                    crate::reprintln!("[req] lane {i}: stream cancelled — unconsumed event backlog at the --stream-backlog-events limit (reader stalled; LR-5)");
+                }
                 finished[i] = true;
             }
         }
@@ -3000,7 +3031,7 @@ impl BatchScheduler {
         // exactly the lanes Phase A did NOT serve (a lane is never double-served, never stranded).
         let mut served = vec![false; b];
         if mtp_dispatch_trace() && b == 1 {
-            eprintln!("[b31-trace] dispatch: active={} src={:?} df2_live={} dflash_live={} dspark_live={} mtp_live={}",
+            crate::reprintln!("[b31-trace] dispatch: active={} src={:?} df2_live={} dflash_live={} dspark_live={} mtp_live={}",
                       policy_active, src, df2_live, dflash_live, dspark_live, mtp_live);
         }
         if df2_live {
@@ -3010,7 +3041,7 @@ impl BatchScheduler {
             // scheduler); it takes the MTP fallback below and is marked stale there.
             let ring_ok = self.df2_ring_at(lane.pos);
             if lane.df2_primed && !lane.df2_stale && !ring_ok {
-                eprintln!("[df2] ring frontier {} != lane pos {}: lane continues on MTP",
+                crate::reprintln!("[df2] ring frontier {} != lane pos {}: lane continues on MTP",
                           self.df2.as_ref().map_or(0, |d| d.nprev()), lane.pos);
             }
             if lane.df2_primed && !lane.df2_stale && ring_ok {
@@ -3062,7 +3093,7 @@ impl BatchScheduler {
             let lane = self.lanes[0].as_ref().unwrap();
             let ring_ok = self.dspark_ring_at(lane.pos);
             if lane.df2_primed && !lane.df2_stale && !ring_ok {
-                eprintln!("[dspark] ring frontier {} != lane pos {}: lane continues on MTP",
+                crate::reprintln!("[dspark] ring frontier {} != lane pos {}: lane continues on MTP",
                           self.dspark.as_ref().map_or(0, |d| d.nprev()), lane.pos);
             }
             if lane.df2_primed && !lane.df2_stale && ring_ok {
@@ -3119,7 +3150,7 @@ impl BatchScheduler {
                 let lane = self.lanes[0].as_ref().unwrap();
                 let is_greedy = lane.greedy;
                 if mtp_dispatch_trace() {
-                    eprintln!("[b31-trace] step b=1: use_mtp={} primed={} stale={} greedy={} schema={}",
+                    crate::reprintln!("[b31-trace] step b=1: use_mtp={} primed={} stale={} greedy={} schema={}",
                               lane.use_mtp(true), lane.mtp_primed, lane.mtp_stale, lane.greedy, lane.schema.is_some());
                 }
                 if lane.use_mtp(true) {
@@ -3161,7 +3192,7 @@ impl BatchScheduler {
         // single source of truth — a source switch can never strand or double-serve a lane).
         let batch_idx: Vec<usize> = (0..b).filter(|&i| !served[i]).collect();
         if mtp_dispatch_trace() && policy_active && !batch_idx.is_empty() {
-            eprintln!("[b31-trace] phaseB: b={} unserved={:?} (policy active but lanes fell to plain decode)",
+            crate::reprintln!("[b31-trace] phaseB: b={} unserved={:?} (policy active but lanes fell to plain decode)",
                       b, batch_idx);
         }
         if !batch_idx.is_empty() {
@@ -3241,6 +3272,7 @@ impl BatchScheduler {
         }
         // Device-resident loop: lane composition changed (a lane finished) — re-upload next step.
         if write < b { self.resident_dirty = true; }
+        crate::metrics::sched_touch(); // H3: round COMPLETE — the age gauge measures from here
     }
 
     /// Build the per-position verify penalty from a lane's committed history (dedup, replicate to all
@@ -3544,7 +3576,7 @@ impl BatchScheduler {
         if self.mtp_stat_steps % 50 == 0 {
             let acc = if self.mtp_stat_drafts > 0 { self.mtp_stat_accepted as f64 / self.mtp_stat_drafts as f64 * 100.0 } else { 0.0 };
             let eff = self.mtp_stat_emitted as f64 / self.mtp_stat_verify_fwds as f64;
-            eprintln!("[mtp/tree] steps={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (depth {} n {}) accept@k [{}]",
+            crate::reprintln!("[mtp/tree] steps={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (depth {} n {}) accept@k [{}]",
                       self.mtp_stat_steps, acc, self.mtp_stat_emitted, eff, depth, n, fmt_accept_by_depth(&self.mtp));
             self.dump_accept_curve();
         }
@@ -3575,7 +3607,7 @@ impl BatchScheduler {
         // A depth-0 policy has nothing to speculate with — serve each packed lane via the
         // single-lane path (which handles depth 0) instead of panicking.
         if self.mtp.depth() == 0 {
-            eprintln!("[mtp] forest: policy depth 0 — per-lane MTP steps (no forest pack)");
+            crate::reprintln!("[mtp] forest: policy depth 0 — per-lane MTP steps (no forest pack)");
             return lanes.iter().map(|&i| (i, self.mtp_lane_step(i))).collect();
         }
         // BATCHED_MTP P0 (the confound fix): the forest draft loop previously ignored
@@ -3786,7 +3818,7 @@ impl BatchScheduler {
                 self.mtp_stat_accepted as f64 / self.mtp_stat_drafts as f64 * 100.0
             } else { 0.0 };
             let eff = self.mtp_stat_emitted as f64 / self.mtp_stat_verify_fwds as f64;
-            eprintln!("[mtp] steps={} drafts={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (forest p={} d={}) accept@k [{}]",
+            crate::reprintln!("[mtp] steps={} drafts={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (forest p={} d={}) accept@k [{}]",
                       self.mtp_stat_steps, self.mtp_stat_drafts, acc,
                       self.mtp_stat_emitted, eff, p, depth, fmt_accept_by_depth(&self.mtp));
             crate::tel::publish_mtp(self.mtp_stat_steps, self.mtp_stat_drafts,
@@ -4238,7 +4270,7 @@ impl BatchScheduler {
             // Effective speedup ceiling = emitted tokens / verify forwards (how many output tokens
             // we get per main-model forward — 1.0 means no MTP benefit).
             let eff = self.mtp_stat_emitted as f64 / self.mtp_stat_verify_fwds as f64;
-            eprintln!("[mtp] steps={} drafts={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (depth {}) accept@k [{}]",
+            crate::reprintln!("[mtp] steps={} drafts={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (depth {}) accept@k [{}]",
                       self.mtp_stat_steps, self.mtp_stat_drafts, acc,
                       self.mtp_stat_emitted, eff, depth, fmt_accept_by_depth(&self.mtp));
             // A.2: same numbers to the status route (published where the log line prints).
@@ -4505,7 +4537,7 @@ impl BatchScheduler {
                 self.mtp_stat_accepted as f64 / self.mtp_stat_drafts as f64 * 100.0
             } else { 0.0 };
             let eff = self.mtp_stat_emitted as f64 / self.mtp_stat_verify_fwds as f64;
-            eprintln!("[mtp] steps={} drafts={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (depth {}) accept@k [{}]",
+            crate::reprintln!("[mtp] steps={} drafts={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (depth {}) accept@k [{}]",
                       self.mtp_stat_steps, self.mtp_stat_drafts, acc,
                       self.mtp_stat_emitted, eff, depth, fmt_accept_by_depth(&self.mtp));
             // A.2: same numbers to the status route (published where the log line prints).
@@ -4694,7 +4726,7 @@ impl BatchScheduler {
             let resc = self.df2_tree_stat_rescues as f64
                 / self.df2_tree_stat_steps.max(1) as f64 * 100.0;
             let width = self.df2_tree_stat_nodes as f64 / self.df2_tree_stat_steps.max(1) as f64;
-            eprintln!("[df2-tree] steps={} b_rescue={:.1}% avg_nodes={:.1} (chain equivalent {})",
+            crate::reprintln!("[df2-tree] steps={} b_rescue={:.1}% avg_nodes={:.1} (chain equivalent {})",
                       self.df2_tree_stat_steps, resc, width, LEVELS + 1);
             // /health: publish the tree window too, so the status route can be asserted on
             // (mode == "dflash2-tree") instead of inferred from the MTP window.

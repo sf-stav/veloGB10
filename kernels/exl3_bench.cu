@@ -5308,6 +5308,303 @@ __device__ __forceinline__ void xq_router_fold_body(
         slotmap[e] = live ? s_slot[f] : -1;
     }
 }
+
+// =============================================================================
+// S-B9-CF-R16 (PLAN/CF_R16_REPORT.md): the routing fold at 9..16 rows.
+// xq_router_fold_c_r16 == xq_router_fold_c (A5-K2 COAL) with (a) the smem partial
+// table 16 rows deep and (b) the tail covering two rows per warp (warp w serves
+// rows w and w+8 with the same warp-local chain), so a forward with m = 9..16
+// rows takes the ONE-launch fold instead of falling back to
+// xq_router_ks + xq_router_combine + xq_router_topk + xq_moe_route (4 launches;
+// 4.8 ms at m = 10 against 1.3 ms for the fold at m = 8).
+// The launch geometry is the m<=8 fold's exactly — grid (ne/4) x 256 threads — so
+// the GEMV (warps 0..7 are the whole block) and the grid-barrier election are the
+// m<=8 code verbatim. BIT-IDENTITY vs the m<=8 fold and vs the legacy chain:
+//   logits  — the same per-thread 40-wide slice chain (float4 groups of 8,
+//             ascending) and the same one-thread ascending s = 0..63 fold; only
+//             the partial table depth (16) and the x load placement change, and
+//             neither is math.
+//   softmax — the per-row chain is the SAME warp-local replay of xq_router_topk's
+//             256-thread code (lane l holds the virtual threads tid = l + 32q over
+//             elements i = tid + 256p; the halving tree replays in the same order
+//             with the same (low, high) operand order), run twice per warp.
+//   top-k   — the COAL lane tree (4 levels) + redux.sync, unchanged; (prob desc,
+//             id asc) is a total order, so the pick sequence is unique.
+//   renorm  — sum = ((0 + w0) + w1) + ... ascending j, w_j / sum, unchanged.
+//   route   — first-seen over ids row-major: s_first = smem atomicMin, slot =
+//             #{first positions < first(e)} (per-warp popc prefix over the 8 warp
+//             ballots; BK = m*k <= 160 spans at most 5 warps and a warp with no
+//             flags contributes 0), the same serial-counter result in the same
+//             row-major order.
+// m <= 8 dispatches to the untouched xq_router_fold_c; this entry is only ever
+// launched for m > 8 (host gate; --exl3-r16=0 restores today's dispatch).
+// Dynamic smem: 8 warps x 4 experts x 40 float4 = XQ_RFC_SMEM_R16 (20 KB, the
+// m<=8 fold's exact carve-out — no opt-in needed). Static: part[16 * 289] (18 KB).
+// =============================================================================
+#define XQ_RFC_SMEM_R16 (8 * 4 * 40 * 16)
+template <bool REMAP, bool COAL = false, bool EP = false>
+__device__ __forceinline__ void xq_router_fold_body_r16(
+        float* out, const __half* __restrict__ w, const __half* __restrict__ x, int M, int N, int K,
+        int* __restrict__ done_cnt, int* __restrict__ ids, float* __restrict__ wts, int k,
+        int* __restrict__ slotmap, int* __restrict__ idxmap, int* __restrict__ esel_dev,
+        unsigned long long* __restrict__ offs_gu, unsigned long long* __restrict__ offs_d,
+        unsigned long long gu_words, unsigned long long d_words, const int* __restrict__ ep_lut = nullptr) {
+    constexpr int MAXM = 16;   // S-B9-CF-R16 row bound (the m<=8 body's MAXM is 8)
+    constexpr int PS = REMAP ? XQ_RFD_PS : XQ_RF_KS;
+    constexpr int RS = REMAP ? XQ_RFD_RS : XQ_RF_EPB * XQ_RF_KS;
+    static_assert(MAXM * RS >= XQ_RFD_NEMAX + 2 * MAXM * XQ_RTR_MAXK + 8, "tail smem alias");
+    __shared__ float part[MAXM * RS];
+    __shared__ int s_last;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int el = REMAP ? (lane >> 3) : (tid / XQ_RF_KS);
+    const int s = REMAP ? ((warp << 3) | (lane & 7)) : (tid % XQ_RF_KS);
+    const int n = blockIdx.x * XQ_RF_EPB + el;
+    // ---- GEMV: xq_router_fused's per-thread body, verbatim ----
+    const int slice = K / XQ_RF_KS;          // host: K % 64 == 0 && slice % 8 == 0
+    const int k0 = s * slice;
+    const __half* wr = w + (size_t)n * K + k0;
+    float acc[MAXM];
+    #pragma unroll
+    for (int r = 0; r < MAXM; r++) acc[r] = 0.0f;
+    if constexpr (COAL) {
+        static_assert(REMAP, "COAL uses the REMAP lane map (warp = 4 experts x 8 slices)");
+        extern __shared__ __align__(16) float4 xq_rfc_ws[];          // [8 warps][4 experts][40]
+        if (slice == 40) {                                           // host: always (K == 2560)
+            float4* ws = xq_rfc_ws + warp * (XQ_RF_EPB * 40);
+            #pragma unroll
+            for (int q = 0; q < 5; ++q) {
+                const int f = (q << 5) | lane, ef = f / 40, c = f - ef * 40;
+                const int nf = blockIdx.x * XQ_RF_EPB + ef;
+                if (nf < N)
+                    lmh_cp16((unsigned)__cvta_generic_to_shared(ws + f),
+                             w + (size_t)nf * K + warp * (8 * 40) + (c << 3));
+            }
+            asm volatile("cp.async.commit_group;\n\tcp.async.wait_group 0;\n" ::: "memory");
+            __syncwarp();
+            if (n < N) {
+                float4 wv5[5];
+                #pragma unroll
+                for (int q = 0; q < 5; ++q) wv5[q] = ws[el * 40 + (lane & 7) * 5 + q];
+                #pragma unroll
+                for (int q = 0; q < 5; ++q) {
+                    const __half* wh = (const __half*)&wv5[q];
+                    // r16: the x load is per row (xv[16] would pin 64 registers);
+                    // loads are not math — the per-(row, q, j) FFMA order is the same.
+                    #pragma unroll
+                    for (int r = 0; r < MAXM; r++) {
+                        if (r < M) {
+                            float4 xv = *(const float4*)(x + (size_t)r * K + k0 + (q << 3));
+                            const __half* xh_ = (const __half*)&xv;
+                            #pragma unroll
+                            for (int j = 0; j < 8; ++j) acc[r] += __half2float(wh[j]) * __half2float(xh_[j]);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+    if (n < N && slice == 40) {
+        float4 wv5[5];
+        #pragma unroll
+        for (int q = 0; q < 5; ++q) wv5[q] = *(const float4*)(wr + (q << 3));
+        #pragma unroll
+        for (int q = 0; q < 5; ++q) {
+            const __half* wh = (const __half*)&wv5[q];
+            #pragma unroll
+            for (int r = 0; r < MAXM; r++) {
+                if (r < M) {
+                    float4 xv = *(const float4*)(x + (size_t)r * K + k0 + (q << 3));
+                    const __half* xh_ = (const __half*)&xv;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) acc[r] += __half2float(wh[j]) * __half2float(xh_[j]);
+                }
+            }
+        }
+    } else if (n < N) {
+        const int s8 = slice >> 3;
+        for (int q = 0; q < s8; ++q) {
+            float4 wv = *(const float4*)(wr + (q << 3));
+            const __half* wh = (const __half*)&wv;
+            #pragma unroll
+            for (int r = 0; r < MAXM; r++) {
+                if (r < M) {
+                    float4 xv = *(const float4*)(x + (size_t)r * K + k0 + (q << 3));
+                    const __half* xh_ = (const __half*)&xv;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) acc[r] += __half2float(wh[j]) * __half2float(xh_[j]);
+                }
+            }
+        }
+        for (int kk = (s8 << 3); kk < slice; ++kk) {
+            #pragma unroll
+            for (int r = 0; r < MAXM; r++)
+                if (r < M) acc[r] += __half2float(wr[kk]) * __half2float(x[(size_t)r * K + k0 + kk]);
+        }
+    }
+    }   // !COAL
+    #pragma unroll
+    for (int r = 0; r < MAXM; r++) if (r < M) part[r * RS + el * PS + s] = acc[r];
+    __syncthreads();
+    if (tid < M * XQ_RF_EPB) {
+        const int r = tid / XQ_RF_EPB, e = tid % XQ_RF_EPB;
+        const int nn = blockIdx.x * XQ_RF_EPB + e;
+        if (nn < N) {
+            float a = 0.0f;
+            for (int q = 0; q < XQ_RF_KS; ++q) a += part[r * RS + e * PS + q];
+            out[(size_t)r * N + nn] = a;
+        }
+    }
+    // ---- publish + elect the last block (every block's logits visible before its ticket) ----
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        const int last = (atomicAdd(done_cnt, 1) == (int)gridDim.x - 1);
+        if (last) __threadfence();
+        s_last = last;
+    }
+    __syncthreads();
+    if (!s_last) return;
+    // ---- tail (last block only). `part` is dead: reuse it for the route scratch ----
+    int* s_first = reinterpret_cast<int*>(part);                 // [ne]  first position of expert e
+    int* s_ids = s_first + XQ_RFD_NEMAX;                         // [M*k] picked ids, row-major
+    int* s_slot = s_ids + MAXM * XQ_RTR_MAXK;              // [M*k] slot of a first position
+    int* s_wc = s_slot + MAXM * XQ_RTR_MAXK;               // [8]   per-warp first counts
+    for (int e = tid; e < N; e += blockDim.x) s_first[e] = 0x7fffffff;
+    // S-B9-CF-R16: 8 warps cover 16 rows — warp w runs the SAME warp-local chain
+    // for rows w and w+8 (sequential replays; per-row bits identical to the
+    // m<=8 tail's warp r <-> row r).
+    for (int rr = 0; rr < 2; ++rr) {
+      const int r = warp + (rr << 3);
+      if (r < M) {
+          const float* lg = out + (size_t)r * N;
+          float v[16];
+          #pragma unroll
+          for (int t = 0; t < 16; ++t) { const int i = lane + 32 * t; v[t] = (i < N) ? __ldcg(lg + i) : 0.0f; }
+          // max: virtual thread q folds i = l+32q, then l+32q+256 (ascending), then the 256-tree.
+          float mq[8];
+          #pragma unroll
+          for (int q = 0; q < 8; ++q) {
+              mq[q] = -INFINITY;
+              if (lane + 32 * q < N) mq[q] = fmaxf(mq[q], v[q]);
+              if (lane + 32 * q + 256 < N) mq[q] = fmaxf(mq[q], v[q + 8]);
+          }
+          #pragma unroll
+          for (int q = 0; q < 4; ++q) mq[q] = fmaxf(mq[q], mq[q + 4]);           // s2 = 128
+          #pragma unroll
+          for (int q = 0; q < 2; ++q) mq[q] = fmaxf(mq[q], mq[q + 2]);           // s2 = 64
+          float mx = fmaxf(mq[0], mq[1]);                                          // s2 = 32
+          #pragma unroll
+          for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, o));
+          const float gmax = __shfl_sync(0xffffffffu, mx, 0);
+          // denominator: the same per-virtual-thread partials and the same halving tree.
+          float ev[16];
+          #pragma unroll
+          for (int t = 0; t < 16; ++t) ev[t] = __expf(v[t] - gmax);
+          float pq[8];
+          #pragma unroll
+          for (int q = 0; q < 8; ++q) {
+              pq[q] = 0.0f;
+              if (lane + 32 * q < N) pq[q] += ev[q];
+              if (lane + 32 * q + 256 < N) pq[q] += ev[q + 8];
+          }
+          #pragma unroll
+          for (int q = 0; q < 4; ++q) pq[q] += pq[q + 4];                          // s2 = 128
+          #pragma unroll
+          for (int q = 0; q < 2; ++q) pq[q] += pq[q + 2];                          // s2 = 64
+          float sm_ = pq[0] + pq[1];                                               // s2 = 32
+          #pragma unroll
+          for (int o = 16; o > 0; o >>= 1) sm_ += __shfl_down_sync(0xffffffffu, sm_, o);
+          const float denom = __shfl_sync(0xffffffffu, sm_, 0);
+          float p[16];
+          #pragma unroll
+          for (int t = 0; t < 16; ++t) p[t] = (lane + 32 * t < N) ? ev[t] / denom : -4.0f;  // -4: never picked
+          // top-k under (prob desc, id asc); lane j keeps pick j; every lane folds the same sum.
+          float myw = 0.0f, sum = 0.0f;
+          int myid = 0;
+          for (int j = 0; j < k; ++j) {
+              float bv = -2.0f; int bi = N;
+              if constexpr (COAL) {
+                  // A5-K2: the same pick, shorter chains. (prob desc, id asc) is a total order on the
+                  // non-NaN probs and every candidate here is a prob in [0, 1] (ev <= 1 after the max
+                  // shift; NaN / picked -3 / padding -4 are never picked: they never beat the (-2, N)
+                  // seed). So: map non-candidates (!(p >= 0)) to -5, take the lane's best by a 4-level
+                  // tree (ids ascend with t, so a pair keeps its lower id unless the higher one is
+                  // strictly greater), then the warp's best as (max key, min id among max-key lanes)
+                  // with redux.sync, key = bits(p) + 1 (order-preserving for p >= 0; 0 = no
+                  // candidate). bv carries the exact prob bits back. == the linear scan + butterfly.
+                  float tv[16]; int ti[16];
+                  #pragma unroll
+                  for (int t = 0; t < 16; ++t) { tv[t] = (p[t] >= 0.0f) ? p[t] : -5.0f; ti[t] = lane + 32 * t; }
+                  #pragma unroll
+                  for (int st = 1; st < 16; st <<= 1) {
+                      #pragma unroll
+                      for (int t = 0; t < 16; t += 2 * st)
+                          if (tv[t + st] > tv[t]) { tv[t] = tv[t + st]; ti[t] = ti[t + st]; }
+                  }
+                  const unsigned key = (tv[0] >= 0.0f) ? __float_as_uint(tv[0]) + 1u : 0u;
+                  const unsigned kmax = __reduce_max_sync(0xffffffffu, key);
+                  const unsigned imin = __reduce_min_sync(0xffffffffu, (key == kmax) ? (unsigned)ti[0] : 0xffffffffu);
+                  if (kmax != 0u) { bv = __uint_as_float(kmax - 1u); bi = (int)imin; }
+              } else {
+              #pragma unroll
+              for (int t = 0; t < 16; ++t) {
+                  const int i = lane + 32 * t;
+                  if (p[t] > bv || (p[t] == bv && i < bi)) { bv = p[t]; bi = i; }
+              }
+              #pragma unroll
+              for (int o = 16; o > 0; o >>= 1) {
+                  const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                  const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                  if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+              }
+              }   // !COAL
+              #pragma unroll
+              for (int t = 0; t < 16; ++t) if (lane + 32 * t == bi) p[t] = -3.0f;
+              const int id = (bi < 0 || bi >= N) ? 0 : bi;   // topk_route's NaN/Inf clamp
+              if (lane == j) { myw = bv; myid = id; }
+              sum += bv;
+          }
+        if (lane < k) {
+            ids[(size_t)r * k + lane] = myid;
+            wts[(size_t)r * k + lane] = myw / sum;
+            s_ids[r * k + lane] = myid;
+        }
+      }
+    }
+    __syncthreads();
+    // ---- first-seen route (xq_moe_route semantics) ----
+    const int BK = M * k;                                        // host: <= 160 <= blockDim (r16)
+    if (tid < BK) { const int e = s_ids[tid]; if (e >= 0 && e < N) atomicMin(&s_first[e], tid); }
+    __syncthreads();
+    int e_t = -1; bool first = false;
+    if (tid < BK) { e_t = s_ids[tid]; first = (e_t >= 0 && e_t < N) && s_first[e_t] == tid; }
+    int le_t = e_t;                                              // the stacked index idxmap/offs carry
+    if constexpr (EP) {
+        if (first) { le_t = __ldg(ep_lut + e_t); first = le_t >= 0; }   // a remote expert takes no slot
+    }
+    const unsigned bal = __ballot_sync(0xffffffffu, first);
+    if (lane == 0) s_wc[warp] = __popc(bal);
+    __syncthreads();
+    int base = 0, total = 0;
+    #pragma unroll
+    for (int w8 = 0; w8 < 8; ++w8) { const int c = s_wc[w8]; total += c; if (w8 < warp) base += c; }
+    if (first) {
+        const int slot = base + __popc(bal & ((1u << lane) - 1u));
+        s_slot[tid] = slot;
+        idxmap[slot] = le_t;
+        offs_gu[slot] = (unsigned long long)le_t * gu_words;
+        offs_d[slot] = (unsigned long long)le_t * d_words;
+    }
+    if (tid == 0) { esel_dev[0] = total; *done_cnt = 0; }   // re-arm for the next launch / graph replay
+    __syncthreads();
+    for (int e = tid; e < N; e += blockDim.x) {
+        const int f = s_first[e];
+        bool live = f != 0x7fffffff;
+        if constexpr (EP) live = live && __ldg(ep_lut + e) >= 0;       // s_slot[f] is unwritten for a remote e
+        slotmap[e] = live ? s_slot[f] : -1;
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256, 3)   // 3 blocks/SM: all ne/4 = 128 blocks in ONE wave
 xq_router_fold(float* out, const __half* __restrict__ w, const __half* __restrict__ x, int M, int N, int K,
                int* __restrict__ done_cnt, int* __restrict__ ids, float* __restrict__ wts, int k,
@@ -5341,6 +5638,20 @@ xq_router_fold_c_ep(float* out, const __half* __restrict__ w, const __half* __re
     xq_router_fold_body<true, true, true>(out, w, x, M, N, K, done_cnt, ids, wts, k, slotmap, idxmap, esel_dev,
                                           offs_gu, offs_d, gu_words, d_words, ep_lut);
 }
+
+// S-B9-CF-R16: the 9..16-row COAL routing fold (see xq_router_fold_body_r16).
+extern "C" __global__ void __launch_bounds__(256, 2)   // 39 KB smem/CTA: 2 CTAs/SM
+xq_router_fold_c_r16(float* out, const __half* __restrict__ w, const __half* __restrict__ x, int M, int N, int K,
+                     int* __restrict__ done_cnt, int* __restrict__ ids, float* __restrict__ wts, int k,
+                     int* __restrict__ slotmap, int* __restrict__ idxmap, int* __restrict__ esel_dev,
+                     unsigned long long* __restrict__ offs_gu, unsigned long long* __restrict__ offs_d,
+                     unsigned long long gu_words, unsigned long long d_words) {
+    XQ_PDL_ENTRY();
+    xq_router_fold_body_r16<true, true>(out, w, x, M, N, K, done_cnt, ids, wts, k, slotmap, idxmap, esel_dev,
+                                        offs_gu, offs_d, gu_words, d_words);
+}
+
+
 extern "C" __global__ void __launch_bounds__(256, 3)
 xq_router_fold_m0(float* out, const __half* __restrict__ w, const __half* __restrict__ x, int M, int N, int K,
                   int* __restrict__ done_cnt, int* __restrict__ ids, float* __restrict__ wts, int k,
@@ -7950,6 +8261,35 @@ extern "C" __global__ void xq_conv1d_chunk_ns(__half* __restrict__ x, const floa
     }
 }
 
+// PACK1 LEG 1: segmented WP12 conv chunk — grid (ceil(conv_dim/256), k_seg), block 256.
+// Per segment: the SAME nostore walk (live ring row read, never written back) on the
+// segment's rows (x based at row_start * row_stride) and the segment's slot state row.
+// Per-token op order identical to xq_conv1d_chunk_ns, so per-segment bytes match the
+// lone chunk bit for bit.
+extern "C" __global__ void xq_conv1d_chunk_seg_ns(__half* __restrict__ x,
+                                                  const float* __restrict__ state,
+                                                  const float* __restrict__ w, int conv_dim,
+                                                  int k, const int* __restrict__ seg,
+                                                  int row_stride) {
+    XQ_PDL_ENTRY();
+    const int s = blockIdx.y * 4;
+    const int slot = seg[s], row0 = seg[s + 1], C = seg[s + 2];
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    float st[8];
+    const float* sbase = state + ((long long)slot * conv_dim + c) * k;
+    for (int j = 0; j < k; j++) st[j] = sbase[j];
+    __half* xc = x + (long long)row0 * row_stride + c;
+    for (int t = 0; t < C; t++) {
+        const float cur = xq_h2f(xc[(long long)t * row_stride]);
+        for (int j = 1; j < k; j++) st[j - 1] = st[j];
+        st[k - 1] = cur;
+        float acc = 0.0f;
+        for (int j = 0; j < k; j++) acc += w[c * k + j] * st[j];
+        xc[(long long)t * row_stride] = xq_f2h(xq_silu(acc));
+    }
+}
+
 // ---- A5 D17: the same conv as xq_conv1d_chunk, fully parallel over (token, channel). Output t
 // is silu(sum_j w[c*k+j] * win_t[j]) with win_t[j] = input at time t-(k-1)+j (the ring after
 // shift+append), times < 0 read from the pre-chunk state (ring index k+tt) — the identical
@@ -8241,6 +8581,34 @@ xq_gdn_step_chunk_r(__half* __restrict__ core, const __half* __restrict__ qkv,
     const bool nostore = (((unsigned)slot_C) >> 30) & 1u;
     xq_gdnr_body(core, qkv, state, b_in, a_in, nh, n_k_heads, kd, vd, a_log, dt_bias,
                  slot, 0, blockIdx.x, C, !nostore, ring);
+}
+
+// PACK1 LEG 1 (S-B9-CF-PACK1): segmented verify chunk — grid (nh, k_seg), block 128.
+// blockIdx.y picks the segment row of `seg` = k_seg x {slot, row_start, len, flags};
+// the SAME xq_gdnr_body runs with slot = seg.slot (state plane), row0 = seg.row_start
+// (qkv/b/a/core rows), C = seg.len (<= XQ_GDNR_CMAX: the shared stages are CMAX-deep)
+// and store = !nostore (the packed verify is nostore; the commit replays from live).
+// The ring base is offset by row_start so the body's t-indexed ring writes land at the
+// segment's absolute rows — no body edit, no reassociation: per-segment bytes equal the
+// lone chunk's by construction (AGENTS 2.8).
+extern "C" __global__ void __launch_bounds__(128, 1)
+xq_gdn_step_chunk_seg(__half* __restrict__ core, const __half* __restrict__ qkv,
+                      float* __restrict__ state, const __half* __restrict__ b_in,
+                      const __half* __restrict__ a_in, int nh_nk, int kd, int vd,
+                      const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                      const int* __restrict__ seg, float* __restrict__ ring) {
+    XQ_PDL_ENTRY();
+    const int nh = nh_nk & 0xFFFF;
+    const int n_k_heads = nh_nk >> 16;
+    const int s = blockIdx.y * 4;
+    const int slot = seg[s], row0 = seg[s + 1], C = seg[s + 2];
+    // seg[s+3] flags: bit0 = nostore (the packed verify never writes live state;
+    // the LEG 2 commit replays from live). Host staging sets flags = 1.
+    const bool nostore = (seg[s + 3] & 1) != 0;
+    if (C < 1 || C > XQ_GDNR_CMAX) __trap();
+    float* ring_seg = ring != nullptr ? ring + (long long)row0 * nh * XQ_GDN_RS : nullptr;
+    xq_gdnr_body(core, qkv, state, b_in, a_in, nh, n_k_heads, kd, vd, a_log, dt_bias,
+                 slot, row0, blockIdx.x, C, !nostore, ring_seg);
 }
 // decode step: the xq_gdn_step signature; grid B*nh (block = b*nh + head), block 128.
 extern "C" __global__ void __launch_bounds__(128, 1)
@@ -9432,6 +9800,42 @@ extern "C" __global__ void xq_ple_conv_chunk(float* __restrict__ resid, const __
     const float w3 = xq_h2f(conv_w[d * 4 + 3]);
     for (int t = 0; t < C; t++) {
         const long long i = (long long)t * 10240 + d;
+        const float cur = xq_h2f(normed[i]);
+        const float acc = w0 * xq_h2f(st[0]) + w1 * xq_h2f(st[3])
+                        + w2 * xq_h2f(st[6]) + w3 * cur;
+        resid[i] += xq_h2f(gated[i]) + xq_silu(acc);
+        for (int a = 0; a < 8; a++) st[a] = st[a + 1];
+        st[8] = xq_f2h(cur);
+    }
+    for (int a = 0; a < 9; a++) sbase[a] = st[a];
+}
+
+// PACK1 LEG 1: segmented PLE conv chunk — grid (ceil(10240/256), k_seg), block 256.
+// Per segment: the SAME 9-deep ring walk with the ring held in `state` plane blockIdx.y
+// (the packed PLE shadow: verify_shadow_seg copies each segment's live PLE row to its own
+// plane; the write-back lands in the shadow, never live) and rows offset by seg.row_start.
+// Per-token op order identical to xq_ple_conv_chunk; per-segment bytes match the lone
+// chunk bit for bit.
+extern "C" __global__ void xq_ple_conv_chunk_seg(float* __restrict__ resid,
+                                                 const __half* __restrict__ gated,
+                                                 const __half* __restrict__ normed,
+                                                 __half* __restrict__ state,
+                                                 const __half* __restrict__ conv_w,
+                                                 const int* __restrict__ seg) {
+    XQ_PDL_ENTRY();
+    const int s = blockIdx.y * 4;
+    const int row0 = seg[s + 1], C = seg[s + 2];
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= 10240) return;
+    __half st[9];
+    __half* sbase = state + ((long long)blockIdx.y * 10240 + d) * 9;
+    for (int a = 0; a < 9; a++) st[a] = sbase[a];
+    const float w0 = xq_h2f(conv_w[d * 4 + 0]);
+    const float w1 = xq_h2f(conv_w[d * 4 + 1]);
+    const float w2 = xq_h2f(conv_w[d * 4 + 2]);
+    const float w3 = xq_h2f(conv_w[d * 4 + 3]);
+    for (int t = 0; t < C; t++) {
+        const long long i = (long long)(row0 + t) * 10240 + d;
         const float cur = xq_h2f(normed[i]);
         const float acc = w0 * xq_h2f(st[0]) + w1 * xq_h2f(st[3])
                         + w2 * xq_h2f(st[6]) + w3 * cur;
@@ -11104,6 +11508,45 @@ xq_hc_fuse_i8_rbk(__half* __restrict__ dd, __half* __restrict__ uu,
         default: break;
     }
 #undef XQ_RBK_CASE
+}
+
+
+// S-B9-CF-R16: the row-batched HC mixer (xq_hc_fuse_i8_rbk) at m = 9..16 rows.
+// xq_hc_fuse_i8_rbk_r16 == xq_hc_fuse_i8_rbk with (a) M = 9..16 template cases
+// and (b) the smem carve-out made DYNAMIC (R4 staging [2][M][1024] halves =
+// m*4096 B, phase B [M][lr] f32; the host opts in past the 48 KB default — a
+// STATIC > 48 KB array compiles but is never resident on this arch).
+// BIT-IDENTITY to xq_hc_fuse_i8_rbk and to xq_hc_fuse_i8k at the same width:
+// every per-row chain is the template body verbatim (down: per-k8 fresh-0 dot8
+// added to acc, steps ascending, XOR butterfly 16..1, f16(acc * s_down); phase B:
+// k-major 16-B word per k16 step, two dot8 locals added in order,
+// f16(acc * s_up)), and the CTA count only grid-strides the outputs.
+// m <= 8 dispatches to the untouched xq_hc_fuse_i8_rbk; this entry is only ever
+// launched for m > 8 (host gate; --exl3-r16=0 restores today's dispatch).
+// Dynamic smem (m*4096 B with R4, m*lr*4 B without): the host opts the function
+// in once and takes the grid from its measured co-residency AT that carve-out.
+extern "C" __global__ void __launch_bounds__(256, 1)
+xq_hc_fuse_i8_rbk_r16(__half* __restrict__ dd, __half* __restrict__ uu,
+                      const __half* __restrict__ hn, const int8_t* __restrict__ q_down,
+                      const float* __restrict__ s_down, const int8_t* __restrict__ q_upk,
+                      const float* __restrict__ s_up, cuda::atomic<int, cuda::thread_scope_device>* bar,
+                      float hcn, int lr_m, int rw, int flags) {
+    const int lr = lr_m & 0xFFFF, m = lr_m >> 16;
+    xq_hc_pf_upk(q_upk, lr, rw, flags & 3);   // static weights: pre-PDL-wait
+    XQ_PDL_ENTRY();
+    // R4: [2][M][1024] halves (<= 64 KB at M = 16); phase B: [M][lr] floats (<= 32 KB).
+    extern __shared__ __align__(16) unsigned char smem[];
+    const bool r4 = (flags & 16) != 0;
+#define XQ_RBK16_CASE(MM) case MM: \
+        if (r4) xq_hc_fuse_i8_rbk_body<MM, true>(dd, uu, hn, q_down, s_down, q_upk, s_up, bar, hcn, lr, rw, smem); \
+        else    xq_hc_fuse_i8_rbk_body<MM, false>(dd, uu, hn, q_down, s_down, q_upk, s_up, bar, hcn, lr, rw, smem); \
+        break;
+    switch (m) {
+        XQ_RBK16_CASE(9) XQ_RBK16_CASE(10) XQ_RBK16_CASE(11) XQ_RBK16_CASE(12)
+        XQ_RBK16_CASE(13) XQ_RBK16_CASE(14) XQ_RBK16_CASE(15) XQ_RBK16_CASE(16)
+        default: break;
+    }
+#undef XQ_RBK16_CASE
 }
 
 // =============================================================================
@@ -13760,6 +14203,148 @@ extern "C" __global__ void xq_accept(const int* __restrict__ d_vec,
     // (state ran ahead of the token/position bookkeeping -> long-horizon drift).
     out[k + 1] = -1;
     out[k + 2] = a;
+}
+
+// PACK1 LEG 1: per-segment accept — grid (k_seg), one thread. Segment j's draft/argmax
+// rows live at seg.row_start with len seg.len; the emitted layout per segment is the
+// lone one shifted to row_start (d before a, e_vec[a] at a, -1 after), and the commit
+// key lands in acc[j*2] = {slot_j, a_j} (LEG 2's segmented commits read it on device;
+// LEG 1's probe reads it on host). No out[k+2] header: the host knows row_start/len.
+extern "C" __global__ void xq_accept_seg(const int* __restrict__ d_vec,
+                                         const int* __restrict__ e_vec,
+                                         int* __restrict__ out, int* __restrict__ acc,
+                                         const int* __restrict__ seg) {
+    XQ_PDL_ENTRY();
+    if (threadIdx.x != 0) return;
+    const int s = blockIdx.x * 4;
+    const int slot = seg[s], row0 = seg[s + 1], kj = seg[s + 2];
+    const int* d = d_vec + row0;
+    const int* e = e_vec + row0;
+    int a = 0;
+    // K2 (REL v0.7.3 review): bound on the DRAFTS (kj - 1 = k), like the lone xq_accept's
+    // `a < k`. The e/d rows run to kj, but a must never reach kj: a zero/stale tail draft
+    // slot equal to the last argmax made a = k + 1, the commit then replayed k + 2 rows
+    // (reading the NEXT segment) and at k = 7 C > XQ_GDN_RING_CMAX trapped.
+    while (a < kj - 1 && d[a] == e[a]) a++;
+    // kj slots per segment (the lone path's extra out[k] header slot lives in acc here):
+    // emitted at i <= a, -1 after — never writes past out[row0 + kj - 1].
+    for (int i = 0; i < kj; i++) {
+        if (i < a) out[row0 + i] = d[i];
+        else if (i == a) out[row0 + i] = e[a];
+        else out[row0 + i] = -1;
+    }
+    acc[blockIdx.x * 2] = slot;
+    acc[blockIdx.x * 2 + 1] = a;
+}
+
+// ---- PACK2 LEG 2 (S-B9-CF-PACK2): per-segment DEVICE-KEYED commit kernels. ----
+// Each calls the same device body as its served twin (xq_conv_commit /
+// xq_gdn_commit_ring / xq_ple_ring_commit) with the commit key (slot, a) read
+// ON DEVICE from acc_seg[j*2..+2] (xq_accept_seg's output — never the host) and
+// the row range taken from the segment table seg[j*4+1] = row0: the packed
+// verify's saves (qkv_save rows, gdn_ring_p ring rows, ple_normed rows) are
+// ABSOLUTE rows of the R_pad-wide staging, so the replay reads rows
+// row0 + t for t < C = a_j + 1. Grids put the segment on blockIdx.y.
+// (The served commit on this model is the fused xq_gdn_commit_all_w4 —
+// bitwise-equal to these per-layer bodies per its own gate's contract — but
+// that kernel reads the served 5-row ring layout and a single acc2 key; a
+// packed fused variant would exceed the 12-arg LaunchAsync cap. The packed
+// commit runs the per-layer launches; commit cost is not what this leg times.)
+
+// Per-segment conv commit: same walk as xq_conv_commit; raw rows at absolute
+// rows of this layer's qkv_save plane (the host passes the plane base pointer,
+// exactly like the served per-layer qkv_post/b_save/a_save offsets).
+extern "C" __global__ void xq_conv_commit_seg(float* __restrict__ state,
+                                              const float* __restrict__ w, int conv_dim, int k,
+                                              const __half* __restrict__ raw,
+                                              const int* __restrict__ seg,
+                                              const int* __restrict__ acc_seg) {
+    XQ_PDL_ENTRY();
+    const int j = blockIdx.y;
+    const int row0 = seg[j * 4 + 1];
+    const int slot = acc_seg[j * 2];
+    const int C = acc_seg[j * 2 + 1] + 1;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    float st[8];
+    float* sbase = state + ((long long)slot * conv_dim + c) * k;
+    for (int j2 = 0; j2 < k; j2++) st[j2] = sbase[j2];
+    for (int t = 0; t < C; t++) {
+        const float cur = xq_h2f(raw[(long long)(row0 + t) * conv_dim + c]);
+        for (int j2 = 1; j2 < k; j2++) st[j2 - 1] = st[j2];
+        st[k - 1] = cur;
+    }
+    for (int j2 = 0; j2 < k; j2++) sbase[j2] = st[j2];
+}
+
+// Per-segment GDN ring commit: same body as xq_gdn_commit_ring; ring rows at
+// ABSOLUTE rows (xq_gdn_step_chunk_seg wrote its ring at row0 + t of the packed
+// 16-row planes; the host passes this layer's plane base).
+extern "C" __global__ void xq_gdn_commit_ring_seg(float* __restrict__ state,
+                                                  const float* __restrict__ ring,
+                                                  int nh, int kd, int vd,
+                                                  const int* __restrict__ seg,
+                                                  const int* __restrict__ acc_seg) {
+    XQ_PDL_ENTRY();
+    const int j = blockIdx.y;
+    const int row0 = seg[j * 4 + 1];
+    const int slot = acc_seg[j * 2];
+    const int C = acc_seg[j * 2 + 1] + 1;
+    // device guard: an accept count past the extent would overrun kr_sh — fail
+    // loudly, never commit a truncated state (same contract as the served twin).
+    if (C < 1 || C > XQ_GDN_RING_CMAX) __trap();
+    const int nchunk = vd / XQ_GDN_C;
+    const int chunk = blockIdx.x % nchunk;
+    const int head = blockIdx.x / nchunk;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int col = chunk * XQ_GDN_C + lane;
+    __shared__ float kr_sh[XQ_GDN_RING_CMAX][128];
+    __shared__ float g_sh[XQ_GDN_RING_CMAX];
+    for (int i = threadIdx.x; i < C * kd; i += blockDim.x) {
+        const int t = i / kd, r = i - t * kd;
+        kr_sh[t][r] = ring[((long long)(row0 + t) * nh + head) * XQ_GDN_RS + vd + r];
+    }
+    if (threadIdx.x < C) g_sh[threadIdx.x] = ring[((long long)(row0 + threadIdx.x) * nh + head) * XQ_GDN_RS + vd + kd];
+    constexpr int RPT = 128 / 4;                 // rows per thread (kd = 128, 4 warps)
+    float* S = state + ((long long)slot * nh + head) * kd * vd + col;
+    float s[RPT];
+    #pragma unroll
+    for (int i = 0; i < RPT; i++) s[i] = S[(long long)(warp + 4 * i) * vd];
+    __syncthreads();
+    for (int t = 0; t < C; t++) {
+        const float gt = g_sh[t];
+        const float d = __ldg(ring + ((long long)(row0 + t) * nh + head) * XQ_GDN_RS + col);
+        #pragma unroll
+        for (int i = 0; i < RPT; i++) s[i] *= gt;
+        #pragma unroll
+        for (int i = 0; i < RPT; i++) s[i] = __fmaf_rn(kr_sh[t][warp + 4 * i], d, s[i]);
+    }
+    #pragma unroll
+    for (int i = 0; i < RPT; i++) S[(long long)(warp + 4 * i) * vd] = s[i];
+}
+
+// Per-segment PLE ring commit: same body as xq_ple_ring_commit; normed rows at
+// ABSOLUTE rows of the packed ple_normed staging.
+extern "C" __global__ void xq_ple_ring_commit_seg(const __half* __restrict__ normed,
+                                                  __half* __restrict__ state,
+                                                  const int* __restrict__ seg,
+                                                  const int* __restrict__ acc_seg) {
+    XQ_PDL_ENTRY();
+    const int j = blockIdx.y;
+    const int row0 = seg[j * 4 + 1];
+    const int slot = acc_seg[j * 2];
+    const int C = acc_seg[j * 2 + 1] + 1;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= 10240) return;
+    __half* sbase = state + ((long long)slot * 10240 + d) * 9;
+    __half st[9];
+    for (int a = 0; a < 9; a++) st[a] = sbase[a];
+    for (int t = 0; t < C; t++) {
+        const float cur = xq_h2f(normed[(long long)(row0 + t) * 10240 + d]);
+        for (int a2 = 0; a2 < 8; a2++) st[a2] = st[a2 + 1];
+        st[8] = xq_f2h(cur);
+    }
+    for (int a2 = 0; a2 < 9; a2++) sbase[a2] = st[a2];
 }
 
 // 1-element i32 device copy with dst offset (compute-stream D2D; AGENTS 2.3 —
@@ -17041,6 +17626,26 @@ extern "C" __global__ void xq_moe_route_ep(const int* __restrict__ ids, int m, i
         offs_gu[s] = (unsigned long long)le * gu_words;
         offs_d[s] = (unsigned long long)le * d_words;
     }
+}
+
+// PACK1 LEG 1: pad-row route fixup — rows >= r_live duplicate live row r_live-1's expert
+// ids/weights so the per-row route tables never reference a pad row's arbitrary (though
+// in-range) top-k. Layout matches sc.ids/sc.wts ([row*topk + j]; cf. xq_moe_route_ep's
+// t in 0..m*topk scan). LEG 1 runs at exact R (5+5, no pad rows); this entry ships beside
+// the router fold's route tail per design section 4 and is validated synthetically by
+// --probe-exl3-pack2. NOTE for the k=3 leg: the fold's route tail compacts BEFORE this
+// copy, so pad rows enter the compacted GEMM with their staged ids and only the per-row
+// id/weight tables are aligned here — pad rows must be staged as duplicates of a live row
+// (not zeros) unless this moves before the fold in that leg.
+extern "C" __global__ void xq_pad_route(int* __restrict__ ids, float* __restrict__ wts,
+                                        int topk, int r_live, int npad) {
+    XQ_PDL_ENTRY();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= npad * topk) return;
+    const int dst_row = r_live + i / topk;
+    const int j = i - (dst_row - r_live) * topk;
+    ids[dst_row * topk + j] = ids[(r_live - 1) * topk + j];
+    if (wts != nullptr) wts[dst_row * topk + j] = wts[(r_live - 1) * topk + j];
 }
 
 // == xq_moe_combine (same sgv tree, same j order, the WP20 combine's explicit roundings) with an

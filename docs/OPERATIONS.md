@@ -11,8 +11,8 @@ Every TP head failure path exits the process: a scheduler failure exits `70`, th
 watchdog exits `3`. The **node** re-arms by itself (its resident supervisor re-arms per head
 session — start it once and forget it). The **head** has no in-process supervisor: one abort or
 panic after hours means head down, node re-armed and waiting — to a user, "inference stopped".
-A process supervisor on the head closes that hole; `--exit-on-fatal` (below) makes the exit
-prompt and supervisor-friendly instead of lingering in a dead state.
+A process supervisor on the head closes that hole; `--exit-on-fatal` (default since v0.7.3;
+below) makes the exit prompt and supervisor-friendly instead of lingering in a dead state.
 
 ## 2. systemd units (examples — adjust paths, ports and flags)
 
@@ -51,9 +51,11 @@ Node unit (`/etc/systemd/system/velogb10-node.service`), on each peer:
     [Install]
     WantedBy=multi-user.target
 
-`--exit-on-fatal` (EXL3 server): on a sticky CUDA error or scheduler-thread panic, finish the
-in-flight request with an error, then exit `70` for the supervisor to restart — instead of
-serving every later request a 503 from a DEAD engine. The node never needs it (it re-arms).
+`--exit-on-fatal` (EXL3 server, **default ON since v0.7.3**; `--exit-on-fatal off` opts out):
+on a sticky CUDA error or scheduler-thread panic, finish the in-flight request with an error,
+then exit `70` for the supervisor to restart — instead of serving every later request a 503
+from a DEAD engine. The node never needs it (it re-arms). The unit examples above pass the flag
+explicitly for readability; with the v0.7.3 default it can be omitted.
 
 The release tarball's `run_tp_server.sh` / `run_tp_node.sh` wrap the same flags (`--help` on
 both; `--dry-run` prints the exact engine command line) if you prefer scripts over units.
@@ -110,7 +112,7 @@ speculation counters, and `velogb10_build_info`.
 
 | code | meaning |
 |---|---|
-| 70 | engine abort: TP scheduler failure; fatal CUDA error with `--exit-on-fatal`; scheduler-thread panic |
+| 70 | engine abort: TP scheduler failure; fatal CUDA error (default; `--exit-on-fatal off` keeps a DEAD engine instead); scheduler-thread panic |
 | 3 | host-memory watchdog: `MemAvailable` below `--mem-watchdog-gb` for 400 ms — the box survives, the process dies |
 | 10 | TP abort code (in logs): dead peer detected in an exchange; the process exit is 70/3 |
 | 11 | device-side exchange deadline (in logs, "status 11"); process exit is 70 |

@@ -83,7 +83,7 @@ pub fn start() {
                         eprintln!("\n[memwatch] MemAvailable {:.1} GB < floor {:.1} GB — exiting NOW to keep the box alive \
                                    (--mem-watchdog-gb raises/lowers the floor, 0 disables).",
                                   avail as f64 / 1e9, floor_gb);
-                        std::process::exit(3);
+                        crate::logq::flush_and_exit(std::time::Duration::from_millis(300), 3); // H7
                     }
                 } else {
                     strikes = 0;

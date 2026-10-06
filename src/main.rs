@@ -36,7 +36,8 @@ fn print_help() {
     println!("  MODEL");
     println!("    --model-dir <DIR>          Model directory (config.json + *.safetensors + tokenizer).");
     println!("                               THIS is the normal way to load.                   [required]");
-    println!("    --model-name <NAME>        Name reported by /v1/models    [derived from the dir name]");
+    println!("    --model-name <NAME>        Name reported by /v1/models    [model card base_model: else dir name]");
+    println!("    --served-model-name <NAME> Alias of --model-name (the vLLM spelling)");
     println!("    --model <FILE>             Legacy: single .safetensors file (use --model-dir instead)");
     println!("    --tokenizer <FILE>         Legacy: tokenizer.json path (implied by --model-dir)");
     println!();
@@ -331,7 +332,8 @@ fn print_help() {
     println!("  per-box options (--port, --rdma-dev, --tp-cache). Mixer sharding is default-on under");
     println!("  --tp/--head (--no-shard-mixers turns it off). Test drills: --tp-tail-drill (invert");
     println!("  commit/payload every 4096th epoch), --tp-agree-drill N (corrupt this rank's agree hash");
-    println!("  at step N) — see --help-diag.");
+    println!("  at step N), --tp-race-probe <ms> (issue #10: force the world-2 pre-verify exchange/epoch");
+    println!("  slot race) — see --help-diag.");
     println!();
     println!("  TYPICAL");
     println!("    peer: ./gb10_inference --node --port 29500");
@@ -1424,6 +1426,37 @@ fn main() {
         });
         return;
     }
+
+    // PACK1 LEG 1 (S-B9-CF-PACK1): the eager 2-request packed-verify probe.
+    if args.iter().any(|a| a == "--probe-exl3-pack2") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-pack2 requires --model-dir <DIR>");
+        let max_pos: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
+        gb10_inference::exl3_forward::pack2_probe_exl3(&dir, max_pos).unwrap_or_else(|e| {
+            eprintln!("EXL3_PACK2_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+
+    // PACK2 LEG 2 (S-B9-CF-PACK2): the packed-ROUND correctness probe.
+    if args.iter().any(|a| a == "--probe-exl3-packstate") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-packstate requires --model-dir <DIR>");
+        let max_pos: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
+        gb10_inference::exl3_forward::packstate_probe_exl3(&dir, max_pos).unwrap_or_else(|e| {
+            eprintln!("EXL3_PACKSTATE_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    if args.iter().any(|a| a == "--probe-exl3-pack3") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-pack3 requires --model-dir <DIR>");
+        let max_pos: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
+        gb10_inference::exl3_forward::pack3_probe_exl3(&dir, max_pos).unwrap_or_else(|e| {
+            eprintln!("EXL3_PACK3_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
     // TP-4T1: the prefill tail-chunk small-M GEMM (synthetic; bitwise vs xq_gemm_f16 + per-call timing).
     if args.iter().any(|a| a == "--probe-exl3-tailgemm") {
         gb10_inference::exl3_bench::probe_tailgemm().unwrap_or_else(|e| {
@@ -2174,17 +2207,11 @@ fn cli_opts_bridge(args: &[String]) {
     }
 }
 
+/// S1 (REL_V0_7_3): the NVFP4-side twin now delegates to the ONE shared `=`-aware parser
+/// (`gb10_inference::arg_value`) — body moved there verbatim so both servers parse
+/// `--flag value` and `--flag=value` identically.
 fn parse_arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|a| a == flag || a.starts_with(&format!("{}=", flag)))
-        .and_then(|i| {
-            let arg = &args[i];
-            if let Some(val) = arg.strip_prefix(&format!("{}=", flag)) {
-                Some(val)
-            } else {
-                args.get(i + 1).map(|s| s.as_str())
-            }
-        })
+    gb10_inference::arg_value(args, flag)
 }
 
 /// Mandatory directory argument (owner rule 2026-08-23): NO default, NO fallback constant —
@@ -15358,11 +15385,11 @@ fn run_server(args: &[String]) {
         run_dsv4_server_tp(args, &model_path, port);
         return;
     }
-    // Model name for /v1/models: just the directory name.
-    // Public model id: the model card's `base_model:` (e.g. Qwen/Qwen3.8-27B), dir name as
-    // fallback — see server::model_id_from_dir. --model-name still overrides both.
-    let model_name = parse_arg(args, "--model-name").map(|s| s.to_string())
-        .unwrap_or_else(|| gb10_inference::server::model_id_from_dir(&model_path));
+    // Model name for /v1/models. Public model id (v0.7.3, issue #8.3): --model-name >
+    // --served-model-name (alias) > the model card's `base_model:` (e.g.
+    // Qwen/Qwen3.8-27B) > dir name — see server::resolve_model_name.
+    let model_name = gb10_inference::server::resolve_model_name(
+        parse_arg(args, "--model-name"), parse_arg(args, "--served-model-name"), &model_path);
     let default_max_tokens = parse_arg(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()).unwrap_or(8192);
     // Model-card presence-penalty default varies by model size (2B: 2.0, 4B+: 1.5). Temperature
     // and top_p defaults are applied per-request via serde defaults in server.rs.
@@ -15378,14 +15405,10 @@ fn run_server(args: &[String]) {
     // single predictable branch). See gb10_inference::otel — the design IS the interference
     // gate: lock-free ring push (no alloc/lock/syscall/wake), drop-on-full (the client can
     // never back-pressure decode), ONE timer-polled sender task off the compute stream.
-    let otel_cfg = parse_arg(args, "--otel-endpoint").map(|ep| gb10_inference::otel::OtelConfig {
-        endpoint: ep.trim_end_matches('/').to_string(),
-        batch_size: parse_arg(args, "--otel-batch-size").and_then(|s| s.parse().ok()).unwrap_or(512),
-        batch_interval_ms: parse_arg(args, "--otel-batch-interval-ms").and_then(|s| s.parse().ok()).unwrap_or(100),
-        include_tokens: matches!(parse_arg(args, "--otel-include-tokens").unwrap_or("on"),
-                                 "on" | "true" | "1" | "yes"),
-        model_id: parse_arg(args, "--otel-model-id").map(str::to_string),
-        topology: parse_arg(args, "--otel-topology").map(str::to_string),
+    // v0.7.3 ("tel"): the SAME shared parser as the EXL3 server (otel::config_from_args) —
+    // one flag vocabulary, one behaviour, every engine.
+    let otel_cfg = gb10_inference::otel::config_from_args(|flag| {
+        parse_arg(args, &format!("--{flag}")).map(str::to_string)
     });
     // Refuse an UNUSABLE endpoint before the multi-minute model load. At RUNTIME the emitter is
     // best-effort (ring-full drops rows, failed POSTs drop the batch); a misconfigured one must
@@ -15951,10 +15974,10 @@ fn run_server(args: &[String]) {
                     if let Err(e) = tokio::spawn(scheduler.run()).await {
                         eprintln!("\n*** FATAL: the scheduler task died ({e}). The server cannot serve without \
                                    it and will not pretend to. Exiting. ***\n");
-                        std::process::exit(70);
+                        gb10_inference::logq::flush_and_exit(std::time::Duration::from_millis(300), 70); // H7
                     }
                     eprintln!("\n*** FATAL: the scheduler loop returned unexpectedly. Exiting. ***\n");
-                    std::process::exit(70);
+                    gb10_inference::logq::flush_and_exit(std::time::Duration::from_millis(300), 70); // H7
                 });
             }
             Some(mut streams) => {
@@ -15976,7 +15999,7 @@ fn run_server(args: &[String]) {
                     if !gb10_inference::net::pin_thread(9) {
                         eprintln!("\n*** FATAL: TP head scheduler failed to pin to core 9 -- TP refuses \
                                    to run unpinned. Exiting. ***\n");
-                        std::process::exit(70);
+                        gb10_inference::logq::flush_and_exit(std::time::Duration::from_millis(300), 70); // H7
                     }
                     let rt = tokio::runtime::Builder::new_current_thread().enable_all()
                         .build().expect("scheduler runtime");
@@ -15987,7 +16010,7 @@ fn run_server(args: &[String]) {
                         Ok(Err(e)) => eprintln!("\n*** FATAL: the TP scheduler loop failed: {e:#}. Exiting. ***\n"),
                         Err(_) => eprintln!("\n*** FATAL: the TP scheduler task panicked. Exiting. ***\n"),
                     }
-                    std::process::exit(70);
+                    gb10_inference::logq::flush_and_exit(std::time::Duration::from_millis(300), 70); // H7
                 });
             }
         }

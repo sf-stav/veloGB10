@@ -19,6 +19,7 @@ pub struct NetCtx {
 extern "C" {
     /// CLI-1: the transport's options (the shim reads no env) — call before every net_init.
     fn net_set_opts(spin_us: u64, tail_drill: c_int, oneshot: c_int, tp_diag: c_int);
+    fn net_set_probe(hold_ms: u32);
     fn net_init(rank: c_int, world: c_int, peer_ips: *const *const c_char, n_peers: c_int,
                 tcp_port: c_int, dev_name: *const c_char,
                 gid_idx: c_int, fp32_capacity_bytes: c_int, payload_bytes: c_int) -> *mut NetCtx;
@@ -37,6 +38,11 @@ extern "C" {
     fn net_recv_dptr(c: *mut NetCtx) -> *mut c_void;
     fn net_send_hptr(c: *mut NetCtx) -> *mut c_void;
     fn net_recv_hptr(c: *mut NetCtx) -> *mut c_void;
+    /// S-B9-REL-TP2RACE (issue #10): the exchange generation counter, a monotone bump for the race
+    /// probe's slot alignment, and the probe's withheld-slot clobber counter (must stay 0).
+    fn net_xchg_gen(c: *mut NetCtx) -> u64;
+    fn net_gen_add(c: *mut NetCtx, delta: u64) -> u64;
+    fn net_probe_hits(c: *mut NetCtx) -> u64;
     fn net_device_epoch(c: *mut NetCtx) -> u64;
     fn net_gate_waits(c: *mut NetCtx) -> u64;
     fn net_wait_sleeps() -> u64;
@@ -314,7 +320,9 @@ pub fn agree_ext(step: u64, accept_count: u8, k_verify: u8, hash: u32) -> Option
 
 /// Ship a small u32 payload to the peer over the startup/audit channel (the `TpLink::exchange`
 /// path, using the process-registered ctx — works while the RDMA proxy runs: the exchange's send
-/// CQE is handed over via `xchg_send_done`, and the recv ring is separate from the hot-path rings).
+/// CQE is handed over via `xchg_send_done`). S-B9-REL-TP2RACE: at world 2 the frame stages and
+/// lands in the DEDICATED control slots (net_shim.c ctrl region), disjoint from the hot-path
+/// doorbell rings — before that fix it landed in recv slot `gen & 7` OF those rings, the #10 race.
 /// Both ranks call it in the same SPMD order; rank 0 fills `mine` with its payload, rank 1 with
 /// zeros, and BOTH read the peer's payload from the received slot. Returns the peer's words.
 ///
@@ -544,6 +552,53 @@ pub fn traced_abort_status() -> u64 {
     if c == 0 { 0 } else { unsafe { net_abort_status(c as *mut NetCtx) } }
 }
 
+// ---------------------------------------------------------------------------------
+// S-B9-REL-TP2RACE (public issue #10): the world-2 pre-verify race probe + diagnostics.
+//
+// At world 2 the host exchanges now ride DEDICATED control slots (net_shim.c xchg_* helpers), so a
+// control frame can no longer land on a doorbell recv slot that holds a validated-but-unconsumed
+// epoch payload (the reporter's hypothesis; four v0.7.x head exits "TP pre-verify FAILED" with only
+// the drafts hash differing). --tp-race-probe <ms> forces the window deterministically: the node's
+// proxy holds every epoch release by <ms> (its K2 then consumes nothing), the head aligns its next
+// exchange generation onto the withheld epoch's recv slot, and the proxy CLOBBER-detects any change
+// of the withheld payload. The probe must fire on the old hot-ring transport and stay silent (and
+// the pre-verify hashes agree) on the dedicated-slot one.
+
+/// `--tp-race-probe <ms>` — 0/unset = off. Spmd scope: both ranks resolve it identically.
+pub fn race_probe_hold_ms() -> u32 {
+    static G: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        crate::opts::var(crate::opt!("tp-race-probe")).ok()
+            .and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0)
+    });
+    *G
+}
+
+/// The smallest delta >= 0 with `((gen + delta + 1) & 7) == want_next_slot` — the probe's
+/// generation alignment. Pure: unit-tested. Both ranks compute the same delta at the same
+/// lockstep point (same device epoch, same gen), so the exchange generations stay paired.
+pub fn probe_gen_delta(gen: u64, want_next_slot: u64) -> u64 {
+    (want_next_slot.wrapping_add(8).wrapping_sub((gen.wrapping_add(1)) & 7)) & 7
+}
+
+/// The registered link's exchange generation (for the pre-verify bail diagnostic: `gen & 7` next to
+/// `device_epoch & 7`). 0 when no link.
+pub fn traced_xchg_gen() -> u64 {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { 0 } else { unsafe { net_xchg_gen(c as *mut NetCtx) } }
+}
+
+/// Monotone bump of the link's exchange generation by `delta` (returns the new gen). Probe-only.
+pub fn traced_gen_add(delta: u64) -> u64 {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { 0 } else { unsafe { net_gen_add(c as *mut NetCtx, delta) } }
+}
+
+/// The probe's withheld-slot clobber count (0 = clean; any hit = the race fired).
+pub fn traced_probe_hits() -> u64 {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { 0 } else { unsafe { net_probe_hits(c as *mut NetCtx) } }
+}
+
 /// The link's tail-epoch guard fire count (MUST stay 0; a fire means RC/PCIe placement ordering
 /// failed). Same traced pattern as `traced_abort_status`.
 /// TP-I: wait until the proxy has posted AND retired (send CQE) every hot-path epoch the device has
@@ -645,7 +700,9 @@ fn push_net_opts() {
     let tail = opts::var(opt!("tp-tail-drill")).is_ok() as c_int;
     let oneshot = opts::var(opt!("tp-oneshot")).map_or(false, |v| !v.starts_with('0')) as c_int;
     let diag = opts::var(opt!("tp-diag")).is_ok() as c_int;
-    unsafe { net_set_opts(spin, tail, oneshot, diag) }
+    let probe: u32 = opts::var(opt!("tp-race-probe")).ok()
+        .and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+    unsafe { net_set_opts(spin, tail, oneshot, diag); net_set_probe(probe) }
 }
 
 impl TpLink {
@@ -1205,5 +1262,34 @@ mod hub_tests {
         let out = hub_unpack(&frame, wire, 3, world);
         for k in 0..world { assert_eq!(Some(&out[k]), all[k].as_ref()); }
         assert!(frame[3..wire].iter().all(|&x| x == 0), "headroom of block 0 must be zero");
+    }
+}
+
+
+#[cfg(test)]
+mod tp2race_tests {
+    use super::probe_gen_delta;
+
+    /// The alignment invariant: after the bump, the NEXT exchange lands on the wanted slot.
+    #[test]
+    fn gen_delta_lands_next_gen_on_wanted_slot() {
+        for gen in [0u64, 1, 7, 8, 9, 4095, 3052830, u64::MAX - 16] {
+            for want in 0u64..8 {
+                let d = probe_gen_delta(gen, want);
+                assert!(d < 8, "delta must stay in 0..=7");
+                assert_eq!((gen.wrapping_add(d).wrapping_add(1)) & 7, want,
+                           "gen {gen} want {want} delta {d}");
+            }
+        }
+    }
+
+    /// Zero delta exactly when the next generation is already on the wanted slot.
+    #[test]
+    fn gen_delta_is_minimal() {
+        assert_eq!(probe_gen_delta(7, 0), 0);   // next gen 8 -> slot 0 already
+        assert_eq!(probe_gen_delta(6, 0), 1);   // next gen 7 -> slot 7; want 0 -> +1
+        assert_eq!(probe_gen_delta(0, 0), 7);   // next gen 1 -> slot 1; want 0 -> +7
+        assert_eq!(probe_gen_delta(0, 1), 0);   // next gen 1 -> slot 1
+        assert_eq!(probe_gen_delta(0, 2), 1);
     }
 }

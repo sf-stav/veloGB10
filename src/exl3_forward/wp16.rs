@@ -524,7 +524,7 @@ impl<B> CkptStore<B> {
             match alloc() {
                 Ok(b) => { self.n_alloc += 1; return Some(b); }
                 Err(e) => {
-                    println!("[exl3-serve] WP16: checkpoint allocation failed after {} buffer(s) ({e:#}) — \
+                    crate::rprintln!("[exl3-serve] WP16: checkpoint allocation failed after {} buffer(s) ({e:#}) — \
                               the cap is frozen there (LRU eviction from now on)", self.n_alloc);
                     self.alloc_failed = true;
                 }

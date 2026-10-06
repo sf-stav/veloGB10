@@ -208,6 +208,84 @@ fn parse_block(body: &str, tools: Option<&[Value]>, idx: usize) -> Vec<ToolCall>
     parse_xml_calls(body, tools)
 }
 
+/// Skip the whitespace that may sit between structural tags. Deliberately the SAME set
+/// `find_function_tag_mode` accepts before a bare `function=` repair (newline, CR, space, tab) —
+/// not arbitrary Unicode whitespace, which is content.
+fn skip_tag_ws(s: &str) -> &str {
+    let mut i = 0;
+    for b in s.bytes() {
+        if matches!(b, b'\n' | b'\r' | b' ' | b'\t') { i += 1 } else { break }
+    }
+    &s[i..]
+}
+
+/// The structural-terminator lookahead (v0.7.3): does the text AFTER a candidate `</parameter>`
+/// prove the candidate is the real close of the value?
+///
+/// The template's close is always followed (tag whitespace aside) by one of:
+///  * `<parameter=` — the next parameter of the same call;
+///  * `</function>` — the call close, itself followed by the end of the block body or a further
+///    `<function=` / bare `function=` tag (another call in the same `<tool_call>` block);
+///  * the next call's tag directly — `<function=` or a bare `function=` repair (K3: malformed
+///    output can OMIT `</function>` between two calls; the same tag detection
+///    `find_function_tag_mode` applies decides what counts as a tag);
+///  * nothing — the end of the block body (today's tolerance for a missing `</function>`).
+///
+/// Anything else (e.g. `\n</parameter>…` — the reporter's file-about-tools payload embeds the
+/// sequence `</parameter>\n</function>` MID-value) means the candidate is quoted content, not
+/// the close.
+fn structural_continuation(after: &str) -> bool {
+    let rest = skip_tag_ws(after);
+    if rest.is_empty() || rest.starts_with("<parameter=") {
+        return true;
+    }
+    // K3 (REL v0.7.3 review): the next call's tag DIRECTLY after the close (no
+    // `</function>` between the calls) also proves the candidate is the real close.
+    // Before this the close was treated as quoted content and the next call's
+    // `<parameter=…>` was swallowed into THIS call's value — the pre-v0.7.3 first-close
+    // parser returned both calls. `skip_tag_ws` already consumed exactly the boundary
+    // characters `find_function_tag_mode` accepts before a bare tag, so a tag at
+    // position 0 here is a tag there too.
+    if rest.starts_with("<function=") || rest.starts_with("function=") {
+        return true;
+    }
+    let Some(tail) = rest.strip_prefix("</function>") else { return false };
+    let tail = skip_tag_ws(tail);
+    tail.is_empty() || tail.starts_with("<function=") || tail.starts_with("function=")
+}
+
+/// End of a `<parameter=…>` value: the byte offset (relative to `vstart`, which runs to the end
+/// of the block body) of the STRUCTURAL `</parameter>`, or `None` when the value is never closed
+/// (truncated output).
+///
+/// Pre-v0.7.3 this was `vstart.find("</parameter>")` — the FIRST close tag — so a value quoting
+/// the tool format itself was silently truncated at the embedded tag (an agent writing a file
+/// ABOUT tool calls lost the tail of the file). Each candidate close is validated by
+/// `structural_continuation`; rejected candidates keep the scan going.
+///
+/// Fallback: when NO candidate satisfies the rule (malformed or truncated output) the FIRST
+/// candidate is used — exactly the old behaviour, so garbage in still parses as it did.
+///
+/// Cost on the common path (exactly one `</parameter>` in the value): one `find` plus one O(1)
+/// lookahead check; the fallback scan never runs. The candidate scan is SEQUENTIAL (each `find`
+/// resumes where the previous candidate ended), so even a 1 MB value full of embedded close tags
+/// costs one linear pass, never quadratic restarts.
+fn param_end(vstart: &str) -> Option<usize> {
+    const CLOSE: &str = "</parameter>";
+    let first = vstart.find(CLOSE)?;
+    let mut cand = first;
+    loop {
+        let after = &vstart[cand + CLOSE.len()..];
+        if structural_continuation(after) {
+            return Some(cand);
+        }
+        let Some(rel) = after.find(CLOSE) else { break };
+        cand += CLOSE.len() + rel;
+    }
+    // No candidate satisfies the structural rule: keep today's behaviour (the first close tag).
+    Some(first)
+}
+
 /// The XML form: one call per `<function=NAME>` tag, each owning the `<parameter=…>` pairs up
 /// to the next tag. Also accepts a JSON-object body inside the function tag (the Froggeric
 /// template's string-arguments history form) when no `<parameter=` pair is present.
@@ -241,7 +319,9 @@ fn parse_xml_calls(body: &str, tools: Option<&[Value]>) -> Vec<ToolCall> {
             let Some(gt2) = a.find('>') else { break };
             let key = a[..gt2].trim().to_string();
             let vstart = &a[gt2 + 1..];
-            let Some(pclose) = vstart.find("</parameter>") else { break };
+            // v0.7.3: the STRUCTURAL close (`param_end`), not merely the first close tag — a
+            // value that quotes the tool format keeps its embedded `</parameter>` as content.
+            let Some(pclose) = param_end(vstart) else { break };
             // The template puts a newline after `>` and before `</parameter>`; they are delimiters,
             // not part of the value. Trim only those, so interior whitespace of a multi-line value
             // survives.
@@ -1094,5 +1174,518 @@ mod tests {
         let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
         assert_eq!(a["code"], r#"print("hi")"#);
         assert!(empty_arg_alarms(raw, Some(&tools), &out.tool_calls).is_empty());
+    }
+
+    // =====================================================================================
+    // v0.7.3: structural `</parameter>` terminator (reporter: literal tags in tool payloads).
+    // =====================================================================================
+
+    /// Verbatim copy of the PRE-v0.7.3 terminator (first close tag wins), for differential
+    /// testing. Do NOT "fix" this copy: it IS the old behaviour under test.
+    fn old_param_end(vstart: &str) -> Option<usize> {
+        vstart.find("</parameter>")
+    }
+
+    /// Verbatim copy of the PRE-v0.7.3 `parse_xml_calls` (value spans ended at
+    /// `old_param_end`), for differential testing on corpora. The `[tool-args-alarm]`
+    /// eprintln of the original is the only omission (it is a log line, not behaviour).
+    fn old_parse_xml_calls(body: &str, tools: Option<&[Value]>) -> Vec<ToolCall> {
+        let mut calls = Vec::new();
+        let wf_only = body.contains("<function=");
+        let mut from = 0usize;
+        while let Some((i, tlen)) = find_function_tag_mode(&body[from..], wf_only) {
+            let start = from + i;
+            let name_from = start + tlen;
+            let Some(gt) = body[name_from..].find('>') else { from = name_from; continue };
+            let name = body[name_from..name_from + gt].trim().to_string();
+            let after_name = name_from + gt + 1;
+            if name.is_empty() { from = after_name; continue; }
+            let schema = tools.and_then(|ts| param_schema(ts, &name));
+            let mut args = serde_json::Map::new();
+            let mut cursor = after_name;
+            loop {
+                let next_tag = find_function_tag_mode(&body[cursor..], wf_only).map(|(ti, _)| cursor + ti);
+                let next_param = body[cursor..].find("<parameter=").map(|pi| cursor + pi);
+                let Some(popen) = next_param else { break };
+                if next_tag.map_or(false, |t| t < popen) { break; }
+                let a = &body[popen + "<parameter=".len()..];
+                let Some(gt2) = a.find('>') else { break };
+                let key = a[..gt2].trim().to_string();
+                let vstart = &a[gt2 + 1..];
+                let Some(pclose) = old_param_end(vstart) else { break };
+                let raw = vstart[..pclose].trim_matches('\n');
+                args.insert(key.clone(), coerce(raw, schema.and_then(|s| s.get(&key))));
+                cursor = body.len() - vstart.len() + pclose + "</parameter>".len();
+            }
+            let end = find_function_tag_mode(&body[cursor..], wf_only).map(|(ti, _)| cursor + ti).unwrap_or(body.len());
+            let after = &body[start + tlen..end];
+            if args.is_empty() {
+                let jb = after[gt + 1..].trim();
+                let jb = jb.strip_suffix("</function>").unwrap_or(jb).trim();
+                let jsonish = jb.starts_with('{') || jb.starts_with('[');
+                if jsonish {
+                    let jb = strip_stray_param_close(jb);
+                    if let Some(o) = json_object_lenient(jb) {
+                        for (k, v) in o { args.insert(k, v); }
+                    }
+                }
+            }
+            calls.push(ToolCall {
+                id: format!("call_{}", CALL_SEQ.fetch_add(1, Ordering::Relaxed)),
+                kind: "function".to_string(),
+                function: crate::tokenizer::FunctionCall {
+                    name,
+                    arguments: serde_json::to_string(&Value::Object(args)).unwrap_or_else(|_| "{}".into()),
+                },
+            });
+            from = end;
+        }
+        calls
+    }
+
+    /// Compare new vs old parser output. Call IDS are skipped on purpose: they come from the
+    /// process-wide `CALL_SEQ` counter and differ between the two runs.
+    fn assert_same_calls(new: Vec<ToolCall>, old: Vec<ToolCall>, ctx: &str) {
+        assert_eq!(new.len(), old.len(), "{ctx}: call count differs");
+        for (n, o) in new.iter().zip(old.iter()) {
+            assert_eq!(n.function.name, o.function.name, "{ctx}: name differs");
+            assert_eq!(n.function.arguments, o.function.arguments, "{ctx}: arguments differ");
+        }
+    }
+
+    /// Body of the FIRST `<tool_call>…</tool_call>` block of `raw` (the block-level extraction
+    /// is UNCHANGED by v0.7.3, so differential tests compare at body level).
+    fn first_block_body(raw: &str) -> &str {
+        let open = raw.find(CALL_OPEN).expect("no <tool_call>");
+        let after = &raw[open + CALL_OPEN.len()..];
+        let close = after.find(CALL_CLOSE).expect("no </tool_call>");
+        &after[..close]
+    }
+
+    /// The reporter's six-line file: a tool call ABOUT the tool-call format.
+    const REPORTER_FILE_VALUE: &str =
+        "# Tool format notes\n<function=read>\n<parameter=path>\nsrc/app.py\n</parameter>\n</function>";
+
+    #[test]
+    fn reporter_payload_keeps_embedded_close_tags() {
+        let raw = format!(
+            "<tool_call>\n<function=write>\n<parameter=path>\ndocs/format.md\n</parameter>\n\
+             <parameter=content>\n{REPORTER_FILE_VALUE}\n</parameter>\n</function>\n</tool_call>"
+        );
+        let out = parse(&raw, None);
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].function.name, "write");
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["path"], "docs/format.md");
+        // The FULL six-line value — v0.7.2 silently dropped the last two lines
+        // (`</parameter>` / `</function>`) at the FIRST embedded close tag.
+        assert_eq!(a["content"], REPORTER_FILE_VALUE);
+    }
+
+    #[test]
+    fn reporter_payload_as_middle_parameter_of_three() {
+        let raw = format!(
+            "<tool_call>\n<function=write>\n<parameter=mode>\noverwrite\n</parameter>\n\
+             <parameter=content>\n{REPORTER_FILE_VALUE}\n</parameter>\n\
+             <parameter=path>\ndocs/format.md\n</parameter>\n</function>\n</tool_call>"
+        );
+        let out = parse(&raw, None);
+        assert_eq!(out.tool_calls.len(), 1);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["mode"], "overwrite");
+        assert_eq!(a["content"], REPORTER_FILE_VALUE);
+        assert_eq!(a["path"], "docs/format.md");
+    }
+
+    #[test]
+    fn embedded_close_sequence_with_following_call() {
+        // First call's value embeds `</parameter>\n</function>`; a second call follows in the
+        // SAME block. The embedded sequence must stay content, and the second call must survive.
+        let raw = "<tool_call>\n<function=write>\n<parameter=content>\nline1\n</parameter>\n</function>\n</parameter>\n<parameter=path>\nx.txt\n</parameter>\n</function>\n<function=read>\n<parameter=path>\ny.txt\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(raw, None);
+        assert_eq!(out.tool_calls.len(), 2, "embedded close tags must not split/eat the second call");
+        assert_eq!(out.tool_calls[0].function.name, "write");
+        let a0: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a0["content"], "line1\n</parameter>\n</function>");
+        assert_eq!(a0["path"], "x.txt");
+        assert_eq!(out.tool_calls[1].function.name, "read");
+        let a1: Value = serde_json::from_str(&out.tool_calls[1].function.arguments).unwrap();
+        assert_eq!(a1["path"], "y.txt");
+    }
+
+    #[test]
+    fn same_line_close_tag_is_content() {
+        // `</parameter> foo` mid-value: the follower is prose, so the candidate is rejected and
+        // the whole line is CONTENT (the value runs to the structural close).
+        let raw = "<tool_call>\n<function=write>\n<parameter=content>\nA\n</parameter> foo\nB\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(raw, None);
+        assert_eq!(out.tool_calls.len(), 1);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["content"], "A\n</parameter> foo\nB");
+    }
+
+    #[test]
+    fn embedded_parameter_open_tag_is_content() {
+        let raw = "<tool_call>\n<function=write>\n<parameter=content>\nsee <parameter=name> below\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(raw, None);
+        assert_eq!(out.tool_calls.len(), 1);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["content"], "see <parameter=name> below");
+    }
+
+    #[test]
+    fn embedded_function_close_only_is_content() {
+        let raw = "<tool_call>\n<function=write>\n<parameter=content>\nnotes about </function> tags\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(raw, None);
+        assert_eq!(out.tool_calls.len(), 1);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["content"], "notes about </function> tags");
+    }
+
+    #[test]
+    fn normal_calls_match_old_parser() {
+        let t = tools();
+        let cases = [
+            // 1 parameter
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+            // 2 parameters
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+            // 3 parameters
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=exact>\ntrue\n</parameter>\n</function>\n</tool_call>",
+            // prose before and after the block
+            "Let me check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>\nDone.",
+            // two functions in one block
+            "<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n</function>\n<function=b>\n<parameter=y>\n2\n</parameter>\n</function>\n</tool_call>",
+            // empty value
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\n</parameter>\n</function>\n</tool_call>",
+        ];
+        for c in cases {
+            let body = first_block_body(c);
+            assert_same_calls(parse_xml_calls(body, Some(&t)), old_parse_xml_calls(body, Some(&t)), c);
+        }
+    }
+
+    #[test]
+    fn truncated_value_matches_today() {
+        // No block close at all: the whole call is dropped (unchanged block-level rule).
+        let raw = "<tool_call>\n<function=write>\n<parameter=path>\ndocs/x.md\n</parameter>\n<parameter=content>\nline1\nline2";
+        let out = parse(raw, None);
+        assert_eq!(out.tool_calls.len(), 0);
+        // Value-level: no close anywhere -> None, parameter dropped.
+        assert_eq!(param_end("line1\nline2"), None);
+        assert_eq!(old_param_end("line1\nline2"), None);
+        // Block closed but the LAST value never closed: the unclosed parameter is dropped, the
+        // earlier one survives -- identical to the old parser.
+        let raw2 = "<tool_call>\n<function=write>\n<parameter=path>\ndocs/x.md\n</parameter>\n<parameter=content>\nline1\nline2\n</tool_call>";
+        let body = first_block_body(raw2);
+        assert_same_calls(parse_xml_calls(body, None), old_parse_xml_calls(body, None), raw2);
+        let out2 = parse(raw2, None);
+        assert_eq!(out2.tool_calls.len(), 1);
+        let a: Value = serde_json::from_str(&out2.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["path"], "docs/x.md");
+        assert!(a.get("content").is_none());
+    }
+
+    #[test]
+    fn documented_ambiguity_embedded_closing_sequence_at_block_end_keeps_todays_result() {
+        // The stream `...text\n</parameter>\n</function>` + end of block is byte-identical to a
+        // value that ENDS with the embedded closing sequence but omitted the real close. The
+        // structural reading wins (value = "text") -- exactly today's behaviour. An agent that
+        // must emit such a value has to break the sequence (release-notes advice).
+        let raw = "<tool_call>\n<function=write>\n<parameter=content>\ntext\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(raw, None);
+        assert_eq!(out.tool_calls.len(), 1);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["content"], "text");
+        let body = first_block_body(raw);
+        assert_same_calls(parse_xml_calls(body, None), old_parse_xml_calls(body, None), raw);
+    }
+
+    #[test]
+    fn fallback_to_first_close_when_no_structural_candidate() {
+        // Every candidate fails the lookahead (malformed tail) -> FIRST close is used, exactly
+        // the old behaviour.
+        let body = "<function=f>\n<parameter=a>\nX</parameter> Y\n</parameter> Z";
+        assert_same_calls(parse_xml_calls(body, None), old_parse_xml_calls(body, None), body);
+        let vstart = "X</parameter> Y\n</parameter> Z";
+        assert_eq!(param_end(vstart), old_param_end(vstart));
+        // The value under both: "X".
+        let raw = format!("<tool_call>\n{body}\n</tool_call>");
+        let out = parse(&raw, None);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["a"], "X");
+    }
+
+    // =====================================================================================
+    // S-B9-REL-FIXB K3: malformed block WITHOUT `</function>` between two calls.
+    // =====================================================================================
+
+    #[test]
+    fn malformed_missing_function_close_between_calls_is_two_calls() {
+        // The review's exact block: `</parameter>` followed directly by the next call's
+        // tag. Pre-K3 the structural rule rejected the close as quoted content and call b
+        // was swallowed into parameter x; the pre-v0.7.3 parser returned both calls.
+        let body = "<function=a><parameter=x>1</parameter><function=b><parameter=y>2</parameter></function>";
+        let out = parse(&format!("<tool_call>\n{body}\n</tool_call>"), None);
+        assert_eq!(out.tool_calls.len(), 2, "the next call must not be swallowed");
+        assert_eq!(out.tool_calls[0].function.name, "a");
+        assert_eq!(out.tool_calls[1].function.name, "b");
+        let a0: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        let a1: Value = serde_json::from_str(&out.tool_calls[1].function.arguments).unwrap();
+        assert_eq!(a0["x"], "1");
+        assert_eq!(a1["y"], "2");
+        // ...and the NEW parser now matches the OLD one on this malformed shape.
+        assert_same_calls(parse_xml_calls(body, None), old_parse_xml_calls(body, None), body);
+        // Newline-flavoured boundary (what the model actually emits) and the bare-tag
+        // repair form (no well-formed tag anywhere in the body).
+        let nl = "<function=a>\n<parameter=x>\n1\n</parameter>\n<function=b>\n<parameter=y>\n2\n</parameter>\n</function>";
+        let out = parse(&format!("<tool_call>\n{nl}\n</tool_call>"), None);
+        assert_eq!(out.tool_calls.len(), 2);
+        assert_same_calls(parse_xml_calls(nl, None), old_parse_xml_calls(nl, None), nl);
+        let bare = "function=a>\n<parameter=x>\n1\n</parameter>\nfunction=b>\n<parameter=y>\n2\n</parameter>\n</function>";
+        let out = parse(&format!("<tool_call>\n{bare}\n</tool_call>"), None);
+        assert_eq!(out.tool_calls.len(), 2, "bare-tag repair: the next call must survive too");
+        assert_same_calls(parse_xml_calls(bare, None), old_parse_xml_calls(bare, None), bare);
+    }
+
+    #[test]
+    fn malformed_missing_function_close_three_calls() {
+        let body = "<function=a><parameter=x>1</parameter><function=b><parameter=y>2</parameter><function=c><parameter=z>3</parameter></function>";
+        let out = parse(&format!("<tool_call>\n{body}\n</tool_call>"), None);
+        assert_eq!(out.tool_calls.len(), 3);
+        let a0: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        let a1: Value = serde_json::from_str(&out.tool_calls[1].function.arguments).unwrap();
+        let a2: Value = serde_json::from_str(&out.tool_calls[2].function.arguments).unwrap();
+        assert_eq!(a0["x"], "1");
+        assert_eq!(a1["y"], "2");
+        assert_eq!(a2["z"], "3");
+        assert_same_calls(parse_xml_calls(body, None), old_parse_xml_calls(body, None), body);
+    }
+
+    #[test]
+    fn reporter_payload_still_full_value_after_k3() {
+        // The K3 relaxation must not reopen the original hole: the reporter's six-line
+        // file embeds `</parameter>\n</function>` MID-value, and that candidate is still
+        // rejected (a `<function=` after `</function>` needs the close BETWEEN them; the
+        // file's follower is `</parameter>`, not a call tag).
+        let raw = format!(
+            "<tool_call>\n<function=write>\n<parameter=content>\n{REPORTER_FILE_VALUE}\n</parameter>\n</function>\n</tool_call>"
+        );
+        let out = parse(&raw, None);
+        assert_eq!(out.tool_calls.len(), 1);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["content"], REPORTER_FILE_VALUE);
+    }
+
+    /// K3 differential: malformed variants over a generated corpus (same LCG, values never
+    /// contain `</parameter>` text). Whenever the value has no embedded close tag the NEW
+    /// structural terminator must agree with the OLD first-close parser:
+    ///  * variant 0 — `</function>` dropped between call i and i+1;
+    ///  * variant 1 — the final `</function>` dropped;
+    ///  * variant 2 — the final `</parameter>` dropped.
+    #[test]
+    fn differential_corpus_malformed_variants() {
+        let mut rng = Lcg(0x5EED_2026_0A05);
+        const KEYS: [&str; 6] = ["alpha", "beta", "gamma", "count", "flag", "path"];
+        const FNAMES: [&str; 4] = ["get_weather", "read_file", "write", "run"];
+        let mut blocks = 0usize;
+        for variant in 0..3 {
+            for _ in 0..300 {
+                // Build a WELL-FORMED body first (same generator as the well-formed corpus).
+                let mut body = String::new();
+                let fns = 1 + rng.below(3) as usize;
+                for f in 0..fns {
+                    if f > 0 { body.push('\n'); }
+                    body.push_str("<function=");
+                    body.push_str(FNAMES[rng.below(4) as usize]);
+                    body.push_str(">\n");
+                    let params = 1 + rng.below(3) as usize;
+                    for _ in 0..params {
+                        body.push_str("<parameter=");
+                        body.push_str(KEYS[rng.below(6) as usize]);
+                        body.push_str(">\n");
+                        let lines = 1 + rng.below(3) as usize;
+                        for _ in 0..lines {
+                            body.push_str(&format!("value {} row {}\n", rng.below(1000), rng.below(1000)));
+                        }
+                        body.push_str("</parameter>\n");
+                    }
+                    body.push_str("</function>\n");
+                }
+                // Apply the malformation.
+                let malformed = match variant {
+                    0 => {
+                        // Drop `</function>` between call i and i+1 (the FIRST separator
+                        // when the body has >= 2 calls; single-call bodies skip unchanged).
+                        let n = body.matches("</function>\n").count();
+                        if n < 2 { body.clone() } else {
+                            body.replacen("</function>\n", "\n", 1)
+                        }
+                    }
+                    1 => body.strip_suffix("</function>\n").unwrap_or(&body).to_string(),
+                    _ => {
+                        // Drop the FINAL `</parameter>` of the body.
+                        match body.rfind("</parameter>\n") {
+                            Some(i) => format!("{}{}", &body[..i], &body[i + "</parameter>\n".len()..]),
+                            None => body.clone(),
+                        }
+                    }
+                };
+                assert!(!malformed.is_empty());
+                let raw = format!("<tool_call>\n{malformed}</tool_call>");
+                let b = first_block_body(&raw);
+                assert_same_calls(parse_xml_calls(b, None), old_parse_xml_calls(b, None), &raw);
+                blocks += 1;
+            }
+        }
+        assert_eq!(blocks, 900);
+    }
+
+    #[test]
+    fn one_megabyte_value_with_many_embedded_candidates() {
+        // 1 MB of payload with an embedded close tag every ~64 bytes: the candidate scan must
+        // stay a single linear pass (a restarting/quadratic scan would hang this test) and the
+        // value must survive whole.
+        let mut v = String::with_capacity(1 << 20);
+        v.push_str("start\n");
+        while v.len() < (1 << 20) - 80 {
+            v.push_str("data line 0123456789abcdefghijklmnopqrstuvwxyz\n");
+            v.push_str("</parameter> trailing text still content\n");
+        }
+        v.push_str("end");
+        let raw = format!(
+            "<tool_call>\n<function=write>\n<parameter=content>\n{v}\n</parameter>\n</function>\n</tool_call>"
+        );
+        let out = parse(&raw, None);
+        assert_eq!(out.tool_calls.len(), 1);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        let got = a["content"].as_str().unwrap();
+        assert_eq!(got.len(), v.len(), "1 MB value must survive whole");
+        assert!(got.starts_with("start\n") && got.ends_with("end"));
+        assert!(got.contains("</parameter> trailing text still content\n"));
+    }
+
+    #[test]
+    fn whitespace_and_crlf_variants() {
+        // Spaces/tabs (and none) between the close and the next parameter.
+        let raw = "<tool_call>\n<function=f>\n<parameter=a>\n1\n</parameter>  \t\n<parameter=b>\n2\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(raw, None);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["a"], "1");
+        assert_eq!(a["b"], "2");
+        assert_same_calls(parse_xml_calls(first_block_body(raw), None),
+                          old_parse_xml_calls(first_block_body(raw), None), raw);
+
+        // CRLF between every structural tag.
+        let crlf = "<tool_call>\r\n<function=f>\r\n<parameter=a>\r\nval\r\n</parameter>\r\n</function>\r\n</tool_call>";
+        let out = parse(crlf, None);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["a"], "\r\nval\r"); // pre-existing template-trim quirk: only '\n' is trimmed
+        assert_same_calls(parse_xml_calls(first_block_body(crlf), None),
+                          old_parse_xml_calls(first_block_body(crlf), None), crlf);
+
+        // Indented `</function>` + next function tag after the close.
+        let two = "<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n</function>  \n<function=b>\n<parameter=y>\n2\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(two, None);
+        assert_eq!(out.tool_calls.len(), 2);
+        assert_same_calls(parse_xml_calls(first_block_body(two), None),
+                          old_parse_xml_calls(first_block_body(two), None), two);
+    }
+
+    /// Deterministic LCG (no `rand` dependency): the corpus is reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    /// Differential test: NEW vs OLD parser over a generated corpus of well-formed calls
+    /// (random keys/values, values WITHOUT `</parameter>` text, 1-5 parameters, 1-3 functions,
+    /// 500 blocks). Well-formed output must parse byte-identically.
+    #[test]
+    fn differential_corpus_well_formed_calls() {
+        let mut rng = Lcg(0x5EED_2026_1005);
+        const KEYS: [&str; 6] = ["alpha", "beta", "gamma", "count", "flag", "path"];
+        const FNAMES: [&str; 4] = ["get_weather", "read_file", "write", "run"];
+        let t = tools();
+        let mut blocks = 0usize;
+        for _ in 0..500 {
+            let mut body = String::new();
+            let fns = 1 + rng.below(3) as usize; // 1..=3 functions per block
+            for f in 0..fns {
+                if f > 0 { body.push('\n'); }
+                body.push_str("<function=");
+                body.push_str(FNAMES[rng.below(4) as usize]);
+                body.push_str(">\n");
+                let params = 1 + rng.below(5) as usize; // 1..=5 parameters per call
+                for _ in 0..params {
+                    body.push_str("<parameter=");
+                    body.push_str(KEYS[rng.below(6) as usize]);
+                    body.push_str(">\n");
+                    let lines = 1 + rng.below(4) as usize;
+                    for _ in 0..lines {
+                        body.push_str(&format!("value {} row {}\n", rng.below(1000), rng.below(1000)));
+                    }
+                    body.push_str("</parameter>\n");
+                }
+                body.push_str("</function>\n");
+            }
+            let raw = format!("<tool_call>\n{body}</tool_call>");
+            let b = first_block_body(&raw);
+            assert_same_calls(parse_xml_calls(b, Some(&t)), old_parse_xml_calls(b, Some(&t)), &raw);
+            blocks += 1;
+        }
+        assert_eq!(blocks, 500);
+    }
+
+    /// G2 corpus replay: the on-disk artifacts that contain `<tool_call>` text, discovered by
+    /// `grep -rl -F "<tool_call>"` over PLAN/, scripts/ and bounded /tmp on the dev box
+    /// (2026-10-05; the exact list is in REL_TOOLTAG_REPORT.md). Each is replayed through the
+    /// NEW parser and the OLD algorithm copy; outputs must be identical. `#[ignore]`: replays
+    /// repo evidence files (manifest-relative), run explicitly:
+    ///   cargo test --release --lib corpus_replay -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn corpus_replay_evidence_files() {
+        // Repo-relative via the compile-time manifest dir (AGENTS §8: no lab paths in
+        // source; the resolved strings never name a dev box).
+        const FILES: [&str; 7] = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/PLAN/GLM53_VLLM_SKILL/goldens/e2e_api_greedy_logprobs.json"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/PLAN/GLM53_VLLM_SKILL/03_inference_loop.md"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/PLAN/TP-HW8_REPORT.md"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/PLAN/REL_SESSION_PROMPT_TOOLTAG.md"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/PLAN/S_A3_D_FIRST_TOKENS.md"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/PLAN/HOTFIX_TOOLCALL_SERIAL_PROMPT.md"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/PLAN/TOOLCALL_COMPLIANCE_TRIAGE.md"),
+        ];
+        let files: Vec<std::path::PathBuf> = FILES.iter().map(std::path::PathBuf::from).collect();
+        let mut n_files = 0usize;
+        let mut n_blocks = 0usize;
+        let mut n_calls = 0usize;
+        for f in files {
+            let Ok(bytes) = std::fs::read(&f) else { continue };
+            let text = String::from_utf8_lossy(&bytes);
+            if !text.contains(CALL_OPEN) { continue; }
+            n_files += 1;
+            let mut rest = text.as_ref();
+            while let Some(open) = rest.find(CALL_OPEN) {
+                let after = &rest[open + CALL_OPEN.len()..];
+                let Some(close) = after.find(CALL_CLOSE) else { break };
+                let body = &after[..close];
+                if !body.trim_start().starts_with('{') {
+                    // XML bodies only: the JSON path is untouched by this change.
+                    let new = parse_xml_calls(body, None);
+                    n_calls += new.len();
+                    assert_same_calls(new, old_parse_xml_calls(body, None), &f.to_string_lossy());
+                    n_blocks += 1;
+                }
+                rest = &after[close + CALL_CLOSE.len()..];
+            }
+        }
+        println!("[corpus-replay] files={n_files} blocks={n_blocks} calls={n_calls} -- all identical");
+        assert!(n_blocks > 0, "expected at least one replayable block");
     }
 }

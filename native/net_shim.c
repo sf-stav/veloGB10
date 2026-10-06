@@ -197,6 +197,12 @@ typedef struct NetCtx {
     uint64_t  agree_last;            // last lockstep token shipped
     int       last_posted_peer;      // last QP's peer rank (world>2 self-clocking of the reuse gate)
     uint32_t  rng;
+    // S-B9-REL-TP2RACE probe (--tp-race-probe <ms>, issue #10): rank 1's proxy holds every world-2
+    // epoch release (cpu_done) by this many ms and hashes the withheld slot across the hold — any
+    // change is a host exchange frame landing on an unconsumed epoch payload, caught at the
+    // transport layer whatever it does to the drafts. 0 = off (production).
+    uint32_t  probe_hold_ms;
+    uint64_t  probe_hits;            // withheld slots observed changing (MUST stay 0 on a fixed transport)
 } NetCtx;
 
 // ---------------------------------------------------------------- helpers
@@ -228,6 +234,9 @@ static unsigned long long g_opt_spin_us = 0;   /* --tp-spin-us (0 = unset / the 
 static int g_opt_tail_drill = 0;               /* --tp-tail-drill (test-only) */
 static int g_opt_oneshot = 0;                  /* --tp-oneshot (world == 4 only) */
 static int g_opt_tp_diag = 0;                  /* --tp-diag */
+static unsigned g_opt_probe_hold_ms = 0;   /* --tp-race-probe <ms> (0 = off; test-only, issue #10) */
+void net_set_probe(unsigned hold_ms) { g_opt_probe_hold_ms = hold_ms; }
+
 void net_set_opts(unsigned long long spin_us, int tail_drill, int oneshot, int tp_diag) {
     g_opt_spin_us = spin_us; g_opt_tail_drill = tail_drill; g_opt_oneshot = oneshot; g_opt_tp_diag = tp_diag;
 }
@@ -305,8 +314,9 @@ static void wdog_dump(NetCtx* c, uint64_t posted, uint64_t matched) {
     snprintf(path, sizeof(path), "/tmp/tp_wdog.rank%d.dump", c->rank);
     FILE* f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "# rank %d world %d rounds %d slot_stride %u recv_gpu %d\n",
-            c->rank, c->world, c->rounds, c->slot_stride, c->recv_gpu);
+    fprintf(f, "# rank %d world %d rounds %d slot_stride %u recv_gpu %d xchg_gen %llu (slot %llu)\n",
+            c->rank, c->world, c->rounds, c->slot_stride, c->recv_gpu,
+            (unsigned long long)c->gen, (unsigned long long)(c->gen & (TP_RING_SLOTS - 1)));
     fprintf(f, "# posted %llu matched %llu retired %llu released %llu device_epoch %llu\n",
             (unsigned long long)posted, (unsigned long long)matched,
             (unsigned long long)c->retired_epochs, (unsigned long long)c->released_epochs,
@@ -723,6 +733,27 @@ static inline char* ctrl_send_slot(NetCtx* c) {
     return (char*)c->hbuf + c->ctrl_send_off;
 }
 
+// S-B9-REL-TP2RACE (issue #10): the world-2 exchange's slot arithmetic. At world 2 the frame stages
+// in the DEDICATED ctrl send slot and lands in the peer's ctrl recv ring, slot (src, g%TP_CTRL_RING)
+// — memory no doorbell epoch can touch, so an in-flight/unconsumed epoch payload can never be
+// clobbered by a control frame and the frame can never be clobbered by an epoch. World>2 keeps the
+// historical hot-ring addressing for this pairwise channel (its lockstep rides net_exchange_one).
+static inline char* xchg_stage_slot(NetCtx* c) {
+    return (c->world == 2) ? ctrl_send_slot(c) : (char*)c->hbuf + TP_RING_BASE;
+}
+static inline char* xchg_recv_slot_ptr(NetCtx* c, uint64_t g) {
+    if (c->world != 2) return recv_slot(c, g);
+    return ctrl_recv_slot(c, 1 - c->rank, g);
+}
+static inline uint64_t xchg_remote_slot(NetCtx* c, uint64_t g) {
+    if (c->world != 2)
+        return (uint64_t)((char*)control_remote_addr(c) + TP_RING_BASE
+                          + (size_t)TP_RING_SLOTS * c->slot_stride)
+               + (size_t)(g & (TP_RING_SLOTS - 1)) * c->slot_stride;
+    return control_remote_addr(c)
+         + (uint64_t)((char*)ctrl_recv_slot(c, c->rank, g) - (char*)c->hbuf);
+}
+
 // ---------------------------------------------------------------- init
 
 // Forward declarations (defined below; net_init dispatches to them).
@@ -773,6 +804,24 @@ NetCtx* net_init(int rank, int world, const char* const* peer_ips, int n_peers,
 }
 
 // The pre-P3 single-QP bring-up, byte-for-byte. MUST NOT change (world==2 fast path).
+// S-B9-REL-TP2RACE side item (REL-NGRAM one transient bring-up failure): the link pinned regions
+// are small but a cudaHostAlloc can fail transiently right after the model + primary rail came up
+// (unified-memory squeeze) — the head never reached its TCP listener and the node logged
+// `connect :29600 refused`. Retry a few times before giving up; persistent failure stays loud.
+static void* host_alloc_with_retry(size_t bytes) {
+    void* p = NULL;
+    for (int i = 0; i < 5; i++) {
+        if (cudaHostAlloc(&p, bytes, cudaHostAllocMapped|cudaHostAllocPortable) == cudaSuccess) {
+            if (i) LOGE("cudaHostAlloc(%zu) succeeded on retry %d", bytes, i);
+            return p;
+        }
+        LOGE("cudaHostAlloc(%zu) failed (attempt %d/5) — retrying in 1 s", bytes, i + 1);
+        struct timespec d = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&d, NULL);
+    }
+    return NULL;
+}
+
 static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, const char* dev_name,
                                int gid_idx, int fp32_capacity_bytes, int payload_bytes) {
     NetCtx* c = (NetCtx*)calloc(1, sizeof(NetCtx));
@@ -783,7 +832,22 @@ static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, cons
     if (c->tail_drill) LOGE("TAIL DRILL ON: inverting commit/payload order every 4096th epoch");
     // slot = payload capacity + 8 B tail epoch, 64 B aligned so no two slots share a line
     c->slot_stride = (unsigned)(((size_t)fp32_capacity_bytes + TP_TAIL_BYTES + TP_CL - 1) & ~(size_t)(TP_CL - 1));
-    c->region_bytes = TP_RING_BASE + (size_t)2 * TP_RING_SLOTS * c->slot_stride;
+    // S-B9-REL-TP2RACE (issue #10): world 2 now appends the DEDICATED control region after the
+    // doorbell rings — the same region world>2 has had since P5 — and every world-2 host exchange
+    // (net_exchange: pre-verify, tp_round, step-go, bring-up) stages and lands there instead of the
+    // hot-path rings. The R1 "byte-for-byte world==2" rule is kept for everything the device sees:
+    // no existing offset moves (flags, len rings, both rings, dev_ctx) — the MR simply grows by
+    // 11 slots (~11.5 MB pinned). The pre-verify exchange frame can then never overwrite a peer
+    // epoch payload that is validated but not yet consumed by its K2 (the #10 race: drafts diverge,
+    // "TP pre-verify FAILED", 4 head exits over v0.7.0-0.7.2), and no drain/fence is needed for it.
+    c->ctrl_recv_off = TP_RING_BASE + (size_t)2 * TP_RING_SLOTS * c->slot_stride;
+    c->ctrl_last_off = c->ctrl_recv_off + (size_t)2 * TP_CTRL_RING * c->slot_stride;
+    c->ctrl_send_off = c->ctrl_last_off + (size_t)2 * c->slot_stride;
+    c->region_bytes  = c->ctrl_send_off + c->slot_stride;
+    c->probe_hold_ms = g_opt_probe_hold_ms;
+    if (c->probe_hold_ms)
+        LOGE("TP RACE PROBE ON: rank %d holds every epoch release by %u ms and watches the withheld "
+             "slot for a host exchange frame (issue #10 fault injection; test-only)", c->rank, c->probe_hold_ms);
 
     int n=0; struct ibv_device** devs = ibv_get_device_list(&n);
     if (!devs || n<=0){ LOGE("get_device_list"); return NULL; }
@@ -798,7 +862,7 @@ static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, cons
     c->cq_startup = ibv_create_cq(c->ctx, 256, NULL, NULL, 0);
     if (!c->ctx || !c->pd || !c->cq_send || !c->cq_startup){ LOGE("ctx/pd/cq"); return NULL; }
 
-    if (cudaHostAlloc(&c->hbuf, c->region_bytes, cudaHostAllocMapped|cudaHostAllocPortable) != cudaSuccess){
+    if ((c->hbuf = (char*)host_alloc_with_retry(c->region_bytes)) == NULL){
         LOGE("cudaHostAlloc(%zu)", c->region_bytes); return NULL; }
     memset(c->hbuf, 0, c->region_bytes);
     if (cudaHostGetDevicePointer(&c->dbuf, c->hbuf, 0) != cudaSuccess){ LOGE("devptr"); return NULL; }
@@ -810,8 +874,7 @@ static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, cons
     if (!c->mr){ LOGE("reg_mr on cudaHostAlloc buffer (%s)", strerror(errno)); return NULL; }
 
     // Device ctx: mapped pinned so the host can read the device epoch counter (I8/Q4 tripwire).
-    if (cudaHostAlloc((void**)&c->dev_ctx_h, sizeof(tp_dev_ctx),
-                      cudaHostAllocMapped|cudaHostAllocPortable) != cudaSuccess){
+    if ((c->dev_ctx_h = (tp_dev_ctx*)host_alloc_with_retry(sizeof(tp_dev_ctx))) == NULL){
         LOGE("cudaHostAlloc(dev_ctx)"); return NULL; }
     memset(c->dev_ctx_h, 0, sizeof(tp_dev_ctx));
     if (cudaHostGetDevicePointer(&c->dev_ctx_d, c->dev_ctx_h, 0) != cudaSuccess){ LOGE("devptr ctx"); return NULL; }
@@ -952,7 +1015,7 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
     c->cq_startup = ibv_create_cq(c->ctx, 256, NULL, NULL, 0);
     if (!c->ctx || !c->pd || !c->cq_send || !c->cq_startup){ LOGE("ctx/pd/cq"); return NULL; }
 
-    if (cudaHostAlloc(&c->hbuf, c->region_bytes, cudaHostAllocMapped|cudaHostAllocPortable) != cudaSuccess){
+    if ((c->hbuf = (char*)host_alloc_with_retry(c->region_bytes)) == NULL){
         LOGE("cudaHostAlloc(%zu)", c->region_bytes); return NULL; }
     memset(c->hbuf, 0, c->region_bytes);
     if (cudaHostGetDevicePointer(&c->dbuf, c->hbuf, 0) != cudaSuccess){ LOGE("devptr"); return NULL; }
@@ -960,8 +1023,7 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
         IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ);
     if (!c->mr){ LOGE("reg_mr on cudaHostAlloc buffer (%s)", strerror(errno)); return NULL; }
 
-    if (cudaHostAlloc((void**)&c->dev_ctx_h, sizeof(tp_dev_ctx),
-                      cudaHostAllocMapped|cudaHostAllocPortable) != cudaSuccess){
+    if ((c->dev_ctx_h = (tp_dev_ctx*)host_alloc_with_retry(sizeof(tp_dev_ctx))) == NULL){
         LOGE("cudaHostAlloc(dev_ctx)"); return NULL; }
     memset(c->dev_ctx_h, 0, sizeof(tp_dev_ctx));
     if (cudaHostGetDevicePointer(&c->dev_ctx_d, c->dev_ctx_h, 0) != cudaSuccess){ LOGE("devptr ctx"); return NULL; }
@@ -1103,10 +1165,19 @@ int net_set_recv_mode(NetCtx* c, int gpu) {
 // The GPU's receive watermark (TP_F_RX_DONE) — the watchdog's v2 debt signal + diagnostics.
 uint64_t net_rx_done(const NetCtx* c) { return *flagp(c, TP_F_RX_DONE); }
 
+// S-B9-REL-TP2RACE (issue #10): the exchange generation counter (for the pre-verify bail diagnostic
+// — "gen & 7 next to device_epoch & 7"), the probe's alignment bump (Rust computes the delta so it
+// is unit-testable; the shim owns the counter so it stays race-free), and the probe hit count.
+uint64_t net_xchg_gen(const NetCtx* c) { return c->gen; }
+uint64_t net_gen_add(NetCtx* c, uint64_t delta) { c->gen += delta; return c->gen; }
+uint64_t net_probe_hits(const NetCtx* c) { return c->probe_hits; }
+
 const char* net_peer_ip(NetCtx* c) { return c->peer_ip; }   // TP-F: the aux rail dials the same peer
 void* net_ctx_dptr(NetCtx* c)   { return c->dev_ctx_d; }          // K1/K2 kernel arg (the ONLY one)
 void* net_flags_dptr(NetCtx* c) { return c->dbuf; }
-void* net_send_hptr(NetCtx* c)  { return (char*)c->hbuf + TP_RING_BASE; }                 // slot 0
+// S-B9-REL-TP2RACE: at world 2 the exchange staging/readback is the DEDICATED ctrl slot pair, off
+// the hot-path rings (issue #10); world>2 keeps the legacy slot-0 staging for this pairwise channel.
+void* net_send_hptr(NetCtx* c)  { return xchg_stage_slot(c); }                             // ctrl send slot (w2)
 // world>2: host view of the control receive slot for sender rank `src` (net_exchange_one's receiver).
 void* net_ctrl_recv_hptr(NetCtx* c, int src) { return ctrl_last_slot(c, src); }
 // world>2: host view of the dedicated control SEND staging slot (net_exchange_one's sender).
@@ -1116,7 +1187,7 @@ int   net_rank(NetCtx* c) { return c->rank; }
 // Startup-channel read view: the slot of the LAST COMPLETED exchange generation. Exchanges are
 // gen-slotted on the receive side (see net_exchange), so a fast peer's NEXT generation can never
 // clobber the payload a slow reader is still consuming (the sanity->broadcast 0x0-stamp race).
-void* net_recv_hptr(NetCtx* c)  { return recv_slot(c, c->last_xchg_gen); }
+void* net_recv_hptr(NetCtx* c)  { return xchg_recv_slot_ptr(c, c->last_xchg_gen); }
 void* net_send_dptr(NetCtx* c)  { return (char*)c->dbuf + TP_RING_BASE; }
 void* net_recv_dptr(NetCtx* c)  { return (char*)c->dbuf + TP_RING_BASE
                                        + (size_t)TP_RING_SLOTS * c->slot_stride; }
@@ -1799,6 +1870,31 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
                          (unsigned long long)e, (unsigned long long)c->tail_waits);
             }
             if (!ok) break;
+            // S-B9-REL-TP2RACE probe (--tp-race-probe, issue #10): rank 1 holds THIS release by
+            // probe_hold_ms. Nothing legitimate can write recv_slot(pc) while the epoch is withheld
+            // (the lockstep bounds both ranks' K1s behind this very release), so a hash change
+            // across the hold is a host exchange frame clobbering an unconsumed epoch payload —
+            // the race, caught at the transport layer regardless of what it does to the drafts.
+            if (c->probe_hold_ms && c->rank == 1) {
+                char* pslot = recv_slot(c, pc);
+                uint64_t h0 = tp_fnv64(pslot, 64);
+                uint64_t pt0 = now_ns();
+                while (now_ns() - pt0 < (uint64_t)c->probe_hold_ms * 1000000ull) {
+                    if (c->aborted || *flagp(c, TP_F_ABORT)) break;
+                    struct timespec pd = { .tv_sec = 0, .tv_nsec = 200000 };
+                    nanosleep(&pd, NULL);
+                }
+                uint64_t h1 = tp_fnv64(pslot, 64);
+                if (h0 != h1) {
+                    c->probe_hits++;
+                    LOGE("[tp-race-probe] CLOBBER at epoch %llu slot %llu: the withheld payload changed "
+                         "(hash %016llx -> %016llx, first word %016llx, tail-elem guard had passed) — a host "
+                         "exchange frame landed on an unconsumed epoch payload (issue #10 race CONFIRMED)",
+                         (unsigned long long)pc, (unsigned long long)(pc & (TP_RING_SLOTS - 1)),
+                         (unsigned long long)h0, (unsigned long long)h1,
+                         (unsigned long long)*(volatile uint64_t*)pslot);
+                }
+            }
             // Full fence, then RELEASE-store cpu_done: when the GPU acquire-loads it, this core's
             // coherent view of the NIC's payload writes is ordered behind the flag read (I5).
             __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -2178,9 +2274,7 @@ int net_exchange(NetCtx* c, int nbytes) {
     wr.wr_id=TP_XCHG_WR_ID;   // drain_cq hands this CQE over via xchg_send_done (see the define)
     // Control QP (head<->node): world==2 it is the single QP; world>2 it is the rank-0<->rank-1 QP
     // (net_exchange/net_agree stay pairwise on the control QP in P3 — P5 makes them N-way).
-    wr.wr.rdma.remote_addr = (uint64_t)((char*)control_remote_addr(c) + TP_RING_BASE
-                             + (size_t)TP_RING_SLOTS * c->slot_stride)
-                             + (size_t)(g & (TP_RING_SLOTS - 1)) * c->slot_stride;   // peer recv_slot(g)
+    wr.wr.rdma.remote_addr = xchg_remote_slot(c, g);   // peer's exchange slot for gen g (world 2: ctrl ring)
     wr.wr.rdma.rkey=control_remote_rkey(c);
     __atomic_store_n(&c->xchg_send_done, 0, __ATOMIC_RELEASE);
     if (ibv_post_send(control_qp(c),&wr,&bad)){ LOGE("post_send"); return -1; }
@@ -2246,7 +2340,7 @@ int net_exchange(NetCtx* c, int nbytes) {
     // Placement proof for the payload we are about to let the caller read (point 2 above). The
     // per-gen slot means this wait cannot be clobbered by the peer's next generation while we wait.
     {
-        volatile uint64_t* tailp = (volatile uint64_t*)((char*)recv_slot(c, g) + nbytes - TP_TAIL_BYTES);
+        volatile uint64_t* tailp = (volatile uint64_t*)(xchg_recv_slot_ptr(c, g) + nbytes - TP_TAIL_BYTES);
         uint64_t tw = now_ns();
         while (*tailp != g) {
             if (c->aborted) return -2;

@@ -382,7 +382,7 @@ fn round_prof_add(v: [f64; 5]) {
     g.push(v);
     if g.len() % 100 == 0 {
         let med = |j: usize| { let mut c: Vec<f64> = g.iter().map(|r| r[j]).collect(); c.sort_by(|a, b| a.partial_cmp(b).unwrap()); c[c.len() / 2] };
-        println!("ROUND_PROF n={} median ms: draft_issue {:.2} draft_drain {:.2} host_ple_upload {:.2} verify_issue {:.2} verify_drain {:.2} (sum {:.2})",
+        crate::rprintln!("ROUND_PROF n={} median ms: draft_issue {:.2} draft_drain {:.2} host_ple_upload {:.2} verify_issue {:.2} verify_drain {:.2} (sum {:.2})",
                  g.len(), med(0), med(1), med(2), med(3), med(4), (0..5).map(med).sum::<f64>());
     }
 }
@@ -1128,6 +1128,21 @@ impl Drop for RpRt {
 }
 
 #[cfg(test)]
+mod rel_gates2_reprime_words_tests {
+    use super::*;
+
+    /// GATES2 finding: the REPRIME readback must fit the pinned buffer it is sized with, and cover every word
+    /// xq_accept writes (out[0..=k+2]); accept_out itself is wider (K4) and is NOT the copy length.
+    #[test]
+    fn reprime_readback_is_the_pin_width_not_the_accept_out_width() {
+        assert!(RP_ACCEPT_WORDS >= MTP_MAX_K + 3, "must cover out[0..=k+2] at the max depth");
+        assert!(RP_ACCEPT_WORDS <= accept_out_words(), "must fit inside accept_out");
+        assert!(accept_out_words() > RP_ACCEPT_WORDS, "K4: accept_out is deliberately wider (packed tail to 16 rows)");
+        assert_eq!(RP_ACCEPT_WORDS, 10, "v0.7.2 readback width (40 B) is unchanged");
+    }
+}
+
+#[cfg(test)]
 mod pfx1_tests {
     use super::*;
 
@@ -1405,6 +1420,429 @@ fn ple_read_table(shards: &[std::fs::File], data_off: &[u64], per: usize) -> Res
     });
     for r in res { r?; }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// REL-NGRAM (v0.7.3 issue #9): the 128-shard n-gram sidecar layout of exllamav3 1.5.x.
+//
+// Packs written by exllamav3 1.5.x keep the PLE n-gram table as 128 tensors
+// `<PLE_KEY>.ple_embedding.ngram_embedding.shard_{0..127}.trellis` inside the sidecar
+// `ngram_embedding.safetensors` — and the model's model.safetensors.index.json does NOT list
+// them. The pre-fix loader resolved every shard only through the index (`ple shard N not in
+// index`) and insisted on row width 51 (K=5). The fix: when a shard is not in the index
+// weight_map, resolve it from the sidecar file's own safetensors header, with the same
+// 10*K+1 / K in {5,6} width rule the single-tensor path (CF-P1g) already uses, plus full
+// layout validation (dtype I16, uniform rows/width, shards contiguous and in order).
+// Shards that ARE in the index keep today's code path byte-for-byte.
+// ---------------------------------------------------------------------------
+
+/// Where one of the 128 n-gram trellis shards comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PleShardSrc {
+    /// Resolved through model.safetensors.index.json's weight_map (today's only path; the
+    /// named file's own safetensors header supplies shape + data_offsets, as before).
+    Index(String),
+    /// Not in the index: resolved from `ngram_embedding.safetensors`'s own header
+    /// (exllamav3 1.5.x layout). `abs_off` is the shard's absolute byte offset in the file.
+    Sidecar { fname: String, abs_off: u64 },
+}
+
+/// Read + parse the n-gram sidecar file's safetensors header once (None if there is no
+/// sidecar file). Returns (fname, header_json_len, parsed_header).
+pub(crate) fn ple_sidecar_header(pack_dir: &str) -> Result<Option<(String, u64, serde_json::Value)>> {
+    use std::io::Read;
+    let fname = "ngram_embedding.safetensors".to_string();
+    let path = format!("{}/{}", pack_dir.trim_end_matches('/'), fname);
+    if !std::path::Path::new(&path).is_file() { return Ok(None); }
+    let mut f = std::fs::File::open(&path).with_context(|| format!("ple open {path}"))?;
+    let mut lb = [0u8; 8];
+    f.read_exact(&mut lb)?;
+    let hlen = u64::from_le_bytes(lb);
+    let mut hb = vec![0u8; hlen as usize];
+    f.read_exact(&mut hb)?;
+    let hdr: serde_json::Value = serde_json::from_slice(&hb).with_context(|| format!("ple sidecar header parse {path}"))?;
+    Ok(Some((fname, hlen, hdr)))
+}
+
+/// Validate the 128-shard layout described by a sidecar safetensors header and compute each
+/// shard's absolute data offset (8 + header_len + data_offsets[0]). Pure — no I/O — so it is
+/// unit-testable with synthetic headers. Rules (mirroring the single-tensor path's width rule
+/// at CF-P1g and the reporter's verified layout for issue #9):
+///   * every `names[i]` must be present (error names the shard);
+///   * dtype must be I16;
+///   * shape must be [rows, 10*K+1] with K in {5,6}, uniform across shards;
+///   * rows must be uniform across shards;
+///   * the byte span of every shard must equal rows*width*2 and shards must be contiguous
+///     and in order (shard i starts exactly where shard i-1 ends);
+///   * `__metadata__.shard_rows`, when present, is cross-checked against the shapes and only
+///     warned about on mismatch (the single-tensor path derives everything from shapes and
+///     ignores metadata — we keep that semantic and never trust metadata over shapes).
+/// Returns (rows_per_shard, row_words, absolute offsets in `names` order).
+pub(crate) fn ple_sidecar_shard_plan(
+    hdr: &serde_json::Value,
+    hlen: u64,
+    names: &[String],
+) -> Result<(i64, usize, Vec<u64>)> {
+    let mut rows_per_shard: i64 = 0;
+    let mut row_words: usize = 0;
+    let mut offs = Vec::with_capacity(names.len());
+    let mut prev_end: Option<u64> = None;
+    for (i, name) in names.iter().enumerate() {
+        let ent = hdr.get(name.as_str())
+            .with_context(|| format!("ple shard {i} missing from ngram_embedding.safetensors header (model index does not list it either)"))?;
+        let dtype = ent.get("dtype").and_then(|v| v.as_str()).unwrap_or("?");
+        anyhow::ensure!(dtype == "I16", "ple sidecar shard {i} dtype {dtype:?}, expected I16");
+        let shape = ent.get("shape").and_then(|v| v.as_array()).context("ple sidecar shard shape")?;
+        anyhow::ensure!(shape.len() == 2, "ple sidecar shard {i} shape {shape:?}: expected 2 dims");
+        let (srows, swidth) = (shape[0].as_i64().unwrap_or(-1), shape[1].as_i64().unwrap_or(-1));
+        anyhow::ensure!(swidth > 0 && (swidth - 1) % 10 == 0 && matches!((swidth - 1) / 10, 5 | 6),
+                        "ple sidecar shard {i} row width {swidth}: rows must be 10*K+1 words with K = 5 or 6");
+        if i == 0 {
+            rows_per_shard = srows;
+            row_words = swidth as usize;
+        } else {
+            anyhow::ensure!(srows == rows_per_shard,
+                            "ple sidecar shard {i} has {srows} rows, shard 0 has {rows_per_shard}: rows must be uniform");
+            anyhow::ensure!(swidth as usize == row_words,
+                            "ple sidecar shard {i} row width {swidth} differs from shard 0 ({row_words}): width must be uniform (K = 5 or 6)");
+        }
+        let doff = ent.get("data_offsets").and_then(|v| v.as_array()).context("ple sidecar shard offsets")?;
+        let (d0, d1) = (doff[0].as_u64().context("ple sidecar shard offset start")?,
+                        doff[1].as_u64().context("ple sidecar shard offset end")?);
+        anyhow::ensure!(d1 > d0 && (d1 - d0) == srows as u64 * swidth as u64 * 2,
+                        "ple sidecar shard {i} byte span {} != rows*width*2 = {}", d1 - d0, srows as u64 * swidth as u64 * 2);
+        if let Some(pe) = prev_end {
+            anyhow::ensure!(d0 == pe,
+                            "ple sidecar shards not contiguous/in order: shard {i} starts at {d0} but shard {} ends at {pe}", i - 1);
+        }
+        prev_end = Some(d1);
+        offs.push(8 + hlen + d0);
+    }
+    if let Some(m) = hdr.get("__metadata__") {
+        if let Some(sr) = m.get("shard_rows").and_then(|v| v.as_i64()) {
+            if sr != rows_per_shard {
+                println!("  [ple] note: sidecar metadata shard_rows={sr} but shard shapes say {rows_per_shard}; trusting the shapes");
+            }
+        }
+    }
+    Ok((rows_per_shard, row_words, offs))
+}
+
+/// Decide, for each of the 128 shard names, whether it resolves through the index weight_map
+/// (today's path, untouched) or through the sidecar header (issue #9 packs), and validate the
+/// sidecar-sourced subset. Returns the per-shard sources plus the sidecar layout
+/// (rows_per_shard, row_words) when at least one shard is sidecar-sourced.
+/// K8 (REL v0.7.3 review): plan ONLY the sidecar-sourced subset of shards. Same
+/// dtype/width/rows/span validation as `ple_sidecar_shard_plan`, but the subset's spans
+/// must merely not OVERLAP — numeric order / global contiguity is not required when every
+/// offset is explicit (a sidecar may hold just the shards the model index does not list).
+/// Returns (rows_per_shard, row_words, absolute offsets in `idxs` order). Pure.
+pub(crate) fn ple_sidecar_shard_plan_subset(
+    hdr: &serde_json::Value,
+    hlen: u64,
+    idxs: &[usize],
+    names: &[String],
+) -> Result<(i64, usize, Vec<u64>)> {
+    let mut rows_per_shard: i64 = 0;
+    let mut row_words: usize = 0;
+    let mut spans: Vec<(u64, u64, usize)> = Vec::with_capacity(idxs.len()); // (d0, d1, shard)
+    let mut offs = Vec::with_capacity(idxs.len());
+    for (k, &i) in idxs.iter().enumerate() {
+        let name = names.get(i).context("ple sidecar subset index out of range")?;
+        let ent = hdr.get(name.as_str())
+            .with_context(|| format!("ple shard {i} missing from ngram_embedding.safetensors header (model index does not list it either)"))?;
+        let dtype = ent.get("dtype").and_then(|v| v.as_str()).unwrap_or("?");
+        anyhow::ensure!(dtype == "I16", "ple sidecar shard {i} dtype {dtype:?}, expected I16");
+        let shape = ent.get("shape").and_then(|v| v.as_array()).context("ple sidecar shard shape")?;
+        anyhow::ensure!(shape.len() == 2, "ple sidecar shard {i} shape {shape:?}: expected 2 dims");
+        let (srows, swidth) = (shape[0].as_i64().unwrap_or(-1), shape[1].as_i64().unwrap_or(-1));
+        anyhow::ensure!(swidth > 0 && (swidth - 1) % 10 == 0 && matches!((swidth - 1) / 10, 5 | 6),
+                        "ple sidecar shard {i} row width {swidth}: rows must be 10*K+1 words with K = 5 or 6");
+        if k == 0 {
+            rows_per_shard = srows;
+            row_words = swidth as usize;
+        } else {
+            anyhow::ensure!(srows == rows_per_shard,
+                            "ple sidecar shard {i} has {srows} rows, shard {} has {rows_per_shard}: rows must be uniform",
+                            idxs[0]);
+            anyhow::ensure!(swidth as usize == row_words,
+                            "ple sidecar shard {i} row width {swidth} differs from shard {} ({row_words}): width must be uniform (K = 5 or 6)",
+                            idxs[0]);
+        }
+        let doff = ent.get("data_offsets").and_then(|v| v.as_array()).context("ple sidecar shard offsets")?;
+        let (d0, d1) = (doff[0].as_u64().context("ple sidecar shard offset start")?,
+                        doff[1].as_u64().context("ple sidecar shard offset end")?);
+        anyhow::ensure!(d1 > d0 && (d1 - d0) == srows as u64 * swidth as u64 * 2,
+                        "ple sidecar shard {i} byte span {} != rows*width*2 = {}", d1 - d0, srows as u64 * swidth as u64 * 2);
+        spans.push((d0, d1, i));
+        offs.push(8 + hlen + d0);
+    }
+    spans.sort_by_key(|s| s.0);
+    for w in spans.windows(2) {
+        anyhow::ensure!(w[1].0 >= w[0].1,
+                        "ple sidecar shards {} and {} overlap in the sidecar data region", w[0].2, w[1].2);
+    }
+    Ok((rows_per_shard, row_words, offs))
+}
+
+pub(crate) fn ple_shard_sources(
+    wmap: Option<&serde_json::Map<String, serde_json::Value>>,
+    sidecar: Option<(&str, u64, &serde_json::Value)>,
+    names: &[String],
+) -> Result<(Vec<PleShardSrc>, Option<(i64, usize)>)> {
+    let mut srcs = Vec::with_capacity(names.len());
+    let mut sidecar_idx: Vec<usize> = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let via_index = wmap.and_then(|w| w.get(name)).and_then(|v| v.as_str());
+        match via_index {
+            Some(f) => srcs.push(PleShardSrc::Index(f.to_string())),
+            None => {
+                if sidecar.is_none() {
+                    anyhow::bail!("ple shard {i} not in index");
+                }
+                sidecar_idx.push(i);
+                srcs.push(PleShardSrc::Sidecar { fname: String::new(), abs_off: 0 });
+            }
+        }
+    }
+    let mut layout = None;
+    if !sidecar_idx.is_empty() {
+        let (fname, hlen, hdr) = sidecar.unwrap();
+        // K8: a sidecar holding ONLY the shards the index does not list plans just that
+        // subset (non-overlapping spans; numeric order not required). The full-sidecar
+        // layout keeps today's stricter contiguous-and-in-order planner.
+        let (rows, words, offs) = if sidecar_idx.len() == names.len() {
+            ple_sidecar_shard_plan(hdr, hlen, names)?
+        } else {
+            ple_sidecar_shard_plan_subset(hdr, hlen, &sidecar_idx, names)?
+        };
+        for (k, &i) in sidecar_idx.iter().enumerate() {
+            srcs[i] = PleShardSrc::Sidecar { fname: fname.to_string(), abs_off: offs[k] };
+        }
+        layout = Some((rows, words));
+    }
+    Ok((srcs, layout))
+}
+
+#[cfg(test)]
+mod ple_ngram_tests {
+    use super::*;
+    use serde_json::json;
+
+    const KEY: &str = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
+    const ROWS: i64 = 4096; // synthetic small row count; the planner is size-agnostic
+
+    fn shard_name(i: usize) -> String { format!("{KEY}.shard_{i}.trellis") }
+    fn names() -> Vec<String> { (0..128).map(shard_name).collect() }
+
+    /// Synthetic sidecar header: 128 contiguous I16 shards [ROWS, 10*k+1], optionally with a
+    /// mutation applied to one shard entry (hooks for the failure cases). Returns a made-up
+    /// header length; the planner only uses it to make offsets absolute.
+    fn synth_sidecar(k: usize, mutate: Option<(usize, fn(serde_json::Value) -> serde_json::Value)>) -> (u64, serde_json::Value) {
+        let width = 10 * k + 1;
+        let mut hdr = serde_json::Map::new();
+        hdr.insert("__metadata__".to_string(), json!({"format": "exl3_ngram_trellis", "K": k.to_string(), "shard_rows": ROWS}));
+        let per = ROWS as u64 * width as u64 * 2;
+        let mut off = 0u64;
+        for i in 0..128usize {
+            let mut ent = json!({"dtype": "I16", "shape": [ROWS, width], "data_offsets": [off, off + per]});
+            if let Some((idx, f)) = &mutate { if *idx == i { ent = f(ent); } }
+            hdr.insert(shard_name(i), ent);
+            off += per;
+        }
+        (500u64, serde_json::Value::Object(hdr))
+    }
+
+    fn wmap_with_shards(file: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        for n in names() { m.insert(n, json!(file)); }
+        m
+    }
+
+    #[test]
+    fn sidecar_k5_plan_ok() {
+        let (hlen, hdr) = synth_sidecar(5, None);
+        let (rows, words, offs) = ple_sidecar_shard_plan(&hdr, hlen, &names()).unwrap();
+        assert_eq!((rows, words), (ROWS, 51));
+        assert_eq!(offs.len(), 128);
+        let per = ROWS as u64 * 51 * 2;
+        assert_eq!(offs[0], 8 + hlen, "shard 0 starts right after the header");
+        for i in 1..128 { assert_eq!(offs[i], offs[0] + per * i as u64, "contiguous in order, shard {i}"); }
+    }
+
+    #[test]
+    fn sidecar_k6_plan_ok() {
+        let (hlen, hdr) = synth_sidecar(6, None);
+        let (rows, words, offs) = ple_sidecar_shard_plan(&hdr, hlen, &names()).unwrap();
+        assert_eq!((rows, words), (ROWS, 61));
+        assert_eq!(offs.len(), 128);
+        assert_eq!(offs[127], offs[0] + ROWS as u64 * 61 * 2 * 127);
+    }
+
+    #[test]
+    fn sidecar_missing_shard_named() {
+        let (hlen, mut hdr) = synth_sidecar(6, None);
+        hdr.as_object_mut().unwrap().remove(shard_name(42).as_str());
+        let err = ple_sidecar_shard_plan(&hdr, hlen, &names()).unwrap_err().to_string();
+        assert!(err.contains("shard 42"), "error names the shard: {err}");
+    }
+
+    #[test]
+    fn sidecar_non_contiguous_named() {
+        let gap = |e: serde_json::Value| {
+            let mut o = e;
+            let offs = o["data_offsets"].as_array().unwrap().clone();
+            o["data_offsets"] = json!([offs[0].as_u64().unwrap() + 16, offs[1].as_u64().unwrap() + 16]);
+            o
+        };
+        let (hlen, hdr) = synth_sidecar(5, Some((7, gap)));
+        let err = ple_sidecar_shard_plan(&hdr, hlen, &names()).unwrap_err().to_string();
+        assert!(err.contains("shard 7") && err.contains("contiguous"), "error names the shard and the rule: {err}");
+    }
+
+    #[test]
+    fn sidecar_rejected_widths_named() {
+        // Widths that are not 10*K+1 with K in {5,6}: K=4 (41), K=7 (71), and a non-multiple (52).
+        // (The mutation hook is a non-capturing fn pointer, hence the literals.)
+        for w in [41usize, 71, 52] {
+            let (hlen, hdr) = match w {
+                41 => synth_sidecar(5, Some((9, |mut e| { e["shape"] = json!([ROWS, 41]); e }))),
+                71 => synth_sidecar(5, Some((9, |mut e| { e["shape"] = json!([ROWS, 71]); e }))),
+                _ => synth_sidecar(5, Some((9, |mut e| { e["shape"] = json!([ROWS, 52]); e }))),
+            };
+            let err = ple_sidecar_shard_plan(&hdr, hlen, &names()).unwrap_err().to_string();
+            assert!(err.contains("shard 9"), "error names the shard (w={w}): {err}");
+        }
+        // Mixed widths across shards (51 vs 61) also fails, naming the shard.
+        let (hlen, hdr) = synth_sidecar(5, Some((9, |mut e| { e["shape"] = json!([ROWS, 61]); e })));
+        let err = ple_sidecar_shard_plan(&hdr, hlen, &names()).unwrap_err().to_string();
+        assert!(err.contains("shard 9") && err.contains("uniform"), "{err}");
+    }
+
+    #[test]
+    fn sidecar_bad_dtype_and_rowcount_named() {
+        let (hlen, hdr) = synth_sidecar(6, Some((3, |mut e| { e["dtype"] = json!("F16"); e })));
+        let err = ple_sidecar_shard_plan(&hdr, hlen, &names()).unwrap_err().to_string();
+        assert!(err.contains("shard 3") && err.contains("I16"), "{err}");
+        let (hlen, hdr) = synth_sidecar(6, Some((4, |mut e| { e["shape"] = json!([ROWS + 1, 61]); e })));
+        let err = ple_sidecar_shard_plan(&hdr, hlen, &names()).unwrap_err().to_string();
+        assert!(err.contains("shard 4") && err.contains("rows"), "{err}");
+    }
+
+    #[test]
+    fn sidecar_shard_rows_metadata_mismatch_is_a_note_not_an_error() {
+        let (hlen, mut hdr) = synth_sidecar(5, None);
+        hdr["__metadata__"]["shard_rows"] = json!(ROWS + 12345);
+        assert!(ple_sidecar_shard_plan(&hdr, hlen, &names()).is_ok(),
+                "shapes win over metadata (single-tensor-path semantic); mismatch only logs");
+    }
+
+    #[test]
+    fn index_listed_shards_untouched_no_sidecar_consulted() {
+        // Today's behaviour: the index lists every shard -> all Index sources, the sidecar
+        // planner is never invoked (a garbage sidecar header must not matter).
+        let wmap = wmap_with_shards("ngram_embedding.safetensors");
+        let (srcs, layout) = ple_shard_sources(Some(&wmap), None, &names()).unwrap();
+        assert!(layout.is_none());
+        assert!(srcs.iter().all(|s| matches!(s, PleShardSrc::Index(f) if f == "ngram_embedding.safetensors")));
+        // Even a present-but-broken sidecar is not consulted when the index lists the shards.
+        let (hlen, hdr) = synth_sidecar(5, Some((0, |mut e| { e["dtype"] = json!("F32"); e })));
+        let (srcs2, layout2) = ple_shard_sources(Some(&wmap), Some(("ngram_embedding.safetensors", hlen, &hdr)), &names()).unwrap();
+        assert!(layout2.is_none() && srcs2 == srcs);
+    }
+
+    #[test]
+    fn mixed_index_and_sidecar_subset_loads() {
+        // K8 (REL v0.7.3 review): the index lists shards 0..63; the sidecar holds ONLY
+        // 64..127. The old code planned ALL 128 names against the sidecar header and
+        // failed "shard 0 missing"; the subset planner must load the mixed layout with
+        // correct absolute offsets.
+        let (hlen, hdr) = synth_sidecar(6, None);
+        let mut wmap = serde_json::Map::new();
+        for n in names().into_iter().take(64) { wmap.insert(n, json!("model-00001.safetensors")); }
+        let (srcs, layout) = ple_shard_sources(Some(&wmap), Some(("ngram_embedding.safetensors", hlen, &hdr)), &names()).unwrap();
+        assert_eq!(layout, Some((ROWS, 61)));
+        let per = ROWS as u64 * 61 * 2;
+        for (i, s) in srcs.iter().enumerate() {
+            match s {
+                PleShardSrc::Index(f) => assert!(i < 64 && f == "model-00001.safetensors", "src {i}: {f:?}"),
+                PleShardSrc::Sidecar { fname, abs_off } => {
+                    assert!(i >= 64 && fname == "ngram_embedding.safetensors", "src {i}");
+                    assert_eq!(*abs_off, 8 + hlen + per * i as u64, "shard {i} absolute offset");
+                }
+            }
+        }
+        // A sidecar shard of the subset missing from the sidecar header is named.
+        let (hlen2, mut hdr2) = synth_sidecar(6, None);
+        hdr2.as_object_mut().unwrap().remove(shard_name(100).as_str());
+        let err = ple_shard_sources(Some(&wmap), Some(("ngram_embedding.safetensors", hlen2, &hdr2)), &names())
+            .unwrap_err().to_string();
+        assert!(err.contains("shard 100") && err.contains("missing"), "{err}");
+        // Two overlapping subset spans are rejected (order-independent).
+        let (hlen3, hdr3) = synth_sidecar(6, Some((70, |mut e| {
+            let offs = e["data_offsets"].as_array().unwrap().clone();
+            let d0 = offs[0].as_u64().unwrap(); let d1 = offs[1].as_u64().unwrap();
+            e["data_offsets"] = json!([d0 - 8, d1 - 8]);
+            e
+        })));
+        let err = ple_shard_sources(Some(&wmap), Some(("ngram_embedding.safetensors", hlen3, &hdr3)), &names())
+            .unwrap_err().to_string();
+        assert!(err.contains("overlap"), "{err}");
+        // Out-of-order sidecar entries (explicit absolute offsets) are fine for a subset.
+        let (hlen4, mut hdr4) = synth_sidecar(6, None);
+        let h = hdr4.as_object_mut().unwrap();
+        for i in 64..128usize {
+            let e = h.get(&shard_name(i)).cloned().unwrap();
+            h.insert(format!("zz_{i}"), e.clone());
+            h.insert(shard_name(i), json!({}));
+            h.insert(shard_name(i), e);
+        }
+        // (same entries, just re-inserted — real out-of-order below)
+        let (srcs4, _) = ple_shard_sources(Some(&wmap), Some(("ngram_embedding.safetensors", hlen4, &hdr4)), &names()).unwrap();
+        assert!(matches!(srcs4[127], PleShardSrc::Sidecar { .. }));
+    }
+
+    #[test]
+    fn sidecar_fallback_when_index_lacks_shards() {
+        // Issue #9 layout: the index lists nothing n-gram; the sidecar holds the 128 shards.
+        let (hlen, hdr) = synth_sidecar(6, None);
+        let (srcs, layout) = ple_shard_sources(None, Some(("ngram_embedding.safetensors", hlen, &hdr)), &names()).unwrap();
+        assert_eq!(layout, Some((ROWS, 61)));
+        assert!(srcs.iter().all(|s| matches!(s, PleShardSrc::Sidecar { fname, .. } if fname == "ngram_embedding.safetensors")));
+        let offs: Vec<u64> = srcs.iter().map(|s| if let PleShardSrc::Sidecar { abs_off, .. } = s { *abs_off } else { unreachable!() }).collect();
+        assert_eq!(offs[0], 8 + hlen);
+        // K=5 too...
+        let (hlen5, hdr5) = synth_sidecar(5, None);
+        let (_, l5) = ple_shard_sources(None, Some(("ngram_embedding.safetensors", hlen5, &hdr5)), &names()).unwrap();
+        assert_eq!(l5, Some((ROWS, 51)));
+        // ...and the failure text when there is no sidecar at all keeps the original words.
+        let err = ple_shard_sources(None, None, &names()).unwrap_err().to_string();
+        assert!(err.contains("ple shard 0 not in index"), "original v0.7.2 message preserved: {err}");
+        // A sidecar that exists but lacks the shard names it clearly.
+        let (hlenb, hdrb) = synth_sidecar(6, None);
+        let mut small = json!({"__metadata__": {}});
+        small[shard_name(0).as_str()] = hdrb[shard_name(0).as_str()].clone();
+        let err = ple_shard_sources(None, Some(("ngram_embedding.safetensors", hlenb, &small)), &names()).unwrap_err().to_string();
+        assert!(err.contains("shard 1") && err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn mixed_index_and_sidecar_sources_validated() {
+        // Half index, half sidecar: the sidecar subset is still validated in full and the
+        // per-shard offsets stay right for both sources.
+        let (hlen, hdr) = synth_sidecar(6, None);
+        let mut wmap = serde_json::Map::new();
+        for n in names().iter().take(64) { wmap.insert(n.clone(), json!("model-00001-of-00007.safetensors")); }
+        let (srcs, layout) = ple_shard_sources(Some(&wmap), Some(("ngram_embedding.safetensors", hlen, &hdr)), &names()).unwrap();
+        assert_eq!(layout, Some((ROWS, 61)));
+        assert!(matches!(srcs[0], PleShardSrc::Index(_)));
+        assert!(matches!(srcs[63], PleShardSrc::Index(_)));
+        assert!(matches!(srcs[64], PleShardSrc::Sidecar { .. }));
+        assert!(matches!(srcs[127], PleShardSrc::Sidecar { .. }));
+        if let PleShardSrc::Sidecar { abs_off, .. } = &srcs[127] {
+            assert_eq!(*abs_off, 8 + hlen + ROWS as u64 * 61 * 2 * 127);
+        } else { unreachable!() }
+    }
 }
 
 /// PLE n-gram table location at weight-load time. `ram`: read into host memory now. `ssd`: per-token pread
@@ -1923,6 +2361,13 @@ pub struct Scratch {
     d_dev: CudaSlice<i32>,
     accept_out: CudaSlice<i32>,
     acc2: CudaSlice<i32>,
+    // PACK1 LEG 1 (S-B9-CF-PACK1): packed-verify metadata + packed-only buffers.
+    // seg: k_seg x {slot, row_start, len, flags}; acc_seg: {slot, a} x k_seg (device
+    // commit keys, xq_accept_seg). gdn_ring_p: the packed ring, 16 rows per GDN layer
+    // (the lone path keeps its MTP_MAX_K+1-deep plane stride; offsets unchanged).
+    seg: CudaSlice<i32>,
+    acc_seg: CudaSlice<i32>,
+    gdn_ring_p: CudaSlice<f32>,
     taps_keep: CudaSlice<f32>,
     // Verify shadow states (one slot): GDN recurrent + conv ring per layer, PLE ring.
     s_state_sh: Vec<CudaSlice<f32>>,
@@ -1936,8 +2381,8 @@ pub struct Scratch {
     // verify_commit runs as a separate pass where the shared qkv/a_out/b_out
     // hold only the LAST GDN layer's rows.
     qkv_post: CudaSlice<u16>, // post-conv qkv rows (xq_gdn_token's q/k/v input)
-    a_save: CudaSlice<u16>,   // gate a rows [n_gdn, MTP_MAX_K+1, nh]
-    b_save: CudaSlice<u16>,   // gate b rows [n_gdn, MTP_MAX_K+1, nh]
+    a_save: CudaSlice<u16>,   // gate a rows [n_gdn, SAVE_PLANE_ROWS, nh]
+    b_save: CudaSlice<u16>,   // gate b rows [n_gdn, SAVE_PLANE_ROWS, nh]
     // S-A3-o G1: per-token rank-1 GDN update factors written by the verify chunk
     // [n_gdn, MTP_MAX_K+1, nh, XQ_GDN_RS] f32 (delta | krow | g); read by the ring commit.
     gdn_ring: CudaSlice<f32>,
@@ -2124,11 +2569,21 @@ impl Scratch {
             ple_qn: dev.alloc_zeros::<f32>(w * 10240)?,
             ple_gated: dev.alloc_zeros::<u16>(w * 10240)?,
             ple_normed: dev.alloc_zeros::<u16>(w * 10240)?,
-            d_dev: dev.alloc_zeros::<i32>((MTP_MAX_K + 3).max(8))?,
+            // K4 (REL v0.7.3 review): the PACKED staging (stage_packed / xq_accept_seg) uses
+            // row indices to R_pad - 1 (up to 15); 10 ints truncated the staged drafts above
+            // R_pad 10 and made the pack3-family identity compare partly vacuous there.
+            d_dev: dev.alloc_zeros::<i32>(accept_out_words())?,
             // S-A3-x: xq_accept writes out[0..=k+2] — size from MTP_MAX_K (was a fixed 8: an
-            // OOB device write at k >= 6 that no K<=5 path could reach). K=5 kept 8; WP23 K=7 -> 10.
-            accept_out: dev.alloc_zeros::<i32>((MTP_MAX_K + 3).max(8))?,
+            // OOB device write at k >= 6 that no K<=5 path could reach). K=5 kept 8; WP23 K=7 -> 10;
+            // the packed tail (no header slot) runs to R_pad = 16 rows.
+            accept_out: dev.alloc_zeros::<i32>(accept_out_words())?,
             acc2: dev.alloc_zeros::<i32>(2)?,
+            seg: dev.alloc_zeros::<i32>(PACK_SEG_MAX * 4)?,
+            acc_seg: dev.alloc_zeros::<i32>(PACK_SEG_MAX * 2)?,
+            gdn_ring_p: dev.alloc_zeros::<f32>(
+                cfg.layer_types.iter().filter(|t| matches!(t, crate::qwen::LayerType::LinearAttention)).count()
+                    * 16 * cfg.lin_num_v_heads * GDN_RS,
+            )?,
             // WP03: per-slot windows [w][MTP_MAX_K+1][hc*h] (was ONE w*hc*h window shared by every
             // lane: with >= 2 decoding lanes each round drafted from another lane's hidden).
             // (--a-taps=shared keeps the old size: the old seam read this buffer's uninitialized
@@ -2143,33 +2598,34 @@ impl Scratch {
             conv_sh: (0..cfg.num_layers).map(|_| {
                 dev.alloc_zeros::<f32>((cfg.key_dim() * 2 + cfg.value_dim()) * cfg.conv_kernel)
             }).collect::<Result<_, _>>()?,
-            ple_ring_sh: dev.alloc_zeros::<u16>(10240 * 9)?,
+            // PACK1 LEG 1: x PACK_SEG_MAX planes — segment j's PLE shadow lives at plane j.
+            ple_ring_sh: dev.alloc_zeros::<u16>(10240 * 9 * PACK_SEG_MAX)?,
             // Raw pre-conv qkv rows per GDN layer for the commit replay:
-            // n_gdn * (MTP_MAX_K+1) * conv_dim u16 (~4.5 MB at this model).
+            // n_gdn * SAVE_PLANE_ROWS * conv_dim u16 (PACK2/D1: the save planes are 16 rows).
             qkv_save: dev.alloc_zeros::<u16>(
                 cfg.layer_types.iter().filter(|t| matches!(t, crate::qwen::LayerType::LinearAttention)).count()
-                    * (MTP_MAX_K + 1)
+                    * SAVE_PLANE_ROWS
                     * (cfg.key_dim() * 2 + cfg.value_dim()),
             )?,
             qkv_post: dev.alloc_zeros::<u16>(
                 cfg.layer_types.iter().filter(|t| matches!(t, crate::qwen::LayerType::LinearAttention)).count()
-                    * (MTP_MAX_K + 1)
+                    * SAVE_PLANE_ROWS
                     * (cfg.key_dim() * 2 + cfg.value_dim()),
             )?,
             a_save: dev.alloc_zeros::<u16>(
                 cfg.layer_types.iter().filter(|t| matches!(t, crate::qwen::LayerType::LinearAttention)).count()
-                    * (MTP_MAX_K + 1) * 48,
+                    * SAVE_PLANE_ROWS * 48,
             )?,
             b_save: dev.alloc_zeros::<u16>(
                 cfg.layer_types.iter().filter(|t| matches!(t, crate::qwen::LayerType::LinearAttention)).count()
-                    * (MTP_MAX_K + 1) * 48,
+                    * SAVE_PLANE_ROWS * 48,
             )?,
             gdn_ring: dev.alloc_zeros::<f32>(
                 cfg.layer_types.iter().filter(|t| matches!(t, crate::qwen::LayerType::LinearAttention)).count()
                     * (MTP_MAX_K + 1) * cfg.lin_num_v_heads * GDN_RS,
             )?,
             draft_meta: dev.htod_sync_copy(&[0i32; 4])?,
-            rp: match RpRt::new(dev, (MTP_MAX_K + 3).max(8)) {
+            rp: match RpRt::new(dev, RP_ACCEPT_WORDS) {
                 Ok(r) => Some(r),
                 Err(e) => { println!("REPRIME: device re-prime runtime unavailable ({e:#}) — eager re-prime"); None }
             },
@@ -2811,6 +3267,363 @@ fn stream_capturing(l: &Launcher) -> bool {
     r != sys::CUresult::CUDA_SUCCESS || st != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
 }
 
+/// S-B9-CF-R16 (PLAN/CF_R16_REPORT.md): serve 9..16-row forwards on the 9..16-row twins of the
+/// routing fold (xq_router_fold_c_r16) and the row-batched HC mixer (xq_hc_fuse_i8_rbk_r16 /
+/// xq_hc_w4). Both are bit-identical to the paths today's >8 rows take, so the escape restores
+/// today's dispatch exactly: --exl3-r16=0 => the 4-kernel legacy router chain + the m-grid
+/// xq_hc_fuse_i8k. m <= 8 is never affected by the flag.
+fn exl3_r16_on() -> bool {
+    // S-B9-CF-R16B FIX: `opts::var` only sees EXPLICITLY set flags, so the R16 leg's
+    // `.is_ok()` gate kept the WHOLE r16 path dormant at default flags (the liveness
+    // receipt caught it: "fallback hc=xq_hc_fuse_i8k (reason: --exl3-r16=0)" on a boot
+    // with no --exl3-r16 flag). Unset now reads the table default (opts_table: def "on");
+    // `--exl3-r16=0/off` still restores today's pre-R16 dispatch exactly.
+    // S-B9-REL-FIXB K9: cached once — the flag cannot change after boot and this is
+    // consulted at every HC launch (it used to allocate a String per call).
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = crate::opts::var(crate::opt!("exl3-r16"))
+            .unwrap_or_else(|_| crate::opt!("exl3-r16").def().def.to_string());
+        !matches!(v.trim(), "" | "0" | "off" | "false" | "OFF")
+    })
+}
+/// S-B9-CF-R16B: the once-per-boot liveness receipt (TASK 3) — which router fold and which
+/// HC mixer entry served (or were skipped for) the first 9..16-row forward at the CURRENT
+/// flags. An identity-hash gate proves nothing about liveness: a path that never runs also
+/// gives identical hashes; this line is the receipt future sessions grep for. The HC mixer
+/// runs BEFORE the router fold inside a forward, so the line normally prints from the
+/// router-fold site; if the fold never takes at m > 8, the second HC width emits it with
+/// "(router fold not reached)" so the receipt always exists.
+static R16_ROUTER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static R16_HC: std::sync::OnceLock<(&'static str, Option<&'static str>)> = std::sync::OnceLock::new();
+static R16_HC_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static R16_PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn r16_set_router(name: &str) {
+    let _ = R16_ROUTER.set(name.to_string());
+    r16_emit(false);
+}
+pub(crate) fn r16_liveness(hc: &'static str, reason: Option<&'static str>) {
+    let n = R16_HC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n == 0 { let _ = R16_HC.set((hc, reason)); }
+    // The MTP draft chain runs the head's HC mixer k(=7) times per round BEFORE the
+    // verify's first router fold, so a force at the second hit would print before any
+    // m > 8 routing ran. Force only as a last resort (no-MoE model): hit 12.
+    r16_emit(n >= 11);
+}
+fn r16_emit(force: bool) {
+    let Some((hc, reason)) = R16_HC.get() else { return };
+    if !(force || R16_ROUTER.get().is_some()) { return; }
+    if R16_PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+    let r = R16_ROUTER.get().map(String::as_str).unwrap_or("(router fold not reached)");
+    match reason {
+        Some(rr) => println!("EXL3-R16: fallback router={r} hc={hc} (reason: {rr})"),
+        None => println!("EXL3-R16: live router={r} hc={hc}"),
+    }
+}
+
+/// S-B9-REL-FIXB K1: which router entry serves a forward of m rows. PURE (no tune
+/// lookups, no side effects) so the selection is exhaustively testable
+/// (`router_selection_table_exhaustive`). The caller resolves every flag; `moe_inner`
+/// maps each variant to its launch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RouterEntry {
+    /// xq_router_ks + combine (or xq_gemm_f16_f32_v) + xq_router_topk + xq_moe_route — any m.
+    Legacy,
+    /// xq_router_fused + xq_router_topk_route — M <= 8 hardware only.
+    FusedPair,
+    /// xq_router_fold_c_ep — M <= 8 (XQ_RF_MAXM 8).
+    FoldEp,
+    /// xq_router_fold_c_r16 — the ONLY 9..16-row entry (coal fold, non-EP rank).
+    FoldR16,
+    /// xq_router_fold_c — M <= 8.
+    FoldCoal,
+    /// xq_router_fold_w4 — M <= 8.
+    FoldW4,
+    /// xq_router_fold — M <= 8.
+    Fold,
+    /// xq_router_fold_m0 — M <= 8.
+    FoldM0,
+}
+
+impl RouterEntry {
+    /// True for every fold-family entry (the one-launch routing fold).
+    pub(crate) fn is_fold(self) -> bool {
+        matches!(self, RouterEntry::FoldEp | RouterEntry::FoldR16 | RouterEntry::FoldCoal
+                     | RouterEntry::FoldW4 | RouterEntry::Fold | RouterEntry::FoldM0)
+    }
+}
+
+/// The invariant this function exists to enforce (REL v0.7.3 review K1): for m > 8 the
+/// only possible entries are `FoldR16` and `Legacy` — no M <= 8 body (xq_router_fold_c_ep,
+/// _c, _w4, xq_router_fold, _m0, the fused pair) can ever be selected, whatever the flags.
+/// At m <= 8 and with r16 off the selection is EXACTLY the pre-R16 (v0.7.2) dispatch.
+pub(crate) fn router_entry(
+    m: usize,
+    ep: bool,          // moe.ep.is_some() (this rank holds an EP shard)
+    coal: bool,        // router-coal twin eligible (h == 2560 && T_MOE_ROUTER_COAL)
+    route_fold: bool,  // xtp::route_fold_on()
+    r16_hw: bool,      // --exl3-r16 on AND the r16 smem opt-in succeeded
+    fused_ok: bool,    // m-free fused gates (rks == 64 && shape gates && T_ROUTER_FUSED)
+    fold_ok: bool,     // m-free fold gates (wp10_fold_on() && ne <= 512)
+    topk_cap: bool,    // m * topk <= (m <= 8 ? 128 : 160)
+    w4r: bool,         // the W4S twin took the fold (it launches itself)
+    gemv_remap: bool,  // wp10_gemv_remap()
+    xcheck: bool,      // an eager XCHECK snapshot precedes the fold (rxc || fxc)
+) -> RouterEntry {
+    // K1: the r16 twin exists ONLY as the COAL fold on a NON-EP rank. EP ranks and
+    // non-coal runs keep the pre-R16 dispatch (legacy chain) at 9..16 rows.
+    let r16 = m > 8 && m <= 16 && r16_hw && coal && !ep;
+    let fold = fused_ok && fold_ok && topk_cap && (m <= 8 || r16);
+    if !fold {
+        // The non-fold fused pair is M <= 8 hardware (its GEMV covers 8 rows) — K1
+        // corollary: it never serves above 8 rows, not even as an xcheck reference.
+        return if fused_ok && m <= 8 { RouterEntry::FusedPair } else { RouterEntry::Legacy };
+    }
+    if coal && m <= 8 && !xcheck && ep && route_fold {
+        return RouterEntry::FoldEp;
+    }
+    if m > 8 {
+        // fold at m > 8 requires r16 by construction; FoldR16 is the safe answer even
+        // if a future edit breaks that — it is the only 9..16-row body.
+        return RouterEntry::FoldR16;
+    }
+    if coal {
+        return RouterEntry::FoldCoal;
+    }
+    if w4r {
+        return RouterEntry::FoldW4;
+    }
+    if gemv_remap {
+        RouterEntry::Fold
+    } else {
+        RouterEntry::FoldM0
+    }
+}
+
+#[cfg(test)]
+mod rel_fixb_router_selection {
+    use super::*;
+
+    /// The pre-R16 (v0.7.2) decision, copied from
+    /// `git show baseline/cf-2026-10-03:src/exl3_forward.rs`:
+    ///   let fused = <m-free gates> && m <= 8;
+    ///   let fold  = fused && wp10_fold_on() && ne <= 512 && m * topk <= 128;
+    ///   ... fname = ep_fold ? "xq_router_fold_c_ep" : coal ? "xq_router_fold_c"
+    ///               : w4r ? "xq_router_fold_w4" : remap ? "xq_router_fold" : "_m0";
+    /// with ep_fold = coal && snap.is_none() && ep && route_fold_on().
+    fn baseline_router_entry(m: usize, ep: bool, coal: bool, route_fold: bool, fused_ok: bool,
+                             fold_ok: bool, topk_cap: bool, w4r: bool, gemv_remap: bool,
+                             xcheck: bool) -> RouterEntry {
+        let fused = fused_ok && m <= 8;
+        let fold = fused && fold_ok && topk_cap;
+        if !fold {
+            return if fused { RouterEntry::FusedPair } else { RouterEntry::Legacy };
+        }
+        let ep_fold = coal && !xcheck && ep && route_fold;
+        if ep_fold { RouterEntry::FoldEp }
+        else if coal { RouterEntry::FoldCoal }
+        else if w4r { RouterEntry::FoldW4 }
+        else if gemv_remap { RouterEntry::Fold }
+        else { RouterEntry::FoldM0 }
+    }
+
+    /// The PRE-FIX (master, REL v0.7.3) dispatch copied from the same file — the K1 bug
+    /// this session fixes: r16 without coal/EP and ep_fold without m <= 8. Kept here so
+    /// `router_selection_pre_fix_predicate_fails` proves the table test can detect the
+    /// regression class (if this copy stops failing the asserts, master changed — re-copy).
+    fn pre_fix_router_entry(m: usize, ep: bool, coal: bool, route_fold: bool, r16_on: bool,
+                            fused_ok: bool, fold_ok: bool, topk_cap: bool, w4r: bool,
+                            gemv_remap: bool, xcheck: bool) -> RouterEntry {
+        let r16 = m > 8 && m <= 16 && r16_on; // no coal, no !ep  <-- K1
+        let fold = fused_ok && fold_ok && topk_cap && (m <= 8 || r16);
+        if !fold {
+            return if fused_ok && m <= 8 { RouterEntry::FusedPair } else { RouterEntry::Legacy };
+        }
+        let ep_fold = coal && !xcheck && ep && route_fold; // no m <= 8  <-- K1
+        if ep_fold { RouterEntry::FoldEp }
+        else if coal && r16 { RouterEntry::FoldR16 }
+        else if coal { RouterEntry::FoldCoal }
+        else if w4r { RouterEntry::FoldW4 }
+        else if gemv_remap { RouterEntry::Fold }
+        else { RouterEntry::FoldM0 }
+    }
+
+    /// RouterEntry restricted to the baseline's variant set (no FoldR16).
+    fn baseline_view(e: RouterEntry) -> Option<RouterEntry> {
+        match e {
+            RouterEntry::FoldR16 => None,
+            other => Some(other),
+        }
+    }
+
+    #[test]
+    fn router_selection_table_exhaustive() {
+        let mut combos = 0usize;
+        for m in 1..=16usize {
+            for &ep in &[false, true] {
+            for &coal in &[false, true] {
+            for &route_fold in &[false, true] {
+            for &r16_hw in &[false, true] {
+            for &fused_ok in &[false, true] {
+            for &fold_ok in &[false, true] {
+            for &topk_cap in &[false, true] {
+            for &w4r in &[false, true] {
+            for &gemv_remap in &[false, true] {
+            for &xcheck in &[false, true] {
+                combos += 1;
+                let e = router_entry(m, ep, coal, route_fold, r16_hw, fused_ok, fold_ok,
+                                     topk_cap, w4r, gemv_remap, xcheck);
+                let ctx = format!("m={} ep={} coal={} rf={} r16={} fu={} fo={} tk={} w4r={} gr={} xc={} -> {:?}",
+                                  m, ep, coal, route_fold, r16_hw, fused_ok, fold_ok,
+                                  topk_cap, w4r, gemv_remap, xcheck, e);
+                // (a) no M <= 8 entry ever serves m > 8.
+                if m > 8 {
+                    assert!(
+                        matches!(e, RouterEntry::FoldR16 | RouterEntry::Legacy),
+                        "K1 invariant violated: {}", ctx
+                    );
+                }
+                // (b) m <= 8 selection == the pre-R16 baseline decision.
+                if m <= 8 {
+                    let b = baseline_router_entry(m, ep, coal, route_fold, fused_ok, fold_ok,
+                                                  topk_cap, w4r, gemv_remap, xcheck);
+                    assert_eq!(baseline_view(e), Some(b), "m<=8 differs from baseline: {}", ctx);
+                }
+                // (c) with r16 off, the selection equals the baseline for EVERY m.
+                if !r16_hw {
+                    let b = baseline_router_entry(m, ep, coal, route_fold, fused_ok, fold_ok,
+                                                  topk_cap, w4r, gemv_remap, xcheck);
+                    assert_eq!(baseline_view(e), Some(b), "r16-off differs from baseline: {}", ctx);
+                }
+                // (d) at 9..=16 rows a non-EP coal rank takes the r16 fold; an EP rank
+                // (or any r16-ineligible width) keeps the legacy chain.
+                if (9..=16).contains(&m) && fused_ok && fold_ok && topk_cap {
+                    if r16_hw && coal && !ep {
+                        assert_eq!(e, RouterEntry::FoldR16, "{}", ctx);
+                    }
+                    if ep {
+                        assert_eq!(e, RouterEntry::Legacy, "{}", ctx);
+                    }
+                }
+            }}}}}}}}}}
+        }
+        assert_eq!(combos, 16 * 1024);
+    }
+
+    #[test]
+    fn router_selection_pre_fix_predicate_fails() {
+        // Proof the table test can detect the K1 class: run the PRE-FIX (master)
+        // predicate through invariant (a)'s check and confirm it VIOLATES it.
+        let mut violations = 0usize;
+        for m in 9..=16usize {
+            for &ep in &[false, true] {
+            for &coal in &[false, true] {
+            for &route_fold in &[false, true] {
+            for &fused_ok in &[false, true] {
+            for &fold_ok in &[false, true] {
+            for &topk_cap in &[false, true] {
+            for &w4r in &[false, true] {
+            for &gemv_remap in &[false, true] {
+            for &xcheck in &[false, true] {
+                let e = pre_fix_router_entry(m, ep, coal, route_fold, true, fused_ok, fold_ok,
+                                             topk_cap, w4r, gemv_remap, xcheck);
+                if !matches!(e, RouterEntry::FoldR16 | RouterEntry::Legacy) {
+                    violations += 1; // an M <= 8 body selected above 8 rows
+                }
+            }}}}}}}}}
+        }
+        assert!(violations > 0, "pre-fix predicate no longer violates the invariant —                                  master's dispatch changed; re-copy pre_fix_router_entry");
+        // The two review counterexamples, explicitly:
+        // EP rank (TP >= 2, route-fold on, coal): xq_router_fold_c_ep (M <= 8) at m = 12.
+        assert_eq!(pre_fix_router_entry(12, true, true, true, true, true, true, true, false, true, false),
+                   RouterEntry::FoldEp);
+        // --router-coal 0: falls to xq_router_fold / _m0 (M <= 8) at m = 12.
+        assert_eq!(pre_fix_router_entry(12, false, false, true, true, true, true, true, false, true, false),
+                   RouterEntry::Fold);
+        // ...and the FIXED selection for both is the legacy chain.
+        assert_eq!(router_entry(12, true, true, true, true, true, true, true, false, true, false),
+                   RouterEntry::Legacy);
+        assert_eq!(router_entry(12, false, false, true, true, true, true, true, false, true, false),
+                   RouterEntry::Legacy);
+        // The r16 fold is still reachable on a non-EP coal rank at 9..16 rows.
+        assert_eq!(router_entry(12, false, true, true, true, true, true, true, false, true, false),
+                   RouterEntry::FoldR16);
+    }
+}
+/// Dynamic smem of xq_router_fold_c_r16 (8 warps x 4 experts x 40 float4 == XQ_RFC_SMEM_R16 —
+/// the m<=8 fold's exact 20 KB carve-out; the 256-thread geometry never changed).
+pub(crate) const RFC_SMEM_R16: u32 = 8 * 4 * 40 * 16;
+/// S-B9-CF-R16: ONE-TIME smem-cap opt-in on xq_router_fold_c_r16. 20 KB is under the 48 KB
+/// default, so this is belt-and-braces (it also proves the entry is in the loaded module);
+/// a refusal drops m > 8 back to today's path instead of aborting a launch. The call site
+/// caches the result in a OnceLock — never a per-launch driver call.
+/// (xq_hc_fuse_i8_rbk_r16's 64 KB is STATIC smem: part of the launch config, no opt-in.)
+pub(crate) fn r16_smem_optin(dev: &Arc<CudaDevice>, name: &str, bytes: i32) -> bool {
+    use cudarc::driver::sys;
+    // xq_raw_fn already hands back the raw CUfunction cuFuncSetAttribute wants.
+    let Some(f) = xq_raw_fn(name) else {
+        eprintln!("EXL3-R16: {name} not in the module (stale PTX?)");
+        return false;
+    };
+    let r = unsafe {
+        sys::cuFuncSetAttribute(f, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes)
+    };
+    if r != sys::CUresult::CUDA_SUCCESS {
+        eprintln!("EXL3-R16: {name} smem opt-in of {bytes} B failed ({r:?})");
+        return false;
+    }
+    true
+}
+/// S-B9-CF-R16: xq_hc_fuse_i8_rbk_r16 takes its smem carve-out DYNAMICALLY (R4 hn staging
+/// [2][m][1024] halves = m*4096 B; phase B [m][lr] f32 <= m*2048 B at lr = 512). The m = 16
+/// R4 case asks 64 KB — over the 48 KB default — so the function must opt in once before it
+/// launches or is measured (a STATIC 64 KB array compiles but cuOccupancy* reports 0 resident
+/// CTAs for it on this arch; dynamic + opt-in is the supported path). 65536 B covers this
+/// family (lr = 512); the dispatch gate keeps widths needing more on today's m-grid path.
+pub(crate) fn r16_hc_smem_optin() -> bool {
+    use cudarc::driver::sys;
+    let Some(f) = xq_raw_fn("xq_hc_fuse_i8_rbk_r16") else {
+        eprintln!("EXL3-R16: xq_hc_fuse_i8_rbk_r16 not in the module (stale PTX?)");
+        return false;
+    };
+    for (attr, val) in [
+        (sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 65536),
+        (sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100),
+    ] {
+        let r = unsafe { sys::cuFuncSetAttribute(f, attr, val) };
+        if r != sys::CUresult::CUDA_SUCCESS {
+            eprintln!("EXL3-R16: xq_hc_fuse_i8_rbk_r16 smem opt-in ({val}) failed ({r:?})");
+            return false;
+        }
+    }
+    true
+}
+
+/// Occupancy of the RAW-module handle (exl3_bench.ptx is loaded TWICE: xq_raw_fn's copy,
+/// which the PDL launches run, and cudarc's get_func copy, whose opt-in state is
+/// unreachable — cu_function is pub(crate)). The r16 HC twin's > 48 KB dynamic carve-out
+/// can only be opted in on the raw copy (xq_raw_fn_smem does it), so its co-residency is
+/// measured on THAT handle, at the carve-out its launches actually use.
+fn wp11_capacity_raw_dsmem(dev: &Arc<CudaDevice>, name: &str, dsmem: u32) -> u32 {
+    use cudarc::driver::sys;
+    let Some(f) = xq_raw_fn_smem(name, dsmem) else { return 0; };
+    let mut b: std::ffi::c_int = 0;
+    let r = unsafe { sys::cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+        &mut b, f, 256, dsmem as usize, 0u32) };   // 0 = CU_OCCUPANCY_DEFAULT
+    if r != sys::CUresult::CUDA_SUCCESS || b <= 0 { return 0; }
+    let Ok(sms) = dev.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT) else { return 0; };
+    (b as u32).saturating_mul(sms.max(0) as u32)
+}
+/// wp11_capacity as pub (the r16 probe sizes the HC r16 grid the way the launcher does).
+pub(crate) fn wp11_capacity_pub(dev: &Arc<CudaDevice>, name: &str) -> u32 {
+    wp11_capacity(dev, name)
+}
+/// wp11_capacity_raw_dsmem as pub (the r16 HC probe measures at the 64 KB carve-out,
+/// on the same raw-module handle its launches use).
+pub(crate) fn wp11_capacity_raw_dsmem_pub(dev: &Arc<CudaDevice>, name: &str, dsmem: u32) -> u32 {
+    wp11_capacity_raw_dsmem(dev, name, dsmem)
+}
 /// WP10 routing fold (xq_router_fold: router GEMV + top-k + route in one launch, bitwise) — default
 /// on; --wp10-off=1 = the S-A3-z xq_router_fused + xq_router_topk_route pair.
 fn wp10_fold_on() -> bool {
@@ -5510,7 +6323,7 @@ fn exl3_chain_pair(l: &Launcher, q0: &Quad, q1: &Quad, x: &CudaSlice<u16>,
         let c = N.fetch_add(1, Ordering::SeqCst) + 1;
         if bad > 0 { BAD.fetch_add(1, Ordering::SeqCst); }
         if bad > 0 || c % 500 == 0 {
-            println!("CHAIN_PAIR_CHECK: calls {c} bad {} (this: m {m} K {k} N {n} mism {bad})", BAD.load(Ordering::SeqCst));
+            crate::rprintln!("CHAIN_PAIR_CHECK: calls {c} bad {} (this: m {m} K {k} N {n} mism {bad})", BAD.load(Ordering::SeqCst));
         }
     }
     Ok(())
@@ -6579,29 +7392,83 @@ impl FwdModel {
                         }
                         true
                     } else { false };
+                    // REL-NGRAM (issue #9): resolve each shard through the index when listed
+                    // (today's path, byte-for-byte) and otherwise through the sidecar's own
+                    // safetensors header (exllamav3 1.5.x packs; validated by ple_shard_sources).
+                    let (shard_names, shard_srcs, sc_layout) = if single_loaded {
+                        (Vec::new(), Vec::new(), None)
+                    } else {
+                        let names: Vec<String> = (0..128)
+                            .map(|snum| format!("{PLE_KEY}.ple_embedding.ngram_embedding.shard_{snum}.trellis"))
+                            .collect();
+                        let sidecar = ple_sidecar_header(pack_dir)?;
+                        let (srcs, layout) = ple_shard_sources(
+                            Some(wmap),
+                            sidecar.as_ref().map(|(f, h, hdr)| (f.as_str(), *h, hdr)),
+                            &names,
+                        )?;
+                        (names, srcs, layout)
+                    };
+                    let mut n_via_index = 0usize;
                     for snum in 0..(if single_loaded { 0usize } else { 128usize }) {
-                        let name = format!("{PLE_KEY}.ple_embedding.ngram_embedding.shard_{snum}.trellis");
-                        let fname = wmap.get(&name).and_then(|v| v.as_str())
-                            .with_context(|| format!("ple shard {snum} not in index"))?.to_string();
-                        let mut f = std::fs::File::open(format!("{pack_dir}/{fname}"))
-                            .with_context(|| format!("ple open {fname}"))?;
-                        let mut lb = [0u8; 8];
-                        f.read_exact(&mut lb)?;
-                        let hlen = u64::from_le_bytes(lb) as usize;
-                        let mut hb = vec![0u8; hlen];
-                        f.read_exact(&mut hb)?;
-                        let hdr: serde_json::Value = serde_json::from_slice(&hb)?;
-                        let ent = &hdr[name.as_str()];
-                        let shape: Vec<i64> = ent["shape"].as_array().context("ple shard shape")?
-                            .iter().map(|v| v.as_i64().unwrap_or(0)).collect();
-                        if snum == 0 {
-                            rows_per_shard = shape[0];
-                            anyhow::ensure!(shape[1] == 51, "ple shard row width");
-                            row_words = 51;
+                        let name = &shard_names[snum];
+                        match &shard_srcs[snum] {
+                            PleShardSrc::Index(fname) => {
+                                n_via_index += 1;
+                                let fname = fname.as_str();
+                                let mut f = std::fs::File::open(format!("{pack_dir}/{fname}"))
+                                    .with_context(|| format!("ple open {fname}"))?;
+                                let mut lb = [0u8; 8];
+                                f.read_exact(&mut lb)?;
+                                let hlen = u64::from_le_bytes(lb) as usize;
+                                let mut hb = vec![0u8; hlen];
+                                f.read_exact(&mut hb)?;
+                                let hdr: serde_json::Value = serde_json::from_slice(&hb)?;
+                                let ent = &hdr[name.as_str()];
+                                let shape: Vec<i64> = ent["shape"].as_array().context("ple shard shape")?
+                                    .iter().map(|v| v.as_i64().unwrap_or(0)).collect();
+                                if snum == 0 {
+                                    rows_per_shard = shape[0];
+                                    anyhow::ensure!(shape[1] == 51, "ple shard row width");
+                                    row_words = 51;
+                                }
+                                // Mixed-source packs only (all-index packs keep today's checks
+                                // exactly): an index shard must agree with the sidecar layout.
+                                if let Some((rows, words)) = sc_layout {
+                                    anyhow::ensure!(shape[0] == rows && shape[1] as usize == words,
+                                        "ple shard {snum} shape {shape:?} disagrees with the sidecar shards' [{rows}, {words}]");
+                                }
+                                let off0 = ent["data_offsets"][0].as_u64().context("ple shard offset")?;
+                                shard_data_off.push(8 + hlen as u64 + off0);
+                                shards.push(f);
+                            }
+                            PleShardSrc::Sidecar { fname, abs_off } => {
+                                if snum == 0 {
+                                    let (rows, words) = sc_layout.expect("sidecar layout present");
+                                    rows_per_shard = rows;
+                                    row_words = words;
+                                }
+                                let mut f = std::fs::File::open(format!("{pack_dir}/{fname}"))
+                                    .with_context(|| format!("ple open {fname}"))?;
+                                shard_data_off.push(*abs_off);
+                                shards.push(f);
+                            }
                         }
-                        let off0 = ent["data_offsets"][0].as_u64().context("ple shard offset")?;
-                        shard_data_off.push(8 + hlen as u64 + off0);
-                        shards.push(f);
+                    }
+                    // REL-NGRAM: once-per-boot line naming which n-gram layout served the pack
+                    // (the single-tensor / via-index / via-sidecar distinction).
+                    if single_loaded {
+                        println!("  PLE n-gram table: single trellis tensor, K={}, rows/shard {} (128 virtual shards)",
+                                 (row_words - 1) / 10, rows_per_shard);
+                    } else if n_via_index == 128 {
+                        println!("  PLE n-gram table: 128 shards via model index, K={}, rows/shard {}",
+                                 (row_words - 1) / 10, rows_per_shard);
+                    } else if n_via_index == 0 {
+                        println!("  PLE n-gram table: 128 shards via sidecar header (exllamav3 1.5.x layout, issue #9), K={}, rows/shard {}",
+                                 (row_words - 1) / 10, rows_per_shard);
+                    } else {
+                        println!("  PLE n-gram table: {n_via_index} shards via model index + {} via sidecar header, K={}, rows/shard {}",
+                                 128 - n_via_index, (row_words - 1) / 10, rows_per_shard);
                     }
                     let ram = std::sync::OnceLock::new();
                     let row_bytes = row_words * 2;
@@ -7406,7 +8273,16 @@ impl FwdModel {
 
     /// HC (w4): does hc_mixer take xq_hc_w4 for this mixer at width m (non-legacy, w4 allowed)?
     fn w4hc_takes(&self, hc: &HcDev, m: usize) -> bool {
-        self.w4hc_grid > 0 && w4hc_fuse_on() && m >= 1 && m <= 8 && (m >= 2 || w4hc_m1_on())
+        // S-B9-CF-R16B FIX: m <= 8 ONLY. The R16 leg added an r16 arm here
+        // (`|| (exl3_r16_on() && m <= 16)`) but never extended xq_hc_w4 to 9..16 rows
+        // (CF_R16_REPORT deviations: "the rbk twin only (xq_hc_w4 NOT extended)"). The
+        // arm was dead code on master (exl3_r16_on() was false at default flags — the
+        // `.is_ok()` gate); R16B fixing that gate woke it: at m = 9..16 the W4 branch
+        // swallowed the round BEFORE the int8 rbk_r16 twin and faulted (compute-
+        // sanitizer: Invalid __shared__ write in xq_hc_w4, host frame w4hc_launch).
+        // m > 8 belongs to the int8 twins below, exactly as CF_R16 intended.
+        self.w4hc_grid > 0 && w4hc_fuse_on() && m >= 1 && m <= 8
+            && (m >= 2 || w4hc_m1_on())
             && hc.q8.as_ref().is_some_and(|q| q.up_kmajor)
             && !matches!(crate::opts::var(crate::opt!("hc-fuse")).as_deref(), Ok("0"))
             && crate::opts::var(crate::opt!("hc-int8-check")).is_err()
@@ -7525,6 +8401,38 @@ impl FwdModel {
                         let capk = (self.hc_fuse_cap.min(self.wp11_cap.0) * 5) / 6;
                         let bxk = (capk / m as u32).clamp(1, 40);
                         let capr = (self.hc_fuse_cap.min(self.wp11_cap.1) * 5) / 6;
+                        // S-B9-CF-R16: the 9..16-row rbk twin's own co-residency (64 KB smem),
+                        // measured once. < 4 CTAs (or the flag off) and the width keeps today's
+                        // m-grid path below — never a silently skipped mixer.
+                        // S-B9-CF-R16B: NO pdl_on() gate any more — the twin launches through the
+                        // RAW-module handle (xqlaunch_raw!) at EVERY flags value, so its > 48 KB
+                        // carve-out is opted in on the raw copy even with --exl3-pdl=0. Only
+                        // --exl3-r16=0 keeps m > 8 on today's m-grid path (cap16 = 0).
+                        let cap16 = if m > 8 && exl3_r16_on() {
+                            static C16: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+                            // capacity at the WORST carve-out (R4 on, m = 16): conservative
+                            // for smaller widths, and the barrier is never oversubscribed.
+                            let need = m * 4096;
+                            let c = if need > 65536 { 0 } else {
+                                *C16.get_or_init(|| {
+                                    if !r16_hc_smem_optin() { return 0; }
+                                    wp11_capacity_raw_dsmem(&self.dev, "xq_hc_fuse_i8_rbk_r16", 65536)
+                                })
+                            };
+                            if exl3_r16_on() && c < 4 {
+                                static R16NC: std::sync::Once = std::sync::Once::new();
+                                R16NC.call_once(|| println!("EXL3-R16: xq_hc_fuse_i8_rbk_r16 not co-resident \
+                                                       ({c} CTAs); m > 8 keeps the m-grid path"));
+                            }
+                            c
+                        } else { 0 };
+                        // S-B9-CF-R16B: the precise reason when the r16 twin does NOT take this
+                        // width (the receipt names the entry that served instead).
+                        let r16_skip = if !exl3_r16_on() { "--exl3-r16=0" }
+                            else if !hc_rb_on() { "--hc-rb=0" }
+                            else if !upk { "up_q not k-major (legacy load)" }
+                            else if cap16 < 4 { "xq_hc_fuse_i8_rbk_r16 co-residency < 4 CTAs" }
+                            else { "rb budget" };
                         if crate::opts::var(crate::opt!("hc-int8-check")).is_ok() {
                             // diagnostic (eager: --exl3-no-graph=1): fp16 twin first, then int8
                             xqlaunch!(l, "xq_hc_fuse", (bx, m as u32, 1), (256, 1, 1), 0,
@@ -7544,29 +8452,69 @@ impl FwdModel {
                             self.dev.synchronize()?;
                             let t = self.dev.dtoh_sync_copy(&sc.uu)?;
                             hc_int8_check(&r[..m * rw], &t[..m * rw]);
-                        } else if upk && m >= 2 && m <= 8 && hc_rb_on() && capr >= 4 {
+                        } else if upk && m >= 2 && hc_rb_on()
+                                   && ((m <= 8 && capr >= 4)
+                                       || (m > 8 && exl3_r16_on() && m <= 16 && cap16 >= 4)) {
                             // WP11 row-batched twin (R1 prefetch, R3 k-major, R4 hn staging).
-                            let bxr = hc_bxr().min(capr);
+                            // S-B9-CF-R16: at 9..16 rows the r16 twin serves the width,
+                            // bit-identical (64 KB smem, M = 9..16 cases); its grid comes from
+                            // ITS measured co-residency, never more CTAs than fit.
                             let r4 = if wp11_r4_on() && rw % 1024 == 0 { 16 } else { 0 };
-                            xqlaunch!(l, "xq_hc_fuse_i8_rbk", (bxr, 1, 1), (256, 1, 1), 0,
+                            // the r16 twin's dynamic carve-out: R4 staging m*4096 B,
+                            // else phase B m*lr*4 B (both <= 65536 for this family).
+                            let (kern, capb, dsmem) = if m > 8 {
+                                ("xq_hc_fuse_i8_rbk_r16", cap16,
+                                 (m * if r4 != 0 { 4096 } else { lr * 4 }) as u32)
+                            } else { ("xq_hc_fuse_i8_rbk", capr, 0u32) };
+                            // S-B9-REL-FIXB K7: the r16 twin's grid keeps the same 1/6
+                            // residency margin as every other grid-barrier twin (cap /
+                            // capk / capr all derive *5/6 before the min); a tuner pick
+                            // of 48 can never reach the bare co-residency. m <= 8 (capr)
+                            // is already margined at its own derivation.
+                            let bxr = hc_bxr().min(if m > 8 { (capb * 5) / 6 } else { capb });
+                            if m > 8 {
+                                // S-B9-CF-R16B: the r16 twin's > 48 KB dynamic-smem opt-in lives
+                                // on the RAW-module copy (exl3_bench.ptx is loaded TWICE; cudarc's
+                                // `get_func` handle cannot be opted in from outside the crate), so
+                                // the launch goes through xqlaunch_raw! — a plain cuLaunchKernel on
+                                // the raw function when pdl_on() is 0 (same stream, graph-capture-
+                                // safe), the identical PDL launch when --exl3-pdl=1. Same kernel,
+                                // same args, bitwise-same outputs either way. m <= 8 (the rbk twin)
+                                // keeps the cudarc launch, untouched.
+                                r16_liveness(kern, None);
+                                xqlaunch_raw!(l, kern, (bxr, 1, 1), (256, 1, 1), dsmem,
+                                         (&mut sc.dd, &mut sc.uu, &sc.hn, &q.down_q, &q.down_s, &q.up_q, &q.up_s,
+                                          &sc.hc_bar, hcn as f32, (lr as i32) | ((m as i32) << 16), rw as i32, pf | r4))?;
+                            } else {
+                                xqlaunch!(l, kern, (bxr, 1, 1), (256, 1, 1), dsmem,
                                      (&mut sc.dd, &mut sc.uu, &sc.hn, &q.down_q, &q.down_s, &q.up_q, &q.up_s,
                                       &sc.hc_bar, hcn as f32, (lr as i32) | ((m as i32) << 16), rw as i32, pf | r4))?;
+                            }
                         } else if upk && bxk * m as u32 <= capk {
                             // WP11 m-grid twin (m = 1 decode/draft/seam; any width rb does not take).
                             let cvt = if wp11_cvt_i2f() { 4 } else { 0 };
+                            if m > 8 { r16_liveness("xq_hc_fuse_i8k", Some(r16_skip)); }
                             xqlaunch!(l, "xq_hc_fuse_i8k", (bxk, m as u32, 1), (256, 1, 1), 0,
                                      (&mut sc.dd, &mut sc.uu, &sc.hn, &q.down_q, &q.down_s, &q.up_q, &q.up_s,
                                       &sc.hc_bar, hcn as f32, lr as i32, rw as i32, pf | cvt))?;
                         } else if m >= 2 && m <= 8 && lr <= 512 && hc_rb_on() {
                             // row-batched twin: weights streamed once for all m rows, per-row
                             // arithmetic identical (bitwise). 40 blocks, one grid row.
+                            // S-B9-REL-FIXB K1 (HC audit): m <= 8 ONLY — the R16 leg widened
+                            // this gate to m <= 16 under --exl3-r16, but xq_hc_fuse_i8_rb's
+                            // switch covers m 1..8 (default: break = a silent no-op), so a
+                            // 9..16-row legacy-load forward (or cap16 < 4) wrote NOTHING to
+                            // uu/dd. The 9..16-row width falls to the m-grid twins below,
+                            // exactly as pre-R16 (the same class w4hc_takes already fixed).
                             let up_rm = up_rm.context("hc int8: row-major q_up missing for the old kernel")?;
                             let bxr = hc_bxr().min(cap.max(4));
+                            if m > 8 { r16_liveness("xq_hc_fuse_i8_rb", Some(r16_skip)); }
                             xqlaunch!(l, "xq_hc_fuse_i8_rb", (bxr, 1, 1), (256, 1, 1), 0,
                                      (&mut sc.dd, &mut sc.uu, &sc.hn, &q.down_q, &q.down_s, up_rm, &q.up_s,
                                       &sc.hc_bar, hcn as f32, (lr as i32) | ((m as i32) << 16), rw as i32))?;
                         } else {
                             let up_rm = up_rm.context("hc int8: row-major q_up missing for the old kernel")?;
+                            if m > 8 { r16_liveness("xq_hc_fuse_i8", Some(r16_skip)); }
                             xqlaunch!(l, "xq_hc_fuse_i8", (bx, m as u32, 1), (256, 1, 1), 0,
                                      (&mut sc.dd, &mut sc.uu, &sc.hn, &q.down_q, &q.down_s, up_rm, &q.up_s,
                                       &sc.hc_bar, hcn as f32, lr as i32, rw as i32))?;
@@ -7854,16 +8802,50 @@ impl FwdModel {
         // S-A3-z lever 2: fused routing (router GEMV + K-split combine; top-k + route) — bit-identical
         // to the ks=64 path below. --exl3-router-fused=0 = the old launches; --exl3-router-xcheck=1
         // runs both and diffs logits / ids / wts / route tables bitwise (eager only).
-        let fused = rks == 64 && m <= 8 && ne % 4 == 0 && h % 64 == 0 && (h / 64) % 8 == 0 && topk <= 16
-            && tune::get(&T_ROUTER_FUSED, &l.cx()) != 0;
-        let rxc = fused && crate::opts::var(crate::opt!("exl3-router-xcheck")).is_ok();
+        // S-B9-CF-R16: the 9..16-row r16 fold (xq_router_fold_c_r16) is bit-identical, so the fused
+        // path serves those widths too when the flag is on. m <= 8 is unchanged.
+        // S-B9-REL-FIXB K1: the router selection is decided by the PURE router_entry()
+        // (above; test router_selection_table_exhaustive). The 9..16-row width can only
+        // ever reach xq_router_fold_c_r16 or the legacy chain: r16 additionally requires
+        // the COAL fold and a NON-EP rank, so EP ranks and non-coal runs keep the EXACT
+        // pre-R16 (v0.7.2) dispatch above 8 rows. The r16 smem opt-in is hoisted here —
+        // a refusal now turns r16 OFF (the width drops to the legacy chain) instead of
+        // falling through to xq_router_fold_c, an M <= 8 body.
+        let coal = h == 64 * 40 && tune::get(&T_MOE_ROUTER_COAL, &l.cx()) != 0;
+        let r16 = m > 8 && m <= 16 && exl3_r16_on() && coal && moe.ep.is_none() && ne <= 512 && {
+            static R16_SMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *R16_SMO.get_or_init(|| r16_smem_optin(&self.dev, "xq_router_fold_c_r16", RFC_SMEM_R16 as i32))
+        };
+        let fused_ok = rks == 64 && ne % 4 == 0 && h % 64 == 0 && (h / 64) % 8 == 0
+            && topk <= 16 && tune::get(&T_ROUTER_FUSED, &l.cx()) != 0;
         // WP10: routing fold — xq_router_fused + xq_router_topk_route in ONE launch (the last GEMV block
         // runs softmax / top-k / renorm / route), bit-identical. Default ON; --wp10-off=1 = the
         // S-A3-z two-kernel path. With ROUTER_XCHECK the fold is diffed against the ks path;
         // --wp10-xcheck=1 diffs it against the S-A3-z pair (both eager only).
-        let fold = fused && wp10_fold_on() && ne <= 512 && m * topk <= 128;
-        let fxc = fold && crate::opts::var(crate::opt!("wp10-xcheck")).is_ok();
+        // S-B9-CF-R16: the r16 tail's route scratch is 16*16 deep, so m*topk <= 160 at m > 8
+        // (BK <= 160 spans at most 5 of the 8 prefix warps); m <= 8 keeps today's 128 gate.
+        let fold_ok = wp10_fold_on() && ne <= 512;
+        let topk_cap = m * topk <= if m <= 8 { 128 } else { 160 };
+        // S-B9-REL-FIXB K1: the wp10-xcheck reference pair is M <= 8 hardware, so fxc
+        // never applies above 8 rows (the pair would read uninitialised rows and the
+        // compare would false-bail). rxc keeps the legacy chain as its reference, which
+        // serves any m — the r16 fold is still cross-checked at 9..16 rows.
+        let rxc_flag = crate::opts::var(crate::opt!("exl3-router-xcheck")).is_ok();
+        let fxc_flag = crate::opts::var(crate::opt!("wp10-xcheck")).is_ok() && m <= 8;
+        let entry = router_entry(m, moe.ep.is_some(), coal, xtp::route_fold_on(), r16,
+                                 fused_ok, fold_ok, topk_cap, false, wp10_gemv_remap(),
+                                 rxc_flag || fxc_flag);
+        let fold = entry.is_fold();
+        let fused = fused_ok && (m <= 8 || fold);
+        let rxc = fused && rxc_flag;
+        let fxc = fold && fxc_flag;
         if !fused || rxc {
+        if m > 8 {
+            // S-B9-CF-R16B: the receipt's router half must name the TRUE entry — at m > 8
+            // this legacy ks chain is what serves the width whenever the fold does not take
+            // (flag off / wp10 off / m*topk > 160), so record it like the fold site does.
+            r16_set_router("legacy ks chain (xq_router_ks+combine+topk+moe_route)");
+        }
         if rks > 1 && sc.router_ws.len() >= rw_need {
             xqlaunch!(l, "xq_router_ks", (((ne as u32) + 255) / 256, m as u32, rks), (256, 1, 1), 0,
                      (&mut sc.router_ws, &moe.router, &sc.x, m as i32, ne as i32, h as i32, rks as i32))?;
@@ -7886,7 +8868,7 @@ impl FwdModel {
                  (&sc.ids, m as i32, topk as i32, ne as i32, &mut sc.slotmap, &mut sc.idxmap,
                   &mut sc.esel, &mut sc.offs_gu, &mut sc.offs_d, moe.gu_words, moe.d_words))?;
         }
-        if fused && (!fold || fxc) {
+        if fused && m <= 8 && (!fold || fxc) {
             let snap = if rxc {
                 self.dev.synchronize()?;
                 Some((self.dev.dtoh_sync_copy(&sc.logits_r)?, self.dev.dtoh_sync_copy(&sc.ids)?,
@@ -7955,15 +8937,31 @@ impl FwdModel {
             // the fold below). The ROUTER_XCHECK / WP10_XCHECK snapshots above then check it too.
             // A5-K2 (moe.router_coal): the coalesced-weight twin xq_router_fold_c (grid ne/4 x 256,
             // K == 2560 only: the 40-wide slice chains), ahead of W4S router when on.
-            let coal = h == 64 * 40 && tune::get(&T_MOE_ROUTER_COAL, &l.cx()) != 0;
+            // S-B9-REL-FIXB K1: fname/dsmem now come from the SAME pure router_entry()
+            // decision made above — ep_fold is m <= 8 only, and the 9..16-row width can
+            // only reach xq_router_fold_c_r16 here (the entry never returns an M <= 8
+            // body above 8 rows). The old coal16 smem-refusal fallthrough to
+            // xq_router_fold_c is gone: a refusal turns r16 off BEFORE the entry is
+            // picked, so the width drops to the legacy chain, as the comment promised.
             let w4r = !coal && w4s_on(W4S_ROUTER) && self.w4s_router_fold(l, sc, moe, m)?;
-            // TP-G (T2 lever #5): on an EP rank, the COAL fold's route tail builds the LOCAL tables
-            // itself (xq_router_fold_c_ep; bitwise == fold + xq_moe_route_ep) — one launch fewer per MoE
-            // layer. Not under the eager XCHECK snapshots (their reference is the global route).
-            let ep_fold = coal && snap.is_none() && moe.ep.is_some() && xtp::route_fold_on();
-            let fname = if ep_fold { "xq_router_fold_c_ep" } else if coal { "xq_router_fold_c" } else if w4r { "xq_router_fold_w4" }
-                        else if wp10_gemv_remap() { "xq_router_fold" } else { "xq_router_fold_m0" };
-            let dsmem = if coal { RFC_SMEM } else { 0 };
+            let entry = if w4r { RouterEntry::FoldW4 } else { entry };
+            let fname = match entry {
+                RouterEntry::FoldEp => "xq_router_fold_c_ep",
+                RouterEntry::FoldR16 => "xq_router_fold_c_r16",
+                RouterEntry::FoldCoal => "xq_router_fold_c",
+                RouterEntry::FoldW4 => "xq_router_fold_w4",
+                RouterEntry::Fold => "xq_router_fold",
+                RouterEntry::FoldM0 => "xq_router_fold_m0",
+                // `fold` above is exactly entry.is_fold(); reaching here is a logic error.
+                RouterEntry::FusedPair | RouterEntry::Legacy => {
+                    anyhow::bail!("router_entry returned {entry:?} inside the fold branch")
+                }
+            };
+            let dsmem = match entry {
+                RouterEntry::FoldR16 => RFC_SMEM_R16,
+                RouterEntry::FoldCoal | RouterEntry::FoldEp => RFC_SMEM,
+                _ => 0,
+            };
             if coal {
                 static K2_ONCE: std::sync::Once = std::sync::Once::new();
                 K2_ONCE.call_once(|| println!("A5-K2: router fold COAL ON (xq_router_fold_c, grid {} x 256, smem {RFC_SMEM}; \
@@ -7975,6 +8973,11 @@ impl FwdModel {
             static WP10_ONCE: std::sync::Once = std::sync::Once::new();
             WP10_ONCE.call_once(|| println!("WP10: routing fold ON ({fname}; --wp10-off=1 = S-A3-z pair, \
                                               --wp10-gemv=0 = legacy GEMV lane map)"));
+            if m > 8 {
+                // S-B9-CF-R16B: record the router entry actually serving a 9..16-row group
+                // (the liveness receipt's router half; printed by the HC site).
+                r16_set_router(fname);
+            }
             let mut a_lg = *sc.logits_r.device_ptr() as u64;
             let mut a_w = *moe.router.device_ptr() as u64; let mut a_x = *sc.x.device_ptr() as u64;
             let mut a_m = m as i32; let mut a_n = ne as i32; let mut a_h = h as i32;
@@ -7996,7 +8999,7 @@ impl FwdModel {
                 &mut a_gw as *mut u64 as *mut _, &mut a_dw as *mut u64 as *mut _,
                 &mut a_lut as *mut u64 as *mut _,   // read only by xq_router_fold_c_ep (extra params are ignored)
             ];
-            if ep_fold {
+            if matches!(entry, RouterEntry::FoldEp) {
                 static EPF_ONCE: std::sync::Once = std::sync::Once::new();
                 EPF_ONCE.call_once(|| println!("TP-G: EP route folded into the router fold (xq_router_fold_c_ep; \
                                                 --tp-route-fold=0 = fold + xq_moe_route_ep)"));
@@ -8012,7 +9015,7 @@ impl FwdModel {
                 };
                 anyhow::ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "{fname} launch ({r:?})");
             }
-            ep_routed = ep_fold;
+            ep_routed = matches!(entry, RouterEntry::FoldEp);
             } // !w4r
             if let Some((l0, i0, w0, s0, x0, e0, g0, d0)) = snap {
                 self.dev.synchronize()?;
@@ -9686,7 +10689,7 @@ impl FwdModel {
         unsafe {
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
-                println!("EXL3_GRAPH: BeginCapture failed ({r:?}) at width {m} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: BeginCapture failed ({r:?}) at width {m} — staying eager");
                 return;
             }
         }
@@ -9694,7 +10697,7 @@ impl FwdModel {
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
-            println!("EXL3_GRAPH: capture failed (end={r2:?}, body={:?}) at width {m} — staying eager", cap.err());
+            crate::rprintln!("EXL3_GRAPH: capture failed (end={r2:?}, body={:?}) at width {m} — staying eager", cap.err());
             return;
         }
         crate::exl3_wp27::finish(graph, "step", m); // WP27: node priorities + DAG receipt
@@ -9705,10 +10708,10 @@ impl FwdModel {
             sys::cuGraphDestroy(graph);
             if r3 == sys::CUresult::CUDA_SUCCESS {
                 precap_upload(exec, raw);
-                self.graphs.lock().unwrap().insert(gkey, crate::gpu::CudaGraph::from_exec(exec, raw));
-                if graph_log_on() { println!("EXL3_GRAPH: captured decode step at width {m}"); }
+                crate::metrics::set_graph_entries({ let mut g = self.graphs.lock().unwrap(); g.insert(gkey, crate::gpu::CudaGraph::from_exec(exec, raw)); g.len() as u64 });
+                if graph_log_on() { crate::rprintln!("EXL3_GRAPH: captured decode step at width {m}"); }
             } else {
-                println!("EXL3_GRAPH: instantiate failed ({r3:?}) at width {m} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: instantiate failed ({r3:?}) at width {m} — staying eager");
             }
         }
     }
@@ -11118,6 +12121,107 @@ fn stage_key(name: &str) -> (usize, usize) {
     (li, pri)
 }
 
+// ==================== PACK1 LEG 1 (S-B9-CF-PACK1) ====================
+/// Max segments in the packed verify (v1: k <= 3 per the design; LEG 1 uses 2).
+pub(crate) const PACK_SEG_MAX: usize = 3;
+
+#[derive(Default, Clone)]
+/// PACK2: device shadow of every persistent state region the two arms
+/// read/write, taken once after the prime (d2d copies — bitwise). Arms restart
+/// from this shadow, NEVER from a re-run prime: the chunked prefill's GEMM
+/// class runs split-K atomics (batch-invariance binds only the decode/verify
+/// classes), so a second prime is NOT bit-equal to the first.
+pub(crate) struct PackShadow {
+    // (dst device ptr, dst/src word offset of the region, saved words) — the
+    // offset is BOTH the save's src offset and the restore's dst offset.
+    parts: Vec<(u64, i64, CudaSlice<u16>)>,
+    hist: Vec<i32>,
+}
+
+pub(crate) struct Pack2Seg {
+    pub core: Vec<u16>,
+    pub x: Vec<u16>,
+    pub logits: Vec<u16>,
+    pub argmax: Vec<i32>,
+    pub out: Vec<i32>,
+    pub acc: Vec<i32>,
+    pub a: usize,
+    pub ms: f64,
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct Pack2Packed {
+    pub core_a: Vec<u16>,
+    pub core_b: Vec<u16>,
+    pub x_a: Vec<u16>,
+    pub x_b: Vec<u16>,
+    pub logits_a: Vec<u16>,
+    pub logits_b: Vec<u16>,
+    pub argmax_a: Vec<i32>,
+    pub argmax_b: Vec<i32>,
+    pub out_a: Vec<i32>,
+    pub out_b: Vec<i32>,
+    pub acc_a: (i32, i32),
+    pub acc_b: (i32, i32),
+    pub a_a: usize,
+    pub a_b: usize,
+    pub ms: f64,
+}
+
+pub(crate) fn fnv64_u16(v: &[u16]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &x in v {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= (x >> 8) as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+pub(crate) fn fnv64_i32(v: &[i32]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &x in v {
+        h ^= (x as u32) as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= ((x as u32) >> 16) as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// PACK1 LEG 1 entry: `--probe-exl3-pack2 --model-dir <pack>`.
+/// EAGER 2-request packed verify vs two serial 5-row verifies: bit identity per
+/// segment, G3 nostore state diff, a/b/c timing and the ratio r. No graphs, no
+/// scheduler, no flag; the served path is untouched (new kernel entries only).
+pub fn pack2_probe_exl3(dir: &str, max_pos: usize) -> Result<()> {
+    let model = FwdModel::load(dir, 2, max_pos)?; // 2 slots: the packed probe primes 0 and 1
+    println!("PACK2: model {} loaded (vocab {}, max_pos {max_pos})", dir, model.cfg.vocab_size);
+    model.probe_pack2()
+}
+
+/// PACK2 LEG 2 entry: `--probe-exl3-packstate --model-dir <pack>`.
+/// The packed ROUND (real draft chains -> one packed verify -> per-segment
+/// accept/commit -> per-request re-prime) proven bit-identical to the same
+/// rounds run serially (lone verify per request through the served verify_block).
+pub fn packstate_probe_exl3(dir: &str, max_pos: usize) -> Result<()> {
+    let model = FwdModel::load(dir, 2, max_pos)?; // 2 slots: the probe primes 0 and 1
+    println!("PACKSTATE: model {} loaded (vocab {}, max_pos {max_pos})", dir, model.cfg.vocab_size);
+    model.probe_packstate()
+}
+
+
+/// PACK3 LEG 3 STEP A entry: `--probe-exl3-pack3 --model-dir <pack>`.
+/// Graphed round-pair A/B (V5 lone graph vs P10 packed graph + eager tail),
+/// graph-vs-eager bit identity, the 6+4 same-graph replay, the per-stage
+/// table and round_pair_ratio.
+pub fn pack3_probe_exl3(dir: &str, max_pos: usize) -> Result<()> {
+    let model = FwdModel::load(dir, 2, max_pos)?; // 2 slots: slots 0 and 1 pack
+    println!("PACK3: model {} loaded (vocab {}, max_pos {max_pos})", dir, model.cfg.vocab_size);
+    model.probe_pack3()
+}
+
+/// K9 (REL v0.7.3 review): the doc block below had wandered onto PACK_SEG_MAX.
 /// `--bench-mtp` on an EXL3 pack: REAL chain-verify losslessness + draft
 /// acceptance. Arm M (slot 0) prefills token-by-token, primes the head ONCE
 /// (tap_snapshot + head_prime — the serve's prime), then decodes with
@@ -14296,6 +15400,18 @@ fn pen_draft_on() -> bool {
 pub const ROUTE_REC: usize = 2 + 16 * 16;
 pub const ROUTE_LOG_CAP: usize = 1 << 18;
 pub const MTP_MAX_K: usize = 7;
+/// PACK2: plane stride (rows) of the qkv_save/qkv_post/a_save/b_save
+/// per-layer save planes. 16 >= the packed R_pad (10): the packed save must
+/// never cross a plane boundary (8 = MTP_MAX_K+1 overflowed by 2 rows/layer).
+pub const SAVE_PLANE_ROWS: usize = 16;
+/// Words of `Scratch::accept_out` the SERVED round reads back (the lone `xq_accept` writes
+/// `out[0..=k+2]`, so `MTP_MAX_K + 3`). The REPRIME pinned buffer (`RpRt::new`) AND the async copy in
+/// `reprime_dev_enqueue` are both sized by THIS, never by `accept_out.len()`: K4 (REL v0.7.3) widened
+/// `accept_out` to 16 words for the packed probes and the 16-word copy overran the 10-word pin, so
+/// every speculative round failed `REPRIME: 16 accept words > pinned 40 B` (found by GATES2).
+pub const RP_ACCEPT_WORDS: usize = MTP_MAX_K + 3;
+/// Allocated width of `Scratch::d_dev` / `accept_out` (K4: the packed tail runs to R_pad = 16 rows).
+pub(crate) fn accept_out_words() -> usize { (MTP_MAX_K + 3).max(16) }
 /// WP23: max rows xq_gdn_commit_ring commits (its kr_sh/g_sh extent + device guard; exl3_bench.cu).
 const GDN_RING_CMAX: usize = 8;
 /// K1: KV cache storage format. [kv-cache] = f32 (exact) | f16 | fp8 | q8 (the server's
@@ -15186,6 +16302,17 @@ fn dkey_of(slot: usize, k: usize, qsa: bool, qb: usize) -> usize {
 fn pkey_of(slot: usize, i: usize, qsa: bool, qb: usize) -> usize {
     (3usize << 30) | (if qsa { (1usize << 20) | (qb << 21) } else { 0 }) | (slot << 8) | i
 }
+/// PACK3 (S-B9-CF-PACK3): the PACKED verify graph key — its own family
+/// (4<<30) so it can never collide with the served vkey/dkey/pkey spaces.
+/// Keyed on R_pad and the QSA regime ONLY: the graphable packed body (seg
+/// trunk + accept_seg + commit_seg) reads every per-staging value from
+/// device buffers (sc.seg and friends), so ONE graph serves any k_seg=2
+/// staging with the same R_pad — any slots, any row0/len split. k_seg is
+/// not in the key (every packed capture today is k_seg=2; the probe guards
+/// this at lookup). Probe-only; the served boot never captures this family.
+fn pkeyv_of(rpad: usize, qsa: bool, qb: usize) -> usize {
+    (4usize << 30) | ((qsa as usize) << 29) | (if qsa { qb << 16 } else { 0 }) | rpad
+}
 /// WP24: draft graph key bits 42-43 = the passes' rq mode (0 = today's tail: the boot precapture's
 /// keys and graphs; 1 = + the dump list; 2 = real-q old-tail sampling). Verify keys carry the
 /// real-q sampler as bit 44 (rq_verify_key). Both 0 unless --spec-sampling ratio / --wp24-dump.
@@ -15545,7 +16672,7 @@ impl FwdModel {
         xqlaunch!(l, "xq_copy_f32", (((c_e + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
                   (&mut sh2, &self.conv_state[gdn_i], c_e as i64, 0i64, (slot * c_e) as i64))?;
         xqlaunch!(l, "xq_copy_u16", (((n + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
-                  (&mut q2, &sc.qkv_save, n as i64, 0i64, (gdn_i * (MTP_MAX_K + 1) * conv_dim) as i64))?;
+                  (&mut q2, &sc.qkv_save, n as i64, 0i64, (gdn_i * SAVE_PLANE_ROWS * conv_dim) as i64))?;
         xqlaunch!(l, "xq_conv1d_chunk", ((conv_dim as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                   (&mut q2, &mut sh2, &g.conv_w, conv_dim as i32, ck as i32, m as i32, 0i32, conv_dim as i32))?;
         self.dev.synchronize()?;
@@ -15674,9 +16801,11 @@ impl FwdModel {
     /// Off-dequant contract: every chain goes through the m<=16 decode branch of
     /// exl3_chain (never exl3_chain_rb) — the reconstruct/Lt prefill path is
     /// unreachable here BY CONSTRUCTION; m is asserted <= MTP_MAX_K+1 <= 16.
-    fn verify_kernels(&self, l: &Launcher, sc: &mut Scratch, m: usize, qsa: bool, slot: usize) -> Result<()> {
-        anyhow::ensure!(m >= 2 && m <= MTP_MAX_K + 1 && m <= 16,
-                        "verify width {m} out of range");
+    fn verify_kernels(&self, l: &Launcher, sc: &mut Scratch, m: usize, qsa: bool, slot: usize,
+                      seg_k: usize) -> Result<()> {
+        anyhow::ensure!(m >= 2 && m <= 16 && (m <= MTP_MAX_K + 1 || seg_k > 0),
+                        "verify width {m} out of range (seg_k {seg_k})");
+        if seg_k > 0 { anyhow::ensure!(seg_k <= PACK_SEG_MAX && m <= 16, "packed: k_seg {seg_k} m {m}"); }
         let cfg = &self.tc; // TP-B: the trunk's per-rank geometry
         let h = cfg.hidden_size;
         let hcn = cfg.hc_count.max(1);
@@ -15791,9 +16920,16 @@ impl FwdModel {
                          (&sc.ple_qn, &sc.ple_kn, &sc.ple_val, &mut sc.ple_gated, scale))?;
                 xqlaunch!(l, "xq_ple_norm_hh", (m as u32 * 4, 1, 1), (256, 1, 1), 0,
                          (&sc.ple_gated, &ple.norm_conv_w, &mut sc.ple_normed, eps))?;
+                if seg_k > 0 {
+                    // PACK1 LEG 1: segmented PLE conv on the per-segment shadow planes.
+                    xqlaunch!(l, "xq_ple_conv_chunk_seg", ((10240u32 + 255) / 256, seg_k as u32, 1), (256, 1, 1), 0,
+                             (&mut sc.resid, &sc.ple_gated, &sc.ple_normed, &mut sc.ple_ring_sh,
+                              &ple.conv_w, &sc.seg))?;
+                } else {
                 xqlaunch!(l, "xq_ple_conv_chunk", ((10240u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                          (&mut sc.resid, &sc.ple_gated, &sc.ple_normed, &mut sc.ple_ring_sh,
                           &ple.conv_w, 0i32, m as i32))?;
+                }
             }
             // MTP_DIAG: per-layer col-0 dump of the pre-mixer hidden state.
             if let Some(d) = bmtd.as_ref() { dump_u(&d, &sc.x, &format!("xpre{lk}"), 0)?; }
@@ -15839,10 +16975,10 @@ impl FwdModel {
                     // shared a_out/b_out hold the LAST layer's at commit time.
                     xqlaunch!(l, "xq_copy_u16", (((m * nh) as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                              (&mut sc.a_save, &sc.a_out, (m * nh) as i64,
-                              (gdn_i * (MTP_MAX_K + 1) * nh) as i64, 0i64))?;
+                              (gdn_i * SAVE_PLANE_ROWS * nh) as i64, 0i64))?;
                     xqlaunch!(l, "xq_copy_u16", (((m * nh) as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                              (&mut sc.b_save, &sc.b_out, (m * nh) as i64,
-                              (gdn_i * (MTP_MAX_K + 1) * nh) as i64, 0i64))?;
+                              (gdn_i * SAVE_PLANE_ROWS * nh) as i64, 0i64))?;
                     }
                     let wp27_ab = wp27.cut_to(&wp27_q)?; // WP27: resume from the in_qkv tail
                     // conv over the group: rows sequential in-kernel (shadow state)
@@ -15851,16 +16987,27 @@ impl FwdModel {
                     // replay the state window with the RAW projections.
                     xqlaunch!(l, "xq_copy_u16", (((m * conv_dim) as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                              (&mut sc.qkv_save, &sc.qkv, (m * conv_dim) as i64,
-                              (gdn_i * (MTP_MAX_K + 1) * conv_dim) as i64, 0i64))?;
+                              (gdn_i * SAVE_PLANE_ROWS * conv_dim) as i64, 0i64))?;
                     if lk == 0 { if let Some(d) = bmtd.as_ref() { dump_u(&d, &sc.qkv_save, "l0qkvsave", 0)?; } }
                     if wp12_on(WP12_CONV) {
                         // WP12 conv: nostore chunk on the LIVE ring row (read-only here; the
                         // conv commit replays the accepted raw rows) — no shadow copy.
+                        if seg_k > 0 {
+                        // PACK1 LEG 1: segmented WP12 conv — per-segment live-state reads (nostore).
+                        xqlaunch!(l, "xq_conv1d_chunk_seg_ns", ((conv_dim as u32 + 255) / 256, seg_k as u32, 1), (256, 1, 1), 0,
+                                 (&mut sc.qkv, (*self.conv_state[gdn_i].device_ptr()) as u64, &g.conv_w,
+                                  conv_dim as i32, ck as i32, &sc.seg, conv_dim as i32))?;
+                        } else {
                         xqlaunch!(l, "xq_conv1d_chunk_ns", ((conv_dim as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                                  (&mut sc.qkv, (*self.conv_state[gdn_i].device_ptr()) as u64, &g.conv_w,
                                   conv_dim as i32, ck as i32, m as i32, slot as i32, conv_dim as i32))?;
+                        }
                         if wp12_xchk { self.wp12_xcheck_conv(l, sc, g, gdn_i, slot, m)?; }
                     } else {
+                    // K6 (REL v0.7.3 review): the lone conv kernel is per-slot — a packed
+                    // verify (seg_k > 0) must not silently fall to it when WP12_CONV is off.
+                    anyhow::ensure!(seg_k == 0,
+                        "packed verify (seg_k {seg_k}) needs WP12_CONV; the lone xq_conv1d_chunk is per-slot");
                     xqlaunch!(l, "xq_conv1d_chunk", ((conv_dim as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                              (&mut sc.qkv, &mut sc.conv_sh[gdn_i], &g.conv_w,
                               conv_dim as i32, ck as i32, m as i32, 0i32, conv_dim as i32))?;
@@ -15871,7 +17018,7 @@ impl FwdModel {
                     // shared sc.qkv holds only the last GDN layer's at commit time.
                     xqlaunch!(l, "xq_copy_u16", (((m * conv_dim) as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                              (&mut sc.qkv_post, &sc.qkv, (m * conv_dim) as i64,
-                              (gdn_i * (MTP_MAX_K + 1) * conv_dim) as i64, 0i64))?;
+                              (gdn_i * SAVE_PLANE_ROWS * conv_dim) as i64, 0i64))?;
                     }
                     // MTP_DIAG layer-0 bisect: post-conv plane (shadow state).
                     if lk == 0 { if let Some(d) = bmtd.as_ref() { dump_u(&d, &sc.qkv, "l0conv", 0)?; } }
@@ -15880,7 +17027,17 @@ impl FwdModel {
                     // (slot) with nostore — never written back (commit replays from
                     // live), so no shadow copy. slot_C = slot | m<<12 | 1<<30.
                     let slot_c = (slot | (m << 12) | (1 << 30)) as i32;
-                    if wp12_on(WP12_STEP) && kd == 128 && vd == 128 && m <= 8 {
+                    if seg_k > 0 && kd == 128 && vd == 128 {
+                        // PACK1 LEG 1: segmented register-body scan, grid (nh, k_seg); the ring
+                        // is the packed 16-row-deep buffer (plane stride 16 rows); the kernel
+                        // offsets the ring base by row0 so ring rows land at absolute rows.
+                        xqlaunch!(l, "xq_gdn_step_chunk_seg", (nh as u32, seg_k as u32, 1), (128, 1, 1), 0,
+                                 (&mut sc.core, &sc.qkv, (*self.s_state[gdn_i].device_ptr()) as u64,
+                                  &sc.b_out, &sc.a_out, (nh | (nk << 16)) as i32, kd as i32, vd as i32,
+                                  &g.a_log, &g.dt_bias, &sc.seg,
+                                  (*sc.gdn_ring_p.device_ptr()) as u64
+                                      + (gdn_i * 16 * nh * GDN_RS * 4) as u64))?;
+                    } else if wp12_on(WP12_STEP) && kd == 128 && vd == 128 && m <= 8 {
                         // WP12 step: register-resident scan (same device body as the decode
                         // step), grid nh x 128 threads; bitwise == xq_gdn_step_chunk.
                         xqlaunch!(l, "xq_gdn_step_chunk_r", (nh as u32, 1, 1), (128, 1, 1), 0,
@@ -15891,6 +17048,10 @@ impl FwdModel {
                                       + (gdn_i * (MTP_MAX_K + 1) * nh * GDN_RS * 4) as u64))?;
                         if wp12_xchk { self.wp12_xcheck_verify_step(l, sc, g, gdn_i, slot_c, m)?; }
                     } else {
+                    // K6: the lone chunk scan is per-slot (slot_c) — kd/vd != 128 has no
+                    // segmented twin, so a packed verify must refuse instead of falling to it.
+                    anyhow::ensure!(seg_k == 0,
+                        "packed verify (seg_k {seg_k}) needs kd = vd = 128; the lone xq_gdn_step_chunk is per-slot");
                     xqlaunch!(l, "xq_gdn_step_chunk", ((nh * nchunk) as u32, 1, 1), (kd as u32, 1, 1), smem as u32,
                              (&mut sc.core, &sc.qkv, (*self.s_state[gdn_i].device_ptr()) as u64,
                               &sc.b_out, &sc.a_out, (nh | (nk << 16)) as i32, kd as i32, vd as i32,
@@ -15918,7 +17079,14 @@ impl FwdModel {
                     // the verify rows (per-row selections; prep writes all K/V first,
                     // so row r still only ever attends positions <= its own).
                     if qsa && a.idx.is_some() {
-                        self.qsa_attn_step(l, sc, a, att_i, m, idx_pre, true)?;    // one slot: union gather
+                        // K6 (corrected by GATES2): the union gather hard-wires ONE slot, so a packed
+                        // (multi-slot) verify must never take it. Pass one_slot = (seg_k == 0): packed
+                        // rows get the slot-aware gather (qsa_gather_old) — exactly what the packed
+                        // probes ran before K6 (the union path is opt-in --w4qsa=1 and only for
+                        // m >= 2 single-slot verifies). K6's first form, ensure!(seg_k == 0), refused
+                        // EVERY packed verify at a qsa-live context and broke --probe-exl3-pack2 /
+                        // --probe-exl3-packstate ("packed verify (seg_k 2): ... single-slot").
+                        self.qsa_attn_step(l, sc, a, att_i, m, idx_pre, seg_k == 0)?;
                     } else {
                     self.qsa_keys_append_dense(l, sc, a, att_i, m, idx_pre)?;
                     if self.dense_v3_ok(a) {
@@ -16031,7 +17199,7 @@ impl FwdModel {
                 xqlaunch!(l, "xq_conv_commit", ((conv_dim as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                          ((*self.conv_state[gdn_i].device_ptr()) as u64, &g.conv_w,
                           conv_dim as i32, ck as i32, &sc.qkv_save,
-                          (gdn_i * (MTP_MAX_K + 1) * conv_dim) as i64, &sc.acc2))?;
+                          (gdn_i * SAVE_PLANE_ROWS * conv_dim) as i64, &sc.acc2))?;
                 // MTP_DIAG: the live conv/GDN state right after the commit — layer 0.
                 if gdn_i == 0 {
                     if let Ok(d) = crate::opts::var(crate::opt!("mtp-dump")) {
@@ -16071,12 +17239,12 @@ impl FwdModel {
                 xqlaunch!(l, "xq_gdn_commit", ((nh * nchunk) as u32, 1, 1), (kd as u32, 1, 1), smem as u32,
                          (&mut sc.core,
                           ((*sc.qkv_post.device_ptr()) as u64
-                           + (gdn_i * (MTP_MAX_K + 1) * conv_dim * 2) as u64) as u64,
+                           + (gdn_i * SAVE_PLANE_ROWS * conv_dim * 2) as u64) as u64,
                           (*self.s_state[gdn_i].device_ptr()) as u64,
                           ((*sc.b_save.device_ptr()) as u64
-                           + (gdn_i * (MTP_MAX_K + 1) * nh * 2) as u64) as u64,
+                           + (gdn_i * SAVE_PLANE_ROWS * nh * 2) as u64) as u64,
                           ((*sc.a_save.device_ptr()) as u64
-                           + (gdn_i * (MTP_MAX_K + 1) * nh * 2) as u64) as u64,
+                           + (gdn_i * SAVE_PLANE_ROWS * nh * 2) as u64) as u64,
                           nh as i32, nk as i32, kd as i32, vd as i32,
                           &g.a_log, &g.dt_bias, &sc.acc2))?;
                 if ring_mode == 2 {
@@ -16114,7 +17282,7 @@ impl FwdModel {
         let he = self.cfg.hc_count.max(1) * self.cfg.hidden_size;
         let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
         self.verify_shadow(l, sc, slot)?;
-        self.verify_kernels(l, sc, m, qsa, slot)?;
+        self.verify_kernels(l, sc, m, qsa, slot, 0)?;
         // taps snapshot (rows 0..m-1 for re-prime / next draft-extend) into THIS slot's window
         // (WP03; the offset is a per-slot constant — verify graphs are keyed per slot)
         let tb = self.tap_base(sc, slot)?;
@@ -16127,6 +17295,1669 @@ impl FwdModel {
         self.verify_commit(l, sc)
     }
 
+    // ==================== PACK1 LEG 1 (S-B9-CF-PACK1) ====================
+    // EAGER 2-request packed speculative verify: probe-only helpers. No graphs, no
+    // scheduler integration, no flag; reachable only from --probe-exl3-pack2. The
+    // served verify_block is untouched (shadow -> kernels -> taps -> accept -> commit);
+    // the packed block is shadow_seg -> kernels(seg) -> accept_seg, NO taps, NO commit
+    // (nostore: the packed verify never writes live state — gate G3).
+    fn verify_shadow_seg(&self, l: &Launcher, sc: &mut Scratch, segs: &[[i32; 4]]) -> Result<()> {
+        let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
+        // WP12: GDN/conv shadows are skipped (the seg kernels read the LIVE rows with
+        // nostore, exactly like the served lone verify). Only the PLE ring shadow is
+        // unconditional — one copy per segment into its own plane of ple_ring_sh.
+        for (j, sg) in segs.iter().enumerate() {
+            let pr = (sg[0] as i64) * (10240 * 9) as i64;
+            xqlaunch!(l, "xq_copy_u16", grid((10240 * 9) as i64), (256, 1, 1), 0,
+                      (&mut sc.ple_ring_sh, &self.ple_state, (10240 * 9) as i64,
+                       (j as i64) * (10240 * 9) as i64, pr))?;
+        }
+        Ok(())
+    }
+
+    fn verify_block_packed(&self, l: &Launcher, sc: &mut Scratch, segs: &[[i32; 4]],
+                           r: usize, k_seg: usize, qsa: bool) -> Result<()> {
+        let _tc = tune::enter(tune::Ctx::fam(tune::Fam::Verify, r).regime(qsa));
+        self.verify_shadow_seg(l, sc, segs)?;
+        self.verify_kernels(l, sc, r, qsa, segs[0][0] as usize, k_seg)?;
+        xqlaunch!(l, "xq_accept_seg", (k_seg as u32, 1, 1), (32, 1, 1), 0,
+                  (&sc.d_dev, &sc.argmax, &mut sc.accept_out, &mut sc.acc_seg, &sc.seg))?;
+        Ok(())
+    }
+
+    fn verify_block_nostore(&self, l: &Launcher, sc: &mut Scratch, slot: usize, m: usize,
+                            k: usize, qsa: bool) -> Result<()> {
+        let _tc = tune::enter(tune::Ctx::fam(tune::Fam::Verify, m).regime(qsa));
+        self.verify_shadow(l, sc, slot)?;
+        self.verify_kernels(l, sc, m, qsa, slot, 0)?;
+        xqlaunch!(l, "xq_accept", (1, 1, 1), (32, 1, 1), 0,
+                  (&sc.d_dev, &sc.argmax, &mut sc.accept_out, &mut sc.acc2,
+                   k as i32, slot as i32))?;
+        Ok(())
+    }
+
+
+    // ==================== PACK2 LEG 2 (S-B9-CF-PACK2) ====================
+    // Per-segment device-keyed commit + the packed ROUND probe (--probe-exl3-packstate).
+    // The served path is untouched: seg_k=0 launches exactly today's kernels; the
+    // packed block below is reachable only from the probe.
+
+    /// The segmented commit: the served per-layer commit bodies (xq_conv_commit /
+    /// xq_gdn_commit_ring / xq_ple_ring_commit) with the commit key (slot, a) read
+    /// ON DEVICE from acc_seg[j*2..+2] (xq_accept_seg's output) and rows from the
+    /// seg table. Ring-mode only (the ring commit IS the served GDN commit here;
+    /// gdn_commit_mode == 1 is asserted by the probe).
+    fn verify_commit_seg(&self, l: &Launcher, sc: &mut Scratch, k_seg: usize) -> Result<()> {
+        let cfg = &self.tc; // TP-B: the trunk's per-rank geometry
+        let kd = cfg.lin_k_dim;
+        let vd = cfg.lin_v_dim;
+        let nh = cfg.lin_num_v_heads;
+        let conv_dim = cfg.key_dim() * 2 + cfg.value_dim();
+        let ck = cfg.conv_kernel;
+        let nchunk = vd / 32;
+        let mut gdn_i = 0usize;
+        for layer in self.layers.iter() {
+            if let Mixer::Gdn(g) = &layer.mixer {
+                // raw conv rows: this layer's qkv_save plane (rows are ABSOLUTE —
+                // the seg kernel adds seg.row0); state writes keyed by acc_seg.
+                xqlaunch!(l, "xq_conv_commit_seg", ((conv_dim as u32 + 255) / 256, k_seg as u32, 1), (256, 1, 1), 0,
+                          ((*self.conv_state[gdn_i].device_ptr()) as u64, &g.conv_w,
+                           conv_dim as i32, ck as i32,
+                           ((*sc.qkv_save.device_ptr()) as u64
+                            + (gdn_i * SAVE_PLANE_ROWS * conv_dim * 2) as u64) as u64, // ELEMENTS->BYTES
+                           &sc.seg, &sc.acc_seg))?;
+                // packed ring planes: 16 rows per GDN layer (xq_gdn_step_chunk_seg's
+                // layout); ring rows are absolute (row0 + t).
+                let ring_p = (*sc.gdn_ring_p.device_ptr()) as u64
+                    + (gdn_i * 16 * nh * GDN_RS * 4) as u64;
+                xqlaunch!(l, "xq_gdn_commit_ring_seg", ((nh * nchunk) as u32, k_seg as u32, 1), (kd as u32, 1, 1), 0,
+                          ((*self.s_state[gdn_i].device_ptr()) as u64, ring_p,
+                           nh as i32, kd as i32, vd as i32, &sc.seg, &sc.acc_seg))?;
+                gdn_i += 1;
+            }
+        }
+        if self.ple.is_some() && crate::opts::var(crate::opt!("exl3-no-ple")).is_err() {
+            xqlaunch!(l, "xq_ple_ring_commit_seg", ((10240u32 + 255) / 256, k_seg as u32, 1), (256, 1, 1), 0,
+                      (&sc.ple_normed, (*self.ple_state.device_ptr()) as u64, &sc.seg, &sc.acc_seg))?;
+        }
+        Ok(())
+    }
+
+    /// The packed verify BLOCK (LEG 2): shadow_seg -> seg kernels -> PER-SEGMENT
+    /// taps snapshot (each request's OWN rows into ITS window) -> accept_seg ->
+    /// the segmented commit. The re-prime then reads each slot's taps exactly
+    /// like the served lone path.
+    fn verify_block_packed_full(&self, l: &Launcher, sc: &mut Scratch, segs: &[[i32; 4]],
+                                r: usize, k_seg: usize, qsa: bool) -> Result<()> {
+        let _tc = tune::enter(tune::Ctx::fam(tune::Fam::Verify, r).regime(qsa));
+        let he = self.cfg.hc_count.max(1) * self.cfg.hidden_size;
+        let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
+        self.verify_shadow_seg(l, sc, segs)?;
+        self.verify_kernels(l, sc, r, qsa, segs[0][0] as usize, k_seg)?;
+        // per-segment taps snapshot: rows row0..row0+len -> slot's window rows 0..len
+        for sg in segs.iter() {
+            let (slot, row0, len) = (sg[0] as usize, sg[1] as usize, sg[2] as usize);
+            let tb = self.tap_base(sc, slot)?;
+            xqlaunch!(l, "xq_copy_f32", grid((he * len) as i64), (256, 1, 1), 0,
+                      (&mut sc.taps_keep, &sc.resid, (he * len) as i64, tb as i64,
+                       (row0 * he) as i64))?;
+        }
+        xqlaunch!(l, "xq_accept_seg", (k_seg as u32, 1, 1), (32, 1, 1), 0,
+                  (&sc.d_dev, &sc.argmax, &mut sc.accept_out, &mut sc.acc_seg, &sc.seg))?;
+        self.verify_commit_seg(l, sc, k_seg)
+    }
+
+    /// LEG 2 state snapshot: EVERYTHING the next round consumes, serialized
+    /// deterministically — trunk GDN/conv rows per layer, PLE row, trunk KV rows
+    /// 0..rows per attention layer, trunk QSA raw+pooled planes (rows-h prefix),
+    /// taps windows (whole buffer), host ple_hist, head KV + head QSA planes.
+    fn packstate_snap(&self, l: &Launcher, sc: &Scratch, slots: &[usize], rows: usize) -> Result<Vec<u64>> {
+        let cfg = &self.tc;
+        let he = cfg.hc_count.max(1) * cfg.hidden_size;
+        let s_e = (cfg.lin_num_v_heads * cfg.lin_k_dim * cfg.lin_v_dim) as i64;
+        let c_e = ((cfg.key_dim() * 2 + cfg.value_dim()) * cfg.conv_kernel) as i64;
+        let p_e = (10240 * 9) as i64;
+        let nkv = cfg.num_kv_heads;
+        let rb = kv_rowbytes(self.kv_fmt, cfg.head_dim);
+        let hdx = cfg.indexer_head_dim;
+        let ratio = cfg.indexer_compress_ratio.max(1);
+        let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
+        let rows = rows.min(self.max_pos) as i64;
+        let kv_w = (rows as usize * rb / 2) as i64;      // u16 words of one slot's KV prefix
+        let qa_w = if hdx > 0 { (rows as usize * hdx) as i64 } else { 0 };
+        let tmp_w = kv_w.max(qa_w).max(1);
+        let mut s_tmp = self.dev.alloc_zeros::<f32>(s_e as usize)?;
+        let mut c_tmp = self.dev.alloc_zeros::<f32>(c_e as usize)?;
+        let mut p_tmp = self.dev.alloc_zeros::<u16>(p_e as usize)?;
+        let mut kv_tmp = self.dev.alloc_zeros::<u16>(tmp_w as usize)?;
+        let mut out = Vec::new();
+        out.push(rows as u64);
+        {
+            let nkv_layers = self.k_cache.len();
+            eprintln!(
+                "SNAPMAP rows {rows} s_e {s_e} c_e {c_e} ple {p_e} taps {} kv_layers {nkv_layers} kv_w {kv_w} slots {}",
+                (MTP_MAX_K + 1) * he, slots.len());
+        }
+        for &slot in slots {
+            for li in 0..self.s_state.len() {
+                xqlaunch!(l, "xq_copy_f32", grid(s_e), (256, 1, 1), 0,
+                          (&mut s_tmp, &self.s_state[li], s_e, 0i64, (slot as i64) * s_e))?;
+                for f in self.dev.dtoh_sync_copy(&s_tmp)? { out.push(f.to_bits() as u64); }
+                xqlaunch!(l, "xq_copy_f32", grid(c_e), (256, 1, 1), 0,
+                          (&mut c_tmp, &self.conv_state[li], c_e, 0i64, (slot as i64) * c_e))?;
+                for f in self.dev.dtoh_sync_copy(&c_tmp)? { out.push(f.to_bits() as u64); }
+            }
+            xqlaunch!(l, "xq_copy_u16", grid(p_e), (256, 1, 1), 0,
+                      (&mut p_tmp, &self.ple_state, p_e, 0i64, (slot as i64) * p_e))?;
+            for u in self.dev.dtoh_sync_copy(&p_tmp)? { out.push(u as u64); }
+            // this slot's taps window (rows 0..MTP_MAX_K+1): round 0's tap comes
+            // from the prime, later rounds' from the previous verify — persistent.
+            {
+                let he64 = he as i64;
+                let mut t_tmp = self.dev.alloc_zeros::<f32>(((MTP_MAX_K + 1) * he) as usize)?;
+                xqlaunch!(l, "xq_copy_f32", grid(((MTP_MAX_K as i64 + 1) * he64)), (256, 1, 1), 0,
+                          (&mut t_tmp, &sc.taps_keep, (MTP_MAX_K as i64 + 1) * he64, 0i64,
+                           (slot as i64) * ((MTP_MAX_K as i64 + 1) * he64)))?;
+                for f in self.dev.dtoh_sync_copy(&t_tmp)? { out.push(f.to_bits() as u64); }
+            }
+            // trunk KV prefix per attention layer (row bytes are % 16 -> u16 copies)
+            let kv_src = ((slot as i64) * 2 * (nkv as i64) * (self.max_pos as i64)) * (rb as i64) / 2;
+            for kc in self.k_cache.iter() {
+                xqlaunch!(l, "xq_copy_u16", grid(kv_w), (256, 1, 1), 0,
+                          (&mut kv_tmp, (*kc.device_ptr()) as u64, kv_w, 0i64, kv_src))?;
+                for u in self.dev.dtoh_sync_copy(&kv_tmp)?.iter().take(kv_w as usize) {
+                    out.push(*u as u64);
+                }
+            }
+            // trunk QSA planes (raw keys rows*hdx, pooled rows/ratio*hdx)
+            if hdx > 0 {
+                for att in 0..self.k_cache.len() {
+                    if let Some(k) = self.qsa_keys.get(att) {
+                        let n = (rows as usize * hdx) as i64;
+                        let src = (slot as i64) * (self.max_pos as i64) * (hdx as i64);
+                        xqlaunch!(l, "xq_copy_u16", grid(n), (256, 1, 1), 0,
+                                  (&mut kv_tmp, (*k.device_ptr()) as u64, n, 0i64, src))?;
+                        for u in self.dev.dtoh_sync_copy(&kv_tmp)?.iter().take(n as usize) {
+                            out.push(*u as u64);
+                        }
+                    }
+                    if let Some(k) = self.qsa_pool.get(att) {
+                        let n = ((rows as usize / ratio) * hdx) as i64;
+                        let src = (slot as i64) * ((self.max_pos as i64) / (ratio as i64)) * (hdx as i64);
+                        xqlaunch!(l, "xq_copy_u16", grid(n), (256, 1, 1), 0,
+                                  (&mut kv_tmp, (*k.device_ptr()) as u64, n, 0i64, src))?;
+                        for u in self.dev.dtoh_sync_copy(&kv_tmp)?.iter().take(n as usize) {
+                            out.push(*u as u64);
+                        }
+                    }
+                }
+            }
+        }
+        // head KV + head QSA (the draft side's persistent state)
+        if let Some(h) = self.mtp.as_ref() {
+            for &slot in slots {
+                let kv_src = ((slot as i64) * 2 * (nkv as i64) * (self.max_pos as i64)) * (rb as i64) / 2;
+                xqlaunch!(l, "xq_copy_u16", grid(kv_w), (256, 1, 1), 0,
+                          (&mut kv_tmp, (*h.kv.device_ptr()) as u64, kv_w, 0i64, kv_src))?;
+                for u in self.dev.dtoh_sync_copy(&kv_tmp)?.iter().take(kv_w as usize) {
+                    out.push(*u as u64);
+                }
+                if hdx > 0 {
+                    if let Some(k) = h.qsa_keys.as_ref() {
+                        let n = (rows as usize * hdx) as i64;
+                        let src = (slot as i64) * (self.max_pos as i64) * (hdx as i64);
+                        xqlaunch!(l, "xq_copy_u16", grid(n), (256, 1, 1), 0,
+                                  (&mut kv_tmp, (*k.device_ptr()) as u64, n, 0i64, src))?;
+                        for u in self.dev.dtoh_sync_copy(&kv_tmp)?.iter().take(n as usize) {
+                            out.push(*u as u64);
+                        }
+                    }
+                    if let Some(k) = h.qsa_pool.as_ref() {
+                        let n = ((rows as usize / ratio) * hdx) as i64;
+                        let src = (slot as i64) * ((self.max_pos as i64) / (ratio as i64)) * (hdx as i64);
+                        xqlaunch!(l, "xq_copy_u16", grid(n), (256, 1, 1), 0,
+                                  (&mut kv_tmp, (*k.device_ptr()) as u64, n, 0i64, src))?;
+                        for u in self.dev.dtoh_sync_copy(&kv_tmp)?.iter().take(n as usize) {
+                            out.push(*u as u64);
+                        }
+                    }
+                }
+            }
+        }
+        // host PLE ring pair (both arms must hold it equal). taps_keep is
+        // deliberately EXCLUDED: every round's verify fully rewrites rows 0..m of
+        // each window before any read (tap_row <= k < m is that same round's row),
+        // so stale window contents cannot affect a round — token+accept+state
+        // equality over 20 rounds proves the taps stayed in sync.
+        let hist = self.ple_hist.lock().unwrap();
+        for j in 0..self.width * 2 { out.push(hist[j] as i64 as u64); }
+        Ok(out)
+    }
+
+    /// One request's draft chain (the served draft_block with mtp_round's meta +
+    /// QSA staging), from the tap already restored into sc.resid row 0. Returns
+    /// the clamped drafts (the served clamp: out-of-range -> 0, verify rejects).
+    fn packstate_draft(&self, l: &Launcher, sc: &mut Scratch, head: &DraftHead,
+                       slot: usize, k: usize, b: i32, p: usize) -> Result<Vec<i32>> {
+        self.dev.htod_copy_into(vec![b, p as i32, slot as i32, sc.rq_dctr], &mut sc.draft_meta)?;
+        let dqsa = self.qsa_live(p + k - 1);
+        let (dg, _) = self.qsa_grid_bucket_key(p + k - 1);
+        sc.qsa_grid_nblk = dg;
+        // mtp_round stages slot_ids for the chain UNCONDITIONALLY (the head key
+        // write targets slot_ids[b]'s plane even in the dense regime); a
+        // conditional stage leaks the previous op's slot into the chain writes.
+        self.dev.htod_copy_into(vec![slot as i32; sc.slot_ids.len()], &mut sc.slot_ids)?;
+        self.draft_block(l, sc, head, k, dqsa)?;
+        self.dev.synchronize()?;
+        let d_buf = self.dev.dtoh_sync_copy(&sc.d_dev)?;
+        let v = self.cfg.vocab_size as i32;
+        let mut drafts: Vec<i32> = d_buf[..k].to_vec();
+        for d in drafts.iter_mut() { if *d < 0 || *d >= v { *d = 0; } }
+        Ok(drafts)
+    }
+
+    /// Restore the round's tap (mtp_round's step 1): sc.resid row 0 <- taps_keep[slot].tap_row.
+    fn packstate_tap_restore(&self, l: &Launcher, sc: &mut Scratch, slot: usize, tap_row: usize) -> Result<()> {
+        if tap_row == usize::MAX { return Ok(()); } // control-round marker: resid already holds it
+        let he = self.cfg.hc_count.max(1) * self.cfg.hidden_size;
+        let tb = self.tap_base(sc, slot)?;
+        xqlaunch!(l, "xq_copy_f32", ((((he as i64) + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
+                  (&mut sc.resid, &sc.taps_keep, he as i64, 0i64, (tb + tap_row * he) as i64))?;
+        Ok(())
+    }
+
+    /// One SERIAL lone round for one request: the served verify_block (taps
+    /// snapshot -> accept -> the W4S/per-layer commit). Returns accept_out.
+    fn packstate_verify_lone(&self, l: &Launcher, sc: &mut Scratch, slot: usize, k: usize,
+                             b: i32, p: usize, drafts: &[i32]) -> Result<Vec<i32>> {
+        let m = k + 1;
+        let rows: Vec<(usize, i32, usize)> =
+            (0..m).map(|r| (slot, if r == 0 { b } else { drafts[r - 1] }, p + r)).collect();
+        self.pack2_stage(sc, &rows)?;
+        let mut dv = vec![0i32; sc.d_dev.len()];
+        dv[..k].copy_from_slice(drafts);
+        self.dev.htod_copy_into(dv, &mut sc.d_dev)?;
+        let qsa = self.qsa_live(p + k);
+        let (qg, _) = self.qsa_grid_bucket_key(p + k);
+        sc.qsa_grid_nblk = qg;
+        self.verify_block(l, sc, slot, m, k, qsa)?;
+        self.dev.synchronize()?;
+        Ok(self.dev.dtoh_sync_copy(&sc.accept_out)?)
+    }
+
+    /// ONE packed round for two requests: staging for both, ONE R_pad verify with
+    /// per-segment taps + accept + commit. Returns (accept_out, acc_seg).
+    fn packstate_verify_packed(&self, l: &Launcher, sc: &mut Scratch,
+                               rows: &[(usize, i32, usize)], d0: &[i32], d1: &[i32],
+                               k: usize, pmax: usize) -> Result<(Vec<i32>, Vec<i32>)> {
+        let m = k + 1;
+        let r = rows.len();
+        anyhow::ensure!(r == 2 * m, "packstate: packed rows {} != 2 x {m}", r);
+        let segs: [[i32; 4]; 2] =
+            [[rows[0].0 as i32, 0, m as i32, 1], [rows[m].0 as i32, m as i32, m as i32, 1]];
+        self.pack2_stage(sc, rows)?;
+        let mut dv = vec![0i32; sc.d_dev.len()];
+        anyhow::ensure!(dv.len() >= m + k, "packstate: d_dev narrower than 2 x k");
+        dv[..k].copy_from_slice(d0);
+        dv[m..m + k].copy_from_slice(d1);
+        self.dev.htod_copy_into(dv, &mut sc.d_dev)?;
+        let mut seg_flat: Vec<i32> = segs.iter().flat_map(|s| s.iter().cloned()).collect();
+        seg_flat.resize(PACK_SEG_MAX * 4, 0);
+        self.dev.htod_copy_into(seg_flat, &mut sc.seg)?;
+        let qsa = self.qsa_live(pmax + k);
+        let (qg, qb) = self.qsa_grid_bucket_key(pmax + k);
+        sc.qsa_grid_nblk = qg;
+        // PACK3 STEP B (--pack3-graphs): replay the packed verify through the
+        // R_pad graph family (lazy capture on first use; the graphable body is
+        // verify_kernels(seg)+accept_seg+commit_seg, the slot/row0/len-baked
+        // PLE shadow + taps run as the eager tail). Default flag off = the
+        // PACK2 eager block, byte for byte.
+        if crate::opts::on(crate::opt!("pack3-graphs")) {
+            let pkey = pkeyv_of(r, qsa, qb) | sk(sc);
+            if !self.graphs.lock().unwrap().contains_key(&pkey) {
+                self.dev.synchronize()?;
+                self.capture_verify_graph_packed(l, sc, r, 2, qsa, pkey);
+            }
+            if self.graphs.lock().unwrap().contains_key(&pkey) {
+                self.pack_eager_tail_pre(l, sc, &segs)?;
+                self.graphs.lock().unwrap().get(&pkey).unwrap().launch();
+                self.pack_eager_tail_post(l, sc, &segs)?;
+                self.dev.synchronize()?;
+                return Ok((self.dev.dtoh_sync_copy(&sc.accept_out)?, self.dev.dtoh_sync_copy(&sc.acc_seg)?));
+            }
+            // rel/cutb (v0.7.3): per-round anomaly marker moved to logq — a direct println! on the
+            // scheduler thread blocks on a full stdout pipe (GATES1/FIXC direct-print rule).
+            crate::rprintln!("EXL3_GRAPH: packed graph missing at rpad={r} — eager fallback this round");
+        }
+        self.verify_block_packed_full(l, sc, &segs, r, 2, qsa)?;
+        self.dev.synchronize()?;
+        Ok((self.dev.dtoh_sync_copy(&sc.accept_out)?, self.dev.dtoh_sync_copy(&sc.acc_seg)?))
+    }
+
+    /// The served host ring restore (mtp_verify's rule) for one request.
+    fn packstate_hist_restore(&self, slot: usize, hist_pre: (i32, i32), toks_v: &[i32],
+                              a: usize, b: i32) {
+        let mut hist = self.ple_hist.lock().unwrap();
+        if a == 0 {
+            hist[slot * 2] = hist_pre.1;
+            hist[slot * 2 + 1] = b;
+        } else {
+            hist[slot * 2] = toks_v[a - 1];
+            hist[slot * 2 + 1] = toks_v[a];
+        }
+    }
+
+    /// Save the shadow: d2d copies of every persistent region (GDN/conv slot
+    /// rows, PLE row, trunk KV + QSA prefix [0, cap), head KV + QSA prefix) plus
+    /// the host ple_hist. Restoring replays the copies back (bitwise).
+    fn packstate_save(&self, l: &Launcher, sc: &Scratch, slots: &[usize], cap: usize) -> Result<PackShadow> {
+        let cfg = &self.tc;
+        let he = cfg.hc_count.max(1) * cfg.hidden_size;
+        let sc_taps = &sc.taps_keep;
+        let s_e = (cfg.lin_num_v_heads * cfg.lin_k_dim * cfg.lin_v_dim) as i64;
+        let c_e = ((cfg.key_dim() * 2 + cfg.value_dim()) * cfg.conv_kernel) as i64;
+        let nkv = cfg.num_kv_heads;
+        let rb = kv_rowbytes(self.kv_fmt, cfg.head_dim) as i64;
+        let hdx = cfg.indexer_head_dim as i64;
+        let ratio = cfg.indexer_compress_ratio.max(1) as i64;
+        let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
+        let cap = cap.min(self.max_pos) as i64;
+        let mut specs: Vec<(u64, i64, i64)> = Vec::new(); // (dst, n u16, src_off)
+        for &slot in slots {
+            let sl = slot as i64;
+            for ss in &self.s_state {
+                specs.push(((*ss.device_ptr()) as u64, s_e * 2, sl * s_e * 2));
+            }
+            for cs in &self.conv_state {
+                specs.push(((*cs.device_ptr()) as u64, c_e * 2, sl * c_e * 2));
+            }
+            specs.push(((*self.ple_state.device_ptr()) as u64, 10240 * 9, sl * (10240 * 9)));
+            specs.push(((*sc_taps.device_ptr()) as u64, (MTP_MAX_K as i64 + 1) * (he as i64) * 2,
+                        sl * ((MTP_MAX_K as i64 + 1) * (he as i64) * 2)));
+            let kv_n = cap * rb / 2;
+            let kv_base = (sl * 2 * (nkv as i64) * (self.max_pos as i64)) * rb / 2;
+            for kc in self.k_cache.iter() {
+                specs.push(((*kc.device_ptr()) as u64, kv_n, kv_base));
+            }
+            if hdx > 0 {
+                let kn = cap * hdx;
+                let kb = sl * (self.max_pos as i64) * hdx;
+                for k in self.qsa_keys.iter() {
+                    specs.push(((*k.device_ptr()) as u64, kn, kb));
+                }
+                let pn = (cap / ratio) * hdx;
+                let pb = sl * ((self.max_pos as i64) / ratio) * hdx;
+                for k in self.qsa_pool.iter() {
+                    specs.push(((*k.device_ptr()) as u64, pn, pb));
+                }
+            }
+        }
+        if let Some(h) = self.mtp.as_ref() {
+            for &slot in slots {
+                let sl = slot as i64;
+                let kv_n = cap * rb / 2;
+                let kv_base = (sl * 2 * (nkv as i64) * (self.max_pos as i64)) * rb / 2;
+                specs.push(((*h.kv.device_ptr()) as u64, kv_n, kv_base));
+                if hdx > 0 {
+                    let kn = cap * hdx;
+                    let kb = sl * (self.max_pos as i64) * hdx;
+                    if let Some(k) = h.qsa_keys.as_ref() {
+                        specs.push(((*k.device_ptr()) as u64, kn, kb));
+                    }
+                    let pn = (cap / ratio) * hdx;
+                    let pb = sl * ((self.max_pos as i64) / ratio) * hdx;
+                    if let Some(k) = h.qsa_pool.as_ref() {
+                        specs.push(((*k.device_ptr()) as u64, pn, pb));
+                    }
+                }
+            }
+        }
+        let mut parts = Vec::with_capacity(specs.len());
+        for (dst, n, soff) in specs {
+            let mut tmp = self.dev.alloc_zeros::<u16>(n as usize)?;
+            xqlaunch!(l, "xq_copy_u16", grid(n), (256, 1, 1), 0,
+                      (&mut tmp, dst, n, 0i64, soff))?;
+            parts.push((dst, soff, tmp));
+        }
+        let hist = self.ple_hist.lock().unwrap().clone();
+        Ok(PackShadow { parts, hist })
+    }
+
+    /// Restore the shadow: the same copies replayed back (u16 words are byte-exact).
+    fn packstate_restore(&self, l: &Launcher, sh: &PackShadow) -> Result<()> {
+        let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
+        for (dst, doff, tmp) in sh.parts.iter() {
+            let n = tmp.len() as i64;
+            xqlaunch!(l, "xq_copy_u16", grid(n), (256, 1, 1), 0,
+                      (*dst, tmp, n, *doff, 0i64))?;
+        }
+        self.ple_hist.lock().unwrap().copy_from_slice(&sh.hist);
+        Ok(())
+    }
+
+    /// PACK2 diagnostic: the region layout of packstate_snap's output (name,
+    /// start word) for a given rows count — mirrors its push order exactly.
+    fn packstate_regions(&self, rows: usize) -> Vec<(String, usize)> {
+        let cfg = &self.tc;
+        let s_e = (cfg.lin_num_v_heads * cfg.lin_k_dim * cfg.lin_v_dim) as usize;
+        let c_e = (cfg.key_dim() * 2 + cfg.value_dim()) * cfg.conv_kernel;
+        let p_e = 10240 * 9;
+        let rb = kv_rowbytes(self.kv_fmt, cfg.head_dim);
+        let hdx = cfg.indexer_head_dim as usize;
+        let ratio = cfg.indexer_compress_ratio.max(1);
+        let rows = rows.min(self.max_pos);
+        let kv_w = rows * rb / 2;
+        let he = cfg.hc_count.max(1) * cfg.hidden_size;
+        let mut out: Vec<(String, usize)> = Vec::new();
+        let mut at = 1usize;
+        let mut push = |out: &mut Vec<(String, usize)>, at: &mut usize, name: String, n: usize| {
+            out.push((name, *at)); *at += n;
+        };
+        for slot in 0usize..2 {
+            for li in 0..self.s_state.len() { push(&mut out, &mut at, format!("s{slot}.{li}"), s_e); }
+            for li in 0..self.s_state.len() { push(&mut out, &mut at, format!("c{slot}.{li}"), c_e); }
+            push(&mut out, &mut at, format!("ple{slot}"), p_e);
+            push(&mut out, &mut at, format!("taps{slot}"), (MTP_MAX_K + 1) * he);
+            for att in 0..self.k_cache.len() { push(&mut out, &mut at, format!("kv{slot}.{att}"), kv_w); }
+            if hdx > 0 {
+                for att in 0..self.k_cache.len() {
+                    if att < self.qsa_keys.len() { push(&mut out, &mut at, format!("qk{slot}.{att}"), rows * hdx); }
+                    if att < self.qsa_pool.len() { push(&mut out, &mut at, format!("qp{slot}.{att}"), (rows / ratio) * hdx); }
+                }
+            }
+        }
+        if self.mtp.is_some() {
+            for slot in 0usize..2 {
+                push(&mut out, &mut at, format!("hkv{slot}"), kv_w);
+                if hdx > 0 {
+                    push(&mut out, &mut at, format!("hqk{slot}"), rows * hdx);
+                    push(&mut out, &mut at, format!("hqp{slot}"), (rows / ratio) * hdx);
+                }
+            }
+        }
+        push(&mut out, &mut at, "hist".to_string(), self.width * 2);
+        out
+    }
+
+    /// PACK2 diagnostic: hash the commit INPUT rows (GDN ring, conv raw saves,
+    /// PLE normed rows) after a verify so packed-vs-lone staging can be compared
+    /// row by row. `packed` selects the buffer layout (16-row planes + absolute
+    /// rows vs the served 8-row planes).
+    fn packstate_dump_inputs(&self, l: &Launcher, sc: &Scratch, tag: &str, packed: bool,
+                             layers: &[usize], nrows: usize) -> Result<()> {
+        let cfg = &self.tc;
+        let nh = cfg.lin_num_v_heads;
+        let conv_dim = cfg.key_dim() * 2 + cfg.value_dim();
+        let rs = GDN_RS; // 260
+        let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
+        let mut tmp = self.dev.alloc_zeros::<u16>(nh * rs * 2.max(nrows))?;
+        // r13 word-level diff: stash LONE B's layer-0 raw rows 0..4 on host, then in the
+        // PACKED arm diff PACK plane rows 5..9 against the stash (same-time reads).
+        if tag == "LONE" && Self::r13_stash_borrow().is_none() {
+            let cd = (self.tc.key_dim() * 2 + self.tc.value_dim()) as usize;
+            let n2 = (cd * 2) as i64;
+            let mut t = self.dev.alloc_zeros::<u16>(cd * 2)?;
+            let mut stash: Vec<Vec<u16>> = Vec::new();
+            for r in 0..nrows.min(5) {
+                let off = ((*sc.qkv_save.device_ptr()) as u64 + ((r * cd * 2) as u64));
+                xqlaunch!(l, "xq_copy_u16", grid(n2), (256, 1, 1), 0, (&mut t, off, n2, 0i64, 0i64))?;
+                stash.push(self.dev.dtoh_sync_copy(&t)?);
+            }
+            *Self::r13_stash_borrow() = Some(stash);
+            println!("QKVDIFF: stashed {} LONE B raw rows (layer 0)", nrows.min(5));
+        }
+        if tag == "PACK" {
+            if let Some(stash) = Self::r13_stash_borrow().clone() {
+                let cd = (self.tc.key_dim() * 2 + self.tc.value_dim()) as usize;
+                let n2 = (cd * 2) as i64;
+                let mut t = self.dev.alloc_zeros::<u16>(cd * 2)?;
+                for (rp, rl, label) in [(7usize, 2usize, "B-r2"), (8usize, 3usize, "B-r3"), (9usize, 4usize, "B-r4"), (5usize, 0usize, "B-r0"), (6usize, 1usize, "B-r1")] {
+                    if rl >= stash.len() { continue; }
+                    let off = ((*sc.qkv_save.device_ptr()) as u64 + ((rp * cd * 2) as u64));
+                    xqlaunch!(l, "xq_copy_u16", grid(n2), (256, 1, 1), 0, (&mut t, off, n2, 0i64, 0i64))?;
+                    let vp = self.dev.dtoh_sync_copy(&t)?;
+                    let vl = &stash[rl];
+                    let diffs: Vec<usize> = (0..cd * 2).filter(|&i| vp[i] != vl[i]).collect();
+                    let mut buckets = [0usize; 10];
+                    for &i in diffs.iter() { buckets[(i / 1024).min(9)] += 1; }
+                    println!("QKVDIFF2 PACK r{rp} vs LONE r{rl} ({label}): {} differ; buckets {:?}; first {:?} (p,l) {:?}",
+                             diffs.len(), buckets, &diffs[..diffs.len().min(6)],
+                             diffs.iter().take(6).map(|&i| (vp[i], vl[i])).collect::<Vec<_>>());
+                }
+                *Self::r13_stash_borrow() = None;
+            }
+        }
+        // resid rows at verify input (he f32 each) — rows 0..nrows (packed: absolute)
+        {
+            let he = (self.cfg.hc_count.max(1) * self.cfg.hidden_size) as i64;
+            let mut rtmp = self.dev.alloc_zeros::<f32>(he as usize)?;
+            for r in 0..nrows {
+                let off = ((*sc.resid.device_ptr()) as u64 + ((r as u64) * (he as u64) * 4));
+                xqlaunch!(l, "xq_copy_f32", grid(he), (256, 1, 1), 0, (&mut rtmp, off, he, 0i64, 0i64))?;
+                let hb = self.dev.dtoh_sync_copy(&rtmp)?;
+                let mut bytes = Vec::with_capacity((he * 4) as usize);
+                for &x in hb.iter() { bytes.extend_from_slice(&x.to_bits().to_le_bytes()); }
+                let h = fnv64_u16(bytemuck::cast_slice::<u8, u16>(&bytes));
+                println!("INP {tag} resid r{r} {h:016x}");
+            }
+        }
+        for &li in layers {
+            for r in 0..nrows {
+                let (off, n) = if packed {
+                    ((*sc.gdn_ring_p.device_ptr()) as u64
+                        + ((li * 16 + r) * nh * rs * 4) as u64, (nh * rs * 2) as i64)
+                } else {
+                    ((*sc.gdn_ring.device_ptr()) as u64
+                        + ((li * (MTP_MAX_K + 1) + r) * nh * rs * 4) as u64, (nh * rs * 2) as i64)
+                };
+                xqlaunch!(l, "xq_copy_u16", grid(n), (256, 1, 1), 0, (&mut tmp, off, n, 0i64, 0i64))?;
+                let h = fnv64_u16(&self.dev.dtoh_sync_copy(&tmp)?[..n as usize]);
+                print!("INP {tag} ring l{li} r{r} {:016x}\n", h);
+            }
+            for r in 0..nrows {
+                let off = ((*sc.qkv_save.device_ptr()) as u64
+                    + ((li * SAVE_PLANE_ROWS + r) * conv_dim * 2) as u64);
+                let n = (conv_dim * 2) as i64;
+                xqlaunch!(l, "xq_copy_u16", grid(n), (256, 1, 1), 0, (&mut tmp, off, n, 0i64, 0i64))?;
+                let h = fnv64_u16(&self.dev.dtoh_sync_copy(&tmp)?[..n as usize]);
+                print!("INP {tag} qkv l{li} r{r} {:016x}\n", h);
+            }
+            for r in 0..nrows {
+                let off = ((*sc.ple_normed.device_ptr()) as u64 + ((r * 10240) * 2) as u64);
+                let n = (10240 * 2) as i64;
+                xqlaunch!(l, "xq_copy_u16", grid(n), (256, 1, 1), 0, (&mut tmp, off, n, 0i64, 0i64))?;
+                let h = fnv64_u16(&self.dev.dtoh_sync_copy(&tmp)?[..n as usize]);
+                print!("INP {tag} ple l{li} r{r} {:016x}\n", h);
+            }
+        }
+        let _ = grid;
+        Ok(())
+    }
+
+    /// PACK2 r13 word-diff stash (probe-only): the LONE B raw rows on host.
+    fn r13_stash_borrow() -> std::sync::MutexGuard<'static, Option<Vec<Vec<u16>>>> {
+        static STASH: std::sync::Mutex<Option<Vec<Vec<u16>>>> = std::sync::Mutex::new(None);
+        STASH.lock().unwrap()
+    }
+
+    /// PACK2 diagnostic: hash the COMMITTED state rows per layer for one slot
+    /// (s_state + conv_state) - ground truth without the region map.
+    fn packstate_dump_state(&self, l: &Launcher, slot: usize, tag: &str) -> Result<()> {
+        let cfg = &self.tc;
+        let s_e = (cfg.lin_num_v_heads * cfg.lin_k_dim * cfg.lin_v_dim) as i64;
+        let c_e = ((cfg.key_dim() * 2 + cfg.value_dim()) * cfg.conv_kernel) as i64;
+        let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
+        let mut f_tmp = self.dev.alloc_zeros::<u16>((s_e * 2) as usize)?;
+        let mut c_tmp = self.dev.alloc_zeros::<u16>((c_e * 2) as usize)?;
+        for li in 0..self.s_state.len() {
+            let off = (*self.s_state[li].device_ptr()) as u64 + ((slot as u64) * (s_e as u64) * 4);
+            xqlaunch!(l, "xq_copy_u16", grid(s_e * 2), (256, 1, 1), 0, (&mut f_tmp, off, s_e * 2, 0i64, 0i64))?;
+            let h = fnv64_u16(&self.dev.dtoh_sync_copy(&f_tmp)?[..]);
+            println!("ST {tag} s{slot}.l{li} {h:016x}");
+        }
+        for li in 0..self.conv_state.len() {
+            let off = (*self.conv_state[li].device_ptr()) as u64 + ((slot as u64) * (c_e as u64) * 4);
+            xqlaunch!(l, "xq_copy_u16", grid(c_e * 2), (256, 1, 1), 0, (&mut c_tmp, off, c_e * 2, 0i64, 0i64))?;
+            let h = fnv64_u16(&self.dev.dtoh_sync_copy(&c_tmp)?[..]);
+            println!("ST {tag} c{slot}.l{li} {h:016x}");
+        }
+        Ok(())
+    }
+
+    /// PACK2 diagnostic: the round-0 staging as the verify saw it — toks, pos,
+    /// and the ple_emb row hashes (the host ring pairs are row inputs).
+    fn packstate_dump_stage(&self, l: &Launcher, sc: &Scratch, tag: &str, nrows: usize) -> Result<()> {
+        let toks = self.dev.dtoh_sync_copy(&sc.toks)?;
+        let pos = self.dev.dtoh_sync_copy(&sc.pos)?;
+        let emb = self.dev.dtoh_sync_copy(&sc.ple_emb)?;
+        println!("STAGE {tag} toks {:?} pos {:?}", &toks[..nrows], &pos[..nrows]);
+        let grid = (1u32, 1, 1);
+        let mut tmp = self.dev.alloc_zeros::<u16>(10240)?;
+        for r in 0..nrows {
+            xqlaunch!(l, "xq_copy_u16", grid, (256, 1, 1), 0,
+                      (&mut tmp, ((*sc.ple_emb.device_ptr()) as u64) + ((r * 10240) * 2) as u64,
+                       (10240 * 2) as i64, 0i64, 0i64))?;
+            let h = fnv64_u16(&self.dev.dtoh_sync_copy(&tmp)?);
+            println!("STAGE {tag} emb r{r} {h:016x}");
+        }
+        Ok(())
+    }
+
+    /// PACK2 LEG 2: the packed-ROUND probe (--probe-exl3-packstate).
+    /// Real MTP draft chains (the served draft_block per request), ONE packed
+    /// verify per round (per-segment accept + device-keyed commit + per-request
+    /// re-prime), proven bit-identical to the same rounds run serially (lone
+    /// verify per request through the SERVED verify_block): emitted tokens,
+    /// accepted counts, and a full state snapshot after N rounds.
+    pub fn probe_packstate(&self) -> Result<()> {
+        let cfg = &self.tc;
+        // the seg commit is the RING commit (the served GDN commit on this geometry)
+        anyhow::ensure!(gdn_commit_mode(cfg.lin_k_dim, cfg.lin_v_dim) == 1,
+                        "packstate: needs the ring commit mode (gdn_commit_mode == 1)");
+        let head = match self.mtp.as_ref() {
+            Some(h) => h,
+            None => anyhow::bail!("pack has no mtp.* draft head — packstate probe unavailable"),
+        };
+        let l = Launcher { dev: &self.dev, stream: &self.stream };
+        let k = 4usize;
+        let m = k + 1;
+        let rounds = 20usize;
+        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim)?;
+        anyhow::ensure!(sc.d_dev.len() >= m + k, "packstate: d_dev narrower than 2 x k");
+        println!("PACKSTATE: packed ROUND probe (2 requests, k={k}, {rounds} rounds x 3 pairs; \
+                  serial = lone verify per request through the served verify_block; \
+                  packed = one R_pad verify, per-segment accept/commit/re-prime)");
+        let pairs = [(97usize, 89usize), (513usize, 523usize), (2201usize, 2201usize)];
+        let mut unequal_rounds = 0usize;
+        for (pi, &(la, lb)) in pairs.iter().enumerate() {
+            let synth = |n: usize, salt: usize| -> Vec<u32> {
+                (0..n).map(|i| ((i * 7919 + salt * 104729 + 12345) % (cfg.vocab_size - 2000) + 1000) as u32).collect()
+            };
+            let pa = synth(la, 1);
+            let pb = synth(lb, 2);
+            // ---- prime (chunked prefill + one forward_step; the PACK1 probe pattern) ----
+            // After forward_step, sc.resid row 0 IS the stream after n-1 (the true
+            // tap that predicted b) -> tap_snapshot per slot starts round 1 at row 0.
+            let prime = |slot: usize, pr: &[u32], sc: &mut Scratch,
+                         psc: &mut Option<PrefillScratch>| -> Result<(i32, usize)> {
+                let n = pr.len();
+                let mut pos = 0usize;
+                while pos + 1 < n {
+                    let end = (pos + 1024).min(n - 1);
+                    let toks: Vec<i32> = pr[pos..end].iter().map(|&t| t as i32).collect();
+                    if psc.is_none() { *psc = Some(self.prefill_scratch(1024)?); }
+                    self.prefill_chunk(psc.as_mut().unwrap(), &toks, pos, slot, false, None)?;
+                    pos = end;
+                }
+                self.forward_step(sc, &[pr[n - 1] as i32], &[n - 1], &[slot], None)?;
+                let b = self.dev.dtoh_sync_copy(&sc.argmax)?[0];
+                self.tap_snapshot(sc, slot)?;
+                Ok((b, n))
+            };
+            // ---- SERIAL arm: each request runs the SERVED lone round per round ----
+            self.reset_slot(0)?;
+            self.reset_slot(1)?;
+            let mut psc: Option<PrefillScratch> = None;
+            let (b0, p0) = prime(0, &pa, &mut sc, &mut psc)?;
+            let (b1, p1) = prime(1, &pb, &mut sc, &mut psc)?;
+            let cap = p0.max(p1) + rounds * (k + 1) + 8; // every row any round can write
+            let snap0 = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+            let shadow = self.packstate_save(&l, &sc, &[0, 1], cap)?;
+            let mut st = [(b0, p0, 0usize), (b1, p1, 0usize)];
+            let mut tok_s = [Vec::<i32>::new(), Vec::<i32>::new()];
+            let mut acc_s = [Vec::<usize>::new(), Vec::<usize>::new()];
+            let mut ms_s = Vec::new();
+            let mut snaps_s: Vec<Vec<u64>> = Vec::new();
+            for r in 0..rounds {
+                let mut vms = 0f64;
+                for j in 0..2usize {
+                    let (b, p, tr) = st[j];
+                    self.packstate_tap_restore(&l, &mut sc, j, tr)?;
+                    let drafts = self.packstate_draft(&l, &mut sc, head, j, k, b, p)?;
+                    if r >= 12 { println!("DRAFTS LONE r{r} j{j}: {drafts:?}"); }
+                    let hist_pre = { let h = self.ple_hist.lock().unwrap(); (h[j * 2], h[j * 2 + 1]) };
+                    let toks_v: Vec<i32> = std::iter::once(b).chain(drafts.iter().cloned()).collect();
+                    let t0 = std::time::Instant::now();
+                    let out = self.packstate_verify_lone(&l, &mut sc, j, k, b, p, &drafts)?;
+                    if r == 0 {
+                        let ring_h = self.dev.dtoh_sync_copy(&sc.gdn_ring)?;
+                        let nh = self.tc.lin_num_v_heads as usize;
+                        let base = 2 * (MTP_MAX_K + 1) * nh * GDN_RS;
+                        let seg = 5 * nh * GDN_RS;
+                        let mut h: u64 = 0xcbf29ce484222325;
+                        for &f in &ring_h[base..base + seg] { h = (h ^ (f.to_bits() as u64)).wrapping_mul(0x100000001b3); }
+                        eprintln!("RINGHASH L2 serial j{j}: {h:016x}");
+                    }
+                    vms += t0.elapsed().as_secs_f64() * 1e3;
+                    let a = out[k + 2] as usize;
+                    anyhow::ensure!(a <= k, "packstate: serial accept out of range");
+                    self.packstate_hist_restore(j, hist_pre, &toks_v, a, b);
+                    self.head_reprime(&mut sc, head, j, p, &drafts[..a])?;
+                    tok_s[j].extend(out[..=a].to_vec());
+                    acc_s[j].push(a);
+                    st[j] = (out[a], p + a + 1, a);
+                }
+
+                ms_s.push(vms);
+                if r <= 5 { snaps_s.push(self.packstate_snap(&l, &sc, &[0, 1], st[0].1.max(st[1].1) + 8)?); }
+                if r == 0 || r + 1 == rounds {
+                    println!("PACKSTATE SERIAL pair {pi} round {r}: a=({},{}) pos=({},{})",
+                             acc_s[0][r], acc_s[1][r], st[0].1, st[1].1);
+                }
+            }
+            let pmax_s = st[0].1.max(st[1].1);
+            let snap_s = self.packstate_snap(&l, &sc, &[0, 1], pmax_s + 8)?;
+            // ---- restore the saved snapshot (bitwise) and run the PACKED arm ----
+            self.packstate_restore(&l, &shadow)?;
+            let snap0r = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+            let rdiff = snap0.iter().zip(snap0r.iter()).filter(|(x, y)| x != y).count();
+            println!("PACKSTATE PAIR {pi}: save/restore diff = {rdiff} words (must be 0)");
+            anyhow::ensure!(rdiff == 0, "PACKSTATE pair {pi}: device save/restore not bitwise ({rdiff} words)");
+            let mut st = [(b0, p0, 0usize), (b1, p1, 0usize)];
+            let mut tok_p = [Vec::<i32>::new(), Vec::<i32>::new()];
+            let mut acc_p = [Vec::<usize>::new(), Vec::<usize>::new()];
+            let mut ms_p = Vec::new();
+            let mut uneq_pair = 0usize;
+            let mut uneq_fb = 0usize; // unequal accepts in FALLBACK rounds (not packed evidence)
+            for r in 0..rounds {
+                eprintln!("PR2 r{r} begin pos {}/{}", st[0].1, st[1].1);
+                // One regime AND grid bucket per packed verify (design §3.5/R7: lanes
+                // disagreeing on the QSA regime fall back to serial for that round).
+                let qa = self.qsa_live(st[0].1 + k);
+                let qb = self.qsa_live(st[1].1 + k);
+                let (ga, ba) = self.qsa_grid_bucket_key(st[0].1 + k);
+                let (gb, bb) = self.qsa_grid_bucket_key(st[1].1 + k);
+                if qa != qb || ga != gb || ba != bb {
+                    println!("[exl3-serve] lane-pack skip: mixed regime (pair {pi} round {r}, pos {}/{}, bucket {ga}/{gb}) — serial fallback",
+                             st[0].1, st[1].1);
+                    let mut vms = 0f64;
+                    let mut a2 = [0usize; 2];
+                    for j in 0..2usize {
+                        let (b, p, tr) = st[j];
+                        self.packstate_tap_restore(&l, &mut sc, j, tr)?;
+                        let drafts = self.packstate_draft(&l, &mut sc, head, j, k, b, p)?;
+                        let hist_pre = { let h = self.ple_hist.lock().unwrap(); (h[j * 2], h[j * 2 + 1]) };
+                        let toks_v: Vec<i32> = std::iter::once(b).chain(drafts.iter().cloned()).collect();
+                        let t1 = std::time::Instant::now();
+                        let out = self.packstate_verify_lone(&l, &mut sc, j, k, b, p, &drafts)?;
+                        vms += t1.elapsed().as_secs_f64() * 1e3;
+                        let a = out[k + 2] as usize;
+                        anyhow::ensure!(a <= k, "packstate: fallback accept out of range");
+                        self.packstate_hist_restore(j, hist_pre, &toks_v, a, b);
+                        self.head_reprime(&mut sc, head, j, p, &drafts[..a])?;
+                        tok_p[j].extend(out[..=a].to_vec());
+                        acc_p[j].push(a);
+                        a2[j] = a;
+                        st[j] = (out[a], p + a + 1, a);
+                    }
+                    if r < 6 && r < snaps_s.len() {
+                        let sp = self.packstate_snap(&l, &sc, &[0, 1], st[0].1.max(st[1].1) + 8)?;
+                        let d = sp.iter().zip(snaps_s[r].iter()).filter(|(x, y)| x != y).count();
+                        anyhow::ensure!(d == 0 && sp.len() == snaps_s[r].len(),
+                            "PACKSTATE pair {pi} round {r}: fallback round state diverged ({d} words)");
+                    }
+                    if a2[0] != a2[1] { uneq_fb += 1; }
+                    ms_p.push(vms);
+                    if r == 0 || r + 1 == rounds {
+                        println!("PACKSTATE PACKED pair {pi} round {r}: a=({},{}) pos=({},{}) [serial-fb]",
+                                 a2[0], a2[1], st[0].1, st[1].1);
+                    }
+                    continue;
+                }
+                // (i) draft per request — TODAY's single-request chain, sequential
+                let mut dss = [Vec::<i32>::new(), Vec::<i32>::new()];
+                for j in 0..2usize {
+                    let (b, p, tr) = st[j];
+                    self.packstate_tap_restore(&l, &mut sc, j, tr)?;
+                    dss[j] = self.packstate_draft(&l, &mut sc, head, j, k, b, p)?;
+                    if r >= 12 { println!("DRAFTS PACK r{r} j{j}: {:?}", dss[j]); }
+                }
+                eprintln!("PR2 r{r} drafts ok");
+                // (ii) ONE packed verify over both chains
+                let mut rows: Vec<(usize, i32, usize)> =
+                    (0..m).map(|i| (0usize, if i == 0 { st[0].0 } else { dss[0][i - 1] }, st[0].1 + i)).collect();
+                rows.extend((0..m).map(|i| (1usize, if i == 0 { st[1].0 } else { dss[1][i - 1] }, st[1].1 + i)));
+                let hp0 = { let h = self.ple_hist.lock().unwrap(); (h[0], h[1]) };
+                let hp1 = { let h = self.ple_hist.lock().unwrap(); (h[2], h[3]) };
+                let t0 = std::time::Instant::now();
+                let (out, accf) = self.packstate_verify_packed(&l, &mut sc, &rows, &dss[0], &dss[1],
+                                                               k, st[0].1.max(st[1].1))?;
+                eprintln!("PR2 r{r} verify ok {}ms", t0.elapsed().as_millis());
+                if r == 0 {
+                    let ring_h = self.dev.dtoh_sync_copy(&sc.gdn_ring_p)?;
+                    let nh = self.tc.lin_num_v_heads as usize;
+                    let base = 2 * 16 * nh * GDN_RS;
+                    let seg = 5 * nh * GDN_RS;
+                    for half in 0..2usize {
+                        let mut h: u64 = 0xcbf29ce484222325;
+                        for &f in &ring_h[base + half * seg..base + (half + 1) * seg] { h = (h ^ (f.to_bits() as u64)).wrapping_mul(0x100000001b3); }
+                        eprintln!("RINGHASH L2 packed half{half}: {h:016x}");
+                    }
+                }
+                let vms = t0.elapsed().as_secs_f64() * 1e3;
+                // r0 dumps stripped: the PACK dump_inputs wedge (probe-only) blocked G2;
+                // its evidence (QKVDIFF2 row aliasing) is already banked in run22.
+                // (iii)-(v) per-segment accept -> per-segment commit (ran inside the
+                // block, device-keyed) -> re-prime per request with ITS rows' hiddens
+                let mut a2 = [0usize; 2];
+                for j in 0..2usize {
+                    let a = accf[j * 2 + 1] as usize;
+                    eprintln!("PR3 r{r} j{j} a={a} begin");
+                    anyhow::ensure!(a <= k, "packstate: packed accept out of range (seg {j})");
+                    let row0 = j * m;
+                    let toks_v: Vec<i32> =
+                        std::iter::once(st[j].0).chain(dss[j].iter().cloned()).collect();
+                    eprintln!("PR3 r{r} j{j} hist_restore begin");
+                    self.packstate_hist_restore(j, if j == 0 { hp0 } else { hp1 }, &toks_v, a, st[j].0);
+                    eprintln!("PR3 r{r} j{j} hist ok");
+                    eprintln!("PR3 r{r} j{j} head_reprime begin n={}", &dss[j][..a].len());
+                    self.head_reprime(&mut sc, head, j, st[j].1, &dss[j][..a])?;
+                    eprintln!("PR3 r{r} j{j} reprime ok");
+                    let emitted = out[row0..=row0 + a].to_vec();
+                    tok_p[j].extend(emitted.iter().cloned());
+                    acc_p[j].push(a);
+                    a2[j] = a;
+                    st[j] = (emitted[a], st[j].1 + a + 1, a);
+                }
+                eprintln!("PR2 r{r} reprime ok");
+                if r <= 5 {
+                    let sp = self.packstate_snap(&l, &sc, &[0, 1], st[0].1.max(st[1].1) + 8)?;
+                    let n = sp.iter().zip(snaps_s[r].iter()).filter(|(x, y)| x != y).count();
+                    let lmis = sp.len() != snaps_s[r].len();
+                    let didx: Vec<usize> = sp.iter().zip(snaps_s[r].iter()).enumerate()
+                        .filter(|(_, (x, y))| x != y).map(|(i, _)| i).take(12).collect();
+                    eprintln!("PR4 r{r} snapdiff {n} lenmatch {} first {didx:?}", !lmis);
+                    if r == 0 {
+                        for &i in didx.iter().take(4) {
+                            let a = sp.get(i).copied().unwrap_or(0xDEAD);
+                            let b = snaps_s[r].get(i).copied().unwrap_or(0xDEAD);
+                            let (af, bf) = (f32::from_bits(a as u32), f32::from_bits(b as u32));
+                            eprintln!("PR4V idx {i}: packed {a:#018x} ({af:.6e}) serial {b:#018x} ({bf:.6e})");
+                        }
+                    }
+                }
+
+                if a2[0] != a2[1] { unequal_rounds += 1; uneq_pair += 1; }
+                ms_p.push(vms);
+                if r == 0 || r + 1 == rounds || a2[0] != a2[1] {
+                    println!("PACKSTATE PACKED pair {pi} round {r}: a=({},{}){} pos=({},{})",
+                             a2[0], a2[1], if a2[0] != a2[1] { " UNEQUAL" } else { "" }, st[0].1, st[1].1);
+                }
+            }
+            let pmax_p = st[0].1.max(st[1].1);
+            let snap_p = self.packstate_snap(&l, &sc, &[0, 1], pmax_p + 8)?;
+            // ---- compare ----
+            let tok_ok = tok_p.to_vec() == tok_s;
+            let acc_ok = acc_p.to_vec() == acc_s;
+            let snap_diff = if snap_s.len() == snap_p.len() {
+                let n = snap_s.iter().zip(snap_p.iter()).filter(|(x, y)| x != y).count();
+                if n > 0 {
+                    let didx: Vec<usize> = snap_s.iter().zip(snap_p.iter()).enumerate()
+                        .filter(|(_, (x, y))| x != y).map(|(i, _)| i).take(12).collect();
+                    println!("PACKSTATE DIAG pair {pi}: snap diff {n} first_idx {didx:?}");
+                }
+                n
+            } else { usize::MAX };
+            let ms_s_mean = ms_s.iter().sum::<f64>() / ms_s.len().max(1) as f64;
+            let ms_p_mean = ms_p.iter().sum::<f64>() / ms_p.len().max(1) as f64;
+            println!("PACKSTATE PAIR {pi} verdict: tokens {tok_ok} accepts {acc_ok} snap_diff {snap_diff} \
+                      unequal_rounds {uneq_pair} (fb {uneq_fb}) | serial {ms_s_mean:.2} ms/round, packed {ms_p_mean:.2} ms/round \
+                      (verify only, eager) | accS0 {:?} accP0 {:?} accS1 {:?} accP1 {:?}",
+                     &acc_s[0][..], &acc_p[0][..], &acc_s[1][..], &acc_p[1][..]);
+            anyhow::ensure!(tok_ok, "PACKSTATE pair {pi}: emitted tokens diverged");
+            anyhow::ensure!(acc_ok, "PACKSTATE pair {pi}: accepted counts diverged");
+            anyhow::ensure!(snap_diff == 0, "PACKSTATE pair {pi}: state snapshot differs in {snap_diff} words");
+        }
+        println!("PACKSTATE SUMMARY: {rounds} rounds x {} pairs OK; unequal-accept rounds observed: {unequal_rounds} \
+                  (must be > 0 for the per-segment commit to be exercised)", pairs.len());
+        anyhow::ensure!(unequal_rounds > 0, "PACKSTATE: no unequal-accept round observed — \
+                        the per-segment commit was never exercised with a0 != a1");
+        Ok(())
+    }
+
+    /// PACK3 LEG 3 STEP A (S-B9-CF-PACK3): the GRAPHED round-pair A/B.
+    /// V5 = the served-style lone verify graph (slot 0, m=5) captured through
+    /// the SERVED capture_verify_graph machinery; P10 = the packed verify
+    /// graph (R_pad=10, k_seg=2; trunk + accept_seg + commit_seg in the
+    /// graph, PLE shadow + taps as a 4-launch eager tail). Asserts
+    /// graph-vs-eager bit identity (outputs + full post-commit state, 3 reps)
+    /// and the 6+4 SAME-graph replay, then times everything with CUDA events
+    /// around the replay and prints the per-stage table + round_pair_ratio.
+    pub fn probe_pack3(&self) -> Result<()> {
+        anyhow::ensure!(gdn_commit_mode(self.tc.lin_k_dim, self.tc.lin_v_dim) == 1,
+                        "pack3: needs the ring commit mode (gdn_commit_mode == 1)");
+        let head = match self.mtp.as_ref() {
+            Some(h) => h,
+            None => anyhow::bail!("pack has no mtp.* draft head — pack3 probe unavailable"),
+        };
+        let l = Launcher { dev: &self.dev, stream: &self.stream };
+        let k = 4usize;
+        let m = k + 1;
+        let rpad = 2 * m;
+        let m0 = 6usize; // the 6+4 split's first segment length
+        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim)?;
+        anyhow::ensure!(sc.d_dev.len() >= 2 * (k + 1), "pack3: d_dev narrower than 2 x (k+1)");
+        println!("PACK3A: graphed round-pair A/B (k={k}, m={m}, R_pad={rpad}; graph = seg trunk + accept_seg + commit_seg; \
+                  eager tail = PLE shadow + per-segment taps)");
+        // ---- prime two slots (the PACKSTATE probe pattern) ----
+        let synth = |n: usize, salt: usize| -> Vec<u32> {
+            (0..n).map(|i| ((i * 7919 + salt * 104729 + 12345) % (self.cfg.vocab_size - 2000) + 1000) as u32).collect()
+        };
+        let pa = synth(97, 1);
+        let pb = synth(89, 2);
+        self.reset_slot(0)?;
+        self.reset_slot(1)?;
+        let mut psc: Option<PrefillScratch> = None;
+        let prime = |slot: usize, pr: &[u32], sc: &mut Scratch,
+                     psc: &mut Option<PrefillScratch>| -> Result<(i32, usize)> {
+            let n = pr.len();
+            let mut pos = 0usize;
+            while pos + 1 < n {
+                let end = (pos + 1024).min(n - 1);
+                let toks: Vec<i32> = pr[pos..end].iter().map(|&t| t as i32).collect();
+                if psc.is_none() { *psc = Some(self.prefill_scratch(1024)?); }
+                self.prefill_chunk(psc.as_mut().unwrap(), &toks, pos, slot, false, None)?;
+                pos = end;
+            }
+            self.forward_step(sc, &[pr[n - 1] as i32], &[n - 1], &[slot], None)?;
+            let b = self.dev.dtoh_sync_copy(&sc.argmax)?[0];
+            self.tap_snapshot(sc, slot)?;
+            Ok((b, n))
+        };
+        let (b0, p0) = prime(0, &pa, &mut sc, &mut psc)?;
+        let (b1, p1) = prime(1, &pb, &mut sc, &mut psc)?;
+        // real draft chains (k+1 drafts each: the 6+4 arm needs 5 and 3)
+        self.packstate_tap_restore(&l, &mut sc, 0, 0)?;
+        let d0 = self.packstate_draft(&l, &mut sc, head, 0, k + 1, b0, p0)?;
+        self.packstate_tap_restore(&l, &mut sc, 1, 0)?;
+        let d1 = self.packstate_draft(&l, &mut sc, head, 1, k + 1, b1, p1)?;
+        let pmax = p0.max(p1) + k;
+        let qsa = self.qsa_live(pmax);
+        let (qg, qb) = self.qsa_grid_bucket_key(pmax);
+        sc.qsa_grid_nblk = qg;
+        println!("PACK3A: regime qsa={qsa} qb={qb} (frozen for every arm); b=({b0},{b1}) p=({p0},{p1})");
+        // ---- staging helpers ----
+        let stage_lone = |sc: &mut Scratch, rows: &[(usize, i32, usize)], dv: &[i32]| -> Result<()> {
+            self.pack2_stage(sc, rows)?;
+            let mut d = vec![0i32; sc.d_dev.len()];
+            let n = dv.len().min(d.len());
+            d[..n].copy_from_slice(&dv[..n]);
+            self.dev.htod_copy_into(d, &mut sc.d_dev)?;
+            Ok(())
+        };
+        let stage_packed = |sc: &mut Scratch, segs: &[[i32; 4]], rows: &[(usize, i32, usize)],
+                            dv: &[i32]| -> Result<()> {
+            self.pack2_stage(sc, rows)?;
+            let mut d = vec![0i32; sc.d_dev.len()];
+            let n = dv.len().min(d.len());
+            d[..n].copy_from_slice(&dv[..n]);
+            self.dev.htod_copy_into(d, &mut sc.d_dev)?;
+            let mut sf: Vec<i32> = segs.iter().flat_map(|s| s.iter().cloned()).collect();
+            sf.resize(PACK_SEG_MAX * 4, 0);
+            self.dev.htod_copy_into(sf, &mut sc.seg)?;
+            Ok(())
+        };
+        let rows55: Vec<(usize, i32, usize)> = {
+            let mut r: Vec<(usize, i32, usize)> =
+                (0..m).map(|i| (0usize, if i == 0 { b0 } else { d0[i - 1] }, p0 + i)).collect();
+            r.extend((0..m).map(|i| (1usize, if i == 0 { b1 } else { d1[i - 1] }, p1 + i)));
+            r
+        };
+        let segs55: [[i32; 4]; 2] = [[0, 0, m as i32, 1], [1, m as i32, m as i32, 1]];
+        let rows64: Vec<(usize, i32, usize)> = {
+            let mut r: Vec<(usize, i32, usize)> =
+                (0..m0).map(|i| (0usize, if i == 0 { b0 } else { d0[i - 1] }, p0 + i)).collect();
+            r.extend((0..(rpad - m0)).map(|i| (1usize, if i == 0 { b1 } else { d1[i - 1] }, p1 + i)));
+            r
+        };
+        let segs64: [[i32; 4]; 2] = [[0, 0, m0 as i32, 1], [1, m0 as i32, (rpad - m0) as i32, 1]];
+        let dv55: Vec<i32> = {
+            let mut d = vec![0i32; 2 * m];
+            d[..k].copy_from_slice(&d0[..k]);
+            d[m..m + k].copy_from_slice(&d1[..k]);
+            d
+        };
+        let dv64: Vec<i32> = {
+            let mut d = vec![0i32; 2 * m];
+            d[..m0 - 1].copy_from_slice(&d0[..m0 - 1]);
+            d[m0..m0 + (rpad - m0 - 1)].copy_from_slice(&d1[..rpad - m0 - 1]);
+            d
+        };
+        // ---- output collectors (bitwise f32 compare) ----
+        // core/x are bf16 planes (u16 words) — bitwise u16 compare is exact
+        let collect = |sc: &Scratch, rows: usize, packed: bool|
+                -> Result<(Vec<u16>, Vec<u16>, Vec<i32>, Vec<i32>, Vec<i32>)> {
+            Ok((
+                self.dev.dtoh_sync_copy(&sc.core)?[..rows * self.core_row()].to_vec(),
+                self.dev.dtoh_sync_copy(&sc.x)?[..rows * self.cfg.hidden_size].to_vec(),
+                self.dev.dtoh_sync_copy(&sc.argmax)?[..rows].to_vec(),
+                self.dev.dtoh_sync_copy(&sc.accept_out)?.to_vec(),
+                if packed { self.dev.dtoh_sync_copy(&sc.acc_seg)?.to_vec() }
+                else { self.dev.dtoh_sync_copy(&sc.acc2)?.to_vec() },
+            ))
+        };
+        let outs_eq = |a: &(Vec<u16>, Vec<u16>, Vec<i32>, Vec<i32>, Vec<i32>),
+                       b: &(Vec<u16>, Vec<u16>, Vec<i32>, Vec<i32>, Vec<i32>)|
+                -> bool { a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3 && a.4 == b.4 };
+        let cap = p0.max(p1) + 64;
+        // ============ P10: eager reference + graph identity (5+5) ============
+        stage_packed(&mut sc, &segs55, &rows55, &dv55)?;
+        let shadow = self.packstate_save(&l, &sc, &[0, 1], cap)?;
+        self.verify_block_packed_full(&l, &mut sc, &segs55, rpad, 2, qsa)?;
+        self.dev.synchronize()?;
+        let e_out = collect(&sc, rpad, true)?;
+        let e_state = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+        self.packstate_restore(&l, &shadow)?;
+        self.dev.synchronize()?;
+        let pkey = pkeyv_of(rpad, qsa, qb) | sk(&sc);
+        self.capture_verify_graph_packed(&l, &mut sc, rpad, 2, qsa, pkey);
+        anyhow::ensure!(self.graphs.lock().unwrap().contains_key(&pkey),
+                        "pack3: packed graph capture failed (see EXL3_GRAPH lines)");
+        for rep in 0..3usize {
+            self.packstate_restore(&l, &shadow)?;
+            self.pack_eager_tail_pre(&l, &mut sc, &segs55)?;
+            self.graphs.lock().unwrap().get(&pkey).unwrap().launch();
+            self.pack_eager_tail_post(&l, &mut sc, &segs55)?;
+            self.dev.synchronize()?;
+            let g_out = collect(&sc, rpad, true)?;
+            let g_state = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+            anyhow::ensure!(outs_eq(&g_out, &e_out),
+                            "pack3: packed graph outputs differ from eager (5+5, rep {rep})");
+            anyhow::ensure!(g_state == e_state,
+                            "pack3: packed graph post-commit state differs from eager (5+5, rep {rep})");
+        }
+        println!("PACK3A: P10 graph-vs-eager identity (5+5): PASS x3 (outputs + full post-commit state)");
+        // ============ V5: served-style lone graph on slot 0 ============
+        let rows0: Vec<(usize, i32, usize)> =
+            (0..m).map(|r| (0usize, if r == 0 { b0 } else { d0[r - 1] }, p0 + r)).collect();
+        let dv0: Vec<i32> = d0[..k].to_vec();
+        stage_lone(&mut sc, &rows0, &dv0)?;
+        let shadow0 = self.packstate_save(&l, &sc, &[0, 1], cap)?;
+        self.verify_block(&l, &mut sc, 0, m, k, qsa)?;
+        self.dev.synchronize()?;
+        let ev_out = collect(&sc, m, false)?;
+        let ev_state = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+        let vkey = vkey_of(0, m, qsa, qb) | sk(&sc)
+            | ((sc.pen_live as usize) << 40)
+            | rq_verify_key(&sc)
+            | self.vp_key(&sc, m);
+        if !self.graphs.lock().unwrap().contains_key(&vkey) {
+            self.dev.synchronize()?;
+            self.capture_verify_graph(&l, &mut sc, 0, m, k, qsa, vkey);
+        }
+        anyhow::ensure!(self.graphs.lock().unwrap().contains_key(&vkey),
+                        "pack3: lone graph capture failed (see EXL3_GRAPH lines)");
+        for rep in 0..3usize {
+            self.packstate_restore(&l, &shadow0)?;
+            self.graphs.lock().unwrap().get(&vkey).unwrap().launch();
+            self.dev.synchronize()?;
+            let g_out = collect(&sc, m, false)?;
+            let g_state = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+            anyhow::ensure!(outs_eq(&g_out, &ev_out),
+                            "pack3: lone graph outputs differ from eager (rep {rep})");
+            anyhow::ensure!(g_state == ev_state,
+                            "pack3: lone graph post-commit state differs from eager (rep {rep})");
+        }
+        println!("PACK3A: V5 graph-vs-eager identity: PASS x3");
+        // ============ P(6+4): SAME graph, different split ============
+        stage_packed(&mut sc, &segs64, &rows64, &dv64)?;
+        let shadow64 = self.packstate_save(&l, &sc, &[0, 1], cap)?;
+        self.verify_block_packed_full(&l, &mut sc, &segs64, rpad, 2, qsa)?;
+        self.dev.synchronize()?;
+        let e64 = collect(&sc, rpad, true)?;
+        let e64s = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+        self.packstate_restore(&l, &shadow64)?;
+        self.pack_eager_tail_pre(&l, &mut sc, &segs64)?;
+        self.graphs.lock().unwrap().get(&pkey).unwrap().launch();
+        self.pack_eager_tail_post(&l, &mut sc, &segs64)?;
+        self.dev.synchronize()?;
+        let g64 = collect(&sc, rpad, true)?;
+        let g64s = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+        anyhow::ensure!(outs_eq(&g64, &e64), "pack3: 6+4 replay outputs differ from eager");
+        anyhow::ensure!(g64s == e64s, "pack3: 6+4 replay post-state differs from eager");
+        println!("PACK3A: P(6+4) SAME-graph replay (key is R_pad-only): PASS (outputs + post-commit state)");
+        // ============ timing: CUDA events around the replay ============
+        let mut ev: [cudarc::driver::sys::CUevent; 2] = [std::ptr::null_mut(); 2];
+        for e in ev.iter_mut() {
+            let r = unsafe { cudarc::driver::sys::cuEventCreate(e, 0) };
+            anyhow::ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                            "pack3: cuEventCreate ({r:?})");
+        }
+        let (warm, reps) = (3usize, 20usize);
+        let series = |title: &str, f: &mut dyn FnMut()| -> Result<f64> {
+            use cudarc::driver::sys;
+            for _ in 0..warm { f(); }
+            self.dev.synchronize()?;
+            let mut v = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let stream = self.stream.stream;
+                unsafe { sys::cuEventRecord(ev[0], stream); }
+                f();
+                unsafe { sys::cuEventRecord(ev[1], stream); }
+                let r = unsafe { sys::cuEventSynchronize(ev[1]) };
+                anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "pack3: evsync ({r:?})");
+                let mut ms = 0f32;
+                let r = unsafe { sys::cuEventElapsedTime(&mut ms, ev[0], ev[1]) };
+                anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "pack3: elapsed ({r:?})");
+                v.push(ms as f64);
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("PACK3A TIME {title}: median {:.3} ms (min {:.3}, max {:.3})",
+                     v[reps / 2], v[0], v[reps - 1]);
+            Ok(v[reps / 2])
+        };
+        let host_ms = |title: &str, f: &mut dyn FnMut()| -> Result<f64> {
+            for _ in 0..warm { f(); }
+            self.dev.synchronize()?;
+            let mut v = Vec::new();
+            for _ in 0..reps {
+                let t0 = std::time::Instant::now();
+                f();
+                v.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("PACK3A TIME {title}: median {:.3} ms (host wall, min {:.3}, max {:.3})",
+                     v[reps / 2], v[0], v[reps - 1]);
+            Ok(v[reps / 2])
+        };
+        // V5 arms (staging: lone slot 0)
+        stage_lone(&mut sc, &rows0, &dv0)?;
+        self.dev.synchronize()?;
+        let v5_g = series("V5_graph (lone m=5, served-style graph)", &mut || {
+            self.graphs.lock().unwrap().get(&vkey).unwrap().launch();
+        })?;
+        let v5_e = series("V5_eager (lone m=5, verify_block)", &mut || {
+            let _ = self.verify_block(&l, &mut sc, 0, m, k, qsa);
+        })?;
+        // P10 arms (staging: packed 5+5)
+        stage_packed(&mut sc, &segs55, &rows55, &dv55)?;
+        self.dev.synchronize()?;
+        let p10_g = series("P10_graph (packed R_pad=10, graph only)", &mut || {
+            self.graphs.lock().unwrap().get(&pkey).unwrap().launch();
+        })?;
+        let p10_eff = series("P10_eff (graph + 4-launch eager tail)", &mut || {
+            self.pack_eager_tail_pre(&l, &mut sc, &segs55).unwrap();
+            self.graphs.lock().unwrap().get(&pkey).unwrap().launch();
+            self.pack_eager_tail_post(&l, &mut sc, &segs55).unwrap();
+        })?;
+        let p10_e = series("P10_eager (verify_block_packed_full)", &mut || {
+            let _ = self.verify_block_packed_full(&l, &mut sc, &segs55, rpad, 2, qsa);
+        })?;
+        // P(6+4): SAME graph, different split
+        stage_packed(&mut sc, &segs64, &rows64, &dv64)?;
+        self.dev.synchronize()?;
+        let p64_eff = series("P64_eff (SAME R_pad graph, 6+4 split, + tail)", &mut || {
+            self.pack_eager_tail_pre(&l, &mut sc, &segs64).unwrap();
+            self.graphs.lock().unwrap().get(&pkey).unwrap().launch();
+            self.pack_eager_tail_post(&l, &mut sc, &segs64).unwrap();
+        })?;
+        // per-stage eager costs
+        stage_packed(&mut sc, &segs55, &rows55, &dv55)?;
+        self.dev.synchronize()?;
+        let shadow_ms = series("stage shadow_pre (2 launches)", &mut || {
+            let _ = self.pack_eager_tail_pre(&l, &mut sc, &segs55);
+        })?;
+        let taps_ms = series("stage taps_post (2 launches)", &mut || {
+            let _ = self.pack_eager_tail_post(&l, &mut sc, &segs55);
+        })?;
+        let tapr_ms = series("stage tap_restore (1 launch)", &mut || {
+            let _ = self.packstate_tap_restore(&l, &mut sc, 0, 0);
+        })?;
+        let draft_ms = host_ms("stage draft_chain (per request, k=4, probe path incl sync+readback)", &mut || {
+            let _ = self.packstate_draft(&l, &mut sc, head, 0, k, b0, p0);
+        })?;
+        let reprime_ms = host_ms("stage head_reprime (per request)", &mut || {
+            let _ = self.head_reprime(&mut sc, head, 0, p0, &d0[..2]);
+        })?;
+        let readb_ms = host_ms("stage readback (accept_out + acc_seg dtoh)", &mut || {
+            let _ = self.dev.dtoh_sync_copy(&sc.accept_out);
+            let _ = self.dev.dtoh_sync_copy(&sc.acc_seg);
+        })?;
+        let staging_ms = host_ms("stage pack staging (pack2_stage + d_dev + seg htod)", &mut || {
+            let _ = stage_packed(&mut sc, &segs55, &rows55, &dv55);
+        })?;
+        // ---- the round model (equal acceptance assumed; commits inside both graphs) ----
+        let verify_ratio = (2.0 * v5_g) / p10_eff;
+        let serial_pair = 2.0 * (draft_ms + v5_g + tapr_ms + reprime_ms + readb_ms);
+        let packed_round = 2.0 * (draft_ms + tapr_ms) + p10_eff + 2.0 * reprime_ms + readb_ms;
+        let rpr = serial_pair / packed_round;
+        println!("PACK3A: verify_ratio = 2*V5_graph / P10_eff = {verify_ratio:.3}");
+        println!("PACK3A: round_pair_ratio (probe-eager stages) = {rpr:.3} \
+                  (serial {serial_pair:.2} ms vs packed {packed_round:.2} ms; staging {staging_ms:.3} ms extra, not counted)");
+        // served-graphed draft/reprime sensitivity: 0.77 ms per draft pass, 0.24 ms re-prime
+        let draft_g = 0.77 * k as f64;
+        let reprime_g = 0.24f64;
+        let serial_g = 2.0 * (draft_g + v5_g + reprime_g + tapr_ms + readb_ms);
+        let packed_g = 2.0 * (draft_g + tapr_ms) + p10_eff + 2.0 * reprime_g + readb_ms;
+        println!("PACK3A: round_pair_ratio (served-graphed draft {draft_g:.2} ms/req, re-prime {reprime_g:.2} ms) = {:.3} \
+                  (serial {serial_g:.2} ms vs packed {packed_g:.2} ms)",
+                 serial_g / packed_g);
+        let d_v5 = v5_e - v5_g;
+        let d_p10 = p10_e - p10_g;
+        let tail_cost = p10_eff - p10_g;
+        println!("PACK3A: launch-gap recovery: V5 {v5_e:.2} -> {v5_g:.2} ms ({d_v5:.2} ms saved); \
+                  P10 {p10_e:.2} -> {p10_g:.2} ms ({d_p10:.2} ms saved); tail cost {tail_cost:.3} ms; \
+                  shadow {shadow_ms:.3} taps {taps_ms:.3} tapr {tapr_ms:.3} draft {draft_ms:.3} \
+                  reprime {reprime_ms:.3} readback {readb_ms:.3} staging {staging_ms:.3}");
+        // ============ STEP B: the R_pad graph family (--pack3-family) ============
+        // Enumerate R_pad {2..16} x k_seg=2 at the live regime: lazy capture,
+        // graph-vs-eager bit identity x3 per R_pad (outputs + post-commit
+        // state), cuMemGetInfo accounting with the 1 GB cap.
+        if crate::opts::on(crate::opt!("pack3-family")) {
+            use cudarc::driver::sys;
+            println!("PACK3B: family capture begins (R_pad {{2..16}} x k_seg=2, qsa={qsa} qb={qb})");
+            let k7 = 7usize; // MTP_MAX_K: drafts for the widest family member
+            self.packstate_tap_restore(&l, &mut sc, 0, 0)?;
+            let d0f = self.packstate_draft(&l, &mut sc, head, 0, k7, b0, p0)?;
+            self.packstate_tap_restore(&l, &mut sc, 1, 0)?;
+            let d1f = self.packstate_draft(&l, &mut sc, head, 1, k7, b1, p1)?;
+            let (mut free0, _total) = (0usize, 0usize);
+            unsafe {
+                let mut fr: usize = 0; let mut tot: usize = 0;
+                let r = sys::cuMemGetInfo_v2(&mut fr, &mut tot);
+                anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "pack3b: cuMemGetInfo ({r:?})");
+                free0 = fr;
+            }
+            println!("PACK3B: free0 = {:.3} GiB", free0 as f64 / (1 << 30) as f64);
+            let mut cap_bytes = 0usize;
+            let mut capped_at: Option<usize> = None;
+            for rpad_f in [2usize, 4, 6, 8, 10, 12, 14, 16] {
+                if cap_bytes > (1 << 30) {
+                    capped_at = Some(rpad_f);
+                    println!("PACK3B: stopped at the 1 GB cap before R_pad={rpad_f} (captured {cap_bytes} bytes)");
+                    break;
+                }
+                let mm = rpad_f / 2;
+                let rows_f: Vec<(usize, i32, usize)> = {
+                    let mut r: Vec<(usize, i32, usize)> =
+                        (0..mm).map(|i| (0usize, if i == 0 { b0 } else { d0f[i - 1] }, p0 + i)).collect();
+                    r.extend((0..mm).map(|i| (1usize, if i == 0 { b1 } else { d1f[i - 1] }, p1 + i)));
+                    r
+                };
+                let segs_f: [[i32; 4]; 2] =
+                    [[0, 0, mm as i32, 1], [1, mm as i32, mm as i32, 1]];
+                let dv_f: Vec<i32> = {
+                    let mut d = vec![0i32; rpad_f];
+                    d[..mm - 1].copy_from_slice(&d0f[..mm - 1]);
+                    d[mm..rpad_f - 1].copy_from_slice(&d1f[..mm - 1]);
+                    d
+                };
+                stage_packed(&mut sc, &segs_f, &rows_f, &dv_f)?;
+                let sh_f = self.packstate_save(&l, &sc, &[0, 1], cap)?;
+                self.verify_block_packed_full(&l, &mut sc, &segs_f, rpad_f, 2, qsa)?;
+                self.dev.synchronize()?;
+                let ef = collect(&sc, rpad_f, true)?;
+                let efs = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+                self.packstate_restore(&l, &sh_f)?;
+                self.dev.synchronize()?;
+                let key_f = pkeyv_of(rpad_f, qsa, qb) | sk(&sc);
+                self.capture_verify_graph_packed(&l, &mut sc, rpad_f, 2, qsa, key_f);
+                anyhow::ensure!(self.graphs.lock().unwrap().contains_key(&key_f),
+                                "pack3b: family capture failed at R_pad={rpad_f}");
+                for rep in 0..3usize {
+                    self.packstate_restore(&l, &sh_f)?;
+                    self.pack_eager_tail_pre(&l, &mut sc, &segs_f)?;
+                    self.graphs.lock().unwrap().get(&key_f).unwrap().launch();
+                    self.pack_eager_tail_post(&l, &mut sc, &segs_f)?;
+                    self.dev.synchronize()?;
+                    let gf = collect(&sc, rpad_f, true)?;
+                    let gfs = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+                    anyhow::ensure!(outs_eq(&gf, &ef), "pack3b: R_pad={rpad_f} outputs differ (rep {rep})");
+                    anyhow::ensure!(gfs == efs, "pack3b: R_pad={rpad_f} post-state differs (rep {rep})");
+                }
+                let mut fr: usize = 0; let mut tot: usize = 0;
+                unsafe {
+                    let r = sys::cuMemGetInfo_v2(&mut fr, &mut tot);
+                    anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "pack3b: cuMemGetInfo ({r:?})");
+                }
+                let used = free0.saturating_sub(fr).saturating_sub(cap_bytes);
+                cap_bytes = free0.saturating_sub(fr);
+                println!("PACK3B: R_pad={rpad_f:2} identity x3 PASS, graph ~{:.1} MiB (family total {:.1} MiB)",
+                         used as f64 / (1 << 20) as f64, cap_bytes as f64 / (1 << 20) as f64);
+            }
+            let n_family = self.graphs.lock().unwrap().keys()
+                .filter(|k| (**k >> 30) & 0x7 == 4).count();
+            println!("PACK3B: family verdict: {n_family} packed graphs, {:.3} GiB captured{}",
+                     cap_bytes as f64 / (1 << 30) as f64,
+                     if let Some(at) = capped_at { format!(" (CAPPED before R_pad={at})") } else { String::new() });
+            // the qsa=true axis at the shipping width (R_pad=10), best-effort:
+            // eager reference first; on ANY error, skip the regime with a note.
+            let mut qsa_note = String::from("not attempted");
+            match (|| -> Result<()> {
+                let key_q = pkeyv_of(rpad, true, qb) | sk(&sc);
+                stage_packed(&mut sc, &segs55, &rows55, &dv55)?;
+                let sh_q = self.packstate_save(&l, &sc, &[0, 1], cap)?;
+                self.verify_block_packed_full(&l, &mut sc, &segs55, rpad, 2, true)?;
+                self.dev.synchronize()?;
+                let eq_ = collect(&sc, rpad, true)?;
+                let eqs = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+                self.packstate_restore(&l, &sh_q)?;
+                self.dev.synchronize()?;
+                self.capture_verify_graph_packed(&l, &mut sc, rpad, 2, true, key_q);
+                anyhow::ensure!(self.graphs.lock().unwrap().contains_key(&key_q),
+                                "qsa capture failed");
+                for rep in 0..3usize {
+                    self.packstate_restore(&l, &sh_q)?;
+                    self.pack_eager_tail_pre(&l, &mut sc, &segs55)?;
+                    self.graphs.lock().unwrap().get(&key_q).unwrap().launch();
+                    self.pack_eager_tail_post(&l, &mut sc, &segs55)?;
+                    self.dev.synchronize()?;
+                    let gq = collect(&sc, rpad, true)?;
+                    let gqs = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
+                    anyhow::ensure!(outs_eq(&gq, &eq_), "qsa outputs differ (rep {rep})");
+                    anyhow::ensure!(gqs == eqs, "qsa post-state differs (rep {rep})");
+                }
+                Ok(())
+            })() {
+                Ok(()) => qsa_note = format!("qsa=true at R_pad={rpad}: identity x3 PASS"),
+                Err(e) => qsa_note = format!("qsa=true at R_pad={rpad}: SKIPPED ({e:#})"),
+            }
+            println!("PACK3B: QSA axis: {qsa_note} (full 8x2 enumeration belongs to LEG 4 boot precapture; capture is staging-value-independent)");
+        }
+        // ---- nsys receipt window: 5 isolated packed replays ----
+        stage_packed(&mut sc, &segs55, &rows55, &dv55)?;
+        self.dev.synchronize()?;
+        println!("PACK3A: NSYS-WINDOW-BEGIN (5 packed graph replays + tails)");
+        for _ in 0..5usize {
+            self.pack_eager_tail_pre(&l, &mut sc, &segs55)?;
+            self.graphs.lock().unwrap().get(&pkey).unwrap().launch();
+            self.pack_eager_tail_post(&l, &mut sc, &segs55)?;
+        }
+        self.dev.synchronize()?;
+        println!("PACK3A: NSYS-WINDOW-END");
+        for e in ev.iter() { unsafe { cudarc::driver::sys::cuEventDestroy_v2(*e); } }
+        println!("PACK3A: done (V5 + P10 identity x3, 6+4 same-graph PASS; timings above)");
+        Ok(())
+    }
+
+    /// PACK1 probe staging: per-row (slot, tok, pos) uploads + the PLE host half.
+    /// Advances ple_hist (per slot) — the callers save/restore around it.
+    fn pack2_stage(&self, sc: &mut Scratch, rows: &[(usize, i32, usize)]) -> Result<()> {
+        let m = rows.len();
+        let mut toks: Vec<i32> = rows.iter().map(|r| r.1).collect();
+        toks.resize(sc.toks.len(), 0);
+        self.dev.htod_copy_into(toks, &mut sc.toks)?;
+        let mut pos: Vec<i32> = rows.iter().map(|r| r.2 as i32).collect();
+        pos.resize(sc.pos.len(), 0);
+        self.dev.htod_copy_into(pos, &mut sc.pos)?;
+        let mut slotpos = vec![0i32; sc.slots.len()];
+        for (r, row) in rows.iter().enumerate() {
+            slotpos[r * 2] = row.0 as i32;
+            slotpos[r * 2 + 1] = row.2 as i32;
+        }
+        self.dev.htod_copy_into(slotpos, &mut sc.slots)?;
+        let mut sids = vec![0i32; sc.slot_ids.len()];
+        for (r, row) in rows.iter().enumerate() {
+            sids[r] = row.0 as i32;
+        }
+        self.dev.htod_copy_into(sids, &mut sc.slot_ids)?;
+        let mut emb = vec![0u16; sc.ple_emb.len()];
+        let slots_v: Vec<usize> = rows.iter().map(|r| r.0).collect();
+        let tokv: Vec<i32> = rows.iter().map(|r| r.1).collect();
+        self.ple_build_embed(m, &tokv, &slots_v, &mut emb)?;
+        self.dev.htod_copy_into(emb, &mut sc.ple_emb)?;
+        Ok(())
+    }
+
+    /// G3 helper: serialize slots' live GDN/conv/PLE rows (one row per layer) deterministically.
+    fn pack2_snap_state(&self, l: &Launcher, slots: &[usize]) -> Result<Vec<u64>> {
+        let cfg = &self.tc;
+        let s_e = (cfg.lin_num_v_heads * cfg.lin_k_dim * cfg.lin_v_dim) as i64;
+        let c_e = ((cfg.key_dim() * 2 + cfg.value_dim()) * cfg.conv_kernel) as i64;
+        let p_e = (10240 * 9) as i64;
+        let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
+        let mut s_tmp = self.dev.alloc_zeros::<f32>(s_e as usize)?;
+        let mut c_tmp = self.dev.alloc_zeros::<f32>(c_e as usize)?;
+        let mut p_tmp = self.dev.alloc_zeros::<u16>(p_e as usize)?;
+        let mut out = Vec::new();
+        for &slot in slots {
+            for li in 0..self.s_state.len() {
+                xqlaunch!(l, "xq_copy_f32", grid(s_e), (256, 1, 1), 0,
+                          (&mut s_tmp, &self.s_state[li], s_e, 0i64, (slot as i64) * s_e))?;
+                for f in self.dev.dtoh_sync_copy(&s_tmp)? {
+                    out.push(f.to_bits() as u64);
+                }
+                xqlaunch!(l, "xq_copy_f32", grid(c_e), (256, 1, 1), 0,
+                          (&mut c_tmp, &self.conv_state[li], c_e, 0i64, (slot as i64) * c_e))?;
+                for f in self.dev.dtoh_sync_copy(&c_tmp)? {
+                    out.push(f.to_bits() as u64);
+                }
+            }
+            xqlaunch!(l, "xq_copy_u16", grid(p_e), (256, 1, 1), 0,
+                      (&mut p_tmp, &self.ple_state, p_e, 0i64, (slot as i64) * p_e))?;
+            for u in self.dev.dtoh_sync_copy(&p_tmp)? {
+                out.push(u as u64);
+            }
+        }
+        Ok(out)
+    }
+
+    fn pack2_lone(&self, l: &Launcher, sc: &mut Scratch, slot: usize, b: i32, p: usize,
+                  drafts: &[i32], k: usize, qsa: bool) -> Result<Pack2Seg> {
+        let m = k + 1;
+        let hist_save = {
+            let h = self.ple_hist.lock().unwrap();
+            (h[slot * 2], h[slot * 2 + 1])
+        };
+        self.dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        let rows: Vec<(usize, i32, usize)> =
+            (0..m).map(|r| (slot, if r == 0 { b } else { drafts[r - 1] }, p + r)).collect();
+        self.pack2_stage(sc, &rows)?;
+        let mut dv = vec![0i32; sc.d_dev.len()];
+        dv[..k].copy_from_slice(&drafts[..k]);
+        self.dev.htod_copy_into(dv, &mut sc.d_dev)?;
+        self.verify_block_nostore(l, sc, slot, m, k, qsa)?;
+        self.dev.synchronize()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        {
+            let mut h = self.ple_hist.lock().unwrap();
+            h[slot * 2] = hist_save.0;
+            h[slot * 2 + 1] = hist_save.1;
+        }
+        let out = self.dev.dtoh_sync_copy(&sc.accept_out)?;
+        let acc = self.dev.dtoh_sync_copy(&sc.acc2)?;
+        let a = out[k + 2] as usize;
+        Ok(Pack2Seg {
+            core: self.dev.dtoh_sync_copy(&sc.core)?[..m * self.core_row()].to_vec(),
+            x: self.dev.dtoh_sync_copy(&sc.x)?[..m * self.cfg.hidden_size].to_vec(),
+            logits: self.dev.dtoh_sync_copy(&sc.logits)?[..m * self.cfg.vocab_size].to_vec(),
+            argmax: self.dev.dtoh_sync_copy(&sc.argmax)?[..m].to_vec(),
+            out,
+            acc,
+            a,
+            ms,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pack2_packed(&self, l: &Launcher, sc: &mut Scratch, b0: i32, p0: usize, d0: &[i32],
+                    b1: i32, p1: usize, d1: &[i32], k: usize, qsa: bool) -> Result<Pack2Packed> {
+        let m = k + 1;
+        let r = 2 * m;
+        // {slot, row_start, len, flags}; flags bit0 = nostore (the packed verify is
+        // nostore: the LEG 2 commit will replay from live — never store here).
+        let segs: [[i32; 4]; 2] =
+            [[0, 0, m as i32, 1], [1, m as i32, m as i32, 1]];
+        let hist_save = {
+            let h = self.ple_hist.lock().unwrap();
+            (h[0], h[1], h[2], h[3])
+        };
+        self.dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        let mut rows: Vec<(usize, i32, usize)> =
+            (0..m).map(|i| (0usize, if i == 0 { b0 } else { d0[i - 1] }, p0 + i)).collect();
+        rows.extend((0..m).map(|i| (1usize, if i == 0 { b1 } else { d1[i - 1] }, p1 + i)));
+        self.pack2_stage(sc, &rows)?;
+        let mut dv = vec![0i32; sc.d_dev.len()];
+        for (j, &d) in d0.iter().enumerate() { dv[j] = d; }
+        for (j, &d) in d1.iter().enumerate() { dv[m + j] = d; }
+        self.dev.htod_copy_into(dv, &mut sc.d_dev)?;
+        // Pad to PACK_SEG_MAX segments: cudarc's copy asserts exact length, and the
+        // seg kernels only read blockIdx.y < k_seg rows (the padding is inert).
+        let mut seg_flat: Vec<i32> = segs.iter().flat_map(|s| s.iter().cloned()).collect();
+        seg_flat.resize(PACK_SEG_MAX * 4, 0);
+        assert_eq!(seg_flat.len(), sc.seg.len());
+        self.dev.htod_copy_into(seg_flat, &mut sc.seg)?;
+        self.verify_block_packed(l, sc, &segs, r, 2, qsa)?;
+        self.dev.synchronize()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        {
+            let mut h = self.ple_hist.lock().unwrap();
+            h[0] = hist_save.0;
+            h[1] = hist_save.1;
+            h[2] = hist_save.2;
+            h[3] = hist_save.3;
+        }
+        let xf = self.dev.dtoh_sync_copy(&sc.x)?;
+        let lgf = self.dev.dtoh_sync_copy(&sc.logits)?;
+        let cf = self.dev.dtoh_sync_copy(&sc.core)?;
+        let amf = self.dev.dtoh_sync_copy(&sc.argmax)?;
+        let outf = self.dev.dtoh_sync_copy(&sc.accept_out)?;
+        let accf = self.dev.dtoh_sync_copy(&sc.acc_seg)?;
+        let hrow = self.cfg.hidden_size;
+        let vrow = self.cfg.vocab_size;
+        let crow = self.core_row();
+        Ok(Pack2Packed {
+            core_a: cf[..m * crow].to_vec(),
+            core_b: cf[m * crow..r * crow].to_vec(),
+            x_a: xf[..m * hrow].to_vec(),
+            x_b: xf[m * hrow..r * hrow].to_vec(),
+            logits_a: lgf[..m * vrow].to_vec(),
+            logits_b: lgf[m * vrow..r * vrow].to_vec(),
+            argmax_a: amf[..m].to_vec(),
+            argmax_b: amf[m..r].to_vec(),
+            out_a: outf[..m].to_vec(),
+            out_b: outf[m..r].to_vec(),
+            acc_a: (accf[0], accf[1]),
+            acc_b: (accf[2], accf[3]),
+            a_a: accf[1] as usize,
+            a_b: accf[3] as usize,
+            ms,
+        })
+    }
+
+    fn core_row(&self) -> usize {
+        let cfg = &self.tc;
+        cfg.lin_num_v_heads * cfg.lin_v_dim
+    }
+
+    /// PACK1 LEG 1: the eager packed-verify probe (--probe-exl3-pack2).
+    /// Pairs of synthetic prompts prime slots 0/1; then per rep: (a) two lone 5-row
+    /// verifies, (b) ONE packed 10-row verify, (c) the lones re-run (ABAB drift check).
+    /// Per-segment outputs (GDN core rows, final hidden, logits, argmax, accept_out,
+    /// accept keys) are compared BITWISE against the lone verify of the same rep.
+    pub fn probe_pack2(&self) -> Result<()> {
+        let l = Launcher { dev: &self.dev, stream: &self.stream };
+        let k = 4usize;
+        let m = k + 1;
+        let v = self.cfg.vocab_size;
+        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim)?;
+        println!("PACK2: eager packed-verify probe (2 requests x {m} rows, scratch w=16, nostore, eager)");
+        let pairs = [(97usize, 89usize), (513usize, 523usize), (2201usize, 2201usize)];
+        let mut ratios: Vec<f64> = Vec::new();
+        let mut all_id_ok = true;
+        let mut lone_b_debug: (Vec<i32>, usize) = (vec![], 0);
+        for (pi, &(la, lb)) in pairs.iter().enumerate() {
+            let synth = |n: usize, salt: usize| -> Vec<u32> {
+                (0..n).map(|i| ((i * 7919 + salt * 104729 + 12345) % (v - 2000) + 1000) as u32).collect()
+            };
+            let pa = synth(la, 1);
+            let pb = synth(lb, 2);
+            self.reset_slot(0)?;
+            self.reset_slot(1)?;
+            let mut psc: Option<PrefillScratch> = None;
+            let mut prime = |slot: usize, pr: &[u32], sc: &mut Scratch,
+                             psc: &mut Option<PrefillScratch>| -> Result<(i32, usize)> {
+                let n = pr.len();
+                let mut pos = 0usize;
+                while pos + 1 < n {
+                    let end = (pos + 1024).min(n - 1);
+                    let toks: Vec<i32> = pr[pos..end].iter().map(|&t| t as i32).collect();
+                    if psc.is_none() { *psc = Some(self.prefill_scratch(1024)?); }
+                    self.prefill_chunk(psc.as_mut().unwrap(), &toks, pos, slot, false, None)?;
+                    pos = end;
+                }
+                self.forward_step(sc, &[pr[n - 1] as i32], &[n - 1], &[slot], None)?;
+                let b = self.dev.dtoh_sync_copy(&sc.argmax)?[0];
+                Ok((b, n))
+            };
+            let (b0, p0) = prime(0, &pa, &mut sc, &mut psc)?;
+            let (b1, p1) = prime(1, &pb, &mut sc, &mut psc)?;
+            let qa = self.qsa_live(p0 + k);
+            let qb = self.qsa_live(p1 + k);
+            println!("PACK2 PAIR {pi}: len {la}/{lb} pos {p0}/{p1} b {b0}/{b1} qsa {qa}/{qb} agree={}",
+                     qa == qb);
+            anyhow::ensure!(qa == qb, "PACK2: mixed QSA regimes in pair {pi} (design: fall back to serial)");
+            let drafts0: Vec<i32> =
+                (0..k).map(|j| (((b0 as usize) * 31 + j * 7 + 101) % (v - 16)) as i32).collect();
+            let drafts1: Vec<i32> =
+                (0..k).map(|j| (((b1 as usize) * 31 + j * 7 + 103) % (v - 16)) as i32).collect();
+            let snap_pre = self.pack2_snap_state(&l, &[0, 1])?;
+            for rep in 0..3usize {
+                // (a) two serial lone verifies
+                let la_out = self.pack2_lone(&l, &mut sc, 0, b0, p0, &drafts0, k, qa)?;
+                let lb_out = self.pack2_lone(&l, &mut sc, 1, b1, p1, &drafts1, k, qb)?;
+                let a_ms = la_out.ms + lb_out.ms;
+                // (b) ONE packed 10-row verify
+                let pk = self.pack2_packed(&l, &mut sc, b0, p0, &drafts0, b1, p1, &drafts1, k, qa)?;
+                let b_ms = pk.ms;
+                // (c) the lones re-run (drift check)
+                let lc_out = self.pack2_lone(&l, &mut sc, 0, b0, p0, &drafts0, k, qa)?;
+                let ld_out = self.pack2_lone(&l, &mut sc, 1, b1, p1, &drafts1, k, qb)?;
+                let c_ms = lc_out.ms + ld_out.ms;
+                lone_b_debug = (ld_out.out.clone(), ld_out.a);
+                // ---- identity: packed segments vs this rep's lone verifies ----
+                let seg_a_ok = la_out.core == pk.core_a && la_out.x == pk.x_a
+                    && la_out.logits == pk.logits_a && la_out.argmax == pk.argmax_a
+                    && la_out.acc == [pk.acc_a.0, pk.acc_a.1] && la_out.out[..=la_out.a] == pk.out_a[..=pk.a_a];
+                let seg_b_ok = lb_out.core == pk.core_b && lb_out.x == pk.x_b
+                    && lb_out.logits == pk.logits_b && lb_out.argmax == pk.argmax_b
+                    && lb_out.acc == [pk.acc_b.0, pk.acc_b.1] && lb_out.out[..=lb_out.a] == pk.out_b[..=pk.a_b];
+                let drift = la_out.x == lc_out.x && lb_out.x == ld_out.x
+                    && la_out.logits == lc_out.logits && lb_out.logits == ld_out.logits;
+                all_id_ok &= seg_a_ok && seg_b_ok && drift;
+                let b_core = lb_out.core == pk.core_b;
+                let b_x = lb_out.x == pk.x_b;
+                let b_lg = lb_out.logits == pk.logits_b;
+                let b_am = lb_out.argmax == pk.argmax_b;
+                let b_out = lb_out.out[..=lb_out.a] == pk.out_b[..=pk.a_b];
+                let a_lg = la_out.logits == pk.logits_a;
+                let a_am = la_out.argmax == pk.argmax_a;
+                println!("PACK2 IDENT pair {pi} rep {rep}: segA {seg_a_ok} segB {seg_b_ok} drift {drift} | \
+segB bufs core {b_core} x {b_x} lg {b_lg} am {b_am} out {b_out} | segA lg {a_lg} am {a_am} | \
+A(core {:016x} x {:016x} lg {:016x} am {:016x}) B(core {:016x} x {:016x} lg {:016x} am {:016x}) | \
+P(coreA {:016x} coreB {:016x} xA {:016x} xB {:016x} lgA {:016x} lgB {:016x} amB {:016x}) | \
+acc A {:?} B {:?} packedA {:?} packedB {:?}",
+                         fnv64_u16(&la_out.core), fnv64_u16(&la_out.x), fnv64_u16(&la_out.logits),
+                         fnv64_i32(&la_out.argmax), fnv64_u16(&lb_out.core), fnv64_u16(&lb_out.x),
+                         fnv64_u16(&lb_out.logits), fnv64_i32(&lb_out.argmax),
+                         fnv64_u16(&pk.core_a), fnv64_u16(&pk.core_b), fnv64_u16(&pk.x_a),
+                         fnv64_u16(&pk.x_b), fnv64_u16(&pk.logits_a), fnv64_u16(&pk.logits_b),
+                         fnv64_i32(&pk.argmax_b), la_out.acc, lb_out.acc, pk.acc_a, pk.acc_b);
+                let r = a_ms / b_ms;
+                ratios.push(r);
+                println!("PACK2 TIME pair {pi} rep {rep}: a {a_ms:.2} ms  b {b_ms:.2} ms  c {c_ms:.2} ms  r {r:.3}");
+                // G3: live state must be untouched after a + b + c
+                let snap_post = self.pack2_snap_state(&l, &[0, 1])?;
+                let diffs = snap_pre.iter().zip(snap_post.iter()).filter(|(x, y)| x != y).count();
+                if rep == 0 {
+                    println!("PACK2 G3 pair {pi}: live-state words differing after a+b+c = {diffs} (must be 0)");
+                }
+                anyhow::ensure!(diffs == 0, "PACK2 G3 FAIL: live state moved (nostore violated)");
+            }
+        }
+        // ---- pad-route synthetic self-test ----
+        let topk = 10usize;
+        let ids_v: Vec<i32> = (0..5 * topk).map(|i| ((i / topk) * 100 + (i % topk)) as i32).collect();
+        let wts_v: Vec<f32> = (0..5 * topk).map(|i| (i % topk) as f32 * 0.5).collect();
+        let mut ids = self.dev.htod_sync_copy(&ids_v)?;
+        let mut wts = self.dev.htod_sync_copy(&wts_v)?;
+        let pgrid = (((2 * topk + 255) / 256).max(1) as u32, 1, 1);
+        xqlaunch!(l, "xq_pad_route", pgrid, (256, 1, 1), 0,
+                  (&mut ids, &mut wts, topk as i32, 3i32, 2i32))?;
+        let ids_h = self.dev.dtoh_sync_copy(&ids)?;
+        let r2 = &ids_h[2 * topk..3 * topk];
+        let r3 = &ids_h[3 * topk..4 * topk];
+        let r4 = &ids_h[4 * topk..5 * topk];
+        let eq32 = r3 == r2;
+        let eq42 = r4 == r2;
+        let pad_ok = eq32 && eq42;
+        println!("PACK2 PADROUTE: pas={}(rows 3,4 must equal row 2) eq32 {eq32} eq42 {eq42}", pad_ok);
+        println!("PACK2 PADR2 {r2:?}");
+        println!("PACK2 PADR3 {r3:?}");
+        println!("PACK2 PADR4 {r4:?}");
+        let raw_out = self.dev.dtoh_sync_copy(&sc.accept_out)?;
+        println!("PACK2 OUTCHK: last packed accept_out = {:?} (lone B had {:?})", &raw_out[..10], lone_b_debug);
+        let r_mean = ratios.iter().sum::<f64>() / ratios.len().max(1) as f64;
+        let r_min = ratios.iter().cloned().fold(f64::INFINITY, f64::min);
+        println!("PACK2 SUMMARY: r_mean {r_mean:.3} r_min {r_min:.3} over {} reps \
+(decision: >=1.30 GO, 1.20-1.30 borderline, <1.20 STOP)", ratios.len());
+        anyhow::ensure!(pad_ok, "PACK2: pad_route self-test failed");
+        anyhow::ensure!(all_id_ok, "PACK2: per-segment bit-identity failed");
+        Ok(())
+    }
+
     /// Record verify_block into a CUDA graph (after the eager round's readback, so the
     /// capture only RECORDS). Failure is loud and leaves verify eager (never wrong).
     fn capture_verify_graph(&self, l: &Launcher, sc: &mut Scratch, slot: usize, m: usize,
@@ -16136,7 +18967,7 @@ impl FwdModel {
         unsafe {
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
-                println!("EXL3_GRAPH: verify BeginCapture failed ({r:?}) at m={m} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: verify BeginCapture failed ({r:?}) at m={m} — staying eager");
                 return;
             }
         }
@@ -16144,7 +18975,7 @@ impl FwdModel {
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
-            println!("EXL3_GRAPH: verify capture failed (end={r2:?}, body={:?}) at m={m} — staying eager", cap.err());
+            crate::rprintln!("EXL3_GRAPH: verify capture failed (end={r2:?}, body={:?}) at m={m} — staying eager", cap.err());
             return;
         }
         crate::exl3_wp27::finish(graph, "verify", m); // WP27: node priorities + DAG receipt
@@ -16155,10 +18986,89 @@ impl FwdModel {
             sys::cuGraphDestroy(graph);
             if r3 == sys::CUresult::CUDA_SUCCESS {
                 precap_upload(exec, raw);
-                self.graphs.lock().unwrap().insert(vkey, crate::gpu::CudaGraph::from_exec(exec, raw));
-                if graph_log_on() { println!("EXL3_GRAPH: captured verify block at m={m} (qsa={qsa}, slot={slot})"); }
+                crate::metrics::set_graph_entries({ let mut g = self.graphs.lock().unwrap(); g.insert(vkey, crate::gpu::CudaGraph::from_exec(exec, raw)); g.len() as u64 });
+                if graph_log_on() { crate::rprintln!("EXL3_GRAPH: captured verify block at m={m} (qsa={qsa}, slot={slot})"); }
             } else {
-                println!("EXL3_GRAPH: verify instantiate failed ({r3:?}) at m={m} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: verify instantiate failed ({r3:?}) at m={m} — staying eager");
+            }
+        }
+    }
+
+    // ==================== PACK3 LEG 3 (S-B9-CF-PACK3) ====================
+    // Probe-only CUDA-graph path for the packed verify. The graphable body is
+    // the seg trunk + accept_seg + commit_seg: every per-staging value those
+    // consume (slot, row0, len per segment) is read ON DEVICE from sc.seg, so
+    // one graph serves ANY k_seg=2 staging with the same R_pad (5+5, 6+4, ...).
+    // The two spots whose launch offsets bake slot/row0/len — the PLE ring
+    // shadow (slot-plane src) and the per-segment taps snapshot (slot-window
+    // dst + row0/len src) — stay OUT of the graph and run as a 4-launch eager
+    // tail around the replay (`pack_eager_tail_*`; same launches, same args as
+    // verify_block_packed_full's equivalents). The served boot never captures
+    // this family (probe-only, key space 4<<30, own scratch gid via sk()).
+
+    fn verify_block_packed_graphable(&self, l: &Launcher, sc: &mut Scratch, rpad: usize,
+                                     k_seg: usize, qsa: bool) -> Result<()> {
+        let _tc = tune::enter(tune::Ctx::fam(tune::Fam::Verify, rpad).regime(qsa));
+        self.verify_kernels(l, sc, rpad, qsa, 0, k_seg)?;
+        xqlaunch!(l, "xq_accept_seg", (k_seg as u32, 1, 1), (32, 1, 1), 0,
+                  (&sc.d_dev, &sc.argmax, &mut sc.accept_out, &mut sc.acc_seg, &sc.seg))?;
+        self.verify_commit_seg(l, sc, k_seg)
+    }
+
+    /// The eager tail around a packed graph replay: the PLE ring shadow (BEFORE
+    /// the replay) and the per-segment taps snapshot (AFTER — it reads the
+    /// trunk's resid). Same launches, same args as in verify_block_packed_full.
+    fn pack_eager_tail_pre(&self, l: &Launcher, sc: &mut Scratch, segs: &[[i32; 4]]) -> Result<()> {
+        self.verify_shadow_seg(l, sc, segs)
+    }
+
+    fn pack_eager_tail_post(&self, l: &Launcher, sc: &mut Scratch, segs: &[[i32; 4]]) -> Result<()> {
+        let he = self.cfg.hc_count.max(1) * self.cfg.hidden_size;
+        let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
+        for sg in segs.iter() {
+            let (slot, row0, len) = (sg[0] as usize, sg[1] as usize, sg[2] as usize);
+            let tb = self.tap_base(sc, slot)?;
+            xqlaunch!(l, "xq_copy_f32", grid((he * len) as i64), (256, 1, 1), 0,
+                      (&mut sc.taps_keep, &sc.resid, (he * len) as i64, tb as i64,
+                       (row0 * he) as i64))?;
+        }
+        Ok(())
+    }
+
+    /// PACK3: capture the packed verify body under `pkey` (pkeyv_of | sk).
+    /// Mirrors capture_verify_graph: THREAD_LOCAL capture on the compute
+    /// stream, WP27 finish + spine audit, instantiate, into the graph map.
+    /// Stream capture RECORDS only — nothing executes.
+    fn capture_verify_graph_packed(&self, l: &Launcher, sc: &mut Scratch, rpad: usize,
+                                   k_seg: usize, qsa: bool, pkey: usize) {
+        use cudarc::driver::sys;
+        let raw = self.stream.stream;
+        unsafe {
+            let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+            if r != sys::CUresult::CUDA_SUCCESS {
+                crate::rprintln!("EXL3_GRAPH: packed BeginCapture failed ({r:?}) at rpad={rpad} — staying eager");
+                return;
+            }
+        }
+        let cap = self.verify_block_packed_graphable(l, sc, rpad, k_seg, qsa);
+        let mut graph: sys::CUgraph = std::ptr::null_mut();
+        let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
+        if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
+            crate::rprintln!("EXL3_GRAPH: packed capture failed (end={r2:?}, body={:?}) at rpad={rpad} — staying eager", cap.err());
+            return;
+        }
+        crate::exl3_wp27::finish(graph, "packed-verify", rpad);
+        if !self.tp_spine_audit(graph, "packed-verify", rpad) { unsafe { sys::cuGraphDestroy(graph); } return; }
+        unsafe {
+            let mut exec: sys::CUgraphExec = std::ptr::null_mut();
+            let r3 = crate::exl3_wp27::instantiate(&mut exec, graph);
+            sys::cuGraphDestroy(graph);
+            if r3 == sys::CUresult::CUDA_SUCCESS {
+                precap_upload(exec, raw);
+                crate::metrics::set_graph_entries({ let mut g = self.graphs.lock().unwrap(); g.insert(pkey, crate::gpu::CudaGraph::from_exec(exec, raw)); g.len() as u64 });
+                if graph_log_on() { crate::rprintln!("EXL3_GRAPH: captured packed verify at rpad={rpad} (k_seg={k_seg}, qsa={qsa})"); }
+            } else {
+                crate::rprintln!("EXL3_GRAPH: packed instantiate failed ({r3:?}) at rpad={rpad} — staying eager");
             }
         }
     }
@@ -16236,7 +19146,7 @@ impl FwdModel {
         unsafe {
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
-                println!("EXL3_GRAPH: draft-pass BeginCapture failed ({r:?}) at i={i} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: draft-pass BeginCapture failed ({r:?}) at i={i} — staying eager");
                 return;
             }
         }
@@ -16244,7 +19154,7 @@ impl FwdModel {
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
-            println!("EXL3_GRAPH: draft-pass capture failed (end={r2:?}, body={:?}) at i={i} — staying eager", cap.err());
+            crate::rprintln!("EXL3_GRAPH: draft-pass capture failed (end={r2:?}, body={:?}) at i={i} — staying eager", cap.err());
             return;
         }
         crate::exl3_wp27::finish(graph, "draft-pass", i); // WP27: node priorities + DAG receipt (m = pass index)
@@ -16255,9 +19165,9 @@ impl FwdModel {
             sys::cuGraphDestroy(graph);
             if r3 == sys::CUresult::CUDA_SUCCESS {
                 precap_upload(exec, raw);
-                self.graphs.lock().unwrap().insert(key, crate::gpu::CudaGraph::from_exec(exec, raw));
+                crate::metrics::set_graph_entries({ let mut g = self.graphs.lock().unwrap(); g.insert(key, crate::gpu::CudaGraph::from_exec(exec, raw)); g.len() as u64 });
             } else {
-                println!("EXL3_GRAPH: draft-pass instantiate failed ({r3:?}) at i={i} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: draft-pass instantiate failed ({r3:?}) at i={i} — staying eager");
             }
         }
     }
@@ -16268,7 +19178,7 @@ impl FwdModel {
         unsafe {
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
-                println!("EXL3_GRAPH: draft BeginCapture failed ({r:?}) at k={k} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: draft BeginCapture failed ({r:?}) at k={k} — staying eager");
                 return;
             }
         }
@@ -16276,7 +19186,7 @@ impl FwdModel {
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
-            println!("EXL3_GRAPH: draft capture failed (end={r2:?}, body={:?}) at k={k} — staying eager", cap.err());
+            crate::rprintln!("EXL3_GRAPH: draft capture failed (end={r2:?}, body={:?}) at k={k} — staying eager", cap.err());
             return;
         }
         crate::exl3_wp27::finish(graph, "draft-chain", k); // WP27: node priorities + DAG receipt (m = k)
@@ -16287,10 +19197,10 @@ impl FwdModel {
             sys::cuGraphDestroy(graph);
             if r3 == sys::CUresult::CUDA_SUCCESS {
                 precap_upload(exec, raw);
-                self.graphs.lock().unwrap().insert(dkey, crate::gpu::CudaGraph::from_exec(exec, raw));
-                if graph_log_on() { println!("EXL3_GRAPH: captured draft chain at k={k}"); }
+                crate::metrics::set_graph_entries({ let mut g = self.graphs.lock().unwrap(); g.insert(dkey, crate::gpu::CudaGraph::from_exec(exec, raw)); g.len() as u64 });
+                if graph_log_on() { crate::rprintln!("EXL3_GRAPH: captured draft chain at k={k}"); }
             } else {
-                println!("EXL3_GRAPH: draft instantiate failed ({r3:?}) at k={k} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: draft instantiate failed ({r3:?}) at k={k} — staying eager");
             }
         }
     }
@@ -16664,7 +19574,8 @@ impl FwdModel {
         use cudarc::driver::sys;
         let head = self.mtp.as_ref().context("REPRIME: no draft head")?;
         let rows = Self::rp_rows(sc);
-        let words = sc.accept_out.len();
+        let words = RP_ACCEPT_WORDS; // NOT sc.accept_out.len(): that is 16 words wide (K4) and the pin is 10
+        anyhow::ensure!(words <= sc.accept_out.len(), "REPRIME: accept_out narrower than the readback");
         {
             let rp = sc.rp.as_mut().context("REPRIME: runtime missing")?;
             anyhow::ensure!(words * 4 <= rp.pin.len, "REPRIME: {words} accept words > pinned {} B", rp.pin.len);
@@ -16709,14 +19620,14 @@ impl FwdModel {
         let tb = match self.tap_base(sc, slot) {
             Ok(t) => t,
             Err(e) => {
-                println!("EXL3_GRAPH: re-prime capture skipped ({e:#}) at rows={rows} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: re-prime capture skipped ({e:#}) at rows={rows} — staying eager");
                 return;
             }
         };
         unsafe {
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
-                println!("EXL3_GRAPH: re-prime BeginCapture failed ({r:?}) at rows={rows} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: re-prime BeginCapture failed ({r:?}) at rows={rows} — staying eager");
                 return;
             }
         }
@@ -16724,7 +19635,7 @@ impl FwdModel {
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
-            println!("EXL3_GRAPH: re-prime capture failed (end={r2:?}, body={:?}) at rows={rows} — staying eager", cap.err());
+            crate::rprintln!("EXL3_GRAPH: re-prime capture failed (end={r2:?}, body={:?}) at rows={rows} — staying eager", cap.err());
             return;
         }
         if !self.tp_spine_audit(graph, "reprime", rows) { unsafe { sys::cuGraphDestroy(graph); } return; } // TP-C
@@ -16733,10 +19644,10 @@ impl FwdModel {
             let r3 = sys::cuGraphInstantiate_v2(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0);
             sys::cuGraphDestroy(graph);
             if r3 == sys::CUresult::CUDA_SUCCESS {
-                self.graphs.lock().unwrap().insert(key, crate::gpu::CudaGraph::from_exec(exec, raw));
-                println!("EXL3_GRAPH: captured head re-prime at rows={rows} (key {key:#x})");
+                crate::metrics::set_graph_entries({ let mut g = self.graphs.lock().unwrap(); g.insert(key, crate::gpu::CudaGraph::from_exec(exec, raw)); g.len() as u64 });
+                crate::rprintln!("EXL3_GRAPH: captured head re-prime at rows={rows} (key {key:#x})");
             } else {
-                println!("EXL3_GRAPH: re-prime instantiate failed ({r3:?}) at rows={rows} — staying eager");
+                crate::rprintln!("EXL3_GRAPH: re-prime instantiate failed ({r3:?}) at rows={rows} — staying eager");
             }
         }
     }
@@ -17121,7 +20032,7 @@ impl FwdModel {
         if r % 128 == 0 { // cumulative; >= 1 line per 1,024-token code request (~180 rounds)
             let (la, wa) = (SPEC_LAUNCHED.load(std::sync::atomic::Ordering::Relaxed),
                             SPEC_WASTED.load(std::sync::atomic::Ordering::Relaxed));
-            println!("[spec-pass] rounds {r} launched {la} ({:.2}/round) wasted {wa} ({:.1}% of launched)",
+            crate::rprintln!("[spec-pass] rounds {r} launched {la} ({:.2}/round) wasted {wa} ({:.1}% of launched)",
                      la as f64 / r as f64, 100.0 * wa as f64 / la.max(1) as f64);
         }
         Ok(true)

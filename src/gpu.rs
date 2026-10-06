@@ -13020,7 +13020,11 @@ impl GpuModel {
             // First verify at this key: eager answer (warms the pool), then capture for next time.
             let out = self.verify_forward_topo_eager(pool, tokens, state, slot, kv_stride, pos_start, ckpt_slot, penalty, topo);
             if let Some(g) = self.capture_verify_graph(pool, state, slot, kv_stride, pos_start, n, ckpt_slot, penalty) {
-                self.verify_graphs.lock().unwrap().insert(key, g);
+                {
+                    let mut graphs = self.verify_graphs.lock().unwrap();
+                    graphs.insert(key, g);
+                    crate::metrics::set_graph_entries(graphs.len() as u64); // v0.7.3 gauge (LR-6 visibility)
+                }
             }
             return out;
         }

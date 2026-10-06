@@ -8,6 +8,25 @@ pub mod vision_tower;
 pub mod vision_encoder;
 pub mod vision_gpu;
 pub mod gpu;
+/// S1 (REL_V0_7_3 review): THE one `=`-aware command-line flag reader, shared by BOTH
+/// servers' hand-rolled arg loops (EXL3's `arg()` and the NVFP4 path's `parse_arg()`).
+/// Accepts `--flag value` AND `--flag=value`, exactly like the option registry
+/// (opts::parse) — a server-side reader that matched only the space form silently IGNORED
+/// `--lane-order=fcfs` / `--model-name=X` / `--otel-endpoint=...` while `--print-config`
+/// showed them as set.
+pub fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == flag || a.starts_with(&format!("{flag}=")))
+        .and_then(|i| {
+            let arg = &args[i];
+            if let Some(val) = arg.strip_prefix(&format!("{flag}=")) {
+                Some(val)
+            } else {
+                args.get(i + 1).map(|s| s.as_str())
+            }
+        })
+}
+
 pub mod quant;
 pub mod mxfp4;
 pub mod exl3;
@@ -18,6 +37,7 @@ pub mod exl3_forward;
 pub mod exl3_tune;
 pub mod exl3_serve;
 pub mod exl3_wp27;
+pub mod logq;
 pub mod loop_detect;
 pub mod wp24; // WP24: real-q speculative sampling (host replicas, dump, cross-check, gate)
 pub mod batch;
@@ -72,6 +92,16 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    /// v0.7.3 (issue #8.2): OpenAI-compatible prompt-usage detail.
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+/// The `usage.prompt_tokens_details` object (OpenAI / vLLM convention).
+/// `cached_tokens` counts prompt tokens served from the prefix cache (prefill
+/// skipped); 0 on a fresh prefill or an engine without a prefix cache.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: usize,
 }
 
 /// llama.cpp-compatible timing block, emitted as a top-level extension next to `usage`.

@@ -314,7 +314,7 @@ impl FwdModel {
         let gx = (nring + conv_dim.div_ceil(128)).max(10240usize.div_ceil(128));
         let gy = nl + ple as usize;
         let ring_ls = ((MTP_MAX_K + 1) * nh * GDN_RS) as i64;
-        let raw_ls = ((MTP_MAX_K + 1) * conv_dim) as i64;
+        let raw_ls = (SAVE_PLANE_ROWS * conv_dim) as i64; // PACK2/D1: qkv_save planes are SAVE_PLANE_ROWS rows (was MTP_MAX_K+1 — read the wrong layer's raws)
         let nh_kd = (nh | (kd << 16)) as i32;
         let vd_conv = (vd | (conv_dim << 16)) as i32;
         let ple_st = if ple { *self.ple_state.device_ptr() as u64 } else { 0u64 };
@@ -345,7 +345,10 @@ impl FwdModel {
             for i in 0..nl {
                 xqlaunch!(l, "xq_conv_commit", ((conv_dim as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                          ((*rc[i].device_ptr()) as u64, &sc.gdn_ring, conv_dim as i32, ck as i32, &sc.qkv_save,
-                          (i * (MTP_MAX_K + 1) * conv_dim) as i64, &sc.acc2))?;
+                          // K5 (REL v0.7.3 review): the gdn reference reads qkv_save with the SAVE plane
+                          // stride (16 rows) like every other plane site — the old (MTP_MAX_K+1) stride
+                          // read the WRONG LAYER's raws here (false XCHECK mismatches; diagnostic only).
+                          (i * SAVE_PLANE_ROWS * conv_dim) as i64, &sc.acc2))?;
                 let ring_p = (*sc.gdn_ring.device_ptr()) as u64 + (i * (MTP_MAX_K + 1) * nh * GDN_RS * 4) as u64;
                 xqlaunch!(l, "xq_gdn_commit_ring", ((nh * (vd / 32)) as u32, 1, 1), (kd as u32, 1, 1), 0,
                          ((*rs[i].device_ptr()) as u64, ring_p, nh as i32, kd as i32, vd as i32, &sc.acc2))?;

@@ -419,7 +419,7 @@ impl FwdModel {
         let (qg, _) = self.qsa_grid_bucket(p + m - 1);
         sc.qsa_grid_nblk = qg;
         self.verify_shadow(&l, sc, slot)?;
-        self.verify_kernels(&l, sc, m, qsa, slot)?;
+        self.verify_kernels(&l, sc, m, qsa, slot, 0)?;
         self.dev.htod_copy_into(vec![slot as i32, (m - 1) as i32], &mut sc.acc2)?;
         self.verify_commit(&l, sc)?;
         self.dev.synchronize()?;

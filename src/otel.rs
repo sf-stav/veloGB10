@@ -115,11 +115,17 @@ impl OtelConfig {
         if authority.is_empty() {
             return Err(format!("--otel-endpoint has no host: {:?}", self.endpoint));
         }
-        // Bracketed IPv6 keeps its brackets for TcpStream::connect's parser.
+        // Bracketed IPv6 keeps its brackets for the connect parser. S5 (REL_V0_7_3):
+        // return the host WITHOUT the port - the old form handed back the bracketed
+        // authority WITH its port as the host, and the caller re-appended the port again.
         if authority.starts_with('[') {
-            let has_port = authority.rsplit_once("]:").is_some();
-            let hp = if has_port { authority.to_string() } else { format!("{authority}:4318") };
-            return Ok((hp, 4318));
+            return match authority.rsplit_once("]:") {
+                Some((h, p)) => {
+                    let port: u16 = p.parse().map_err(|_| format!("--otel-endpoint bad port {p:?}"))?;
+                    Ok((format!("{h}]"), port))
+                }
+                None => Ok((authority.to_string(), 4318)),
+            };
         }
         match authority.rsplit_once(':') {
             Some((h, p)) => {
@@ -129,6 +135,24 @@ impl OtelConfig {
             None => Ok((authority.to_string(), 4318)), // OTLP/HTTP default port
         }
     }
+}
+
+/// v0.7.3 ("tel"): the ONE shared --otel-* parser, used by EVERY server (the NVFP4 path in
+/// main.rs and the EXL3 server) so the two can never drift. `get` maps a flag name WITHOUT
+/// dashes (e.g. "otel-endpoint") to its value; the caller adapts its own argv parser.
+/// ABSENT --otel-endpoint => None => emitter OFF => zero cost. Values are trimmed; an empty
+/// --otel-model-id / --otel-topology counts as unset (falls back to the auto value).
+pub fn config_from_args(get: impl Fn(&str) -> Option<String>) -> Option<OtelConfig> {
+    let val = |name: &str| get(name).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    Some(OtelConfig {
+        endpoint: val("otel-endpoint")?.trim_end_matches('/').to_string(),
+        batch_size: val("otel-batch-size").and_then(|s| s.parse().ok()).unwrap_or(512),
+        batch_interval_ms: val("otel-batch-interval-ms").and_then(|s| s.parse().ok()).unwrap_or(100),
+        include_tokens: matches!(val("otel-include-tokens").unwrap_or_else(|| "on".into()).as_str(),
+                                 "on" | "true" | "1" | "yes"),
+        model_id: val("otel-model-id"),
+        topology: val("otel-topology"),
+    })
 }
 
 /// `topology` attribute auto-derived from the serve world (AGENTS §7: one generic vocabulary).
@@ -595,9 +619,11 @@ pub async fn run_sender(sink: Arc<OtelSink>) {
     let interval = Duration::from_millis(sink.cfg.batch_interval_ms.max(1));
     // Live Stats stub status: the interface is wired; nothing implements it yet.
     if sink.metrics.live_stats().is_none() {
-        eprintln!("[otel] /v1/metrics wired (stub): no Live Stats source yet — emission is a follow-up");
+        crate::reprintln!("[otel] /v1/metrics wired (stub): no Live Stats source yet — emission is a follow-up");
     }
-    eprintln!("[otel] sender up: {} every {} ms, batch {}, include_tokens={} (model.id={}, topology={})",
+    // S6 (REL_V0_7_3): this task rides the single-threaded HTTP runtime — a direct eprintln
+    // blocks on the process-wide stderr lock while the logq writer is stalled in write(2).
+    crate::reprintln!("[otel] sender up: {} every {} ms, batch {}, include_tokens={} (model.id={}, topology={})",
               sink.cfg.endpoint, sink.cfg.batch_interval_ms, sink.cfg.batch_size,
               sink.cfg.include_tokens, sink.model_id, sink.topology);
     let mut last_status = Instant::now();
@@ -630,14 +656,14 @@ pub async fn run_sender(sink: Arc<OtelSink>) {
                 sink.failed_batches.fetch_add(1, Ordering::Relaxed);
                 fail_streak += 1;
                 if fail_streak <= 3 || fail_streak % 100 == 0 {
-                    eprintln!("[otel] POST /v1/logs failed (streak {fail_streak}): {e} — {} records dropped, decode unaffected",
+                    crate::reprintln!("[otel] POST /v1/logs failed (streak {fail_streak}): {e} — {} records dropped, decode unaffected",
                               rows.len());
                 }
             }
         }
         let dropped = sink.ring.dropped();
         if dropped != drop_logged && last_drop_log.elapsed() >= Duration::from_secs(5) {
-            eprintln!("[otel] {dropped} records dropped ring-full so far (client slower than decode; decode unaffected)");
+            crate::reprintln!("[otel] {dropped} records dropped ring-full so far (client slower than decode; decode unaffected)");
             drop_logged = dropped;
             last_drop_log = Instant::now();
         }
@@ -650,6 +676,51 @@ pub async fn run_sender(sink: Arc<OtelSink>) {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn from_pairs(pairs: &[(&str, &str)]) -> Option<OtelConfig> {
+        config_from_args(|flag| pairs.iter().find(|(k, _)| *k == flag).map(|(_, v)| v.to_string()))
+    }
+
+    /// v0.7.3 ("tel"): the ONE shared parser both servers use — endpoint trimming, defaults,
+    /// include-tokens spellings, empty overrides = unset, and unusable endpoints refused
+    /// by the (caller-invoked) hostport check.
+    #[test]
+    fn shared_flag_parsing_trims_defaults_and_refuses_bad_endpoints() {
+        assert!(from_pairs(&[]).is_none(), "absent --otel-endpoint = OFF = None");
+        assert!(from_pairs(&[("otel-endpoint", "")]).is_none(), "blank endpoint = OFF");
+
+        let cfg = from_pairs(&[("otel-endpoint", "  http://127.0.0.1:4318//  ")]).unwrap();
+        assert_eq!(cfg.endpoint, "http://127.0.0.1:4318", "trimmed + trailing slashes dropped");
+        assert_eq!(cfg.batch_size, 512, "default batch size");
+        assert_eq!(cfg.batch_interval_ms, 100, "default drain period");
+        assert!(cfg.include_tokens, "include_tokens defaults ON");
+        assert_eq!(cfg.model_id, None);
+        assert_eq!(cfg.topology, None);
+        assert_eq!(cfg.hostport().unwrap(), ("127.0.0.1".to_string(), 4318));
+
+        let full = from_pairs(&[
+            ("otel-endpoint", "http://receiver.local:9/"),
+            ("otel-batch-size", "64"), ("otel-batch-interval-ms", "250"),
+            ("otel-include-tokens", "off"),
+            ("otel-model-id", "  my-model  "), ("otel-topology", "")]).unwrap();
+        assert_eq!(full.endpoint, "http://receiver.local:9");
+        assert_eq!(full.batch_size, 64);
+        assert_eq!(full.batch_interval_ms, 250);
+        assert!(!full.include_tokens, "'off' disables token deltas");
+        assert_eq!(full.model_id.as_deref(), Some("my-model"), "trimmed override");
+        assert_eq!(full.topology, None, "empty override counts as unset");
+        assert_eq!(full.hostport().unwrap(), ("receiver.local".to_string(), 9));
+
+        for bad in ["https://x", "http://", "http://h:notaport", "notaurl"] {
+            let cfg = from_pairs(&[("otel-endpoint", bad)]).unwrap();
+            assert!(cfg.hostport().is_err(), "{bad} must be refused by hostport()");
+        }
+        for on in ["on", "true", "1", "yes"] {
+            let cfg = from_pairs(&[("otel-endpoint", "http://h"),
+                                   ("otel-include-tokens", on)]).unwrap();
+            assert!(cfg.include_tokens, "{on} must read as ON");
+        }
+    }
 
     fn cfg(include_tokens: bool) -> OtelConfig {
         OtelConfig {
@@ -972,7 +1043,38 @@ mod tests {
         };
         assert_eq!(mk("http://127.0.0.1:4318").hostport().unwrap(), ("127.0.0.1".into(), 4318));
         assert_eq!(mk("http://otel.lan").hostport().unwrap(), ("otel.lan".into(), 4318));
-        assert_eq!(mk("http://[::1]:9/").hostport().unwrap(), ("[::1]:9".into(), 4318));
+        // S5 (REL_V0_7_3): the bracketed host is returned WITHOUT its port and the PORT is
+        // the written one (this row used to assert the bug: host "[::1]:9" + port 4318).
+        assert_eq!(mk("http://[::1]:9/").hostport().unwrap(), ("[::1]".into(), 9));
         assert!(mk("https://secure").hostport().is_err(), "no TLS in the dependency-free client");
+    }
+}
+
+#[cfg(test)]
+/// S5 (REL_V0_7_3 review): hostport must hand back the host WITHOUT the port for bracketed
+/// IPv6 — the old form returned "[::1]:4318" as the host and the caller re-appended the port.
+mod s5_hostport_tests {
+    use super::*;
+
+    fn cfg(ep: &str) -> OtelConfig {
+        OtelConfig { endpoint: ep.to_string(), batch_size: 1, batch_interval_ms: 1,
+                     include_tokens: false, model_id: None, topology: None }
+    }
+
+    #[test]
+    fn hostport_handles_bracketed_ipv6_and_all_forms() {
+        assert_eq!(cfg("http://[::1]:4318").hostport().unwrap(), ("[::1]".to_string(), 4318),
+                   "bracketed host WITH port: host must NOT carry the port (S5)");
+        assert_eq!(cfg("http://[::1]").hostport().unwrap(), ("[::1]".to_string(), 4318),
+                   "bracketed host without port: default 4318");
+        assert_eq!(cfg("http://[::1]:4318/v1/logs").hostport().unwrap(), ("[::1]".to_string(), 4318),
+                   "path is stripped first");
+        assert_eq!(cfg("http://host:4318").hostport().unwrap(), ("host".to_string(), 4318));
+        assert_eq!(cfg("http://host").hostport().unwrap(), ("host".to_string(), 4318));
+        assert!(cfg("http://[::1]:bad").hostport().is_err(), "a bad port is still refused");
+        // the host must be connectable as-is: (host, port) must resolve for std's parser
+        use std::net::ToSocketAddrs;
+        assert!("[::1]:4318".parse::<std::net::SocketAddr>().is_ok()
+                || ("[::1]", 4318).to_socket_addrs().is_ok());
     }
 }
