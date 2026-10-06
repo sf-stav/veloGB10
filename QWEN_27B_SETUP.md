@@ -88,15 +88,15 @@ Expected output:
 
 ```
 [node-resident] supervisor up on port 29500 — one process per head session; kill this process to stop the node
-[node] gx10-1dcd ready: discovery on UDP 29499, control on TCP 29500, cache ~/.cache/gb10_tp
+[node] <hostname> ready: discovery on UDP 29499, control on TCP 29500, cache ~/.cache/gb10_tp
 ```
 
 At this point the nodes are waiting for the head to launch.
 
 For the examples below we assume nodes are running at:
 
-- **TP=4:** `192.168.177.12:29500`, `192.168.177.13:29500`, `192.168.177.14:29500`
-- **TP=2:** `192.168.177.12:29500`
+- **TP=4:** `192.0.2.12:29500`, `192.0.2.13:29500`, `192.0.2.14:29500`
+- **TP=2:** `192.0.2.12:29500`
 
 > **You do NOT need to copy the model to the nodes.** Required model shards and files are transferred
 > automatically by the head, and in most cases only the files that are actually needed are copied —
@@ -148,7 +148,7 @@ the full directory tree from §1 and these two model directories before launchin
 ./gb10_inference --server \
   --model-dir ~/veloGB10/3.8-27b-nvfp4-full-all \
   --tp 4 \
-  --nodes 192.168.177.12:29500,192.168.177.13:29500,192.168.177.14:29500 \
+  --nodes 192.0.2.12:29500,192.0.2.13:29500,192.0.2.14:29500 \
   --port 9000 \
   --kv-cache k8v8 \
   --max-seq-len 262144 \
@@ -171,7 +171,7 @@ the full directory tree from §1 and these two model directories before launchin
 ./gb10_inference --server \
   --model-dir ~/veloGB10/3.8-27b-nvfp4-full-all \
   --tp 2 \
-  --nodes 192.168.177.12:29500 \
+  --nodes 192.0.2.12:29500 \
   --port 9000 \
   --kv-cache k8v8 \
   --max-seq-len 262144 \
@@ -219,7 +219,7 @@ simultaneous requests you want to handle, e.g.:
 ./gb10_inference --server \
   --model-dir ~/veloGB10/3.8-27b-nvfp4-full-all \
   --tp 4 \
-  --nodes 192.168.177.12:29500,192.168.177.13:29500,192.168.177.14:29500 \
+  --nodes 192.0.2.12:29500,192.0.2.13:29500,192.0.2.14:29500 \
   --port 9000 \
   --max-seq-len 262144 \
   --max-batch 4 \
@@ -253,14 +253,14 @@ During the head bring-up you should see lines like:
 
 ```
 [tp] config installed: world=4 shard_mixers=true shard_mtp=true graph=false ...
-[head] gx10-c9c4 — building manifest for ~/veloGB10/3.8-27b-nvfp4-full-all (world 4) ...
+[head] <hostname> — building manifest for ~/veloGB10/3.8-27b-nvfp4-full-all (world 4) ...
 [head] manifest '3.8-27b-nvfp4-full-all': 39 artifacts, 48.95 GB
 [head] draft manifest 'Qwen3.8-27B-DFlash2': 6 artifacts, 3.85 GB — ships to every node
-[head] 192.168.177.12 (rank 1) needs 0 / 13 artifacts (0.00 GB)
-[head] 192.168.177.12 (rank 1) READY — model at ~/.cache/gb10_tp/models/3.8-27b-nvfp4-full-all (0.00 GB in 0.0s = 0.00 GB/s)
-[head] shipped config to 192.168.177.12 (rank 1/4)
-[head] 192.168.177.12 drafter: 5 / 6 artifacts (3.85 GB)
-[head] 192.168.177.12 drafter READY at ~/.cache/gb10_tp/models/Qwen3.8-27B-DFlash2 (3.85 GB in 7.6s)
+[head] 192.0.2.12 (rank 1) needs 0 / 13 artifacts (0.00 GB)
+[head] 192.0.2.12 (rank 1) READY — model at ~/.cache/gb10_tp/models/3.8-27b-nvfp4-full-all (0.00 GB in 0.0s = 0.00 GB/s)
+[head] shipped config to 192.0.2.12 (rank 1/4)
+[head] 192.0.2.12 drafter: 5 / 6 artifacts (3.85 GB)
+[head] 192.0.2.12 drafter READY at ~/.cache/gb10_tp/models/Qwen3.8-27B-DFlash2 (3.85 GB in 7.6s)
 ...
 [head] 3 node(s) synced; all control streams RETAINED for the serving session
 [tp] rank 0/4 — bringing up RDMA data-plane link on rocep1s0f1 (listening) ...

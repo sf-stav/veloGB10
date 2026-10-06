@@ -39,7 +39,7 @@ calibration over the network at sync time, and only the shards a node actually n
   alias, but it prints a warning on startup.
 
 **Paths and addresses in these commands are examples.** Replace `~/models/...` with wherever you
-keep your models, and the `192.168.177.x` addresses with your own node addresses.
+keep your models, and the `192.0.2.x` addresses with your own node addresses.
 
 ---
 
@@ -57,13 +57,13 @@ Draft: [doth4580/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED](https://huggingface.co/
 ### TP=2
 
 ```bash
-./gb10_inference --server --model-dir ~/models/3.8-27b-nvfp4-full-all --kv-cache k8v8 --tp 2 --nodes 192.168.177.12:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --prefix-cache on --default-presence-penalty 0.0 --mtp=auto --fp8-prefill on --reasoning-effort low --df2-block 16 --df2-round-shard on --spec-source dflash2 --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
+./gb10_inference --server --model-dir ~/models/3.8-27b-nvfp4-full-all --kv-cache k8v8 --tp 2 --nodes 192.0.2.12:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --prefix-cache on --default-presence-penalty 0.0 --mtp=auto --fp8-prefill on --reasoning-effort low --df2-block 16 --df2-round-shard on --spec-source dflash2 --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
 ```
 
 ### TP=4
 
 ```bash
-./gb10_inference --server --model-dir ~/models/3.8-27b-nvfp4-full-all --kv-cache k8v8 --tp 4 --nodes 192.168.177.12:29500,192.168.177.13:29500,192.168.177.14:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --prefix-cache on --default-presence-penalty 0.0 --mtp=auto --fp8-prefill on --reasoning-effort low --df2-block 16 --df2-round-shard on --spec-source dflash2 --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
+./gb10_inference --server --model-dir ~/models/3.8-27b-nvfp4-full-all --kv-cache k8v8 --tp 4 --nodes 192.0.2.12:29500,192.0.2.13:29500,192.0.2.14:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --prefix-cache on --default-presence-penalty 0.0 --mtp=auto --fp8-prefill on --reasoning-effort low --df2-block 16 --df2-round-shard on --spec-source dflash2 --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
 ```
 
 ---
@@ -82,13 +82,13 @@ Same DFlash 2 draft as above.
 ### TP=2
 
 ```bash
-./gb10_inference --server --model-dir ~/models/Qwen/Qwen3.8-27B-FP8 --kv-cache k8v8 --tp 2 --nodes 192.168.177.12:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --prefix-cache on --default-presence-penalty 0.0 --mtp=auto --fp8-prefill on --reasoning-effort low --df2-block 16 --df2-round-shard off --spec-source dflash2 --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
+./gb10_inference --server --model-dir ~/models/Qwen/Qwen3.8-27B-FP8 --kv-cache k8v8 --tp 2 --nodes 192.0.2.12:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --prefix-cache on --default-presence-penalty 0.0 --mtp=auto --fp8-prefill on --reasoning-effort low --df2-block 16 --df2-round-shard off --spec-source dflash2 --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
 ```
 
 ### TP=4
 
 ```bash
-./gb10_inference --server --model-dir ~/models/Qwen/Qwen3.8-27B-FP8 --kv-cache k8v8 --tp 4 --nodes 192.168.177.12:29500,192.168.177.13:29500,192.168.177.14:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --prefix-cache on --default-presence-penalty 0.0 --mtp=auto --fp8-prefill on --reasoning-effort low --df2-block 16 --df2-round-shard off --spec-source dflash2 --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
+./gb10_inference --server --model-dir ~/models/Qwen/Qwen3.8-27B-FP8 --kv-cache k8v8 --tp 4 --nodes 192.0.2.12:29500,192.0.2.13:29500,192.0.2.14:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --prefix-cache on --default-presence-penalty 0.0 --mtp=auto --fp8-prefill on --reasoning-effort low --df2-block 16 --df2-round-shard off --spec-source dflash2 --draft-dir ~/models/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal-FIXED
 ```
 
 ---
@@ -108,13 +108,13 @@ This is the DFlash v1 lane, selected with `--spec-source dflash`.
 ### TP=2
 
 ```bash
-./gb10_inference --server --kv-cache k8v8 --fp8-prefill off --tp 2 --nodes 192.168.177.12:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --default-presence-penalty 0 --prefix-cache on --mtp=auto --df2-block 16 --df2-round-shard on --model-dir ~/models/3.6-35b-nvfp4-mixed --spec-source dflash --draft-dir ~/models/Qwen3.6-35B-A3B-DFlash
+./gb10_inference --server --kv-cache k8v8 --fp8-prefill off --tp 2 --nodes 192.0.2.12:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --default-presence-penalty 0 --prefix-cache on --mtp=auto --df2-block 16 --df2-round-shard on --model-dir ~/models/3.6-35b-nvfp4-mixed --spec-source dflash --draft-dir ~/models/Qwen3.6-35B-A3B-DFlash
 ```
 
 ### TP=4
 
 ```bash
-./gb10_inference --server --kv-cache k8v8 --fp8-prefill off --tp 4 --nodes 192.168.177.12:29500,192.168.177.13:29500,192.168.177.14:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --default-presence-penalty 0 --prefix-cache on --mtp=auto --df2-block 16 --df2-round-shard on --model-dir ~/models/3.6-35b-nvfp4-mixed --spec-source dflash --draft-dir ~/models/Qwen3.6-35B-A3B-DFlash
+./gb10_inference --server --kv-cache k8v8 --fp8-prefill off --tp 4 --nodes 192.0.2.12:29500,192.0.2.13:29500,192.0.2.14:29500 --port 9000 --max-seq-len 262144 --max-batch 1 --max-tokens 65536 --default-presence-penalty 0 --prefix-cache on --mtp=auto --df2-block 16 --df2-round-shard on --model-dir ~/models/3.6-35b-nvfp4-mixed --spec-source dflash --draft-dir ~/models/Qwen3.6-35B-A3B-DFlash
 ```
 
 ---
