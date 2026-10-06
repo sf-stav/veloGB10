@@ -58,6 +58,10 @@ byte-identical before and after (gated). A tested-packs table is in the Flash-Ne
 - Known gaps, stated plainly: the minimal DSV4 server does not report the new fields, and the
   legacy **streaming** `/v1/completions` path emits no usage chunk.
 
+Release artifacts: `velogb10-v0.7.3-gb10-sm121.tar.gz` + `SHA256SUMS.txt` + `PROVENANCE.txt`
+(binary sha256 `949cab4758ae8af04565a826f28290c4f4280b179d95c93257361c6e09af706f`; built from this
+tree at the release-source commit `d7529bd` with a clean checkout; dev repo `rel/cutb` @ `3a4cab1`).
+
 ### Tool calls: literal `</parameter>` inside a value
 
 A parameter value that itself contains the text `</parameter>` (an agent writing a file *about*
