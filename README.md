@@ -115,7 +115,7 @@ Full setup (pack layout, node command, launch lines, expected output):
 
 ### New in v0.7.3
 
-The fixes from your issue reports: the TP=2 pre-verify race (issue #10) and exllamav3 1.5.x
+The fixes from reported issues: the TP=2 pre-verify race (issue #10) and exllamav3 1.5.x
 sharded-sidecar pack loading (issue #9) are fixed; `/v1/models` reports `max_model_len` and
 responses report `usage.prompt_tokens_details.cached_tokens` with a matching
 `velogb10_prompt_tokens_cached_total` counter (issue #8); `--model-name` /

@@ -3,7 +3,7 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
-## v0.7.3 — the fixes you reported: TP=2 pre-verify race, exllamav3 1.5.x pack loading, cached-token accounting; tool-call parsing; long-running hardening
+## v0.7.3 — reported-issue fixes: TP=2 pre-verify race, exllamav3 1.5.x pack loading, cached-token accounting; tool-call parsing; long-running hardening
 
 This release closes the three open issues from the v0.7.2 feedback (#8, #9, #10), makes the
 server tell the truth about cached prompt tokens, stops a stalled log reader (or a slow OTLP
@@ -17,7 +17,7 @@ environment variables.
 At world size 2, the host-side control exchange staged its RDMA frames into the same ring the
 device doorbell epochs use: when the exchange's slot counter happened to alias the slot holding
 the last draft-pass epoch payload, the first bytes of that payload were overwritten and the
-pre-verify hash compare fired — the `TP pre-verify FAILED` abort a few of you hit over
+pre-verify hash compare fired — the `TP pre-verify FAILED` abort reported against
 v0.7.0–v0.7.2, typically hours into a run. World sizes above 2 already used dedicated control
 rings; world 2 now does too, which closes the whole aliasing class (not just the pre-verify
 instance). The bug was confirmed with a deterministic fault-injection probe that fails on
@@ -41,7 +41,7 @@ Flash-Next EXL3 packs now use that layout; some of them also omit the shards fro
 index`). v0.7.3 loads both layouts as shipped — single-tensor and 128-shard, K=5 and K=6,
 index-listed or not (the loader falls back to the sidecar's own safetensors header and
 validates the layout; a boot line names the one in use). No flags, no workarounds: the
-header-rewrite workaround some of you used is no longer needed. Packs that loaded before are
+header-rewrite workaround some users applied is no longer needed. Packs that loaded before are
 byte-identical before and after (gated). A tested-packs table is in the Flash-Next setup guide.
 
 ### Server surface (issue #8)
@@ -149,10 +149,10 @@ path) is still probe-only: it exists as hidden `--probe-exl3-pack*` / `--pack3-*
 is not wired into serving, and is not a supported feature. Two and three concurrent requests
 still share the single-request aggregate rate.
 
-## v0.7.2 — concurrent requests on the EXL3 path, Qwen3.8-Flash-Next 4.05 bpw, `/metrics`, `--host`, and the bugs you reported
+## v0.7.2 — concurrent requests on the EXL3 path, Qwen3.8-Flash-Next 4.05 bpw, `/metrics`, `--host`, and reported-issue fixes
 
-This release answers a community benchmark of Flash-Next as a coding-agent executor (thank you — it
-was exactly the right test), adds the higher-fidelity 4.05 bpw pack, and fixes what was found along
+This release answers a community benchmark of Flash-Next as a coding-agent executor (an apt test of
+the engine), adds the higher-fidelity 4.05 bpw pack, and fixes what was found along
 the way. It adds a **fourth PTX file** to the deploy set (`src/ptx/exl3_bench_k6.ptx`); copy the whole
 `src/ptx/` directory as before — the release tarball already has it.
 
