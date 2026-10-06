@@ -14,6 +14,8 @@ environment variables.
 
 ### Fixed — TP=2 `TP pre-verify FAILED` (issue #10)
 
+Reported by [@JashicTM](https://github.com/JashicTM) (issue #10).
+
 At world size 2, the host-side control exchange staged its RDMA frames into the same ring the
 device doorbell epochs use: when the exchange's slot counter happened to alias the slot holding
 the last draft-pass epoch payload, the first bytes of that payload were overwritten and the
@@ -35,6 +37,8 @@ IDENT_ALL 871f083d58a54281 (code) / 38458d4ce6310c6f (prose) at 10/12/16 lanes, 
 
 ### Fixed — packs from exllamav3 1.5.x with the sharded n-gram sidecar (issue #9)
 
+Reported by [@MushroomMan321](https://github.com/MushroomMan321) (issue #9).
+
 exllamav3 1.5.x writes the n-gram table as 128 shard tensors in the sidecar, and most public
 Flash-Next EXL3 packs now use that layout; some of them also omit the shards from
 `model.safetensors.index.json`. v0.7.2 refused those packs at boot (`ple shard 0 not in
@@ -45,6 +49,8 @@ header-rewrite workaround some users applied is no longer needed. Packs that loa
 byte-identical before and after (gated). A tested-packs table is in the Flash-Next setup guide.
 
 ### Server surface (issue #8)
+
+Reported by [@liorm0505](https://github.com/liorm0505) (issue #8; the same report was first filed as #7 by [@liorzivsensors-cmd](https://github.com/liorzivsensors-cmd)).
 
 - `/v1/models` and `/v1/models/{id}` now report `max_model_len` = the served `--max-seq-len`.
 - `usage.prompt_tokens_details.cached_tokens` — the number of prompt tokens served from the
@@ -221,7 +227,7 @@ arithmetic and the fix (`--ple-ram ssd`, a smaller `--max-batch` / `--max-seq-le
 - **Tool-call history** is rendered the way the model writes it: `arguments` that are a JSON object are
   parsed before the chat template runs, even for templates with an `arguments is string` branch (they
   used to render `{"command": ...}` inside `<function=...>`, a mixed XML/JSON history the model copied
-  in long sessions; issue #6).
+  in long sessions; issue #6, reported by [@JashicTM](https://github.com/JashicTM)).
 - **Tool-call parsing:** text inside a parameter value that merely looks like a function tag
   (`<function=x>` or a bare `function=x>` line, for instance a file an agent is writing about this
   format) is payload and no longer produces a second, phantom tool call.
@@ -339,7 +345,7 @@ chunk scan, hyper-connection fusion, router coalescing, sparse-attention selecti
 folding, and shared-expert overlap. On the EXL3 path, prefill TTFT is down roughly 27–30% against
 the previous release. Autotune tables are now stamped with a build id and validated at load, so a
 stale table cannot be applied to a changed build. NVFP4 W4A4 prefill kernels were contributed via
-community PR #4.
+community PR #4 by [@kedric](https://github.com/kedric).
 
 ### Reliability
 
@@ -466,7 +472,7 @@ rendering, and a broad sweep of TP/FP8/losslessness correctness fixes.
 
 - **Vision generalization + boot fix.** The GPU vision tower now bootstraps opportunistically: a
   non-vision or geometry-incompatible model serves text-only instead of crashing at startup (fixes a
-  v0.5.0 boot crash on non-27B packs). Vision is generalized across the Qwen3.5/3.8 VL family, so
+  v0.5.0 boot crash on non-27B packs; issue #2, reported by [@npw1980](https://github.com/npw1980)). Vision is generalized across the Qwen3.5/3.8 VL family, so
   all vision-tower models serve images.
 - **OpenAI `reasoning_effort`.** Full level table (`none/low/medium/high/xhigh/max`) with
   per-family normalization, plus `--reasoning-effort`; the `high` mapping no longer silently drops
