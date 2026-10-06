@@ -3,6 +3,132 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.7.3 — the fixes you reported: TP=2 pre-verify race, exllamav3 1.5.x pack loading, cached-token accounting; tool-call parsing; long-running hardening
+
+This release closes the three open issues from the v0.7.2 feedback (#8, #9, #10), makes the
+server tell the truth about cached prompt tokens, stops a stalled log reader (or a slow OTLP
+receiver, or a client that stops reading a stream) from stalling the engine, and adds the
+operational surface (gauges, admission bounds, an operations guide) for running the server for
+hours at a time. The two tarball launcher scripts changed interface: they take flags now, not
+environment variables.
+
+### Fixed — TP=2 `TP pre-verify FAILED` (issue #10)
+
+At world size 2, the host-side control exchange staged its RDMA frames into the same ring the
+device doorbell epochs use: when the exchange's slot counter happened to alias the slot holding
+the last draft-pass epoch payload, the first bytes of that payload were overwritten and the
+pre-verify hash compare fired — the `TP pre-verify FAILED` abort a few of you hit over
+v0.7.0–v0.7.2, typically hours into a run. World sizes above 2 already used dedicated control
+rings; world 2 now does too, which closes the whole aliasing class (not just the pre-verify
+instance). The bug was confirmed with a deterministic fault-injection probe that fails on
+v0.7.2 and passes on v0.7.3; outputs are bit-identical to the previous build
+(`--exl3-tp-ident` hashes unchanged at TP=2 and TP=1), and decode speed is unchanged within
+measurement noise. The `--tp-dh-shard 0` workaround is no longer needed. Cost: ~11.5 MB of
+pinned host memory per rank. <<TP2RACE2: 2 h c=1 stress at 16K prompts, temperature 1 — abort
+count on v0.7.2 vs v0.7.3, pending the running verification session>>
+
+### Fixed — packs from exllamav3 1.5.x with the sharded n-gram sidecar (issue #9)
+
+exllamav3 1.5.x writes the n-gram table as 128 shard tensors in the sidecar, and most public
+Flash-Next EXL3 packs now use that layout; some of them also omit the shards from
+`model.safetensors.index.json`. v0.7.2 refused those packs at boot (`ple shard 0 not in
+index`). v0.7.3 loads both layouts as shipped — single-tensor and 128-shard, K=5 and K=6,
+index-listed or not (the loader falls back to the sidecar's own safetensors header and
+validates the layout; a boot line names the one in use). No flags, no workarounds: the
+header-rewrite workaround some of you used is no longer needed. Packs that loaded before are
+byte-identical before and after (gated). A tested-packs table is in the Flash-Next setup guide.
+
+### Server surface (issue #8)
+
+- `/v1/models` and `/v1/models/{id}` now report `max_model_len` = the served `--max-seq-len`.
+- `usage.prompt_tokens_details.cached_tokens` — the number of prompt tokens served from the
+  prefix cache (prompt-end hit or checkpoint resume, whichever is deeper) — on the chat
+  non-streaming response, the streaming usage chunk (`stream_options.include_usage`), and the
+  legacy non-streaming `/v1/completions` response; EXL3 and NVFP4 paths alike. The matching
+  counter is `velogb10_prompt_tokens_cached_total`.
+- `--model-name` / `--served-model-name` are honored on the EXL3 server (they used to be
+  silently ignored there); the resolution order is `--model-name` > `--served-model-name` >
+  the model card's `base_model:` > the directory name. Model ids containing `/` work.
+- Known gaps, stated plainly: the minimal DSV4 server does not report the new fields, and the
+  legacy **streaming** `/v1/completions` path emits no usage chunk.
+
+### Tool calls: literal `</parameter>` inside a value
+
+A parameter value that itself contains the text `</parameter>` (an agent writing a file *about*
+the tool format) used to be silently truncated at that point. The parser now ends a value only
+at the *structural* close — the `</parameter>` followed by the next `<parameter=`, by the
+`</function>` that closes the call, or by the end of the call block. Two residual ambiguities
+are inherent to the format and documented in the Flash-Next guide, together with advice for
+agent authors (prefer a diff-style edit tool, or break the closing sequence when quoting
+tool-call syntax).
+
+### `--keep-tools-when-tool-choice-none` (opt-in, default off)
+
+vLLM-compatible handling of `tool_choice: "none"`: the tool definitions stay in the prompt
+(byte-identical tools block, so the prefix cache and checkpoints survive a mid-conversation
+summary/compaction turn), a do-not-call instruction is appended, and the reply comes back as
+plain content. In the replayed reporter trace (309-message conversation, ~89K prompt tokens),
+the compaction request and the following turn went from three full ~80 s re-prefills to
+7.9 s and 1.3 s. The model still *sees* the tools and is merely told not to call them — a
+stray call returns as visible text. The default stays off (byte-identical legacy behaviour);
+`--max-batch 2` remains the no-flag alternative. Details in the Flash-Next guide.
+
+### Telemetry on Flash-Next
+
+`--otel-endpoint` now works on the EXL3 (Flash-Next) server — it was silently ignored there.
+The `--otel-*` flags are shared by both servers; an unusable endpoint is refused before the
+model load. Under TP, only the head emits (nodes have no HTTP hooks). The sender is fully
+async: a slow or absent receiver delays nothing but itself.
+
+### Long-running hardening
+
+- Log lines no longer go straight to a locked stdout: a bounded non-blocking queue (4096
+  lines, drop-and-count, one recovery summary) means a stalled log reader can no longer stall
+  the scheduler (`velogb10_log_lines_dropped_total` counts the losses).
+- `--max-waiting` (default 256): 503 + `Retry-After: 5` instead of an unbounded admit queue.
+- `--stream-backlog-events` (default 65536 ≈ 11 min at 100 tok/s): a stream whose consumer
+  stopped reading is cancelled like a client disconnect.
+- New gauges (RSS, threads, fds, memory headroom, scheduler progress/busy/age, graph-cache
+  entries, rejected requests, cancelled streams, dropped log lines, cached prompt tokens) and
+  exit-path log flushing, plus `=`-form flag parsing on both servers.
+- New `docs/OPERATIONS.md`: supervisor rationale, systemd units, log handling, the gauge and
+  alert table (alert on `scheduler_busy == 1 AND age > 120` only), exit codes, soak watch-list.
+
+### Kernels
+
+The 9–16-row router fold and HC fast paths are now actually live at default flags (they were
+dead code at those widths in v0.7.2): bit-identical output, 8/8 identity suite. In isolation
+the kernels measure hc ~7.2 → ~6 ms and router ~4.8 → ~1.3 ms at 10 rows; end-to-end aggregate
+throughput at c=1 and c=10 is unchanged within the run-to-run band — claim no app-level win
+from this. At TP ≥ 2 with expert parallelism, 9–16-row forwards deliberately keep the legacy
+router chain, so nothing TP-related changed there.
+
+### `--lane-order fcfs` / `--lane-quantum` (opt-in; default `rr` unchanged)
+
+For several concurrent requests in the serial-speculation arm: `rr` (today's behaviour) gives
+every busy lane a round per scheduler step — n requests each run at 1/n speed and all finish
+late; `fcfs` runs one lane to completion at a time (first-come-first-served, bounded by
+`--lane-quantum`, default 256 generated tokens). Aggregate throughput is unchanged; with
+equal-length turns, mean completion time drops ~25% at 2 and ~33% at 3 concurrent requests, at
+the cost of the later lanes' time-to-first-token. With mixed lengths, `rr` wins the mean.
+Greedy output is byte-identical in both orders; TP=2 output identity verified.
+
+### Launcher interface changed (tarball scripts)
+
+`run_tp_server.sh` and `run_tp_node.sh` took `MODEL_DIR=`, `PORT=`, `NODE=`… environment
+variables and carried stale defaults. They are plain flag scripts now:
+`run_tp_server.sh --model-dir DIR --node IP:29500 [--port 9000] [--max-seq-len N]
+[--max-batch N] [--tp 2] [-- <engine flags>]` and `run_tp_node.sh [--port 29500]
+[--rdma-dev DEV]`; `--help` and `--dry-run` on both, missing required flags fail loudly, and
+the server always binds `--host 0.0.0.0`. The old environment overrides are gone.
+
+### Not in this release
+
+The packed multi-request speculative verify (two and three concurrent requests on the EXL3
+path) is still probe-only: it exists as hidden `--probe-exl3-pack*` / `--pack3-*` diagnostics,
+is not wired into serving, and is not a supported feature. Two and three concurrent requests
+still share the single-request aggregate rate.
+
 ## v0.7.2 — concurrent requests on the EXL3 path, Qwen3.8-Flash-Next 4.05 bpw, `/metrics`, `--host`, and the bugs you reported
 
 This release answers a community benchmark of Flash-Next as a coding-agent executor (thank you — it

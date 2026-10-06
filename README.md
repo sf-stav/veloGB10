@@ -113,6 +113,20 @@ on decode and **×2.0–2.2** on prefill.
 Full setup (pack layout, node command, launch lines, expected output):
 **[QWEN_38_FLASH_NEXT_SETUP.md](QWEN_38_FLASH_NEXT_SETUP.md)**.
 
+### New in v0.7.3
+
+The fixes from your issue reports: the TP=2 pre-verify race (issue #10) and exllamav3 1.5.x
+sharded-sidecar pack loading (issue #9) are fixed; `/v1/models` reports `max_model_len` and
+responses report `usage.prompt_tokens_details.cached_tokens` with a matching
+`velogb10_prompt_tokens_cached_total` counter (issue #8); `--model-name` /
+`--served-model-name` are honored on the EXL3 server. Tool-call values containing a literal
+`</parameter>` are no longer truncated. Long-running hardening: the bounded non-blocking log
+queue, `--max-waiting`, `--stream-backlog-events`, new health gauges, exit-path log flushing —
+see the new **[docs/OPERATIONS.md](docs/OPERATIONS.md)**. Opt-in:
+`--keep-tools-when-tool-choice-none`, `--lane-order fcfs` / `--lane-quantum`. The tarball
+launchers take flags now (`run_tp_server.sh --model-dir ... --node ip:29500`), not
+environment variables. Details: [CHANGELOG](CHANGELOG.md).
+
 ### New in v0.7.2
 
 - **Concurrent requests on the EXL3 path.** With several busy requests the engine now shares one batched
@@ -127,6 +141,7 @@ Full setup (pack layout, node command, launch lines, expected output):
 - **`--ple-ram ram|ssd|auto`** puts the n-gram table on SSD when memory is short (decode ~1–4% slower),
   and a configuration that cannot fit is refused **before** the load with the arithmetic and the fix.
 - **`GET /metrics`** (Prometheus text format, on by default) and **`--host <addr>`** (bind address).
+- **v0.7.3 gauges** on `/metrics`: `velogb10_prompt_tokens_cached_total`, `velogb10_process_rss_bytes`, `velogb10_thread_count`, `velogb10_open_fds`, `velogb10_mem_available_bytes` / `velogb10_mem_min_available_bytes`, `velogb10_scheduler_steps_total` / `velogb10_scheduler_busy` / `velogb10_scheduler_last_step_age_seconds`, `velogb10_graph_cache_entries`, `velogb10_log_lines_dropped_total`, `velogb10_requests_rejected_total`, `velogb10_streams_cancelled_backlog_total` — meanings and alert rules in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 - **Fixes:** tool-call history rendering (issue #6) and a phantom-tool-call parsing bug, the NVFP4
   DFlash2/DSpark two-request crash, NVFP4 `--kv-cache k8v8` with `--max-batch > 1`, TP=2 `--max-batch 16`.
 
@@ -701,7 +716,7 @@ Complete surface of `gb10_inference` (same content as `--help`). Square brackets
 
 | Mode | What it does |
 |---|---|
-| `--server` | OpenAI-compatible HTTP server — the normal way to run (endpoints: `POST /v1/chat/completions`, `POST /v1/tokenize`, `POST /v1/detokenize`, `GET /v1/models[/:id]`, `GET /health`, `GET /metrics`) |
+| `--server` | OpenAI-compatible HTTP server — the normal way to run (endpoints: `POST /v1/chat/completions`, `POST /v1/tokenize`, `POST /v1/detokenize`, `GET /v1/models[/:id]`, `GET /health`, `GET /metrics`) |. v0.7.3: `/v1/models` reports `max_model_len`; chat/legacy non-streaming responses report `usage.prompt_tokens_details.cached_tokens`; the streaming usage chunk carries it too |
 | *(no mode)* | Interactive CLI: load model, generate from `--prompt` |
 | `--help`, `-h` | Print help |
 
@@ -727,12 +742,15 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 |---|---|---|
 | `--model-dir <DIR>` | required | Model directory (`config.json` + safetensors + tokenizer). The normal way to load |
 | `--model-name <NAME>` | dir name | Name reported by `/v1/models` |
+| `--served-model-name <NAME>` | — | Alias of `--model-name` (OpenAI-style spelling; both honored on the NVFP4 and EXL3 servers; resolution: `--model-name` > `--served-model-name` > model-card `base_model:` > directory name) |
 | `--model <FILE>` | — | Legacy: single `.safetensors` file (use `--model-dir`) |
 | `--tokenizer <FILE>` | — | Legacy: tokenizer.json path (implied by `--model-dir`) |
 | `--port <N>` | 8000 | Listen port |
 | `--host <ADDR>` | `0.0.0.0` | HTTP bind address (`127.0.0.1` = this machine only) |
 | `--max-batch <N>` | 8 | Max concurrent sequences (lanes). EXL3: every lane's KV is allocated up front (~5.6 GB per lane at 262K context, 2.8 GB at 131K) |
 | `--spec-lanes-max <auto\|N\|0>` | auto | EXL3 multi-request mode: pick per round between serial speculation and one shared batched step by estimated aggregate tok/s; `N` shares only above N busy requests, `0` = never |
+| `--lane-order <rr\|fcfs>` | rr | Order of serial speculative rounds with several busy requests: `rr` = a round per lane per step (all finish late); `fcfs` = run one lane to completion at a time (≈25%/33% lower mean completion at 2/3 equal-length concurrent, worse TTFT for later lanes; aggregate unchanged; greedy output identical) |
+| `--lane-quantum <N>` | 256 | The `--lane-order=fcfs` turn cap in generated tokens (bounds a pathologically long turn) |
 | `--ple-ram <auto\|ram\|ssd>` | auto | EXL3 n-gram table location: RAM, or read from SSD (frees 30–39 GB, decode ~1–4% slower); `auto` decides after the boot and refuses impossible configurations before the load |
 | `--max-tokens <N>` | 8192 | Generation cap when a request omits `max_tokens` |
 | `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
@@ -757,6 +775,10 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--otel-include-tokens <on\|off>` | off | Include token text in the telemetry |
 | `--otel-model-id <ID>` | auto | Override the `model.id` attribute (auto: `/v1/models` id) |
 | `--otel-topology <T>` | auto | Override the `topology` attribute (auto: `single`/`tp2`/`tp4`) |
+| `--max-waiting <N>` | 256 | Refuse (503 + `Retry-After: 5`) at N or more requests waiting beyond the lanes; 0 = unlimited. Counts the whole handler lifetime |
+| `--stream-backlog-events <N>` | 65536 | Cancel a stream whose unconsumed event backlog reaches N (≈ 11 min at 100 tok/s; 0 = unlimited) — a client that stopped reading frees the lane instead of stalling it |
+| `--keep-tools-when-tool-choice-none` | off | vLLM-compatible `tool_choice:"none"`: keep the tools in the prompt (prefix cache survives compaction turns), append a do-not-call instruction, return plain content |
+| `--exit-on-fatal` | off | EXL3: on a fatal CUDA error / scheduler panic, finish the in-flight request with an error and exit 70 for a supervisor (see docs/OPERATIONS.md) instead of serving 503s from a DEAD engine |
 
 `temperature` / `top_p` / `top_k` / `seed` are **per-request** only (defaults 0.7 / 0.8 / 20) —
 every request may override in its JSON body. There are no MTP env vars; speculation is auto-tuned

@@ -119,8 +119,8 @@ Expected output:
 The node needs **no other flags** and no model path — the head ships each rank its shard. For the
 examples below we assume nodes are running at:
 
-- **TP=2:** `192.168.177.12:29500`
-- **TP=4:** `192.168.177.12:29500`, `192.168.177.13:29500`, `192.168.177.14:29500`
+- **TP=2:** `192.0.2.12:29500`
+- **TP=4:** `192.0.2.12:29500`, `192.0.2.13:29500`, `192.0.2.14:29500`
 
 > **A single machine (TP=1) needs no node process.** Skip to §3 and use the TP=1 command.
 
@@ -137,7 +137,7 @@ the directory holding `gb10_inference` and `src/ptx/`.
 ./gb10_inference --server \
   --tp 4 \
   --model-dir ~/veloGB10/Qwen3.8-Flash-Next-EXL3-3.05bpw \
-  --nodes 192.168.177.12:29500,192.168.177.13:29500,192.168.177.14:29500 \
+  --nodes 192.0.2.12:29500,192.0.2.13:29500,192.0.2.14:29500 \
   --port 9000 \
   --max-seq-len 262144 \
   --max-batch 1
@@ -149,7 +149,7 @@ the directory holding `gb10_inference` and `src/ptx/`.
 ./gb10_inference --server \
   --tp 2 \
   --model-dir ~/veloGB10/Qwen3.8-Flash-Next-EXL3-3.05bpw \
-  --nodes 192.168.177.12:29500 \
+  --nodes 192.0.2.12:29500 \
   --port 9000 \
   --max-seq-len 262144 \
   --max-batch 1
@@ -174,9 +174,9 @@ start of the same model transfers nothing:
 [head] <host> — building manifest for ~/veloGB10/Qwen3.8-Flash-Next-EXL3-3.05bpw (world 4) ...
 [head] B32 plan rank 1/4 (exl3, deal interleave): 65 files, 46.79 GiB
 [head] manifest 'Qwen3.8-Flash-Next-EXL3-3.05bpw': 195 artifacts, 150.72 GB (B32: per-rank shards through the blob cache)
-[head] 192.168.177.12 (rank 1) needs 65 / 65 artifacts (50.24 GB)
-[head] 192.168.177.12 (rank 1) READY — model at ~/.cache/gb10_tp/models/Qwen3.8-Flash-Next-exl3-3.05bpw@exl3-w4-r1-interleave (50.24 GB in 98.3s = 0.51 GB/s)
-[head] shipped config to 192.168.177.12 (rank 1/4)
+[head] 192.0.2.12 (rank 1) needs 65 / 65 artifacts (50.24 GB)
+[head] 192.0.2.12 (rank 1) READY — model at ~/.cache/gb10_tp/models/Qwen3.8-Flash-Next-exl3-3.05bpw@exl3-w4-r1-interleave (50.24 GB in 98.3s = 0.51 GB/s)
+[head] shipped config to 192.0.2.12 (rank 1/4)
 ...
 [head] all 3 node(s) synced.
 ```
@@ -203,7 +203,7 @@ On a TP run the head also confirms every peer and prints the rank map:
 
 ```
 [exl3-serve] TP node rank 1 READY (mirror armed)
-[exl3-serve] TP=4 API up: head = rank 0; rank 1 = 192.168.177.12 (192.168.177.12:29500); rank 2 = ...; rank 3 = ...
+[exl3-serve] TP=4 API up: head = rank 0; rank 1 = 192.0.2.12 (192.0.2.12:29500); rank 2 = ...; rank 3 = ...
 ```
 
 Once the `listening on 0.0.0.0:9000` line appears, the server is up and you can connect with any
@@ -323,4 +323,75 @@ with `--model-dir` pointing at it.
 - **Untuned smoke-test figures** (1,000 generated tokens, 2K prefill, single request): TP=1 63 tok/s decode
   and 1,399 prefill; TP=2 89 and 2,612; TP=4 120 and 3,496. Decode is about 0.86× the 3.05 pack on one or
   two nodes. VeloBenchmark figures will follow.
+
+## 7. Third-party packs and the exllamav3 1.5.x sidecar layout (v0.7.3)
+
+Since v0.7.3, veloGB10 loads both n-gram sidecar layouts written by exllamav3: the original
+single-tensor `ngram_embedding.trellis` and the exllamav3 1.5.x layout of 128 `shard_N.trellis`
+tensors (K=5 and K=6), including packs whose `model.safetensors.index.json` does not list them
+(the loader falls back to the sidecar's own safetensors header and validates the layout; a boot
+line names the layout in use). Packs whose index lists the shards, and single-tensor packs,
+load exactly as before (byte-identity gated). No flags needed — the new layout just loads.
+
+### Tested third-party packs
+
+| repo | revision / commit | bpw | K | n-gram layout | TP | c=1 tok/s (best of 3) | MTP acceptance | checked |
+|---|---|---|---|---|---|---|---|---|
+| SharkWipf/Swift-1.5-Qwen3.8-Flash-Next-exl3 | `4.05bpw_h6_ng6` @ `7bbb89df` | 4.05 | 6 | 128 shards in sidecar, not in index | 1, 2 | 55.4 / 83.4 | up to 91.4% (TP1), 88.9% (TP2) | boot, 5 sanity prompts, tool call, 8K prompt recall, mtp-stats, byte-identity gates |
+| (synthetic, from doth4580 4.05) | fixture `…-shardedfixture` | 4.05 | 6 | 128 shards, no index entries | 1 | — | — | `IDENT_ALL` = original (`5502280475b19ea3`) |
+| (synthetic, from doth4580 3.05) | fixture `…-noindexfixture` | 3.05 | 5 | 128 shards, index stripped | 1 | — | — | `IDENT_ALL` = original (`bf61490644d5c0e3`) |
+| doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw (regression) | current | 3.05 | 5 | 128 shards, index lists them | 1 | — | — | code+prose `IDENT_ALL` unchanged across builds |
+| doth4580 4.05bpw (regression) | current | 4.05 | 6 | single trellis tensor | 1 | — | — | code `IDENT_ALL` unchanged across builds |
+
+## 8. Using Flash-Next as a coding-agent backend
+
+Two flags and one parser rule matter when an agent harness drives the server for hours.
+
+**`--max-batch 2` (no behaviour change).** A coding agent periodically sends a
+compaction/summary request in the middle of a long conversation. With one lane, that request's
+different prompt overwrites the lane's cache and the NEXT normal request re-prefills ~90K
+tokens (~80 s each in the trace we analyzed — about a quarter of the session's wall time). With
+two lanes the summary takes the second lane and the main conversation's cache survives. Cost:
+a second lane's KV (~5 GB at 131K f16 with `--kv-cache f16`).
+
+**`--keep-tools-when-tool-choice-none` (opt-in, default off).** The engine default (llama.cpp
+behaviour) removes the tool definitions from the prompt when `tool_choice:"none"` — but this
+model's chat template renders the tools inside the system block at the very start, so the
+whole prompt differs from token 0 and nothing can be reused. The flag keeps the tools block
+in the prompt (byte-identical to a normal request, so the prefix cache and checkpoints
+survive), appends a `do-not-call` instruction to the last message, and returns the reply as
+plain content. In the replayed reporter trace (309-message conversation, ~89K prompt tokens):
+with the flag off, one summary turn plus its follow-up meant three full ~80 s re-prefills;
+with it on, the summary resumed at 99.9% cache (7.9 s) and the follow-up at 100% (1.3 s).
+Caveat: the model still SEES the tools and is merely told not to call them — a stray
+`<tool_call>` comes back as visible text instead of being executed. `--exit-on-fatal` pairs
+well with a supervisor for unattended runs (see `docs/OPERATIONS.md`).
+
+**Tool-call values that quote tool-call syntax.** A parameter value may itself contain the
+text `</parameter>` (an agent writing a file that documents the tool-call format). The parser
+ends a value only at the *structural* `</parameter>` — the one followed by the next
+`<parameter=`, by the `</function>` closing the call, or by the end of the call block.
+Embedded close tags that fail this lookahead stay part of the value. Two residual ambiguities
+are inherent to the format: (1) a value that ends with the *complete* closing sequence
+(`</parameter>` + `</function>`) right at the end of the call block is indistinguishable from
+the structural close and will be cut there; (2) an embedded `</tool_call>` still ends the
+whole tool-call block. Advice for agent authors: when a tool must write text that quotes
+tool-call syntax, prefer an edit/patch tool with a diff, or break the closing sequence (write
+`< /parameter>` or insert a blank line inside the tag) — the parser cannot recover a complete
+closing sequence at the very end of a value.
+
+## 9. The stack we measured on, and what decode speed to expect
+
+Measured on four DGX Spark units running DGX OS 7.5.0 (Ubuntu 24.04.4), kernel
+`6.17.0-1029-nvidia`, NVIDIA driver 580.173.02, CUDA 13.0. We have NOT run DGX OS 7.6.0 /
+kernel `7.0.0-1019-nvidia` — if you are on that stack and see anything odd, tell us; we
+cannot yet say whether it behaves identically.
+
+Decode speed depends on the workload through MTP acceptance: on near-pure code completions
+the draft accepts often and a single request runs ~137 tok/s (3.05 bpw, TP=1), while mixed
+code+prose sessions measure ~73 tok/s (3.05) and ~63 tok/s (4.05) — the same engine path,
+different acceptance. The figures in section 4 and the 4.05 smoke numbers are the same story:
+expect the pure-code end only when your workload is mostly code; agent conversations with
+tools and prose sit at the lower end. All are single-request numbers; concurrency changes the
+picture as described in the README (v0.7.2 section).
 

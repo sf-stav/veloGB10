@@ -72,14 +72,14 @@ Expected output:
 
 ```
 [node-resident] supervisor up on port 29500 — one process per head session; kill this process to stop the node
-[node] gx10-1dcd ready: discovery on UDP 29499, control on TCP 29500, cache ~/.cache/gb10_tp
+[node] node-1 ready: discovery on UDP 29499, control on TCP 29500, cache ~/.cache/gb10_tp
 ```
 
 At this point the node is waiting for the head to launch.
 
 For the examples below we assume the node is running at:
 
-- **TP=2:** `192.168.177.12:29500`
+- **TP=2:** `192.0.2.12:29500`
 
 > **You do NOT need to copy the model to the node.** The head transfers the required model shards
 > and files automatically. On first start this is a large sync (~170 GB for Hy3) and can take a
@@ -96,34 +96,13 @@ The launch command is best written as a small script so the many options stay re
 following is the known-good TP=2 configuration for Hy3:
 
 ```bash
-MODEL_DIR="${MODEL_DIR:-/path/to/your/models/hy3-nvfp4}"
-PORT=${PORT:-9000}
-NODE="${NODE:-<your node ip address>:29500}"
-SEQ=${SEQ:-262144}
-BATCH=${BATCH:-1}
-PREFIX=${PREFIX:-off}
-KVC=${KVC:-q4}
-MTP=${MTP:-off}
-# Fold explicitly OFF (belt + suspenders).
-FOLD="--moe-no-fold"
-# Graphs ON by default; GRAPHS=eager overrides to the non-graph path.
-GRAPH_FLAGS=""
-[ "${GRAPHS:-on}" = "eager" ] && GRAPH_FLAGS="--no-decode-graphs --no-verify-graph"
-
-set -euo pipefail
-SDIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -x "$SDIR/gb10_inference" ]; then cd "$SDIR"; BIN="./gb10_inference"
-else cd "$SDIR/.."; BIN="./target/release/gb10_inference"; fi
-[ -x "$BIN" ] || { echo "ERROR: no binary at $BIN"; exit 1; }
-[ -f "$MODEL_DIR/config.json" ] || { echo "ERROR: no model at $MODEL_DIR"; exit 1; }
-
-echo "=== GB10 TP=2 HEAD — Hy3 NVFP4 MXFP4-ON  port $PORT  node $NODE  seq $SEQ  batch $BATCH  prefix-cache $PREFIX  mtp $MTP  kv-cache $KVC  fold off  graphs ${GRAPHS:-on} ==="
-echo "    (first start: ~170 GB blob sync to the node; then ~85 s/rank load)"
-exec "$BIN" --server \
-  --model-dir "$MODEL_DIR" --tp --nodes "$NODE" --port "$PORT" \
-  --max-seq-len "$SEQ" --max-batch "$BATCH" --max-tokens 65536 \
-  --default-presence-penalty 1.5 --prefix-cache "$PREFIX" --mtp="$MTP" \
-  --kv-cache "$KVC" --mxfp4=on ${FOLD} ${GRAPH_FLAGS}
+# v0.7.3: flags only — the shipped launcher takes --flags and passes engine flags after --
+./run_tp_server.sh \
+  --model-dir /path/to/your/models/hy3-nvfp4 \
+  --node <your-node-ip>:29500 \
+  --port 9000 --max-seq-len 262144 --max-batch 1 \
+  -- --prefix-cache off --mtp=off --kv-cache q4 --moe-no-fold
+# graphs stay ON by default; add --no-decode-graphs --no-verify-graph after -- for the eager path.
 ```
 > **Note (v0.7.0):** the engine no longer reads environment variables. Every option is a
 > command-line flag; exporting one of the old `GB10_*` variables now refuses startup and names the
@@ -167,10 +146,10 @@ During the head bring-up you should see lines like:
 
 ```
 [tp] config installed: world=2 shard_mixers=true shard_mtp=true graph=false ... mxfp4=true ...
-[head] gx10-c9c4 — building manifest for ~/models/hy3-nvfp4 (world 2) ...
+[head] head-1 — building manifest for ~/models/hy3-nvfp4 (world 2) ...
 [head] manifest 'hy3-nvfp4': 19 artifacts, 169.59 GB
-[head] 192.168.177.12 (rank 1) READY — model at ~/.cache/gb10_tp/models/hy3-nvfp4 (0.00 GB in 0.0s = 0.00 GB/s)
-[head] shipped config to 192.168.177.12 (rank 1/2)
+[head] 192.0.2.12 (rank 1) READY — model at ~/.cache/gb10_tp/models/hy3-nvfp4 (0.00 GB in 0.0s = 0.00 GB/s)
+[head] shipped config to 192.0.2.12 (rank 1/2)
 [head] 1 node(s) synced; all control streams RETAINED for the serving session
 [tp] rank 0/2 — bringing up RDMA data-plane link on rocep1s0f1 (listening) ...
 [tp] rank 0/2 — link UP
