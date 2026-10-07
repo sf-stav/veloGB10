@@ -644,7 +644,7 @@ fn probe_tail(a: &FwdArgs, c: usize, pa: &[u32], t0: usize) -> Result<()> {
     let need = pa.len().max(pb.len()) + cont + 2;
     anyhow::ensure!(need <= a.max_pos, "prompts + continuation need {need} positions > --max-seq-len {}", a.max_pos);
     let model = FwdModel::load(&a.dir, 2, a.max_pos)?;
-    let mut sc = Scratch::new(&model.dev, &model.cfg, 2, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, 2, model.cfg.rotary_dim, model.max_pos())?;
     let mut psc = model.prefill_scratch(2 * c - 1)?; // v2: merged chunks up to 2C - 1 rows
     let v = model.cfg.vocab_size;
     println!("C1 TAIL probe: A {} tokens, tail t={t}, B {} tokens (LCP t), C {c}, continuation {cont}", pa.len(), pb.len());
@@ -748,7 +748,7 @@ pub fn probe_wp16(p: &Wp16ProbeArgs) -> Result<()> {
     let model = FwdModel::load(&a.dir, 2, a.max_pos)?;
     let lay = model.ckpt_layout();
     println!("WP16 probe: A {} tokens, B {} tokens, C {c}, continuation {cont}; {}", pa.len(), pb.len(), lay.describe());
-    let mut sc = Scratch::new(&model.dev, &model.cfg, 2, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, 2, model.cfg.rotary_dim, model.max_pos())?;
     let mut psc = model.prefill_scratch(c)?;
     let v = model.cfg.vocab_size;
     let mut store: CkptStore<RecurCkpt> = CkptStore::new(2, 64);

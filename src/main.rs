@@ -9178,7 +9178,9 @@ fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
         if i + 1 < node_args.len() { node_args[i + 1] = dir_abs.clone(); }
     }
     tpc.exl3_mode = format!("serve:{}", serde_json::to_string(&node_args).expect("argv json"));
-    tpc.max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    tpc.max_seq_len = gb10_inference::exl3_serve::clamp_max_seq_len(
+        model_dir,
+        parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096));
     if args.iter().any(|a| a == "--tp-trace") { tpc.trace = true; }
     exl3_tp_cli_knobs(args, &mut tpc);
     println!("[head] EXL3 TP serve config: deal {} options shipped {:?}; node argv {:?}", tpc.exl3_ep_deal,

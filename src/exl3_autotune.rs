@@ -1572,7 +1572,7 @@ fn cli_inner(args: &[String]) -> Result<bool> {
     let t_load = std::time::Instant::now();
     let model = FwdModel::load(&dir, 1, max_pos)?;
     let head = model.mtp.as_ref().context("the pack has no mtp.* draft head — the self-test needs MTP rounds")?;
-    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, MTP_MAX_K + 1)?;
+    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, MTP_MAX_K + 1, model.max_pos())?;
     let mut psc: Option<PrefillScratch> = None;
     let fp = tune::current_fingerprint(&dir, 1, tune::STOCK_PROFILE_MHZ);
     let fp_json = serde_json::to_value(&fp)?;
@@ -3271,7 +3271,7 @@ fn tune_cli(args: &[String]) -> Result<bool> {
         Some(_) => {}
         None => println!("AUTOTUNE: survivability floor SKIPPED (/proc/meminfo MemAvailable unavailable)"),
     }
-    let sc = FwdModel::scratch(model.dev(), &model.cfg, lanes.max(k + 1))?;
+    let sc = FwdModel::scratch(model.dev(), &model.cfg, lanes.max(k + 1), model.max_pos())?;
     let mut psc0 = model.prefill_scratch(chunk)?;
     model.prefill_warmup(&mut psc0, 0, &FwdModel::prefill_warmup_widths(chunk))?;
     let tok = crate::tokenizer::QwenTokenizer::from_file(&format!("{}/tokenizer.json", dir.trim_end_matches('/')))?;
