@@ -9164,6 +9164,13 @@ fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
         }).collect::<Vec<_>>()
     });
     let wait = std::time::Duration::from_secs(parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
+    // E5: trunk YaRN (the EXL3 serve path). Must be set BEFORE TpConfig::from_opts() so it is
+    // shipped to the node (Scope::Spmd) and hashed into the boot agree (both ranks must build
+    // identical rope tables), and before the load so build_rope_tables sees it. Mirrors the
+    // parse run_server already does on the NVFP4 path.
+    if let Some(f) = parse_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok()) {
+        if f >= 1.0 { gb10_inference::opts::set(gb10_inference::opt!("rope-yarn-factor"), f.to_string()); }
+    }
     let mut tpc = gb10_inference::tp::TpConfig::from_opts();
     tpc.world = world;
     tpc.mode_serve = true;

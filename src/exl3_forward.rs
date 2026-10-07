@@ -1359,24 +1359,149 @@ mod reprime_tests {
     }
 }
 
-/// The prefill prologue's pre-WP05 host RoPE rows for positions pos0..pos0+c (per row:
-/// cos[rdim/2] | 0[rdim/2] | sin[rdim/2] | 0[rdim/2]) — the old per-chunk loop verbatim; the
-/// --wp05-off=pro path and the load-time cos_tab comparison.
-fn prefill_cossin_host(theta: f32, rdim: usize, pos0: usize, c: usize) -> Vec<f32> {
-    let mut cossin: Vec<f32> = Vec::with_capacity(c * 2 * rdim);
+/// The trunk rope's per-dim inverse frequencies and its attention mscale — the one place the
+/// YaRN rescaling lives, so the decode table, the indexer tables, the vision rows and the prefill
+/// loop cannot drift apart.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RopeFreqs {
+    mscale: f32,
+    inv: Vec<f32>,
+}
+
+impl RopeFreqs {
+    /// The native rope: `theta^(-2i/rdim)`, no mscale.
+    pub(crate) fn native(rdim: usize, theta: f32) -> Self {
+        let inv = (0..rdim / 2).map(|i| theta.powf(-(2.0 * i as f32) / rdim as f32)).collect();
+        Self { mscale: 1.0, inv }
+    }
+
+    /// The YaRN-rescaled rope for a factor above 1 — the vLLM-convention per-dim ramp plus the
+    /// attention mscale, anchored on the model's native window.
+    pub(crate) fn yarn(rdim: usize, theta: f32, factor: f32, native_max: usize) -> Self {
+        Self {
+            mscale: 0.1 * factor.ln() + 1.0,
+            inv: crate::dspark::oracle::yaarn_freqs(rdim, theta, factor, native_max, 32, 1),
+        }
+    }
+
+    /// The rope this process serves: YaRN when the factor is set, native otherwise.
+    pub(crate) fn for_opts(rdim: usize, theta: f32, native_max: usize) -> Self {
+        let factor = crate::opts::var(crate::opt!("rope-yarn-factor")).ok()
+            .and_then(|v| v.parse::<f32>().ok()).filter(|f| *f >= 1.0).unwrap_or(1.0f32);
+        if factor > 1.0 {
+            let fr = Self::yarn(rdim, theta, factor, native_max);
+            crate::rprintln!("[rope] EXL3 trunk YaRN factor {factor}: mscale {:.4}, native {native_max} \
+                       (vLLM-convention per-dim ramp, beta 32/1; same math as gpu.rs build_rope_tables)",
+                      fr.mscale);
+            fr
+        } else {
+            Self::native(rdim, theta)
+        }
+    }
+
+    /// cos/sin for position `p` at rotary dim `i`, with the mscale folded in.
+    pub(crate) fn cos_sin(&self, p: usize, i: usize) -> (f32, f32) {
+        let f = p as f32 * self.inv(i);
+        (f.cos() * self.mscale, f.sin() * self.mscale)
+    }
+
+    /// The inverse frequency at rotary dim `i` — a caller whose position differs per axis reads
+    /// this directly.
+    pub(crate) fn inv(&self, i: usize) -> f32 { self.inv[i] }
+    pub(crate) fn mscale(&self) -> f32 { self.mscale }
+    pub(crate) fn half(&self) -> usize { self.inv.len() }
+}
+
+/// One row of the trunk cos/sin table: cos[rdim/2] | 0[rdim/2] | sin[rdim/2] | 0[rdim/2].
+fn cos_tab_row(fr: &RopeFreqs, p: usize) -> Vec<f32> {
+    let half = fr.half();
+    let mut row = Vec::with_capacity(4 * half);
+    for i in 0..half { row.push(fr.cos_sin(p, i).0); }
+    for _ in 0..half { row.push(0.0); }
+    for i in 0..half { row.push(fr.cos_sin(p, i).1); }
+    for _ in 0..half { row.push(0.0); }
+    row
+}
+
+/// The prefill prologue's host RoPE rows for positions pos0..pos0+c — the independent second
+/// implementation the load-time cos_tab comparison is made against.
+fn prefill_cossin_host(fr: &RopeFreqs, pos0: usize, c: usize) -> Vec<f32> {
+    let half = fr.half();
+    let mut cossin: Vec<f32> = Vec::with_capacity(c * 4 * half);
     for p in pos0..pos0 + c {
-        for i in 0..rdim / 2 {
-            let inv = theta.powf(-(2.0 * i as f32) / rdim as f32);
-            cossin.push((p as f32 * inv).cos());
-        }
-        for _ in 0..rdim / 2 { cossin.push(0.0); }
-        for i in 0..rdim / 2 {
-            let inv = theta.powf(-(2.0 * i as f32) / rdim as f32);
-            cossin.push((p as f32 * inv).sin());
-        }
-        for _ in 0..rdim / 2 { cossin.push(0.0); }
+        for i in 0..half { cossin.push(fr.cos_sin(p, i).0); }
+        for _ in 0..half { cossin.push(0.0); }
+        for i in 0..half { cossin.push(fr.cos_sin(p, i).1); }
+        for _ in 0..half { cossin.push(0.0); }
     }
     cossin
+}
+
+#[cfg(test)]
+mod rope_tests {
+    use super::*;
+
+    /// A serve without a factor must produce the same bytes the tables held before YaRN existed.
+    #[test]
+    fn native_rope_is_the_plain_formula() {
+        let (rdim, theta) = (64usize, 1e7f32);
+        let fr = RopeFreqs::native(rdim, theta);
+        assert_eq!(fr.mscale(), 1.0);
+        assert_eq!(fr.half(), rdim / 2);
+        for i in 0..rdim / 2 {
+            let plain = theta.powf(-(2.0 * i as f32) / rdim as f32);
+            assert_eq!(fr.inv(i).to_bits(), plain.to_bits(), "dim {i}");
+        }
+    }
+
+    /// YaRN is exactly the shared oracle's ramp with the vLLM mscale — the property that makes
+    /// this path match the reference engine.
+    #[test]
+    fn yarn_rope_is_the_oracle_ramp_plus_mscale() {
+        let (rdim, theta, factor, native_max) = (64usize, 1e7f32, 4.0f32, 262144usize);
+        let fr = RopeFreqs::yarn(rdim, theta, factor, native_max);
+        let want = crate::dspark::oracle::yaarn_freqs(rdim, theta, factor, native_max, 32, 1);
+        assert_eq!(fr.mscale(), 0.1 * factor.ln() + 1.0);
+        assert_eq!(fr.half(), want.len());
+        for i in 0..want.len() {
+            assert_eq!(fr.inv(i).to_bits(), want[i].to_bits(), "dim {i}");
+        }
+    }
+
+    /// YaRN interpolates the low-frequency dims by 1/factor and extrapolates the high-frequency
+    /// dims unchanged, with the mscale riding on every emitted cos/sin.
+    #[test]
+    fn yarn_interpolates_low_freq_dims_and_scales_the_tables() {
+        let (rdim, theta, native_max, factor) = (64usize, 1e7f32, 262144usize, 4.0f32);
+        let native = RopeFreqs::native(rdim, theta);
+        let yarn = RopeFreqs::yarn(rdim, theta, factor, native_max);
+        assert_eq!(yarn.inv(0), native.inv(0), "the highest frequency is extrapolated unchanged");
+        let slow_native = native.inv(rdim / 2 - 1);
+        let slow_yarn = yarn.inv(rdim / 2 - 1);
+        assert!((slow_yarn - slow_native / factor).abs() <= slow_native * 1e-6,
+                "the lowest frequency is interpolated by 1/factor");
+        let p = 1234usize;
+        for i in [0usize, 7, 31] {
+            let f = p as f32 * yarn.inv(i);
+            assert_eq!(yarn.cos_sin(p, i).0.to_bits(), (f.cos() * yarn.mscale()).to_bits(), "cos dim {i}");
+            assert_eq!(yarn.cos_sin(p, i).1.to_bits(), (f.sin() * yarn.mscale()).to_bits(), "sin dim {i}");
+        }
+    }
+
+    /// The decode table row and the prefill host row are two implementations of one layout, and
+    /// the load-time WP05 comparison depends on them agreeing at every factor.
+    #[test]
+    fn cos_tab_rows_match_the_prefill_host_rows() {
+        for fr in [RopeFreqs::native(64, 1e7), RopeFreqs::yarn(64, 1e7, 4.0, 262144)] {
+            let rows = prefill_cossin_host(&fr, 0, 8);
+            let row_len = 4 * fr.half();
+            assert_eq!(rows.len(), 8 * row_len);
+            for p in 0..8 {
+                let want = cos_tab_row(&fr, p);
+                assert_eq!(&rows[p * row_len..(p + 1) * row_len], &want[..], "position {p}");
+            }
+        }
+    }
 }
 
 /// The n-gram table location: `--ple-ram ram|ssd|auto` (`on`/`off` are the older spellings of ram/ssd).
@@ -2139,6 +2264,8 @@ struct VpHead {
 }
 
 pub struct FwdModel {
+    /// The trunk rope this serve was loaded with (YaRN when the factor is set).
+    pub rope: RopeFreqs,
     dev: Arc<CudaDevice>,
     pub cfg: crate::qwen::Config,
     // TP-B: the TRUNK's per-rank geometry (attention / GDN head counts divided by the world when
@@ -7519,21 +7646,10 @@ impl FwdModel {
         // and ONE blocking compute stream for the model's lifetime.
         let rdim_t = cfg.rotary_dim;
         let theta_t = cfg.rope_theta;
-        let mut cos_tab_h: Vec<f32> = Vec::with_capacity(max_pos * 2 * rdim_t);
-        for p in 0..max_pos {
-            for i in 0..rdim_t / 2 {
-                let inv = theta_t.powf(-(2.0 * i as f32) / rdim_t as f32);
-                let f = p as f32 * inv;
-                cos_tab_h.push(f.cos());
-            }
-            for _ in 0..rdim_t / 2 { cos_tab_h.push(0.0); }
-            for i in 0..rdim_t / 2 {
-                let inv = theta_t.powf(-(2.0 * i as f32) / rdim_t as f32);
-                let f = p as f32 * inv;
-                cos_tab_h.push(f.sin());
-            }
-            for _ in 0..rdim_t / 2 { cos_tab_h.push(0.0); }
-        }
+        // The rope this serve uses, resolved before any table is built.
+        let fr = RopeFreqs::for_opts(rdim_t, theta_t, cfg.max_position_embeddings);
+        let mut cos_tab_h: Vec<f32> = Vec::with_capacity(max_pos * 4 * (rdim_t / 2));
+        for p in 0..max_pos { cos_tab_h.extend_from_slice(&cos_tab_row(&fr, p)); }
         let cos_tab = dev.htod_sync_copy(&cos_tab_h)?;
         // VIS-2: per-slot mrope buffers, zero = text-only (alloc_zeros does not zero: upload zeros)
         let rope_map = dev.htod_sync_copy(&vec![0i32; width * max_pos])?;
@@ -7551,7 +7667,7 @@ impl FwdModel {
             ps.extend(max_pos.saturating_sub(128).max(2048)..max_pos);
             let mut bad = 0usize;
             for &p in &ps {
-                let hrow = prefill_cossin_host(theta_t, rdim_t, p, 1);
+                let hrow = prefill_cossin_host(&fr, p, 1);
                 let trow = &cos_tab_h[p * row..(p + 1) * row];
                 bad += hrow.iter().zip(trow).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             }
@@ -7573,13 +7689,12 @@ impl FwdModel {
             qsa_cos_h.resize(qsa_cos_h.len() + rdim_t, 0.0);
             qsa_sin_h.resize(qsa_sin_h.len() + rdim_t, 0.0);
             for i in 0..rdim_t / 2 {
-                let inv = theta_t.powf(-(2.0 * i as f32) / rdim_t as f32);
-                let f = p as f32 * inv;
-                qsa_cos_h[p * rdim_t + i] = f.cos();
-                qsa_sin_h[p * rdim_t + i] = f.sin();
+                let (c, s) = fr.cos_sin(p, i);
+                qsa_cos_h[p * rdim_t + i] = c;
+                qsa_sin_h[p * rdim_t + i] = s;
                 if qsa_full {
-                    qsa_cos_h[p * rdim_t + i + rdim_t / 2] = f.cos();
-                    qsa_sin_h[p * rdim_t + i + rdim_t / 2] = f.sin();
+                    qsa_cos_h[p * rdim_t + i + rdim_t / 2] = c;
+                    qsa_sin_h[p * rdim_t + i + rdim_t / 2] = s;
                 }
             }
         }
@@ -7914,6 +8029,7 @@ impl FwdModel {
         };
 
         Ok(Arc::new(FwdModel {
+            rope: fr,
             tc,
             dev,
             cfg,
@@ -14149,7 +14265,6 @@ impl FwdModel {
         let nk = cfg.lin_num_k_heads;
         let conv_dim = cfg.key_dim() * 2 + cfg.value_dim();
         let ck = cfg.conv_kernel;
-        let theta = cfg.rope_theta;
         let rdim = cfg.rotary_dim;
 
         let pro = wp05_on("pro") && self.cos_gather_ok && pos0 + c <= self.max_pos
@@ -14188,7 +14303,7 @@ impl FwdModel {
             if ple_xcheck_on() {
                 self.dev.synchronize()?;
                 let got = self.dev.dtoh_sync_copy(&psc.cos)?;
-                let want = prefill_cossin_host(theta, rdim, pos0, c);
+                let want = prefill_cossin_host(&self.rope, pos0, c);
                 let nd = got[..want.len()].iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
                 println!("PLE_XCHECK prefill-rope pos0 {pos0} rows {c}: {nd} mismatching f32 of {}", want.len());
             }
@@ -14197,7 +14312,7 @@ impl FwdModel {
         // S-A3-u D: the MoE row count is a per-chunk constant (c * topk) — one upload per chunk.
         self.dev.htod_copy_into(vec![(c * cfg.num_experts_per_tok) as i32], &mut psc.moerows)?;
         // cossin rows for pos0..pos0+c (same layout contract as forward_step)
-        let cossin = prefill_cossin_host(theta, rdim, pos0, c);
+        let cossin = prefill_cossin_host(&self.rope, pos0, c);
         psc.cos = self.dev.htod_sync_copy(&cossin)?;
         // S-A3-i: per-row (pos, slot, slot|pos) tables for the bf16 selection kernels
         // (they read LOGICAL positions; the prefill slot is uniform per chunk).
@@ -20651,7 +20766,6 @@ impl FwdModel {
         let len = pos3.len();
         anyhow::ensure!(len <= self.max_pos, "VIS-2: {len}-token prompt past max_pos {}", self.max_pos);
         let rdim = self.cfg.rotary_dim;
-        let theta = self.cfg.rope_theta;
         let stride = 2 * rdim;
         let mut map = Vec::with_capacity(len);
         let mut rows: Vec<f32> = Vec::new();
@@ -20665,7 +20779,7 @@ impl FwdModel {
             let k = rows.len() / stride;
             anyhow::ensure!(k < VIS_MROPE_ROWS, "VIS-2: more than {VIS_MROPE_ROWS} image tokens in one request");
             map.push((self.max_pos + slot * VIS_MROPE_ROWS + k) as i32);
-            let row = mrope_cos_row(*p, rdim, theta, sec);
+            let row = mrope_cos_row(&self.rope, *p, sec);
             // VIS-3: the indexer's row for the same position, in qsa_cos/qsa_sin's layout
             let h = rdim / 2;
             let mut qc = vec![0f32; rdim];
@@ -20710,21 +20824,23 @@ impl FwdModel {
 /// in cos_tab's layout and with cos_tab's own f32 formula (load-time loop), each frequency i taking
 /// the axis HF apply_interleaved_mrope gives it: H when i % 3 == 1 and i < 3 * sec[1], W when
 /// i % 3 == 2 and i < 3 * sec[2], else T. For t == h == w this is cos_tab's row t, bit for bit.
-pub fn mrope_cos_row(p: [i64; 3], rdim: usize, theta: f32, sec: [usize; 3]) -> Vec<f32> {
+pub(crate) fn mrope_cos_row(fr: &RopeFreqs, p: [i64; 3], sec: [usize; 3]) -> Vec<f32> {
     let axis = |i: usize| -> usize {
         if i % 3 == 1 && i < 3 * sec[1] { 1 } else if i % 3 == 2 && i < 3 * sec[2] { 2 } else { 0 }
     };
-    let mut row = Vec::with_capacity(2 * rdim);
-    for i in 0..rdim / 2 {
-        let inv = theta.powf(-(2.0 * i as f32) / rdim as f32);
-        row.push((p[axis(i)] as f32 * inv).cos());
+    let half = fr.half();
+    let ms = fr.mscale();
+    let mut row = Vec::with_capacity(4 * half);
+    for i in 0..half {
+        let f = p[axis(i)] as f32 * fr.inv(i);
+        row.push(f.cos() * ms);
     }
-    row.extend(std::iter::repeat(0.0).take(rdim / 2));
-    for i in 0..rdim / 2 {
-        let inv = theta.powf(-(2.0 * i as f32) / rdim as f32);
-        row.push((p[axis(i)] as f32 * inv).sin());
+    row.extend(std::iter::repeat(0.0).take(half));
+    for i in 0..half {
+        let f = p[axis(i)] as f32 * fr.inv(i);
+        row.push(f.sin() * ms);
     }
-    row.extend(std::iter::repeat(0.0).take(rdim / 2));
+    row.extend(std::iter::repeat(0.0).take(half));
     row
 }
 
@@ -20767,10 +20883,11 @@ mod vis2_tests {
         assert_eq!(delta, v["delta"].as_i64().unwrap(), "rope delta differs from HF");
         let rdim = v["rotary_dim"].as_u64().unwrap() as usize;
         let theta = v["rope_theta"].as_f64().unwrap() as f32;
+        let fr = RopeFreqs::native(rdim, theta);
         let s: Vec<usize> = v["mrope_section"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect();
         let mut worst = 0f32;
         for (t, p) in pos.iter().enumerate() {
-            let row = mrope_cos_row(*p, rdim, theta, [s[0], s[1], s[2]]);
+            let row = mrope_cos_row(&fr, *p, [s[0], s[1], s[2]]);
             for i in 0..rdim / 2 {
                 let c = v["cos"][t][i].as_f64().unwrap() as f32;
                 let sn = v["sin"][t][i].as_f64().unwrap() as f32;
@@ -20779,7 +20896,7 @@ mod vis2_tests {
         }
         assert!(worst < 2e-5, "cos/sin differ from HF by {worst}");
         // a text position's row is cos_tab's row exactly (t == h == w)
-        assert_eq!(mrope_cos_row([7, 7, 7], rdim, theta, [11, 11, 10]), mrope_cos_row([7, 7, 7], rdim, theta, [32, 0, 0]));
+        assert_eq!(mrope_cos_row(&fr, [7, 7, 7], [11, 11, 10]), mrope_cos_row(&fr, [7, 7, 7], [32, 0, 0]));
     }
 }
 

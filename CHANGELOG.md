@@ -5,6 +5,18 @@ generic language where they aren't individually notable.
 
 ## Unreleased
 
+### Added — YaRN on the EXL3 path
+
+`--rope-yarn-factor <f>` rescales the EXL3 trunk RoPE — the vLLM-convention per-dim ramp plus the
+`0.1*ln(f)+1` mscale — and extends the rope tables to `f` times the model's native window, so
+`--max-seq-len` may exceed `max_position_embeddings`: factor 4 gives 1M on a 256K-native trunk.
+The ramp is the same validated reference the DSpark path uses, the tables are built once at load,
+and both TP ranks build identical ones. `1.0` (the default) leaves them byte-identical to before.
+
+Measured on Qwen3.8-Flash-Next EXL3 4.05 bpw at TP=2: a needle matrix 8/8 with the fact
+retrieved at 22K-534K tokens and at 5%/50%/95% depth of a 445K context; a 12-item short-context
+battery 12/12 with the factor and 12/12 natively; vision 3/3 with the factor on.
+
 ### Fixed — long contexts corrupted device memory
 
 `Scratch::qsa_scores` was sized from the trained-window clamp (the model's

@@ -3178,6 +3178,11 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         if let Err(e) = cfg.hostport() { eprintln!("[otel] {e}"); crate::logq::flush_and_exit(std::time::Duration::from_millis(300), 1); } // H7
     }
     let port: u16 = arg(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(8000);
+    // E5: trunk YaRN (the EXL3 serve path) — set before the load so build_rope_tables sizes the
+    // tables to factor x native. Mirrors the parse run_server does on the NVFP4 path.
+    if let Some(f) = arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok()) {
+        if f >= 1.0 { crate::opts::set(crate::opt!("rope-yarn-factor"), f.to_string()); }
+    }
     // E5 guard: clamp the context to the effective rope ceiling (native x factor) so a
     // --max-seq-len past the tables is refused here rather than read past at the kernels.
     let max_seq_len: usize = clamp_max_seq_len(model_dir, arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096));
