@@ -3,6 +3,17 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## Unreleased
+
+### Added: `--prefill-interleave N`
+
+EXL3 serve path. After each non-final prefill chunk, run up to N decode steps for the lanes that are
+already generating, so a long joining prompt no longer freezes every other stream. Default 0 keeps
+the previous behavior. Skipped under TP. Greedy output is bit-identical with the flag on or off.
+With two running streams and a 20k-token joiner, the worst stall drops from 16.4 s to 1.5 s at
+`--prefill-chunk 1024 --prefill-interleave 1`, for about +18% joiner time-to-first-token; steady-state
+decode speed is unchanged.
+
 ## v0.7.3 — reported-issue fixes: TP=2 pre-verify race, exllamav3 1.5.x pack loading, cached-token accounting; tool-call parsing; long-running hardening
 
 This release closes the three open issues from the v0.7.2 feedback (#8, #9, #10), makes the

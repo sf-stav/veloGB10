@@ -302,6 +302,13 @@ tables above stay the measured reference; the 4.05 rows are untuned smoke tests,
   2048` restores the previous grid) and `--qsa-key-rope full` (the indexer's pooled keys carry their
   full rotary dimensions; `half` keeps the old bytes for A/B only). Both change long-context output
   bytes versus v0.7.0.
+- **`--prefill-interleave N` (off by default).** A long prompt that joins while other streams are
+  decoding used to freeze them for the whole prefill. With N > 0 the engine runs up to N decode steps
+  for the already-running lanes after each non-final prefill chunk. Smaller chunks mean more
+  interleave points, so pair it with `--prefill-chunk 1024`: on a GB10, a 20k-token joiner stalls two
+  running streams 16.4 s by default and 1.5 s with `--prefill-chunk 1024 --prefill-interleave 1`, at
+  about +18% joiner time-to-first-token. Values above 1 only add joiner latency. Greedy output is
+  unchanged. Single-GPU path only; ignored under TP.
 
 ---
 
