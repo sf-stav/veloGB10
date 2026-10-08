@@ -89,6 +89,8 @@ struct Exl3Scheduler {
     lanes: Vec<Option<Lane>>,
     eos: Vec<u32>,
     chunk: usize, // S-A3-f-b: prefill chunk width (tokens per forward sweep)
+    /// `--prefill-interleave N`: decode steps run for the live lanes after each non-final prefill chunk (0 = off)
+    interleave: usize,
     psc: Option<crate::exl3_forward::PrefillScratch>,
     // S-A3-f-d MTP policy: depth k (--exl3-mtp-k, default MTP_MAX_K = 7 since WP23), auto-disable
     // when the measured per-token cost loses to plain (§6), control-round bookkeeping.
@@ -1067,7 +1069,6 @@ impl Exl3Scheduler {
         if self.psc.is_none() {
             self.psc = Some(self.model.prefill_scratch(psc_rows(c, self.tp.is_some()))?);
         }
-        let psc = self.psc.as_mut().unwrap();
         let mut pos = from;
         let n = to.min(prompt.len().saturating_sub(1)); // the seam token is a decode step
         if pos >= n { return Ok(true); }
@@ -1088,7 +1089,9 @@ impl Exl3Scheduler {
             crate::rprintln!("[exl3-serve] prefill grid slot={slot} n={} (pos {from}..{n}) C={c}: {nchunks} chunk(s), rows {shown}{}",
                      n - from, if absorb.is_some() { " (absorb-tail)" } else { "" });
         }
+        let (mut il_chunks, mut il_steps) = (0usize, 0usize);
         for end in grid {
+            let psc = self.psc.as_mut().unwrap();
             if pos > from {
                 let mut gone = tx.map_or(false, |t| t.is_closed());
                 // TP-D: the HEAD decides (its client); every rank stops at this same chunk boundary
@@ -1128,6 +1131,22 @@ impl Exl3Scheduler {
                 }
             }
             pos = end;
+            // --prefill-interleave: let the already-decoding lanes advance between chunks. lanes[slot] is
+            // None while it prefills and step() never touches self.psc, so the two work on disjoint state.
+            if end < n && self.interleave > 0 && self.tp.is_none() && tx.is_some() {
+                il_chunks += 1;
+                for _ in 0..self.interleave {
+                    if self.fatal.is_some() || self.lanes.iter().all(|l| l.is_none()) { break; }
+                    if let Err(e) = self.step() {
+                        self.fail_step(&e);
+                        return Err(e);
+                    }
+                    il_steps += 1;
+                }
+            }
+        }
+        if il_chunks > 0 {
+            println!("[exl3-serve] prefill-interleave slot={slot} chunks={il_chunks} decode_steps={il_steps}");
         }
         // S-A3-f-d Item 2: serve-path prefill telemetry (TTFT's main term).
         let ms = tp.elapsed().as_secs_f64() * 1e3;
@@ -1996,17 +2015,22 @@ impl Exl3Scheduler {
                 continue;
             }
             if let Err(e) = self.step() {
-                eprintln!("[exl3-serve] decode step failed: {e:#}");
-                // Fail every live lane loudly — never emit garbage as if it were text.
-                for s in 0..self.lanes.len() {
-                    if let Some(lane) = self.lanes[s].take() {
-                        let _ = lane.tx.send(TokEvent::Finish { reason: format!("error: {e}") });
-                    }
-                }
-                if sticky_cuda_error(&e) {
-                    self.fatal = Some(format!("{e:#}"));
-                }
+                self.fail_step(&e);
             }
+        }
+    }
+
+    /// A failed decode step (from `run` or a prefill-interleave hook): fail every live lane loudly
+    /// (never emit garbage as if it were text) and mark the engine dead on a sticky CUDA error.
+    fn fail_step(&mut self, e: &anyhow::Error) {
+        eprintln!("[exl3-serve] decode step failed: {e:#}");
+        for s in 0..self.lanes.len() {
+            if let Some(lane) = self.lanes[s].take() {
+                let _ = lane.tx.send(TokEvent::Finish { reason: format!("error: {e}") });
+            }
+        }
+        if sticky_cuda_error(e) {
+            self.fatal = Some(format!("{e:#}"));
         }
     }
 
@@ -3404,6 +3428,10 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         Some(v) => v.trim().parse::<usize>().map_err(|e| anyhow::anyhow!("--lane-quantum: {e}"))?,
     };
     anyhow::ensure!(lane_quantum > 0, "--lane-quantum must be > 0");
+    let interleave: usize = arg(args, "--prefill-interleave").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if interleave > 0 {
+        println!("[exl3-serve] prefill interleave = {interleave} decode step(s) per prefill chunk (--prefill-interleave; skipped under TP)");
+    }
     if width > 1 && model.mtp.is_some() {
         println!("[exl3-serve] load-adaptive batching (--spec-lanes-max): {} (--max-batch {width})", match spec_policy {
             SpecLanes::Auto => "auto — each round picks serial speculation or ONE shared plain step by estimated aggregate tokens/s".to_string(),
@@ -3413,7 +3441,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     }
     let sched = Exl3Scheduler {
         model: model.clone(), sc, width,
-        lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, psc: Some(psc0),
+        lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, interleave, psc: Some(psc0),
         mtp_k, spec_policy, lane_order, lane_quantum, admit_ctr: 0, fcfs_rots: 0,
         shared_scale: 1.0, shared_last: false, shared_streak: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
         prefix_on, cache: (0..width).map(|_| None).collect(),
@@ -3788,7 +3816,7 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
     let tok = Arc::new(tok);
     let mut sched = Exl3Scheduler {
         model: model.clone(), sc, width,
-        lanes: (0..width).map(|_| None).collect(), eos, chunk, psc: Some(psc0),
+        lanes: (0..width).map(|_| None).collect(), eos, chunk, interleave: 0, psc: Some(psc0),
         mtp_k, spec_policy: SpecLanes::Never, lane_order: LaneOrder::Rr, lane_quantum: 256, admit_ctr: 0, fcfs_rots: 0, shared_scale: 1.0, shared_last: false, shared_streak: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
         prefix_on: true, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
@@ -4237,7 +4265,7 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
     let tok = Arc::new(tok);
     let mut sched = Exl3Scheduler {
         model: model.clone(), sc, width,
-        lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, psc: Some(psc0),
+        lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, interleave: 0, psc: Some(psc0),
         mtp_k, spec_policy: SpecLanes::Never, lane_order: LaneOrder::Rr, lane_quantum: 256, admit_ctr: 0, fcfs_rots: 0, shared_scale: 1.0, shared_last: false, shared_streak: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf: 0.4, cal: DraftCal::new(),
         prefix_on: o.prefix, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
