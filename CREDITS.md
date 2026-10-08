@@ -1,8 +1,6 @@
 # Credits
 
-veloGB10 exists because people sent code, filed precise bug reports and ran it on their own
-hardware. Thank you. The per-release credits are in [CHANGELOG.md](CHANGELOG.md); upstream projects and
-models are acknowledged in the README.
+We would like to thank the following people for their contributions to this project. The per-release credits are in [CHANGELOG.md](CHANGELOG.md); upstream projects and models are acknowledged in the README.
 
 ## Code
 
