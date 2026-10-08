@@ -3,6 +3,34 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## Unreleased
+
+### Added — YaRN on the EXL3 path
+
+`--rope-yarn-factor <f>` rescales the EXL3 trunk RoPE — the vLLM-convention per-dim ramp plus the
+`0.1*ln(f)+1` mscale — and extends the rope tables to `f` times the model's native window, so
+`--max-seq-len` may exceed `max_position_embeddings`: factor 4 gives 1M on a 256K-native trunk.
+The ramp is the same validated reference the DSpark path uses, the tables are built once at load,
+and both TP ranks build identical ones. `1.0` (the default) leaves them byte-identical to before.
+
+Measured on Qwen3.8-Flash-Next EXL3 4.05 bpw at TP=2: a needle matrix 8/8 with the fact
+retrieved at 22K-534K tokens and at 5%/50%/95% depth of a 445K context; a 12-item short-context
+battery 12/12 with the factor and 12/12 natively; vision 3/3 with the factor on.
+
+### Fixed — long contexts corrupted device memory
+
+`Scratch::qsa_scores` was sized from the trained-window clamp (the model's
+`max_position_embeddings`, capped at 262144) divided by the indexer ratio, while the scorer
+writes one block per served position. The two agree exactly at `max_pos == 262145` and nowhere
+above it, so any longer context overran the scratch into adjacent device memory — surfacing
+later, far from the cause, as a sticky `CUDA_ERROR_ILLEGAL_ADDRESS`. The scratch now takes the
+served window as an argument.
+
+The geometry bit-packings (`nh_packed`, `bs_packed`, `stride_nkv` and the QSA geometry word)
+assert in release rather than only in debug, so an out-of-range value fails loudly instead of
+truncating into the next field. `FwdModel::load_tp` refuses a window wider than they can carry,
+and `--max-seq-len` is clamped to the packable ceiling with the limit named.
+
 ## v0.7.3 — reported-issue fixes: TP=2 pre-verify race, exllamav3 1.5.x pack loading, cached-token accounting; tool-call parsing; long-running hardening
 
 This release closes the three open issues from the v0.7.2 feedback (#8, #9, #10), makes the

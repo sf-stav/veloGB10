@@ -2231,6 +2231,55 @@ pub(crate) fn host_shard_nvfp4_row(wt: &[u8], st: &[u8], m: usize, k: usize, ran
     (q_new, s_new, k_local)
 }
 
+/// The `bs_packed` attention word: stride(0-18) | ns_grid(19-24) | batch(25-30) | q_pitch(31-49).
+/// The fields are fixed-width, so a value past its width would land in its neighbour's bits.
+fn pack_bs(stride: usize, ns_grid: usize, batch: usize, q_pitch: usize) -> u64 {
+    assert!(stride < (1 << 19) && ns_grid < (1 << 6) && batch < (1 << 6) && q_pitch < (1 << 19),
+            "bs_packed field overflow (stride/q_pitch 19 bits, ns_grid/batch 6) - lower --max-seq-len");
+    ((q_pitch as u64) << 31) | ((batch as u64) << 25) | ((ns_grid as u64) << 19) | (stride as u64)
+}
+
+/// The QSA geometry word: stride(0-19) | qk_dim(20-39) | nblk_stride(40-63).
+fn pack_qsa_geom(stride: usize, qk_dim: usize, nblk_stride: usize) -> u64 {
+    assert!(stride < (1 << 20) && qk_dim < (1 << 20) && nblk_stride < (1 << 20),
+            "qsa geom overflow (each field 20 bits) - lower --max-seq-len");
+    (stride as u64) | ((qk_dim as u64) << 20) | ((nblk_stride as u64) << 40)
+}
+
+#[cfg(test)]
+mod geom_pack_tests {
+    use super::*;
+
+    /// Every field survives the round trip at its widest value.
+    #[test]
+    fn bs_packed_fields_round_trip() {
+        let w = pack_bs(524_287, 63, 16, 262_143);
+        assert_eq!(w & 0x7FFFF, 524_287);
+        assert_eq!((w >> 19) & 0x3F, 63);
+        assert_eq!((w >> 25) & 0x3F, 16);
+        assert_eq!((w >> 31) & 0x7FFFF, 262_143);
+    }
+
+    /// A stride one past the field must be refused rather than spill into the next field.
+    #[test]
+    #[should_panic(expected = "bs_packed field overflow")]
+    fn bs_packed_refuses_an_oversized_stride() { pack_bs(1 << 19, 1, 1, 1); }
+
+    /// Every field survives the round trip at its widest value.
+    #[test]
+    fn qsa_geom_fields_round_trip() {
+        let g = pack_qsa_geom(1_048_575, 640, 262_143);
+        assert_eq!(g & 0xFFFFF, 1_048_575);
+        assert_eq!((g >> 20) & 0xFFFFF, 640);
+        assert_eq!(g >> 40, 262_143);
+    }
+
+    /// `max_pos` is this word's first field, so its width is what caps the context.
+    #[test]
+    #[should_panic(expected = "qsa geom overflow")]
+    fn qsa_geom_refuses_an_oversized_window() { pack_qsa_geom(1 << 20, 640, 1); }
+}
+
 impl GpuModel {
     /// Synchronize the inference stream (blocks until all GPU work on our stream completes).
     pub fn sync_stream(&self) {
@@ -9841,7 +9890,7 @@ impl GpuModel {
         let attn = pool.get_bf16(nh*hd*batch);
         // nh_packed carries (nh, hd, nkv) bit-packed: nh<2048 (bits 20+), hd<=1023 (bits 10-19),
         // nkv<=1023 (bits 0-9). gqa_attn_splitk/reduce unpack the same layout.
-        debug_assert!(nh < 2048 && hd <= 1023 && nkv <= 1023, "nh_packed field overflow");
+        assert!(nh < 2048 && hd <= 1023 && nkv <= 1023, "nh_packed field overflow (nh 11 bits, hd/nkv 10 bits)");
         // TRAP-7 envelope: gqa_attn_sel_prefill2 sizes fixed per-lane arrays for hd/32 <= 8 (hd <= 256;
         // Flash-Next is exactly 256) — the dispatch below routes wider hd to gqa_attn_sel_prefill,
         // which is parameterized by SK_DPL_MAX (hd <= SK_HD_MAX == 512). Assert the whole QSA
@@ -9912,11 +9961,7 @@ impl GpuModel {
         let pm = pool.get(n_partial);
         let pl = pool.get(n_partial);
         let pa = pool.get(n_partial * hd);          // fp32: the bf16 round-trip was lossy for nothing
-        // bs_packed = stride(bits 0-18) | ns_grid(19-24) | batch(25-30) | q_pitch(31-49), a u64
-        // (the splitk family unpacks long long) — stride packed to fit the 12-arg launch cap; ranges:
-        // stride<=262144<2^19, ns_grid<=32<2^6, batch<2^6, q_pitch<2^19 (the fused qkv mtot / nh*hd).
-        debug_assert!(stride < (1<<19) && ns_grid < (1<<6) && batch < (1<<6) && q_pitch < (1<<19), "bs_packed field overflow");
-        let bs_packed: u64 = ((q_pitch as u64) << 31) | ((batch as u64) << 25) | ((ns_grid as u64) << 19) | (stride as u64);
+        let bs_packed = pack_bs(stride, ns_grid, batch, q_pitch);
         // GQA ratio and escape hatch are shared by the q4 and bf16 dispatch below.
         let gqa_ratio = nh / nkv.max(1);
         // A/B + escape hatch: --no-gqpack=1 forces the per-head kernel. Read per call (the
@@ -9972,7 +10017,7 @@ impl GpuModel {
             } else if use_e_cols {
                 // Independent columns (plain batched decode of several lanes): one batch-1 `_e` launch per
                 // column, outputs/inputs offset to the column — the same kernel a lone request runs.
-                let bs1: u64 = ((q_pitch as u64) << 31) | (1u64 << 25) | ((ns_grid as u64) << 19) | (stride as u64);
+                let bs1 = pack_bs(stride, ns_grid, 1, q_pitch);
                 let (qp, pmp, plp, pap) = (d(q), d(&pm), d(&pl), d(&pa));
                 for c in 0..batch as u64 {
                     let part = c * (nh * ns_grid) as u64;
@@ -10189,6 +10234,7 @@ impl GpuModel {
                     KVCacheMode::Bf16 => "rmsnorm_rope_kvwrite_b",
                     _ => unreachable!("F4 fused kvwrite: TQ/K8v4 use the old pipeline"),
                 };
+                assert!(kv_stride < (1 << 19), "stride_nkv field overflow (kv_stride = cache positions per slot, 19 bits) - lower --max-seq-len");
                 let stride_nkv = ((nkv as u32) << 19) | (kv_stride as u32);
                 let hd_rdim = ((hd as u32) << 16) | (rdim as u32);
                 blaunch!(self, kvwrite, ((batch*nkv) as u32,1,1), (256,1,1), (hd*4) as u32,
@@ -13616,6 +13662,7 @@ impl GpuModel {
                                 KVCacheMode::Bf16 => "rmsnorm_rope_kvwrite_b",
                                 _ => unreachable!("F4 fused kvwrite: TQ/K8v4 use the old pipeline"),
                             };
+                            assert!(kv_stride < (1 << 19), "stride_nkv field overflow (kv_stride = cache positions per slot, 19 bits) - lower --max-seq-len");
                             let stride_nkv = ((nkv as u32) << 19) | (kv_stride as u32);
                             let hd_rdim = ((hd as u32) << 16) | (rdim as u32);
                             blaunch!(self, kvwrite, ((n*nkv) as u32,1,1), (256,1,1), (hd*4) as u32,
@@ -23502,9 +23549,8 @@ impl GpuModel {
         blaunch!(self, "qsa_key_write_b", grid(batch*hdx), (256,1,1), 0,
             (keys_ptr, d(&qk), pos_ptr, slot_ids_ptr, stride as i32, 0i32, qk_dim as i32, (heads*hdx) as i32, hdx as i32, batch as i32));
         let nblk_stride = (max_pc / ratio).max(1);
-        debug_assert!(stride < (1 << 20) && qk_dim < (1 << 20) && nblk_stride < (1 << 20), "qsa geom overflow");
         let scores = pool.get(batch * nblk_stride);
-        let geom: u64 = (stride as u64) | ((qk_dim as u64) << 20) | ((nblk_stride as u64) << 40);
+        let geom = pack_qsa_geom(stride, qk_dim, nblk_stride);
         blaunch!(self, "qsa_score_b", (nblk_stride.div_ceil(8) as u32, batch as u32, 1), (256,1,1), 0,
             (d(&scores), d(&qk), keys_ptr, logical_ptr, slot_ids_ptr, path_ptr, cps_ptr, d(&idx.params), geom as i64));
         let sel_max = self.qsa_limit();
@@ -23638,7 +23684,7 @@ impl GpuModel {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn qsa_attn_prefill_ptrs(&self, attn: &mut B, q: &B, kc_ptr: u64, vc_ptr: u64, stride: usize,
                                         nh: usize, nkv: usize, hd: usize, scale: f32, n: usize, sel_ptr: u64, pos_sel_ptr: u64) {
-        debug_assert!(nh < 2048 && hd <= 1023 && nkv <= 1023, "nh_packed field overflow");
+        assert!(nh < 2048 && hd <= 1023 && nkv <= 1023, "nh_packed field overflow (nh 11 bits, hd/nkv 10 bits)");
         let nh_packed = ((nh << 20) | (hd << 10) | nkv) as i32;
         if hd <= 256 && crate::opts::var(crate::opt!("qsa-sel-v1")).is_err() {
             // v2: K/V rows fetched once per 4-head group, 4 keys in flight (bit-identical to v1).

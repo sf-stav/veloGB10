@@ -396,7 +396,10 @@ impl TpConfig {
             mxfp4_mtp_native: crate::opts::var(crate::opt!("mxfp4-mtp-native")).is_ok(),
             server_dspark: false,
             dspark_fp8_head: crate::opts::var(crate::opt!("dspark-fp8-logits")).is_ok(),
-            rope_yarn_factor: 1.0,
+            // E5: trunk YaRN rides TpConfig to the node (the opt wins in the loader; this keeps the
+            // shipped field honest and covers any TpConfig-only read path).
+            rope_yarn_factor: crate::opts::var(crate::opt!("rope-yarn-factor")).ok()
+                .and_then(|v| v.parse::<f32>().ok()).filter(|f| *f >= 1.0).unwrap_or(1.0),
             dflash: crate::opts::var(crate::opt!("tp-dflash")).is_ok(),
             df2_capture: crate::opts::var(crate::opt!("df2-capture")).is_ok(),
             // E12/E8/E9 escapes: VALUE-based like [kv-tq] — only the explicit disable
