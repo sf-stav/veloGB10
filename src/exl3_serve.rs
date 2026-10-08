@@ -3002,6 +3002,83 @@ fn suggest(p: FitParts, lanes: usize, avail: u64, max_pos: usize) -> String {
     out
 }
 
+/// Which limit trimmed a context request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CtxLimit {
+    /// The model's native window times the YaRN factor.
+    Rope,
+    /// The geometry bit-packings, which carry `max_pos` in 20 bits.
+    Packing,
+}
+
+/// The context a request may use, and the limit that decided it. `native` is the model's window
+/// when it could be read; the packing ceiling is a constant and applies either way.
+pub fn clamp_ctx(max_seq_len: usize, native: Option<usize>, yarn: f32) -> (usize, Option<CtxLimit>) {
+    let pack_eff = (1usize << 20).saturating_sub(1 + crate::batch::decode_headroom(false));
+    let (eff, why) = match native {
+        Some(n) => {
+            let rope_eff = ((n as f64) * (yarn as f64)).ceil() as usize;
+            (rope_eff.min(pack_eff), if pack_eff < rope_eff { CtxLimit::Packing } else { CtxLimit::Rope })
+        }
+        None => (pack_eff, CtxLimit::Packing),
+    };
+    if max_seq_len > eff { (eff, Some(why)) } else { (max_seq_len, None) }
+}
+
+/// The context this serve will honour for `model_dir`, trimmed to the rope and packing ceilings.
+pub fn clamp_max_seq_len(model_dir: &str, max_seq_len: usize) -> usize {
+    let yarn = crate::opts::var(crate::opt!("rope-yarn-factor")).ok()
+        .and_then(|v| v.parse::<f32>().ok()).filter(|f| *f >= 1.0).unwrap_or(1.0f32);
+    let native = std::fs::read(std::path::Path::new(model_dir).join("config.json")).ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|c| {
+            let t = c.get("text_config").cloned().unwrap_or(c);
+            t.get("max_position_embeddings").and_then(|v| v.as_u64())
+        });
+    let (eff, why) = clamp_ctx(max_seq_len, native.map(|v| v as usize), yarn);
+    if let Some(why) = why {
+        let limit = match why {
+            CtxLimit::Rope => format!("the model max {} x rope yarn factor {yarn}", native.unwrap_or(0)),
+            CtxLimit::Packing => format!("the geometry bit-packings (max_pos must stay below {} = 2^20)", 1usize << 20),
+        };
+        crate::rprintln!("[warn] --max-seq-len {max_seq_len} exceeds {limit} - clamping to {eff}.");
+    }
+    eff
+}
+
+#[cfg(test)]
+mod ctx_clamp_tests {
+    use super::*;
+
+    /// Without YaRN the context stops at the model's native window.
+    #[test]
+    fn native_context_stops_at_the_model_window() {
+        assert_eq!(clamp_ctx(300_000, Some(262_144), 1.0), (262_144, Some(CtxLimit::Rope)));
+        assert_eq!(clamp_ctx(262_144, Some(262_144), 1.0), (262_144, None));
+    }
+
+    /// A YaRN factor raises the ceiling to the extended rope, and the packing limit is what the
+    /// extended rope runs into.
+    #[test]
+    fn yarn_raises_the_ceiling_to_the_packing_limit() {
+        assert_eq!(clamp_ctx(1_048_576, Some(262_144), 4.0), (1_048_574, Some(CtxLimit::Packing)));
+        assert_eq!(clamp_ctx(1_048_574, Some(262_144), 4.0), (1_048_574, None));
+    }
+
+    /// The limit reported is the tighter of the two.
+    #[test]
+    fn the_tighter_limit_is_the_one_reported() {
+        assert_eq!(clamp_ctx(600_000, Some(262_144), 2.0), (524_288, Some(CtxLimit::Rope)));
+    }
+
+    /// An unreadable model window must not disable the guard: the packing ceiling still applies.
+    #[test]
+    fn an_unknown_window_still_gets_the_packing_ceiling() {
+        assert_eq!(clamp_ctx(1_048_576, None, 1.0), (1_048_574, Some(CtxLimit::Packing)));
+        assert_eq!(clamp_ctx(262_144, None, 1.0), (262_144, None));
+    }
+}
+
 /// Estimate the footprint of an EXL3 pack from its files and config (no GPU, no weight reads).
 pub fn fit_parts(model_dir: &str, max_pos: usize, world: usize, head: bool, kv_bytes: f64, ckpt_gb: f64) -> Option<FitParts> {
     let dir = std::path::Path::new(model_dir);
@@ -3101,7 +3178,9 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         if let Err(e) = cfg.hostport() { eprintln!("[otel] {e}"); crate::logq::flush_and_exit(std::time::Duration::from_millis(300), 1); } // H7
     }
     let port: u16 = arg(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(8000);
-    let max_seq_len: usize = arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    // E5 guard: clamp the context to the effective rope ceiling (native x factor) so a
+    // --max-seq-len past the tables is refused here rather than read past at the kernels.
+    let max_seq_len: usize = clamp_max_seq_len(model_dir, arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096));
     let width: usize = arg(args, "--max-batch").and_then(|s| s.parse().ok()).unwrap_or(8);
     let max_pos = max_seq_len + crate::batch::decode_headroom(false);
     // --prefix-cache on|off (default on, as the NVFP4 server): per-slot recurrent-state snapshots
@@ -3276,7 +3355,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // BUG-5 FIX (width half): mtp_round verifies at m=k+1 rows — the scratch must
     // hold the verify width even when the lane count is 1 (w1 serve panicked on
     // sc.slots[2] with a 2-element buffer). Model width (state slots) stays = lanes.
-    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1))?;
+    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1), model.max_pos())?;
     // S-A3-f-b: chunked prefill width (CLI --prefill-chunk; user-facing knob).
     // S-A3-f-d Item 2: default 512 -> 2048 — the matched-C table (7838 toks,
     // fixed flash256 kernel) shows 112 tok/s @ C=512 vs 234 @ C=2048 (the KV
@@ -3781,7 +3860,7 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
     let mtp_k = crate::exl3_forward::mtp_depth_default();
     anyhow::ensure!(prompt.len() >= 2 && prompt.len() + positions + mtp_k + 4 < model.max_pos(),
                     "WP24 gate: prompt of {} tokens does not fit the window", prompt.len());
-    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1))?;
+    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1), model.max_pos())?;
     let chunk = 2048usize;
     let psc0 = model.prefill_scratch(chunk)?;
     model.precapture_decode_graphs(&mut sc, width, mtp_k, draft_conf > 0.0)?;
@@ -4230,7 +4309,7 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
     let eos = tok.stop_token_ids(cfg_eos);
     let mtp_k = crate::exl3_forward::mtp_depth_default();
     let width = o.width;
-    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1))?;
+    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1), model.max_pos())?;
     let chunk = 2048usize;
     let psc0 = model.prefill_scratch(chunk)?;
     model.precapture_decode_graphs(&mut sc, width, mtp_k, true)?;

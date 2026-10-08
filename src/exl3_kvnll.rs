@@ -480,7 +480,7 @@ pub fn probe_kv_nll(a: &KvNllArgs) -> Result<()> {
              a.label, kv_rowbytes(fmt, hd), a.max_pos, ids.len(), a.chunk, nd.len(), qsa_splits_dec());
     let v = model.cfg.vocab_size;
     anyhow::ensure!(used.iter().all(|&t| (t as usize) < v), "corpus has token ids >= vocab {v}");
-    let mut sc = Scratch::new(&model.dev, &model.cfg, vw, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, vw, model.cfg.rotary_dim, model.max_pos())?;
     let mut psc_opt: Option<PrefillScratch> = Some(model.prefill_scratch(a.chunk)?);
     model.reset_slot(0)?;
 

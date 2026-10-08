@@ -2480,14 +2480,15 @@ pub struct Scratch {
     rq_draft_i: Option<usize>,
 }
 
-/// S-A3-i: scratch-side max_pos bound (trained window; scratch over-allocates harmlessly).
-fn max_pos_of(cfg: &crate::qwen::Config) -> usize {
-    cfg.max_position_embeddings.clamp(1, 262144)
-}
+/// The widest `max_pos` the geometry bit-packings can carry: `qsa geom` (gpu.rs) and `rdim_maxpos`
+/// (exl3_bench.cu) give it 20 bits. Exceeding it overflows into a neighbouring field — those guards
+/// were debug_asserts, so a release build corrupted memory silently (found 2026-10-06). The loader
+/// now refuses a wider window outright, and the pack sites assert in release too.
+pub const MAX_POS_PACKED: usize = 1 << 20;
 
 impl Scratch {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, w: usize, rdim: usize) -> Result<Self> {
+    pub fn new(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, w: usize, rdim: usize, max_pos: usize) -> Result<Self> {
         let h = cfg.hidden_size;
         let hc = cfg.hc_count.max(1);
         let rw = h * hc;
@@ -2547,7 +2548,8 @@ impl Scratch {
             // S-A3-i QSA pipes (0-sized when the pack has no indexer)
             qsa_qk: dev.alloc_zeros::<u16>(w * if cfg.has_indexer() { (cfg.indexer_n_heads + 1) * cfg.indexer_head_dim } else { 0 })?,
             qsa_qkb: dev.alloc_zeros::<u16>(w * if cfg.has_indexer() { (cfg.indexer_n_heads + 1) * cfg.indexer_head_dim } else { 0 })?,
-            qsa_scores: dev.alloc_zeros::<f32>(w * if cfg.has_indexer() { (max_pos_of(cfg) / cfg.indexer_compress_ratio).max(1) } else { 0 })?,
+            // The scorer writes one block per served position.
+            qsa_scores: dev.alloc_zeros::<f32>(w * if cfg.has_indexer() { (max_pos / cfg.indexer_compress_ratio).max(1) } else { 0 })?,
             qsa_sel: dev.alloc_zeros::<i32>(w * if cfg.has_indexer() { cfg.indexer_budget + cfg.indexer_compress_ratio } else { 0 })?,
             qsa_psel: dev.alloc_zeros::<i32>(w)?,
             slot_ids: dev.alloc_zeros::<i32>(w)?,
@@ -6687,6 +6689,10 @@ impl FwdModel {
     /// attached (payload set, proxy thread spawned) before the model is returned. Everything else
     /// (hc mixers, router, shared expert, attention/GDN, lm_head, PLE, the MTP head) is REPLICATED.
     pub fn load_tp(pack_dir: &str, width: usize, max_pos: usize, tp: Option<xtp::TpAttach>) -> Result<Arc<FwdModel>> {
+        anyhow::ensure!(max_pos < MAX_POS_PACKED,
+            "max_pos {max_pos} exceeds the geometry bit-packings ({MAX_POS_PACKED} = 2^20): the QSA \
+             geom and the EXL3 attention args carry it in 20 bits, so a wider window would overflow \
+             into a neighbouring field. Lower --max-seq-len.");
         // TUNE §4.6: the table is frozen before any knob is read (Load-scope knobs are read below);
         // entry points that booted no table run the built-in defaults (today's behaviour).
         tune::ensure_frozen("FwdModel::load");
@@ -10952,7 +10958,7 @@ const EOS_IDS: [i32; 2] = [248044, 248046];
 
 pub fn run(a: &FwdArgs) -> Result<()> {
     let model = FwdModel::load(&a.dir, a.width.max(a.widths.iter().copied().max().unwrap_or(1)), a.max_pos)?;
-    let mut sc = Scratch::new(&model.dev, &model.cfg, a.width.max(a.widths.iter().copied().max().unwrap_or(1)), model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, a.width.max(a.widths.iter().copied().max().unwrap_or(1)), model.cfg.rotary_dim, model.max_pos())?;
 
     // prompt ids: explicit file wins; else tokenizer encode
     let mut prompt_ids: Vec<u32> = match &a.ids_file {
@@ -11100,7 +11106,7 @@ pub fn run(a: &FwdArgs) -> Result<()> {
         for w in widths {
             // states reset per width via a fresh load (the honest offline reset)
             let m2 = FwdModel::load(&a.dir, w, a.max_pos)?;
-            let mut sc2 = Scratch::new(&m2.dev, &m2.cfg, w, m2.cfg.rotary_dim)?;
+            let mut sc2 = Scratch::new(&m2.dev, &m2.cfg, w, m2.cfg.rotary_dim, m2.max_pos())?;
             let mut pos2 = 0usize;
             let mut last2 = prompt_ids[0] as i32;
             for (i, t) in prompt_ids.iter().enumerate() {
@@ -11158,7 +11164,7 @@ pub fn run_mtp_bench(a: &FwdArgs, depth: usize) -> Result<()> {
         None => bail!("pack has no mtp.* draft head — M1 unavailable"),
     };
     // S-A3-o: the verify round needs width depth+1 (was 1 -> "scratch width 1 < verify width").
-    let mut sc = Scratch::new(&model.dev, &model.cfg, (depth + 1).max(2), model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, (depth + 1).max(2), model.cfg.rotary_dim, model.max_pos())?;
 
     let prompt_ids: Vec<u32> = match &a.ids_file {
         Some(f) => {
@@ -11343,7 +11349,7 @@ pub fn probe_state_exl3(a: &FwdArgs) -> Result<()> {
     let w = 8usize;
     let k_steps = a.max_new.clamp(4, 64);
     let model = FwdModel::load(&a.dir, w, a.max_pos)?;
-    let mut sc = Scratch::new(&model.dev, &model.cfg, w, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, w, model.cfg.rotary_dim, model.max_pos())?;
     let ids = gate_prompt_ids(a)?;
     let v = model.cfg.vocab_size as i32;
     println!("EXL3 GDN state-equivalence probe: prompt={} tokens, K={} continuations, N=1..={w}",
@@ -11633,7 +11639,7 @@ mod l10_prefillx_tests {
 /// prefill_chunk while the same ids through forward_step were exact).
 pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
     let model = FwdModel::load(&a.dir, 1, a.max_pos)?;
-    let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim, model.max_pos())?;
     let ids = gate_prompt_ids(a)?;
     let n = ids.len();
     println!("EXL3 prefill-equivalence probe: prompt={n} tokens");
@@ -11998,7 +12004,7 @@ pub fn probe_pfx_trace(a: &FwdArgs) -> Result<()> {
         std::fs::create_dir_all(d)?;
     }
     let model = FwdModel::load(&a.dir, 1, a.max_pos)?;
-    let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim, model.max_pos())?;
     let ids = gate_prompt_ids(a)?;
     let nl = model.layers.len();
     println!("EXL3 prefill TRACE: {} tokens, {nl} layers; stage diff @ token 0 + first-divergent-token sweep", ids.len());
@@ -12238,7 +12244,7 @@ pub fn bench_mtp_exl3(a: &FwdArgs, depth: usize) -> Result<()> {
     };
     // scratch holds the VERIFY width m=k+1 (mtp_round asserts it); arm S's m=1
     // steps ride the same buffer fine.
-    let mut sc = Scratch::new(&model.dev, &model.cfg, (depth + 1).max(2), model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, (depth + 1).max(2), model.cfg.rotary_dim, model.max_pos())?;
     let prompt_ids = gate_prompt_ids(a)?;
     let plen = prompt_ids.len();
     println!("MTP end-to-end probe (exl3): prompt={plen} tokens, depth={depth}, max_new={} model={}",
@@ -12762,8 +12768,8 @@ impl FwdModel {
     }
 
     /// Scratch constructor for the serve backend (fields stay private to this module).
-    pub fn scratch(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, w: usize) -> Result<Scratch> {
-        Scratch::new(dev, cfg, w, cfg.rotary_dim)
+    pub fn scratch(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, w: usize, max_pos: usize) -> Result<Scratch> {
+        Scratch::new(dev, cfg, w, cfg.rotary_dim, max_pos)
     }
 }
 
@@ -17942,7 +17948,7 @@ impl FwdModel {
         let k = 4usize;
         let m = k + 1;
         let rounds = 20usize;
-        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim)?;
+        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim, self.max_pos)?;
         anyhow::ensure!(sc.d_dev.len() >= m + k, "packstate: d_dev narrower than 2 x k");
         println!("PACKSTATE: packed ROUND probe (2 requests, k={k}, {rounds} rounds x 3 pairs; \
                   serial = lone verify per request through the served verify_block; \
@@ -18215,7 +18221,7 @@ impl FwdModel {
         let m = k + 1;
         let rpad = 2 * m;
         let m0 = 6usize; // the 6+4 split's first segment length
-        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim)?;
+        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim, self.max_pos)?;
         anyhow::ensure!(sc.d_dev.len() >= 2 * (k + 1), "pack3: d_dev narrower than 2 x (k+1)");
         println!("PACK3A: graphed round-pair A/B (k={k}, m={m}, R_pad={rpad}; graph = seg trunk + accept_seg + commit_seg; \
                   eager tail = PLE shadow + per-segment taps)");
@@ -18832,7 +18838,7 @@ impl FwdModel {
         let k = 4usize;
         let m = k + 1;
         let v = self.cfg.vocab_size;
-        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim)?;
+        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim, self.max_pos)?;
         println!("PACK2: eager packed-verify probe (2 requests x {m} rows, scratch w=16, nostore, eager)");
         let pairs = [(97usize, 89usize), (513usize, 523usize), (2201usize, 2201usize)];
         let mut ratios: Vec<f64> = Vec::new();

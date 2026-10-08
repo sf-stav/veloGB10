@@ -3,6 +3,22 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## Unreleased
+
+### Fixed — long contexts corrupted device memory
+
+`Scratch::qsa_scores` was sized from the trained-window clamp (the model's
+`max_position_embeddings`, capped at 262144) divided by the indexer ratio, while the scorer
+writes one block per served position. The two agree exactly at `max_pos == 262145` and nowhere
+above it, so any longer context overran the scratch into adjacent device memory — surfacing
+later, far from the cause, as a sticky `CUDA_ERROR_ILLEGAL_ADDRESS`. The scratch now takes the
+served window as an argument.
+
+The geometry bit-packings (`nh_packed`, `bs_packed`, `stride_nkv` and the QSA geometry word)
+assert in release rather than only in debug, so an out-of-range value fails loudly instead of
+truncating into the next field. `FwdModel::load_tp` refuses a window wider than they can carry,
+and `--max-seq-len` is clamped to the packable ceiling with the limit named.
+
 ## v0.7.3 — reported-issue fixes: TP=2 pre-verify race, exllamav3 1.5.x pack loading, cached-token accounting; tool-call parsing; long-running hardening
 
 This release closes the three open issues from the v0.7.2 feedback (#8, #9, #10), makes the

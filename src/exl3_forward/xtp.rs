@@ -2669,7 +2669,7 @@ fn gates_inner(model: &FwdModel, psc: Option<&mut PrefillScratch>, prompt: &[u32
                sync: &mut dyn FnMut(u64, u32) -> Result<u32>) -> Result<(bool, Vec<String>)> {
     let v = model.cfg.vocab_size;
     let w = nmax.max(2);
-    let mut sc = Scratch::new(&model.dev, &model.cfg, w, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, w, model.cfg.rotary_dim, model.max_pos())?;
     let plen = prompt.len();
     anyhow::ensure!(plen >= 2 && nmax >= 1 && nmax <= MTP_MAX_K + 1, "gates: prompt >= 2 tokens, 1 <= N <= {}", MTP_MAX_K + 1);
     let mut psc = psc;
@@ -2947,7 +2947,7 @@ pub fn probe_xtp_ref(dir: &str, prompt: &[u32], gen: usize, max_pos: usize, out_
     println!("{}", identity_line("xtp-ref"));
     println!("XTP_REF program {} (prompt {} tokens, gen {gen})", opts.to_mode(), prompt.len());
     let model = FwdModel::load(dir, 1, max_pos)?;
-    let mut sc = FwdModel::scratch(&model.dev, &model.cfg, 1)?;
+    let mut sc = FwdModel::scratch(&model.dev, &model.cfg, 1, model.max_pos())?;
     let mut psc_store = match opts.pf_chunk { Some(c) => Some(model.prefill_scratch(c)?), None => None };
     let plen = prompt.len();
     anyhow::ensure!(plen >= 2 && gen >= 1, "xtp: need a prompt of >= 2 tokens and gen >= 1");
@@ -3189,7 +3189,7 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     let model = FwdModel::load_tp(pack_dir, 1, max_pos, Some(TpAttach { rank, world, link }))?;
     println!("[exl3-tp] rank {rank}/{world}: loaded in {:.1}s — trunk per rank: {} q heads / {} kv heads, GDN {} k / {} v heads",
              t_load.elapsed().as_secs_f32(), model.tc.num_heads, model.tc.num_kv_heads, model.tc.lin_num_k_heads, model.tc.lin_num_v_heads);
-    let mut sc = FwdModel::scratch(&model.dev, &model.cfg, 1)?;
+    let mut sc = FwdModel::scratch(&model.dev, &model.cfg, 1, model.max_pos())?;
     let mut psc_store = match opts.pf_chunk { Some(c) => Some(model.prefill_scratch(c)?), None => None };
     let cmp = plen - 1;
     let prompt = seq[..plen].to_vec();
