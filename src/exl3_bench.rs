@@ -373,12 +373,11 @@ fn dev0() -> Result<std::sync::Arc<CudaDevice>> {
 
 static K6_MODULE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// CF-P1g (4.05 bpw): a pack that stores a K = 6 module needs the kernel module built with `case 6` in every bit-width
-/// switch (kernels/exl3_bench_k6.cu). Set by `Exl3Pack::open` before any module of this process is loaded; every K <= 5
-/// pack (3.05 bpw) keeps `exl3_bench.ptx`, which is instruction-identical to the pre-4.05 module.
+/// Select the extended 6..8-bit module from actual trellis headers, before GPU
+/// modules load. The historical _k6 filename is retained for bundle compatibility.
 pub(crate) fn set_k6_module(on: bool) { K6_MODULE.store(on, std::sync::atomic::Ordering::Relaxed); }
 
-/// The path of the EXL3 kernel PTX this process loads (the standard module, or the K = 6 one).
+/// The path of the standard or extended EXL3 kernel PTX this process loads.
 pub(crate) fn bench_ptx_path() -> &'static str {
     if K6_MODULE.load(std::sync::atomic::Ordering::Relaxed) { "src/ptx/exl3_bench_k6.ptx" } else { "src/ptx/exl3_bench.ptx" }
 }
@@ -418,37 +417,11 @@ fn le_f16_bits(bytes: &[u8]) -> Vec<u16> {
         .collect()
 }
 
-/// The bench/gate matrix set: one expert gate (b3), one expert down (b3), one dense
-/// (b5), lm_head (b5), one mtp fc (b4) — spec §2.2's representative shapes.
+/// Cover every stored (class, width, shape), not just one historical pack's
+/// widths. Repeated experts/layers need not repeat identical kernel geometry.
 fn pick_modules(pack: &Exl3Pack) -> Vec<ModuleMeta> {
-    let find = |pred: &dyn Fn(&ModuleMeta) -> bool| {
-        pack.modules.iter().find(|m| pred(m)).cloned()
-    };
-    let mut out = Vec::new();
-    if let Some(m) = find(&|m: &ModuleMeta| {
-        m.class == TensorClass::Expert && m.bits == 3 && m.name.ends_with("gate_proj")
-    }) {
-        out.push(m);
-    }
-    if let Some(m) = find(&|m: &ModuleMeta| {
-        m.class == TensorClass::Expert && m.bits == 3 && m.name.ends_with("down_proj")
-    }) {
-        out.push(m);
-    }
-    if let Some(m) = find(&|m: &ModuleMeta| {
-        m.class == TensorClass::Dense && m.bits == 5 && m.n == 10240
-    }) {
-        out.push(m);
-    }
-    if let Some(m) = find(&|m: &ModuleMeta| m.class == TensorClass::LmHead) {
-        out.push(m);
-    }
-    if let Some(m) = find(&|m: &ModuleMeta| {
-        m.class == TensorClass::Mtp && m.bits == 4 && m.k == 2560 && m.n == 2560
-    }) {
-        out.push(m);
-    }
-    out
+    let mut seen = std::collections::BTreeSet::new();
+    pack.modules.iter().filter(|m| seen.insert((m.class, m.bits, m.k, m.n))).cloned().collect()
 }
 
 /// Deterministic fp16 activations, row-major [rows, k]. Row 0 is INDEPENDENT of
@@ -805,6 +778,210 @@ pub fn probe_kernel_decode(dir: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // 2. G-A3-5: batch invariance + GEMM correctness vs host reference.
 // ---------------------------------------------------------------------------
+/// Model-independent, poisoned-output regression gate for extended trellises.
+/// Exercise the generic decode, grouped/A-once, cooperative and device-routed
+/// prefill entry points on deterministic packed weights, including tail rows.
+pub fn probe_bitwidths() -> Result<()> {
+    set_k6_module(true);
+    let dev = dev0()?;
+    load_module(&dev)?;
+    let stream = fork_blocking_stream(&dev);
+    let cfg = |x, y, threads| LaunchConfig {
+        grid_dim: (x, y, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0,
+    };
+    let check = |got: &[u16], reference: &[f32], tag: &str| -> Result<()> {
+        anyhow::ensure!(got.iter().all(|v| f16::from_bits(*v).is_finite()), "{tag}: non-finite/unwritten output");
+        let (_, rel) = rel_l2(got, reference);
+        anyhow::ensure!(rel <= 5e-4, "{tag}: rel-L2 {rel:e}");
+        Ok(())
+    };
+    let mut cases = 0;
+    for bits in 3..=8usize {
+        for (k, n) in [(128usize, 128usize), (256, 256), (2048, 128)] {
+            let mut seed = 0x51A7u32 ^ bits as u32;
+            let raw: Vec<u16> = (0..k / 16 * (n / 16) * 16 * bits).map(|_| {
+                seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; seed as u16
+            }).collect();
+            let weights = decode_trellis_host(&raw.iter().map(|v| *v as i16).collect::<Vec<_>>(), k / 16, n / 16, bits);
+            let tr = dev.htod_sync_copy(&raw)?;
+            let offsets = dev.htod_sync_copy(&[0u64])?;
+            let esel = dev.htod_sync_copy(&[1i32])?;
+            // CPU/GPU reconstruction equality, independent of GEMM tolerances.
+            let rc = dev.htod_sync_copy(&tmap_inv_table())?;
+            let mut decoded = dev.htod_sync_copy(&vec![0xFFFFu16; k * n])?;
+            unsafe {
+                dev.get_func(MODULE, "exl3_decode_dump8").context("decode_dump8")?.launch_on_stream(
+                    &stream, cfg((k / 16 * (n / 16) / 8) as u32, 1, 256),
+                    (&tr, &rc, &mut decoded, (n / 16) as i32, bits as i32))?;
+            }
+            dev.synchronize()?;
+            anyhow::ensure!(dev.dtoh_sync_copy(&decoded)? == weights, "{bits}-bit reconstruction mismatch");
+            let mut row0 = Vec::new();
+            for m in [1usize, 2, 4, 8, 16, 17, 65] {
+                let x = synth_x(m, k, 0xC0FFEE);
+                let dx = dev.htod_sync_copy(&x)?;
+                let reference = gemm_ref(&weights, &x, m, k, n);
+                let mut baseline = Vec::new();
+                if m <= 16 {
+                    for name in ["exl3_hmma_gemm", "exl3_hmma_gemm_grouped", "xq_gemm_grouped_xh", "xq_moe_coop_a", "xq_moe_coop_b"] {
+                        let mut y = dev.htod_sync_copy(&vec![0xFFFFu16; m * n])?;
+                        let f = dev.get_func(MODULE, name).context("generic GEMM entry")?;
+                        unsafe {
+                            if name == "exl3_hmma_gemm" {
+                                f.launch_on_stream(&stream, cfg((n / 128) as u32, 1, 256),
+                                    (&tr, &dx, &mut y, m as i32, k as i32, n as i32, bits as i32))?;
+                            } else if name == "exl3_hmma_gemm_grouped" {
+                                let mut lc = cfg((n / 128) as u32, 1, 256);
+                                if m * (k + 8) * 2 <= 48 * 1024 { lc.shared_mem_bytes = (m * (k + 8) * 2) as u32; }
+                                f.launch_on_stream(&stream, lc,
+                                    (&tr, &offsets, &dx, &mut y, m as i32, k as i32, n as i32, bits as i32))?;
+                            } else {
+                                let groups = if name.starts_with("xq_moe_coop") { n / 32 } else { n / 128 };
+                                let mut lc = cfg(groups as u32, 1, 256);
+                                if name == "xq_gemm_grouped_xh" && m * (k + 8) * 2 <= 48 * 1024 {
+                                    lc.shared_mem_bytes = (m * (k + 8) * 2) as u32;
+                                }
+                                f.launch_on_stream(&stream, lc,
+                                    (&tr, &offsets, &dx, &mut y, m as i32, k as i32, n as i32, bits as i32, &esel))?;
+                            }
+                        }
+                        dev.synchronize()?;
+                        let got = dev.dtoh_sync_copy(&y)?;
+                        check(&got, &reference, name)?;
+                        if baseline.is_empty() { baseline = got; }
+                        else { anyhow::ensure!(got == baseline, "{name}: {bits}-bit grouped output differs at M={m}"); }
+                        cases += 1;
+                    }
+                    if row0.is_empty() { row0 = baseline[..n].to_vec(); }
+                    else { anyhow::ensure!(baseline[..n] == row0, "{bits}-bit batch invariance failed at M={m}"); }
+                    // Dense serving also uses split-K and its persistent twin.
+                    for ks in [2usize, 4] {
+                        let poison = vec![f32::NAN; ks * m * n];
+                        let mut ws = dev.htod_sync_copy(&poison)?;
+                        unsafe {
+                            dev.get_func(MODULE, "exl3_hmma_gemm_ks").context("split-K")?.launch_on_stream(
+                                &stream, cfg((n / 128) as u32, ks as u32, 256),
+                                (&tr, &dx, &mut ws, m as i32, k as i32, n as i32, bits as i32))?;
+                        }
+                        dev.synchronize()?;
+                        let partials = dev.dtoh_sync_copy(&ws)?;
+                        anyhow::ensure!(partials.iter().all(|v| v.is_finite()), "{bits}-bit split-K left poison");
+                        let combined: Vec<u16> = (0..m * n).map(|i| {
+                            f16::from_f32((0..ks).fold(0.0f32, |a, s| a + partials[s * m * n + i])).to_bits()
+                        }).collect();
+                        check(&combined, &reference, "split-K")?;
+                        cases += 1;
+                        for pf in [0i32, 1, 2] {
+                            let word = bits as i32 | ((ks as i32) << 8) | (pf << 24);
+                            let mut out = dev.htod_sync_copy(&poison)?;
+                            let mut out2 = dev.htod_sync_copy(&poison)?;
+                            let address = *tr.device_ptr() as u64;
+                            unsafe {
+                                dev.get_func(MODULE, "exl3_hmma_gemm_ks_p").context("persistent split-K")?.launch_on_stream(
+                                    &stream, cfg(3, 1, 256),
+                                    (&tr, &dx, &mut out, m as i32, k as i32, n as i32, word, address))?;
+                            }
+                            dev.synchronize()?;
+                            anyhow::ensure!(dev.dtoh_sync_copy(&out)? == partials, "{bits}-bit persistent split-K mismatch");
+                            out = dev.htod_sync_copy(&poison)?;
+                            unsafe {
+                                dev.get_func(MODULE, "exl3_hmma_gemm_ks_p_x2").context("paired persistent split-K")?.launch_on_stream(
+                                    &stream, cfg(3, 1, 256),
+                                    (&tr, &tr, &dx, &dx, &mut out, &mut out2,
+                                     m as i32, k as i32, n as i32, word, address, address))?;
+                            }
+                            dev.synchronize()?;
+                            anyhow::ensure!(dev.dtoh_sync_copy(&out)? == partials && dev.dtoh_sync_copy(&out2)? == partials,
+                                "{bits}-bit paired persistent split-K mismatch");
+                            cases += 2;
+                        }
+                        let svh_host = vec![f16::ONE.to_bits(); n];
+                        let svh = dev.htod_sync_copy(&svh_host)?;
+                        let expected = had_scale_ref(&combined, &svh_host, m, n, false);
+                        let mut y = dev.htod_sync_copy(&vec![0xFFFFu16; m * n])?;
+                        let mut cnt = dev.alloc_zeros::<u32>(n / 128)?;
+                        unsafe {
+                            dev.get_func(MODULE, "exl3_hmma_gemm_ks_fx").context("split-K fixup")?.launch_on_stream(
+                                &stream, cfg((n / 128) as u32, ks as u32, 256),
+                                (&tr, &dx, &mut ws, &svh, &mut y, &mut cnt,
+                                 m as i32, k as i32, n as i32, bits as i32))?;
+                        }
+                        dev.synchronize()?;
+                        anyhow::ensure!(dev.dtoh_sync_copy(&y)? == expected, "{bits}-bit split-K fixup mismatch");
+                        anyhow::ensure!(dev.dtoh_sync_copy(&cnt)?.iter().all(|v| *v == 0), "split-K fixup counter not reset");
+                        cases += 1;
+                    }
+                }
+                // Dense/auxiliary prefill can lack reconstruction buffers. Test
+                // every generic wide entry, not only the expert tile-list entry.
+                let counts = dev.htod_sync_copy(&[m as i32])?;
+                let rows = dev.htod_sync_copy(&[0i32])?;
+                let tokens = dev.htod_sync_copy(&(0..m as i32).collect::<Vec<_>>())?;
+                let mut first_wide = Vec::new();
+                for mt in [1usize, 2, 4, 8] {
+                    let msup = m.div_ceil(16 * mt) as u32;
+                    for name in ["exl3_hmma_gemm_wide", "exl3_hmma_gemm_wide_grouped", "xq_gemm_grouped_rows"] {
+                        let mut y = dev.htod_sync_copy(&vec![0xFFFFu16; m * n])?;
+                        let f = dev.get_func(MODULE, name).context("wide GEMM entry")?;
+                        unsafe {
+                            if name == "exl3_hmma_gemm_wide" {
+                                f.launch_on_stream(&stream, cfg(msup, (n / 128) as u32, 256),
+                                    (&tr, &dx, &mut y, m as i32, k as i32, n as i32, bits as i32, mt as i32))?;
+                            } else if name == "exl3_hmma_gemm_wide_grouped" {
+                                f.launch_on_stream(&stream, cfg(msup, (n / 128) as u32, 256),
+                                    (&tr, &offsets, &dx, &mut y, &rows, &counts,
+                                     k as i32, n as i32, bits as i32, mt as i32, 0i32))?;
+                            } else {
+                                f.launch_on_stream(&stream,
+                                    LaunchConfig { grid_dim: (1, (n / 128) as u32, msup), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                                    (&tr, &offsets, &dx, &tokens, &rows, &counts, &mut y,
+                                     k as i32, n as i32, bits as i32, mt as i32))?;
+                            }
+                        }
+                        dev.synchronize()?;
+                        let got = dev.dtoh_sync_copy(&y)?;
+                        check(&got, &reference, name)?;
+                        anyhow::ensure!(got[..n] == row0, "{bits}-bit dense wide row invariance failed");
+                        if !baseline.is_empty() { anyhow::ensure!(got == baseline, "{bits}-bit dense wide differs from m16"); }
+                        if first_wide.is_empty() { first_wide = got; }
+                        else { anyhow::ensure!(first_wide == got, "{bits}-bit dense wide depends on MT/entry"); }
+                        cases += 1;
+                    }
+                }
+                if bits <= 6 {
+                    let counts = dev.htod_sync_copy(&[m as i32])?;
+                    let rows = dev.htod_sync_copy(&[0i32])?;
+                    let mut first = Vec::new();
+                    for mt in [1usize, 2, 4, 8] {
+                        let nt = m.div_ceil(16 * mt);
+                        let tiles: Vec<i32> = (0..nt).flat_map(|i| [0, i as i32]).collect();
+                        let tiles = dev.htod_sync_copy(&tiles)?;
+                        let ntiles = dev.htod_sync_copy(&[nt as i32])?;
+                        let mut y = dev.htod_sync_copy(&vec![0xFFFFu16; m * n])?;
+                        unsafe {
+                            dev.get_func(MODULE, "exl3_hmma_gemm_wide_tiles").context("wide_tiles")?.launch_on_stream(
+                                &stream, cfg((n / 128) as u32, nt as u32, 256),
+                                (&tr, &offsets, &dx, &mut y, &tiles, &ntiles, &rows, &counts,
+                                 k as i32, n as i32, bits as i32, mt as i32))?;
+                        }
+                        dev.synchronize()?;
+                        let got = dev.dtoh_sync_copy(&y)?;
+                        check(&got, &reference, "wide_tiles")?;
+                        anyhow::ensure!(got[..n] == row0, "{bits}-bit prefill/decode row invariance failed");
+                        if !baseline.is_empty() { anyhow::ensure!(got == baseline, "{bits}-bit wide_tiles differs from m16"); }
+                        if first.is_empty() { first = got; }
+                        else { anyhow::ensure!(first == got, "{bits}-bit wide_tiles depends on MT"); }
+                        cases += 1;
+                    }
+                }
+            }
+            crate::rprintln!("EXL3-BITWIDTHS b={bits} K={k} N={n}: PASS");
+        }
+    }
+    crate::rprintln!("EXL3-BITWIDTHS: PASS ({cases} GEMM launches, 3..8-bit reconstruction)");
+    Ok(())
+}
+
 pub fn probe_gemm(dir: &str, widths: &[usize], slab_cols: usize) -> Result<()> {
     let pack = Exl3Pack::open(dir)?;
     let dev = dev0()?;
@@ -865,7 +1042,7 @@ pub fn probe_gemm(dir: &str, widths: &[usize], slab_cols: usize) -> Result<()> {
         // ---- correctness at width 4 ----
         let w = 4usize;
         let x = synth_x(w, k, 0xC0FFEE);
-        let mut chain = run_chain(&dev, &tr_bits, &suh, &svh, &x, w, k, n_eff16, bits)?;
+        let chain = run_chain(&dev, &tr_bits, &suh, &svh, &x, w, k, n_eff16, bits)?;
         let yraw = dev.dtoh_sync_copy(&chain.d_yraw)?;
         let y = dev.dtoh_sync_copy(&chain.d_y)?;
 
@@ -905,12 +1082,12 @@ pub fn probe_gemm(dir: &str, widths: &[usize], slab_cols: usize) -> Result<()> {
         let mut row0_w: Vec<Vec<u16>> = Vec::new();
         for wd in widths {
             let x = synth_x(*wd, k, 0xC0FFEE);
-            // reuse buffers: relaunch with new x
-            let d_x = dev.htod_sync_copy(&x)?;
-            chain.d_x = d_x;
-            launch_chain(&dev, &mut chain)?;
-            let yraw = dev.dtoh_sync_copy(&chain.d_yraw)?;
-            let y = dev.dtoh_sync_copy(&chain.d_y)?;
+            // Each width needs matching row counts and buffer sizes. Reusing the
+            // four-row correctness chain reads past inputs at widths 1/2 and
+            // does not actually exercise widths above four.
+            let width_chain = run_chain(&dev, &tr_bits, &suh, &svh, &x, *wd, k, n_eff16, bits)?;
+            let yraw = dev.dtoh_sync_copy(&width_chain.d_yraw)?;
+            let y = dev.dtoh_sync_copy(&width_chain.d_y)?;
             row0_w.push(yraw[..n_eff16].to_vec());
             row0_w.push(y[..n_eff16].to_vec());
             let _ = y;

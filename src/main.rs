@@ -382,6 +382,7 @@ fn print_help() {
     println!("                           prefill path + per-prefill-window (n, tp64) records. NEVER on");
     println!("                           for a timing run");
     println!("  --probe-reject           Reject-path checkpoint/rollback 3-way probe");
+    gb10_inference::rprintln!("  --probe-exl3-bitwidths  Synthetic 3..8-bit decode/GEMM and 3..6-bit expert-prefill regression gate (no model)");
     println!("  --probe-exl3-tailgemm    EXL3 prefill tail-chunk small-M GEMM xq_gemm_f16_tail (synthetic): bitwise vs");
     println!("                           xq_gemm_f16 at the served tail shapes, M 1..16, + per-call timing (TP-4T1)");
     println!("  --probe-exl3-routergemm  EXL3 prefill router GEMM xq_gemm_f16_f32_tile128/tile64 (synthetic): bitwise vs");
@@ -1277,6 +1278,13 @@ fn main() {
     // magic-mul + dp4a + fp16 HFMA) dumped via exl3_decode_dump, bitwise vs the Rust oracle
     // (which is G-A3-1-green vs ext.reconstruct). Probe-only; loads src/ptx/exl3_bench.ptx.
     //   ./gb10_inference --probe-exl3-kernel --model-dir <EXL3-pack>
+    if args.iter().any(|a| a == "--probe-exl3-bitwidths") {
+        gb10_inference::exl3_bench::probe_bitwidths().unwrap_or_else(|e| {
+            gb10_inference::reprintln!("EXL3_BITWIDTHS_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
     if args.iter().any(|a| a == "--probe-exl3-kernel") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-kernel requires --model-dir <DIR>");
         gb10_inference::exl3_bench::probe_kernel_decode(&dir).unwrap_or_else(|e| {

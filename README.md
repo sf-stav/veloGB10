@@ -449,8 +449,12 @@ in **[CHANGELOG.md](CHANGELOG.md)**.
 **Build:**
 
 ```bash
-cargo build --release
+CUDA_ROOT=/usr/local/cuda cargo build --release
 ```
+
+`CUDA_ROOT` selects the toolkit used by the Rust CUDA bindings. When multiple
+CUDA versions are installed, point it at the same toolkit as `CUDA_HOME`/`nvcc`
+to avoid linking a binary against a different CUDA major version.
 
 This produces `target/release/gb10_inference` plus the PTX kernel artifacts in `src/ptx/` (the build generates all of them; the engine needs the whole set at runtime).
 **The binary is not self-contained — it loads `src/ptx/*.ptx` relative to its working directory**,
@@ -458,6 +462,29 @@ so run it from a directory that has both (a build-fingerprint handshake refuses 
 binary/PTX pairs, so the two never silently drift apart).
 
 Don't want to build? Use the prebuilt package on the [**Releases** page](https://github.com/sf-stav/veloGB10/releases) instead.
+
+### Extended EXL3 trellises
+
+The extended kernel bundle (historical filename `exl3_bench_k6.ptx`) supports
+6-, 7-, and 8-bit generic decode/GEMM paths. Selection uses actual trellis
+headers, including auxiliary tensors, rather than the pack's average bit rate.
+Dense prefill above 5 bits prefers reconstruction plus cuBLASLt where buffers
+exist; auxiliary call sites without those buffers use generic 3..8-bit wide GEMMs. Device-routed
+6-bit experts automatically use the generic wide-tiles prefill fallback;
+the optimized pipelined expert-prefill kernels remain 3/4-bit only. This does
+not add 7/8-bit expert prefill or extend every specialized fast path.
+
+Run the model-independent numerical regression gate from the build directory:
+
+```bash
+CUDA_ROOT=/usr/local/cuda cargo test --lib wide_bits_guard_tests
+CUDA_ROOT=/usr/local/cuda cargo run --release --bin gb10_inference -- --probe-exl3-bitwidths
+```
+
+The GPU gate checks CPU/GPU reconstruction, poisoned outputs, batch invariance,
+grouped/cooperative GEMMs, split-K/persistent/fixup paths, and expert-prefill
+tiles. Both TP hosts need the same freshly built binary and complete PTX bundle;
+do not mix a rebuilt binary with the upstream prebuilt kernel files.
 
 ## Running
 

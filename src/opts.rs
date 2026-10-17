@@ -643,6 +643,7 @@ pub const HAND_FLAGS: &[(&str, bool)] = &[
     ("probe-dsv4", false),
     ("probe-exl3", false),
     ("probe-exl3-binv", false),
+    ("probe-exl3-bitwidths", false),
     ("probe-exl3-flashpf", false),
     ("probe-exl3-hcw4", false),
     ("probe-exl3-kernel", false),

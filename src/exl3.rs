@@ -295,10 +295,6 @@ impl Exl3Pack {
             mtp_bits: q["mtp_bits"].as_f64().unwrap_or(0.0),
             codebook: q["codebook"].as_str().unwrap_or("").to_string(),
         };
-        // CF-P1g: a pack with a K = 6 module needs the K = 6 kernel module (decided here, before any module loads).
-        let max_k = q["tensor_storage"].as_object()
-            .map(|o| o.values().filter_map(|v| v["bits_per_weight"].as_u64()).max().unwrap_or(0)).unwrap_or(0);
-        crate::exl3_bench::set_k6_module(max_k >= 6);
         if quant.quant_method != "exl3" {
             bail!(
                 "EXL3 pack {dir}: quant_method={:?} (wanted \"exl3\") — refusing to guess",
@@ -386,12 +382,9 @@ impl Exl3Pack {
                 }
             };
             let bits = shape[2] / 16;
-            // This check is the only one the loader makes: it ACCEPTS 1..=8 bits. Whether a kernel decodes a
-            // width is the dispatch's business, and the wide trellis family decodes 3..=5 only
-            // (`exl3_forward::wide_trellis_supports_bits`; the K=6 module adds 6 to the m16 / grouped switches,
-            // not to the wide ones). The comment "loader refuses other rates" in the wide kernel's switch
-            // (kernels/exl3_bench.cu) is therefore wrong; it is left as is so the kernel build id, and with
-            // it every PTX byte, stays what the previous gates ran (S-B9-REL-INTEG D1).
+            // Validate the storage format here. Each execution path separately
+            // guards its supported widths; accepting storage is not a promise
+            // that every optimized kernel supports that width.
             if shape[2] % 16 != 0 || bits == 0 || bits > 8 {
                 bail!(
                     "EXL3 pack {dir}: {name}: trellis last dim {} is not 16*bits (bits 1..8)",
@@ -421,6 +414,9 @@ impl Exl3Pack {
         }
         census.incomplete_quadruples = incomplete;
         modules.sort_by(|a, b| a.name.cmp(&b.name));
+        // tensor_storage can omit auxiliary tensors. Actual trellis headers,
+        // rather than advisory quantization metadata, determine kernel coverage.
+        crate::exl3_bench::set_k6_module(modules.iter().any(|m| m.bits >= 6));
 
         // 7. Sidecars (catalogued; the MTP mixer patch is redundant in-pack data —
         //    spec §6.3 says prefer the main-shard copies and record the patch as ignored).
