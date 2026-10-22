@@ -3891,12 +3891,17 @@ fn recon_min_rows() -> usize {
         .ok().and_then(|v| v.parse().ok()).unwrap_or(17)
 }
 
-/// S-B9-REL-INTEG D1: the bit widths the WIDE trellis GEMM family decodes. Its kernel switches
-/// (`exl3_hmma_gemm_wide`, `_wide_grouped`, `_wide_tiles`) carry cases 3, 4 and 5 and `default: break;` in BOTH
-/// modules (the K=6 module adds `case 6` to the other switches, not to these), so a 6-bit module launched
-/// there writes NOTHING and the request is answered 200 with garbage. The reconstruct + cuBLASLt arm is
-/// bits-generic, which is why the default `--exl3-recon-min 17` is safe for the 4.05 pack's 6-bit modules.
-pub(crate) fn wide_trellis_supports_bits(bits: usize) -> bool { (3..=5).contains(&bits) }
+/// Generic dense wide GEMMs support the extended module's 3..8-bit widths.
+/// Auxiliary projections without reconstruction buffers need this path too.
+pub(crate) fn wide_trellis_supports_bits(bits: usize) -> bool { (3..=8).contains(&bits) }
+
+/// Preserve the conservative reconstruction policy wherever buffers exist,
+/// independently of the wider generic kernel's capability.
+fn dense_prefill_recon_preferred(bits: usize) -> bool { !(3..=5).contains(&bits) }
+
+/// Device-routed expert tiles have a conservative wider-bit fallback. Dense
+/// prefill keeps using reconstruction for these widths; its policy is separate.
+pub(crate) fn expert_tiles_support_bits(bits: usize) -> bool { (3..=6).contains(&bits) }
 
 /// The pipelined prefill MoE expert kernels (`xq_moe_pf*`, `--pf-moe-kernel`) decode 3- and 4-bit trellises only.
 pub(crate) fn moe_pf_kernel_supports_bits(bits: usize) -> bool { matches!(bits, 3 | 4) }
@@ -3905,13 +3910,13 @@ pub(crate) fn moe_pf_kernel_supports_bits(bits: usize) -> bool { matches!(bits, 
 pub(crate) fn wide_arm_bits_refusal(bits: usize, m: usize, k: i32, n: i32, recon_min: usize, have_recon_buffers: bool) -> String {
     let cause = if !have_recon_buffers {
         "this call site has no reconstruct buffers — they exist only where a reconstruct-capable arm is \
-wired; serve these modules from a call site that carries them, or ship the pack in 3-, 4- or 5-bit"
+wired; serve these modules from a call site that carries them, or use supported 3..8-bit trellises"
     } else {
         "the call site HAS reconstruct buffers but the dispatch did not take them — a routing invariant \
 broke; report this"
     };
     format!("EXL3 prefill chain of {m} rows on a {bits}-bit module (K = {k}, N = {n}): the wide trellis GEMM \
-(exl3_hmma_gemm_wide) decodes 3-, 4- and 5-bit trellises only and would leave this module's output \
+(exl3_hmma_gemm_wide) decodes 3..8-bit trellises only and would leave this module's output \
 unwritten (HTTP 200 with garbage). Since F3 the dispatch sends every such module through the reconstruct + \
 cuBLASLt arm whenever the call site carries reconstruct buffers, whatever --exl3-recon-min ({recon_min}) says — \
 the option cannot cause this any more, and neither can an oversized plain step (the serve caps --max-batch at \
@@ -6837,10 +6842,10 @@ fn chain_wide_gemm(l: &Launcher, q: &Quad, xh: &mut CudaSlice<u16>, yraw: &mut C
         // used instead; /metrics counts the served GEMMs (`velogb10_exl3_recon_forced_total`).
         let rmin = recon_min_rows();
         let recon = match rb {
-            Some(r) if !wide_trellis_supports_bits(q.bits as usize) => {
+            Some(r) if dense_prefill_recon_preferred(q.bits as usize) => {
                 if WIDE_FALLBACK_NOTE.set(()).is_ok() {
-                    crate::rprintln!("[exl3] --exl3-recon-min {rmin}: this pack has {}-bit modules the wide trellis kernel \
-cannot decode (3-, 4- and 5-bit only); those modules serve through the reconstruct + cuBLASLt arm, whatever the option says",
+                    crate::rprintln!("[exl3] --exl3-recon-min {rmin}: {}-bit modules use the conservative reconstruct + \
+cuBLASLt arm where buffers exist; generic wide trellis GEMMs handle supported widths at auxiliary call sites without buffers",
                                      q.bits);
                 }
                 crate::metrics::exl3_recon_forced(q.bits);
@@ -7468,7 +7473,8 @@ impl FwdModel {
             let kv = dev.alloc_zeros::<u8>(width * 2 * nkv * max_pos * kv_rowbytes(kv_fmt, hd))?;
             crate::metrics::kv_pool_add_bytes(2, (width * 2 * nkv * max_pos * kv_rowbytes(kv_fmt, hd)) as u64); // issue #24
             println!(
-                "  MTP draft head (mtp.*) loaded as EXL3 (M1 decision): fc 4bpw, attn 5bpw, experts 3bpw ({:.0}s)",
+                "  MTP draft head (mtp.*) loaded as EXL3: fc_hidden {}-bit, fc_embed {}-bit, experts {}-bit ({:.0}s)",
+                fc_hidden.bits, fc_embed.bits, moe.bits,
                 t0h.elapsed().as_secs_f32()
             );
             Some(DraftHead {
@@ -13639,17 +13645,19 @@ impl FwdModel {
             let ne = ne_eff;
             let max_tiles = (r / 16 + ne) as u32;
             // A5-P1 knobs (all bitwise; default OFF): pipelined kernel, WP19 per-expert MT, glue fold.
-            let pk = tune::get(&T_PF_MOE_KERNEL, &l.cx()) != 0 && mi % 128 == 0 && h % 128 == 0;
+            let pk = tune::get(&T_PF_MOE_KERNEL, &l.cx()) != 0 && mi % 128 == 0 && h % 128 == 0
+                && moe_pf_kernel_supports_bits(moe.bits);
             // S-B9-REL-INTEG D1: both arms switch on `bits` with `default: break;` (a launch that writes nothing):
-            // xq_moe_pf* knows 3 and 4, exl3_hmma_gemm_wide_tiles 3, 4 and 5. Refuse before the first launch.
+            // xq_moe_pf* knows 3 and 4; wider experts automatically use the
+            // conservative tiles fallback (3..6). Refuse before the first launch.
             if pk {
                 anyhow::ensure!(moe_pf_kernel_supports_bits(moe.bits),
                     "EXL3 prefill MoE: the pipelined expert kernel (xq_moe_pf*, on by default; --pf-moe-kernel) decodes 3- and 4-bit \
 trellises only and would leave the output of this layer's {}-bit routed experts unwritten (HTTP 200 with garbage); \
-boot with --pf-moe-kernel off to use the wide tiles kernel (3..5 bits)", moe.bits);
+boot with --pf-moe-kernel off to use the wide tiles kernel (3..6 bits)", moe.bits);
             } else {
-                anyhow::ensure!(wide_trellis_supports_bits(moe.bits),
-                    "EXL3 prefill MoE: the wide tiles kernel (exl3_hmma_gemm_wide_tiles) decodes 3-, 4- and 5-bit trellises only and \
+                anyhow::ensure!(expert_tiles_support_bits(moe.bits),
+                    "EXL3 prefill MoE: the wide tiles kernel (exl3_hmma_gemm_wide_tiles) decodes 3..6-bit trellises only and \
 would leave the output of this layer's {}-bit routed experts unwritten (HTTP 200 with garbage)", moe.bits);
             }
             let pe = tune::get(&T_PF_MOE_MT_PE, &l.cx()) != 0 && psc.pf_tiles4.len() > 1;
@@ -22202,23 +22210,29 @@ mod wide_bits_guard_tests {
 
     #[test]
     fn the_predicates_match_the_kernels_switches() {
-        for b in [3usize, 4, 5] { assert!(wide_trellis_supports_bits(b), "{b}"); }
-        for b in [0usize, 1, 2, 6, 7, 8] { assert!(!wide_trellis_supports_bits(b), "{b}"); }
+        for b in 3usize..=8 { assert!(wide_trellis_supports_bits(b), "{b}"); }
+        for b in [0usize, 1, 2, 9] { assert!(!wide_trellis_supports_bits(b), "{b}"); }
         for b in [3usize, 4] { assert!(moe_pf_kernel_supports_bits(b), "{b}"); }
         for b in [0usize, 1, 2, 5, 6, 8] { assert!(!moe_pf_kernel_supports_bits(b), "{b}"); }
-        // the kernel source agrees (the K6 module adds `case 6` to the OTHER switches, not to these)
+        // Expert tiles remain 3..6; dense wide kernels extend through 8.
         let cu = include_str!("../kernels/exl3_bench.cu");
-        for sw in ["switch (bits) { EXL3_WT_CASE(3) EXL3_WT_CASE(4) EXL3_WT_CASE(5) default: break; }",
-                   "switch (bits) { EXL3_WG_CASE(3) EXL3_WG_CASE(4) EXL3_WG_CASE(5) default: break; }",
-                   "EXL3_WIDE_CASE(3);\n        EXL3_WIDE_CASE(4);\n        EXL3_WIDE_CASE(5);\n        default: break;"] {
+        for sw in ["switch (bits) { EXL3_WT_CASE(3) EXL3_WT_CASE(4) EXL3_WT_CASE(5) EXL3_CASE6(EXL3_WT_CASE(6)) default: break; }",
+                   "switch (bits) { EXL3_WG_CASE(3) EXL3_WG_CASE(4) EXL3_WG_CASE(5) EXL3_CASE6(EXL3_WG_CASE(6) EXL3_WG_CASE(7) EXL3_WG_CASE(8)) default: break; }",
+                   "EXL3_CASE6(EXL3_WIDE_CASE(6); EXL3_WIDE_CASE(7); EXL3_WIDE_CASE(8);)",
+                   "EXL3_CASE6(EXL3_ROWS_CASE(6); EXL3_ROWS_CASE(7); EXL3_ROWS_CASE(8);)"] {
             assert!(cu.contains(sw), "the wide kernel's bit switch changed (a 6-bit case?): update wide_trellis_supports_bits\n{sw}");
         }
+        for b in 0..=9 {
+            assert_eq!(expert_tiles_support_bits(b), (3..=6).contains(&b));
+            assert_eq!(dense_prefill_recon_preferred(b), !(3..=5).contains(&b));
+        }
+        assert!(cu.contains("8 * EXL3_COOP_MAX_BITS"));
     }
 
     #[test]
     fn the_refusal_names_the_width_the_option_and_the_arm() {
-        let t = wide_arm_bits_refusal(6, 2048, 2048, 4096, 0, true);
-        for needle in ["6-bit module", "2048 rows", "--exl3-recon-min", "reconstruct + cuBLASLt", "garbage"] {
+        let t = wide_arm_bits_refusal(9, 2048, 2048, 4096, 0, true);
+        for needle in ["9-bit module", "2048 rows", "--exl3-recon-min", "reconstruct + cuBLASLt", "garbage"] {
             assert!(t.contains(needle), "{needle:?} missing: {t}");
         }
         // F3 (owner 2026-10-10): the text names the REAL remaining cause (a call site without
@@ -22230,7 +22244,7 @@ mod wide_bits_guard_tests {
         // buffers ARE present here, so the cause must read as the routing-invariant bug branch:
         assert!(t.contains("routing invariant"), "buffers present but unused reads as a bug: {t}");
         // and the no-buffers branch names the only thing that can still reach the refusal:
-        let t3 = wide_arm_bits_refusal(6, 40, 2048, 4096, 17, false);
+        let t3 = wide_arm_bits_refusal(9, 40, 2048, 4096, 17, false);
         assert!(t3.contains("no reconstruct buffers"), "the remaining cause is named: {t3}");
     }
 
@@ -22242,7 +22256,7 @@ mod wide_bits_guard_tests {
         let src: String = include_str!("exl3_forward.rs").lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let f = &src[src.find("fn chain_wide_gemm(").expect("chain_wide_gemm")..];
         let f = &f[..f.find("\n}\n").expect("fn end")];
-        let forced = f.find("Some(r) if !wide_trellis_supports_bits(q.bits as usize) => {").expect("the forced-recon arm");
+        let forced = f.find("Some(r) if dense_prefill_recon_preferred(q.bits as usize) => {").expect("the forced-recon arm");
         let option = f.find("rmin > 0 && m >= rmin").expect("the option's arm");
         assert!(forced < option, "the forced arm must be matched BEFORE the option's arm");
         assert!(f.contains("WIDE_FALLBACK_NOTE.set(())"), "the once-per-boot line");
@@ -22260,7 +22274,7 @@ mod wide_bits_guard_tests {
         assert!(g < l, "the bit-width guard must come before the wide launch");
         let m = &src[src.find("let pk = tune::get(&T_PF_MOE_KERNEL").expect("pk")..];
         let (g1, g2, l) = (m.find("moe_pf_kernel_supports_bits(moe.bits)").expect("pf guard"),
-                           m.find("wide_trellis_supports_bits(moe.bits)").expect("tiles guard"),
+                           m.find("expert_tiles_support_bits(moe.bits)").expect("tiles guard"),
                            m.find("\"xq_moe_pf_count").expect("first launch"));
         assert!(g1 < l && g2 < l, "the MoE guards must come before the first MoE launch");
     }

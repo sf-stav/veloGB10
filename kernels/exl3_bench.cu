@@ -95,14 +95,14 @@ __device__ __forceinline__ uint16_t exl3_dq_t(const uint32_t* __restrict__ ring,
 // next grid becomes resident while this one's last wave drains (launch gap + tail overlap).
 // The dependent release fires only after ALL CTAs of a grid have started, so co-resident
 // grid-barrier kernels (xq_hc_fuse*) can never be starved by a waiting successor.
-// CF-P1g (4.05 bpw): the K=6 module. kernels/exl3_bench_k6.cu defines EXL3_K6_BUILD and includes this file, which adds a
-// `case 6` next to every K=5 bit-width switch below. The normal build leaves the macro empty, so the 3.05 / K <= 5
-// module is source-identical (and its PTX instruction-identical) to before; the K=6 PTX is loaded only for a pack that
-// stores a K=6 module (exl3_bench::bench_ptx_path).
+// The extended module retains its historical _k6 filename, but supports 6..8-bit
+// trellises. Keep the <=5-bit module's dispatch and shared-memory footprint unchanged.
 #ifdef EXL3_K6_BUILD
 #define EXL3_CASE6(...) __VA_ARGS__
+#define EXL3_COOP_MAX_BITS 8
 #else
 #define EXL3_CASE6(...)
+#define EXL3_COOP_MAX_BITS 5
 #endif
 #define XQ_PDL_ENTRY() do { asm volatile("griddepcontrol.wait;" ::: "memory"); \
                             asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); } while (0)
@@ -672,7 +672,7 @@ extern "C" __global__ void exl3_hmma_gemm(const uint16_t* __restrict__ trellis,
         case 3: exl3_gemm_body<3>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
         case 4: exl3_gemm_body<4>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
         case 5: exl3_gemm_body<5>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
-        EXL3_CASE6(case 6: exl3_gemm_body<6>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;)
+        EXL3_CASE6(case 6: exl3_gemm_body<6>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break; case 7: exl3_gemm_body<7>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break; case 8: exl3_gemm_body<8>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;)
         default: break; // loader refuses other rates before we ever get here
     }
 }
@@ -1299,7 +1299,7 @@ extern "C" __global__ void exl3_hmma_gemm_wide_tiles(const uint16_t* __restrict_
         case 4: exl3_gemm_body_wide<B, 4>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
         case 8: exl3_gemm_body_wide<B, 8>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
         default: break; } break;
-    switch (bits) { EXL3_WT_CASE(3) EXL3_WT_CASE(4) EXL3_WT_CASE(5) default: break; }
+    switch (bits) { EXL3_WT_CASE(3) EXL3_WT_CASE(4) EXL3_WT_CASE(5) EXL3_CASE6(EXL3_WT_CASE(6)) default: break; }
 #undef EXL3_WT_CASE
 }
 
@@ -1335,7 +1335,7 @@ extern "C" __global__ void exl3_hmma_gemm_wide_grouped(const uint16_t* __restric
         case 4: exl3_gemm_body_wide<B, 4>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
         case 8: exl3_gemm_body_wide<B, 8>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
         default: break; } break;
-    switch (bits) { EXL3_WG_CASE(3) EXL3_WG_CASE(4) EXL3_WG_CASE(5) default: break; }
+    switch (bits) { EXL3_WG_CASE(3) EXL3_WG_CASE(4) EXL3_WG_CASE(5) EXL3_CASE6(EXL3_WG_CASE(6) EXL3_WG_CASE(7) EXL3_WG_CASE(8)) default: break; }
 #undef EXL3_WG_CASE
 }
 
@@ -1376,6 +1376,7 @@ extern "C" __global__ void exl3_hmma_gemm_wide(const uint16_t* __restrict__ trel
         EXL3_WIDE_CASE(3);
         EXL3_WIDE_CASE(4);
         EXL3_WIDE_CASE(5);
+        EXL3_CASE6(EXL3_WIDE_CASE(6); EXL3_WIDE_CASE(7); EXL3_WIDE_CASE(8);)
         default: break; // loader refuses other rates before we ever get here
     }
 #undef EXL3_WIDE_CASE
@@ -1405,7 +1406,7 @@ extern "C" __global__ void exl3_hmma_gemm_grouped(const uint16_t* __restrict__ b
             case 3: exl3_gemm_body_a1<3>(tr, xh, ye, M, K, N, tile); break;
             case 4: exl3_gemm_body_a1<4>(tr, xh, ye, M, K, N, tile); break;
             case 5: exl3_gemm_body_a1<5>(tr, xh, ye, M, K, N, tile); break;
-            EXL3_CASE6(case 6: exl3_gemm_body_a1<6>(tr, xh, ye, M, K, N, tile); break;)
+            EXL3_CASE6(case 6: exl3_gemm_body_a1<6>(tr, xh, ye, M, K, N, tile); break; case 7: exl3_gemm_body_a1<7>(tr, xh, ye, M, K, N, tile); break; case 8: exl3_gemm_body_a1<8>(tr, xh, ye, M, K, N, tile); break;)
             default: break;
         }
         return;
@@ -1414,7 +1415,7 @@ extern "C" __global__ void exl3_hmma_gemm_grouped(const uint16_t* __restrict__ b
         case 3: exl3_gemm_body<3>(tr, xh, ye, M, K, N, tile); break;
         case 4: exl3_gemm_body<4>(tr, xh, ye, M, K, N, tile); break;
         case 5: exl3_gemm_body<5>(tr, xh, ye, M, K, N, tile); break;
-        EXL3_CASE6(case 6: exl3_gemm_body<6>(tr, xh, ye, M, K, N, tile); break;)
+        EXL3_CASE6(case 6: exl3_gemm_body<6>(tr, xh, ye, M, K, N, tile); break; case 7: exl3_gemm_body<7>(tr, xh, ye, M, K, N, tile); break; case 8: exl3_gemm_body<8>(tr, xh, ye, M, K, N, tile); break;)
         default: break;
     }
 }
@@ -5802,7 +5803,7 @@ extern "C" __global__ void xq_gemm_grouped_xh(const uint16_t* __restrict__ base,
             case 3: exl3_gemm_body_a1<3>(tr, xe, ye, M, K, N, tile); break;
             case 4: exl3_gemm_body_a1<4>(tr, xe, ye, M, K, N, tile); break;
             case 5: exl3_gemm_body_a1<5>(tr, xe, ye, M, K, N, tile); break;
-            EXL3_CASE6(case 6: exl3_gemm_body_a1<6>(tr, xe, ye, M, K, N, tile); break;)
+            EXL3_CASE6(case 6: exl3_gemm_body_a1<6>(tr, xe, ye, M, K, N, tile); break; case 7: exl3_gemm_body_a1<7>(tr, xe, ye, M, K, N, tile); break; case 8: exl3_gemm_body_a1<8>(tr, xe, ye, M, K, N, tile); break;)
             default: break;
         }
         return;
@@ -5811,7 +5812,7 @@ extern "C" __global__ void xq_gemm_grouped_xh(const uint16_t* __restrict__ base,
         case 3: exl3_gemm_body<3>(tr, xe, ye, M, K, N, tile); break;
         case 4: exl3_gemm_body<4>(tr, xe, ye, M, K, N, tile); break;
         case 5: exl3_gemm_body<5>(tr, xe, ye, M, K, N, tile); break;
-        EXL3_CASE6(case 6: exl3_gemm_body<6>(tr, xe, ye, M, K, N, tile); break;)
+        EXL3_CASE6(case 6: exl3_gemm_body<6>(tr, xe, ye, M, K, N, tile); break; case 7: exl3_gemm_body<7>(tr, xe, ye, M, K, N, tile); break; case 8: exl3_gemm_body<8>(tr, xe, ye, M, K, N, tile); break;)
         default: break;
     }
 }
@@ -7667,13 +7668,13 @@ xq_moe_coop_a(const uint16_t* __restrict__ base,
               int M, int K, int N, int bits,
               const int* __restrict__ esel) {
     XQ_PDL_ENTRY();
-    __shared__ uint32_t sh_tr[MOE_COOP_STAGES][MOE_COOP_GST][2][8 * 5];
+    __shared__ uint32_t sh_tr[MOE_COOP_STAGES][MOE_COOP_GST][2][8 * EXL3_COOP_MAX_BITS];
     __shared__ __half   sh_a [MOE_COOP_STAGES][MOE_COOP_GST][16][16];
     switch (bits) {
         case 3: xq_moe_coop_body<3>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 4: xq_moe_coop_body<4>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 5: xq_moe_coop_body<5>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
-        EXL3_CASE6(case 6: xq_moe_coop_body<6>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;)
+        EXL3_CASE6(case 6: xq_moe_coop_body<6>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break; case 7: xq_moe_coop_body<7>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break; case 8: xq_moe_coop_body<8>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;)
         default: break;
     }
 }
@@ -7686,13 +7687,13 @@ xq_moe_coop_b(const uint16_t* __restrict__ base,
               int M, int K, int N, int bits,
               const int* __restrict__ esel) {
     XQ_PDL_ENTRY();
-    __shared__ uint32_t sh_tr[MOE_COOP_STAGES][MOE_COOP_GST][2][8 * 5];
+    __shared__ uint32_t sh_tr[MOE_COOP_STAGES][MOE_COOP_GST][2][8 * EXL3_COOP_MAX_BITS];
     __shared__ __half   sh_a [MOE_COOP_STAGES][MOE_COOP_GST][16][16];
     switch (bits) {
         case 3: xq_moe_coop_body<3>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 4: xq_moe_coop_body<4>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 5: xq_moe_coop_body<5>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
-        EXL3_CASE6(case 6: xq_moe_coop_body<6>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;)
+        EXL3_CASE6(case 6: xq_moe_coop_body<6>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break; case 7: xq_moe_coop_body<7>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break; case 8: xq_moe_coop_body<8>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;)
         default: break;
     }
 }
@@ -10889,6 +10890,7 @@ extern "C" __global__ void xq_gemm_grouped_rows(const uint16_t* __restrict__ bas
         EXL3_ROWS_CASE(3);
         EXL3_ROWS_CASE(4);
         EXL3_ROWS_CASE(5);
+        EXL3_CASE6(EXL3_ROWS_CASE(6); EXL3_ROWS_CASE(7); EXL3_ROWS_CASE(8);)
         default: break;
     }
 #undef EXL3_ROWS_CASE
@@ -12214,7 +12216,7 @@ extern "C" __global__ void exl3_hmma_gemm_ks(const uint16_t* __restrict__ trelli
         case 3: exl3_gemm_body_ks<3>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
         case 4: exl3_gemm_body_ks<4>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
         case 5: exl3_gemm_body_ks<5>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
-        EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
+        EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; case 7: exl3_gemm_body_ks<7>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; case 8: exl3_gemm_body_ks<8>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
         default: break;
     }
 }
@@ -12237,7 +12239,7 @@ extern "C" __global__ void exl3_hmma_gemm_ks_x2(const uint16_t* __restrict__ tr0
         case 3: exl3_gemm_body_ks<3>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
         case 4: exl3_gemm_body_ks<4>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
         case 5: exl3_gemm_body_ks<5>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
-        EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
+        EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; case 7: exl3_gemm_body_ks<7>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; case 8: exl3_gemm_body_ks<8>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
         default: break;
     }
 }
@@ -12364,7 +12366,7 @@ __device__ __forceinline__ void exl3_ks_fixup(const float* __restrict__ ws,
             case 3: exl3_gemm_body_ks<3>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
             case 4: exl3_gemm_body_ks<4>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
             case 5: exl3_gemm_body_ks<5>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
-            EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;) \
+            EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; case 7: exl3_gemm_body_ks<7>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; case 8: exl3_gemm_body_ks<8>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;) \
             default: break;                                                                         \
         }                                                                                           \
         exl3_ks_fixup(WS, SVH, Y, CNT, M, N);                                                       \
@@ -12686,7 +12688,7 @@ exl3_hmma_gemm_ks_p(const uint16_t* __restrict__ trellis, const __half* __restri
         case 3: exl3_ks_p_body<3>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;
         case 4: exl3_ks_p_body<4>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;
         case 5: exl3_ks_p_body<5>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;
-        EXL3_CASE6(case 6: exl3_ks_p_body<6>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;)
+        EXL3_CASE6(case 6: exl3_ks_p_body<6>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break; case 7: exl3_ks_p_body<7>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break; case 8: exl3_ks_p_body<8>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;)
         default: break;
     }
 }
@@ -12702,7 +12704,7 @@ exl3_hmma_gemm_ks_p_x2(const uint16_t* __restrict__ tr0, const uint16_t* __restr
         case 3: exl3_ks_p_body<3>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;
         case 4: exl3_ks_p_body<4>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;
         case 5: exl3_ks_p_body<5>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;
-        EXL3_CASE6(case 6: exl3_ks_p_body<6>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;)
+        EXL3_CASE6(case 6: exl3_ks_p_body<6>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break; case 7: exl3_ks_p_body<7>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break; case 8: exl3_ks_p_body<8>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;)
         default: break;
     }
 }
