@@ -1412,6 +1412,8 @@ pub fn run_head(args: &[String], model_dir: &str, ctx: crate::tp::TpContext, mut
         decode_headroom: 0,
         // the message boundary (`ckpt_at`) places the Naive prefix snapshot
         prefix_cache: pfx_on,
+        // no deferred schema start on this path
+        schema_defer: false,
         vision_tower: None,
         vision_gpu: None,
         vision_cpu: false,

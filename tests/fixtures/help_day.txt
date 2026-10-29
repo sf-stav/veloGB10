@@ -25,6 +25,6 @@ DAY-TO-DAY LAUNCH OPTIONS (everything the binary accepts: --help-advanced; resol
   SPECULATION
     --mtp <auto|on|off>                Multi-token (MTP) speculative decoding. off = plain decoding only, on every server: no draft head runs and the boot banner says 'MTP OFF (--mtp off)' (the EXL3 server of v0.7.3 and earlier ignored this option). auto (default) = speculation on with the profitability control (NVFP4: calibrated at boot and re-picked live; EXL3: the per-request auto-off and re-probe). on = force it (NVFP4, benchmarking; on EXL3 the same as auto). Greedy verification is lossless (a draft is kept only when it is the model's own next token) and sampled requests stay distribution-exact. Older spellings still accepted: 1 / true = on, 0 / false = off, and the EXL3-only --exl3-no-mtp = off. Rides to the TP nodes  [auto]
 
-  912 further options (diagnostics, test drills, probes, tunables): --help-advanced.   Resolved values: --print-config.
+  913 further options (diagnostics, test drills, probes, tunables): --help-advanced.   Resolved values: --print-config.
 
   A value that really starts with "--" must be written --option=value; a value-taking option is never taken from the next --flag - no value-taking option, registry or hand-read, ever eats one (F7/F9).

@@ -2643,6 +2643,14 @@ pub struct Scratch {
     pen: CudaSlice<u32>,
     pen_live: bool,
     pen_mono: bool,
+    // W2-EXL3: per-row allowed-token bitsets [w][vmask_words(V)] + per-row flags [w]
+    // read by xq_vmask_rows (JSON-schema constrained decoding). vmask_live = host shadow "the
+    // NEXT forward_step masks some row"; ONE-SHOT: forward_step clears it after the step, so a
+    // later caller that did not stage a mask can never inherit one. Part of the decode graph key
+    // (bit 47), so unmasked steps replay graphs with no mask node at all.
+    vmask: CudaSlice<u32>,
+    vmask_flags: CudaSlice<i32>,
+    vmask_live: bool,
     pen_hist: CudaSlice<i32>,
     pen_draft_i: Option<usize>,
     // API-parity DDS: per-draft-pass confidence (the draft head's max logit) [MTP_MAX_K + 1]
@@ -3005,6 +3013,9 @@ impl Scratch {
             pen: dev.htod_sync_copy(&vec![0u32; w.max(1) * 8])?,
             pen_live: false,
             pen_mono: true,
+            vmask: dev.htod_sync_copy(&vec![0u32; w.max(1) * vmask_words(cfg.vocab_size)])?,
+            vmask_flags: dev.htod_sync_copy(&vec![0i32; w.max(1)])?,
+            vmask_live: false,
             pen_hist: dev.htod_sync_copy(&vec![0i32; w.max(1) * PEN_RING])?,
             pen_draft_i: None,
             dconf: dev.htod_sync_copy(&[0f32; MTP_MAX_K + 1])?,
@@ -11015,7 +11026,8 @@ impl FwdModel {
         // which runs unpenalized: pen_live is false at boot). QSAREGIME: a mixed step is its own
         // graph per dense-row count (mixed_key_bits; 0 = the pre-existing keys, bit for bit).
         let gkey = gkey_of(m, qsa, qb) | mixed_key_bits(md) | ((sc.pen_live as usize) << 40) | sk(sc) // TP-C: + the scratch id
-            | self.vp_key(sc, m); // TP-H #4: the vocab-parallel greedy tail = its own graph
+            | self.vp_key(sc, m) // TP-H #4: the vocab-parallel greedy tail = its own graph
+            | vmask_key(sc); // W2-EXL3: a schema-masked step = its own graph (bit 47)
 
         // RoPE: gather this step's rows from the load-time table. The table was built
         // with the SAME host powf/cos/sin code the old per-step loop ran, so the bits
@@ -11075,6 +11087,9 @@ impl FwdModel {
         if want_graph && !graphed {
             self.capture_step_graph(&l, sc, m, gkey, qsa, md);
         }
+        // W2-EXL3: the mask is staged per step (one-shot). Cleared only AFTER the capture above:
+        // the graph recorded under a bit-47 key must contain the mask node it is keyed for.
+        sc.vmask_live = false;
         Ok(ids)
     }
 
@@ -11458,7 +11473,7 @@ impl FwdModel {
             }
         }
         let v = cfg.vocab_size;
-        if self.vp_greedy(sc, m) && ladder.is_none() && !diag {
+        if self.vp_greedy(sc, m) && ladder.is_none() && !diag && !sc.vmask_live {
             // TP-H #4: vocab-parallel greedy tail (see verify_kernels). The ladder / MTP_DUMP
             // diagnostics read the full logits row, so they keep the replicated head (never graphed).
             self.vp_greedy_tail(&l, sc, m)?;
@@ -11473,6 +11488,9 @@ impl FwdModel {
         }
         // WP15: penalties before BOTH the argmax and the sampler (only in pen_live graphs).
         self.pen_rows(l, sc, m)?;
+        // W2-EXL3: the JSON-schema mask after the penalties, before BOTH the argmax and the
+        // sampler (only in vmask_live graphs; unmasked steps launch nothing here).
+        self.vmask_rows(l, sc, m)?;
         // WP09: one multi-block launch for all m rows (bitwise the same ids; escape inside).
         self.argmax_rows(l, sc, m, v)?;
         // API-parity G2: sampled rows overwrite their id (zero-param rows exit at once).
@@ -11492,6 +11510,20 @@ impl FwdModel {
         xqlaunch!(l, "xq_pen_rows", (v.div_ceil(PEN_SPAN) as u32, m as u32, 1), (256, 1, 1), 0,
                   (&mut sc.logits, v as i32, &sc.pen, &sc.toks, &sc.slots, &mut sc.pen_hist,
                    PEN_RING_LOG2 as i32))?;
+        Ok(())
+    }
+
+    /// W2-EXL3: `xq_vmask_rows` over the m logits rows: a row whose flag is set keeps only the
+    /// tokens whose bit is set in its allowed bitset (every other logit becomes -inf). No launch
+    /// unless a mask is staged for this step.
+    fn vmask_rows(&self, l: &Launcher, sc: &mut Scratch, m: usize) -> Result<()> {
+        if !sc.vmask_live {
+            return Ok(());
+        }
+        let v = self.cfg.vocab_size;
+        let nw = vmask_words(v);
+        xqlaunch!(l, "xq_vmask_rows", (v.div_ceil(VMASK_SPAN) as u32, m as u32, 1), (256, 1, 1), 0,
+                  (&mut sc.logits, v as i32, &sc.vmask, nw as i32, &sc.vmask_flags))?;
         Ok(())
     }
 
@@ -13332,6 +13364,34 @@ impl FwdModel {
         self.dev.htod_copy_into(buf, &mut sc.pen)?;
         sc.pen_live = live;
         sc.pen_mono = rows.iter().flatten().all(|p| p.monotone());
+        Ok(())
+    }
+
+    /// W2-EXL3: stage the JSON-schema masks for the NEXT forward_step: row r of the step keeps
+    /// only the tokens set in `rows[r]` (a `vmask_words(V)`-word little-endian bitset; shorter
+    /// bitsets are zero-padded = the missing ids are disallowed); `None` rows are untouched.
+    /// All-`None` stages nothing. One-shot: forward_step consumes the staging.
+    pub fn set_vmask(&self, sc: &mut Scratch, rows: &[Option<&[u32]>]) -> Result<()> {
+        let live = rows.iter().any(|r| r.is_some());
+        if !live {
+            sc.vmask_live = false;
+            return Ok(());
+        }
+        let nw = vmask_words(self.cfg.vocab_size);
+        let w = sc.vmask_flags.len();
+        anyhow::ensure!(rows.len() <= w, "set_vmask: {} rows > scratch width {}", rows.len(), w);
+        let mut words = vec![0u32; sc.vmask.len()];
+        let mut flags = vec![0i32; w];
+        for (r, bits) in rows.iter().enumerate() {
+            if let Some(bits) = bits {
+                let n = bits.len().min(nw);
+                words[r * nw..r * nw + n].copy_from_slice(&bits[..n]);
+                flags[r] = 1;
+            }
+        }
+        self.dev.htod_copy_into(words, &mut sc.vmask)?;
+        self.dev.htod_copy_into(flags, &mut sc.vmask_flags)?;
+        sc.vmask_live = true;
         Ok(())
     }
 
@@ -18225,6 +18285,17 @@ unsafe fn precap_upload(exec: cudarc::driver::sys::CUgraphExec, stream: cudarc::
 fn sk(sc: &Scratch) -> usize {
     (sc.gid as usize & 0x7F) << 48
 }
+/// W2-EXL3: decode-step graph key bit 47 = the step runs xq_vmask_rows (free between the vp tail
+/// bits 45-46 and the scratch id at 48+).
+fn vmask_key(sc: &Scratch) -> usize {
+    (sc.vmask_live as usize) << 47
+}
+/// W2-EXL3: u32 words of one row's allowed-token bitset (= json_schema::vocab_words).
+pub fn vmask_words(vocab: usize) -> usize {
+    vocab.div_ceil(32)
+}
+/// W2-EXL3: vocabulary ids one xq_vmask_rows block covers (256 threads x 8 ids).
+const VMASK_SPAN: usize = 2048;
 static SCRATCH_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 fn gkey_of(m: usize, qsa: bool, qb: usize) -> usize {
     m + if qsa { (1 << 20) | (qb << 21) } else { 0 }

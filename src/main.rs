@@ -16721,6 +16721,8 @@ fn run_server(args: &[String]) {
             max_seq_len,
             decode_headroom,
             prefix_cache,
+            // this scheduler applies a schema from the first token
+            schema_defer: false,
             // Vision tower(s) (v3): load the 333 model.visual.* tensors, and build the GPU fast path
             // on the shared device. Fails softly — a text-only / GPU-less server keeps its exact
             // behavior. --vision-cpu forces the CPU reference tower (diagnostic escape hatch).

@@ -3574,6 +3574,27 @@ extern "C" __global__ void __launch_bounds__(256) xq_pen_draft(
                 p, b, d_dev, p + 1 + i, fmax, fsum);
 }
 
+// W2-EXL3: JSON-schema constrained decoding. grid = (ceil(V / 2048), m), block 256: row r
+// with flags[r] != 0 keeps only the ids whose bit is set in its allowed bitset
+// words[r * nw .. (r + 1) * nw) (bit t of word t >> 5); every other logit becomes -inf (f16 0xFC00),
+// which the argmax never picks and the sampler gives zero mass. Runs after xq_pen_rows and before
+// xq_argmax_rows / xq_sample_rows; launched only in steps that stage a mask.
+extern "C" __global__ void __launch_bounds__(256) xq_vmask_rows(
+        unsigned short* __restrict__ logits, int V, const unsigned int* __restrict__ words, int nw,
+        const int* __restrict__ flags) {
+    XQ_PDL_ENTRY();
+    const int row = blockIdx.y;
+    if (flags[row] == 0) return;
+    const unsigned int* W = words + (long long)row * nw;
+    unsigned short* L = logits + (long long)row * V;
+    const int base = blockIdx.x * 2048;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int t = base + k * 256 + (int)threadIdx.x;
+        if (t < V && ((W[t >> 5] >> (t & 31)) & 1u) == 0u) L[t] = (unsigned short)0xFC00u;
+    }
+}
+
 // =====================================================================
 // WP24: exact speculative sampling with STOCHASTIC drafts (real-q). Opt-in
 // (--spec-sampling ratio); nothing in this section runs on the default match path.

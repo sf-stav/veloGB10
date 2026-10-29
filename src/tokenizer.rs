@@ -260,8 +260,30 @@ impl QwenTokenizer {
     /// Every (token id, piece BYTES) pair of the model vocabulary. This is the token layer of
     /// the JSON-schema FSM walk (W2): the trie is built over bytes because a piece is not always
     /// valid UTF-8 on its own, and the schema machine consumes bytes.
+    /// (token id, the exact bytes the token adds to the OUTPUT text) for every ordinary token —
+    /// the table the JSON-schema mask walks. Special tokens are left out (they are never
+    /// allowed inside a constrained answer, and the stream decoder prints nothing for them).
+    ///
+    /// This used to return `get_vocab(true)`'s piece STRINGS as bytes. For a byte-level BPE
+    /// vocabulary (Qwen) those strings are the GPT-2 byte-to-unicode encoding, not the output:
+    /// a leading space is `Ġ` (bytes C4 A0) and a newline `Ċ`, so the schema machine saw bytes
+    /// the client never receives — no space could ever be produced (an enum value containing a
+    /// space was unreachable) and special tokens such as `<|im_end|>` looked like legal
+    /// string characters. The bytes now come from the same tables the stream decoder uses
+    /// (`piece_bytes` over the inverse byte map), so mask and output agree byte for byte.
     pub fn vocab_pieces(&self) -> Vec<(u32, Vec<u8>)> {
-        self.tokenizer.get_vocab(true).into_iter().map(|(s, id)| (id as u32, s.into_bytes())).collect()
+        let built;
+        let tables: &StreamTables = match &self.cache {
+            Some(c) => &c.stream,
+            None => {
+                let json = stream_json_path(self.model_dir.as_deref());
+                built = StreamTables::build(&self.tokenizer, &self.tokenizer.get_vocab(true), &special_ids(&json));
+                &built
+            }
+        };
+        (0..tables.kind.len() as u32)
+            .filter_map(|id| tables.piece(id).map(|b| (id, b.to_vec())))
+            .collect()
     }
 
     pub fn stop_token_ids(&self, config_eos: u32) -> Vec<u32> {

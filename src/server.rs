@@ -94,6 +94,9 @@ pub struct AppState {
     /// (batch.rs filters it again); gating its render+tokenize here saves the double
     /// template work on every request when the cache is off (TTFT fix (e)).
     pub prefix_cache: bool,
+    /// The scheduler can start a `response_format` constraint after the reasoning block
+    /// (`SchemaMask::defer_until`). When false, a thinking request's schema is not enforced.
+    pub schema_defer: bool,
     /// Vision tower (visual trunk) loaded at server start, for image requests. `None` if the
     /// build/model has no vision (text-only server behaves exactly as before).
     pub vision_tower: Option<std::sync::Arc<crate::vision_tower::VisualTower>>,
@@ -915,6 +918,21 @@ fn split_think_in(s: &str, think_open: &str, think_close: &str, starts_in_reason
     }
 }
 
+/// `split_think_in` for a schema-constrained reply: the reasoning (only when the prompt opened a
+/// think block) ends at the first close tag, where the constraint starts; everything after it is
+/// the constrained document, taken literally (a think tag inside one of its strings is text).
+fn split_constrained(s: &str, think_close: &str, starts_in_reasoning: bool) -> (Option<String>, String) {
+    if !starts_in_reasoning {
+        return (None, s.to_string());
+    }
+    let (r, c) = match s.find(think_close) {
+        Some(i) => (&s[..i], s[i + think_close.len()..].trim_start_matches(['\n', '\r', ' ', '\t'])),
+        None => (s, ""),
+    };
+    let r = r.trim();
+    (if r.is_empty() { None } else { Some(r.to_string()) }, c.to_string())
+}
+
 #[derive(Deserialize)]
 struct ChatCompletionRequest {
     /// OpenAI spec requires `model`, but single-model agent clients sometimes omit it. Accept
@@ -1357,10 +1375,25 @@ fn warn_unenforced_schema_once(why: &str) {
     }
 }
 
-/// Marks a served response whose `response_format` was not enforced (see above).
-fn attach_schema_unenforced_header(resp: &mut Response, unenforced: bool) {
-    if !unenforced { return; }
-    if let Ok(v) = HeaderValue::from_str("none") {
+/// W2-EXL3: the vocabulary table every constrained request shares (built once per process from
+/// the tokenizer's output-byte tables; the server serves one tokenizer).
+fn schema_vocab_table(tok: &crate::tokenizer::QwenTokenizer) -> crate::json_schema::VocabTable {
+    static T: std::sync::OnceLock<crate::json_schema::VocabTable> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let t0 = std::time::Instant::now();
+        let t = crate::json_schema::VocabTable::build(tok.vocab_pieces());
+        crate::reprintln!("[schema] vocabulary table built: {} ids ({:.0} ms, once per process)",
+                          t.len(), t0.elapsed().as_secs_f64() * 1e3);
+        t
+    }).clone()
+}
+
+/// Marks a served response whose `response_format` was not enforced (see above) with
+/// `x-json-schema-enforced: none`, and (W2-EXL3, `--json-schema-enforce on`) one whose schema
+/// WAS armed as a token mask with `x-json-schema-enforced: full`. No header without a schema.
+fn attach_schema_unenforced_header(resp: &mut Response, unenforced: bool, enforced: bool) {
+    let val = if unenforced { "none" } else if enforced { "full" } else { return };
+    if let Ok(v) = HeaderValue::from_str(val) {
         resp.headers_mut().insert("x-json-schema-enforced", v);
     }
 }
@@ -1440,6 +1473,9 @@ pub(crate) struct ChatSse {
     pub starts_in_reasoning: bool,
     pub tool_hold: Option<&'static str>,
     pub parse_as_tool_calls: bool,
+    /// The content is a schema-constrained document: never re-enter reasoning on a think tag
+    /// inside it (`split_constrained`).
+    pub literal_content: bool,
     pub req_tools: Option<Vec<serde_json::Value>>,
     pub include_usage: bool,
     pub prompt_len: usize,
@@ -1535,8 +1571,13 @@ where
     let ChatSse {
         mut rx, bl, mut mt, otel_req, otel_session, role_chunk, completion_id, created, model_name,
         stops, think_open, think_close, starts_in_reasoning, tool_hold, parse_as_tool_calls,
-        req_tools, include_usage, prompt_len, t0, gen_log, tool_trace, mut scrub,
+        literal_content, req_tools, include_usage, prompt_len, t0, gen_log, tool_trace, mut scrub,
     } = cx;
+    let split = move |acc: &str| if literal_content {
+        split_constrained(acc, think_close, starts_in_reasoning)
+    } else {
+        split_think_in(acc, think_open, think_close, starts_in_reasoning)
+    };
     // B2: an empty stop string matches at offset 0 of every text (it would empty the reply); the request
     // deserializer drops it already, this keeps the stream itself safe for any caller.
     let stops: Vec<String> = stops.into_iter().filter(|s| !s.is_empty()).collect();
@@ -1577,7 +1618,8 @@ where
         // think-open tag (content sites) and the request's stop strings (every site). A stop
         // string ends the reply BEFORE itself, so a tail that could be the start of one is held.
         let reason_marks: Vec<&str> = stops.iter().map(String::as_str).collect();
-        let content_marks: Vec<&str> = std::iter::once(think_open).chain(reason_marks.iter().copied()).collect();
+        let content_marks: Vec<&str> = std::iter::once(think_open).filter(|_| !literal_content)
+            .chain(reason_marks.iter().copied()).collect();
         while let Some(ev) = recv_counted(&mut rx, &bl).await { // LR-5: the one decrement (H0)
             match ev {
                 TokEvent::Admitted { cached_tokens } => {
@@ -1692,7 +1734,8 @@ where
                                     // reasoning, then the correct call): only a hit before the marker
                                     // is a think block.
                                     let tool_at = tool_hold.and_then(|m| f_tool_c.find(&acc, cs, m));
-                                    if let Some(upto) = f_open.find(&acc, cs, think_open).filter(|&u| tool_at.map_or(true, |t| u < t)) {
+                                    if let Some(upto) = f_open.find(&acc, cs, think_open)
+                                        .filter(|&u| !literal_content && tool_at.map_or(true, |t| u < t)) {
                                         if upto > content_emitted {
                                             let c = content_chunk(&completion_id, created, &model_name, &scrub.push_content(&acc[content_emitted..upto]));
                                             if let Some(r) = &otel_req { r.delta(&c); }
@@ -1742,7 +1785,7 @@ where
         // held_tail, so streaming can never silently drop text the JSON
         // mode returns (2026-08-27 user report: a malformed `function=NAME>` block with the
         // `<` missing vanished from the SSE stream while the JSON response leaked it).
-        let (_, done_content) = split_think_in(&acc, think_open, think_close, starts_in_reasoning);
+        let (_, done_content) = split(&acc);
         // parse_as_tool_calls == false (keep-tools "none"): never parse — the reply is plain
         // content; finalize_parsed then returns the raw text with finish stop/length.
         let parsed = if parse_as_tool_calls {
@@ -1832,7 +1875,7 @@ where
             content_emitted = acc.len();
         }
         {
-            let (r_txt, c_txt) = split_think_in(&acc, think_open, think_close, starts_in_reasoning);
+            let (r_txt, c_txt) = split(&acc);
             let (r_log, c_log) = gen_log_spans(r_txt.as_deref(), &c_txt, acc.contains(think_close), starts_in_reasoning);
             if let Some(g) = &gen_log {
                 log_generation(&g.tokenizer, &g.stop_ids, &completion_id, &finish,
@@ -1932,16 +1975,19 @@ async fn chat_completions(
     // Flip JSON_SCHEMA_ENFORCEMENT_ENABLED to true only when the emission path is proven
     // end-to-end: `cargo test --lib json_schema::tests` green AND the W2 probe 6/6 enforced
     // across temperature × TP × spec source. Until then, serving + advertising beats refusing.
-    const JSON_SCHEMA_ENFORCEMENT_ENABLED: bool = false;
-    let mut schema_mask: Option<std::sync::Arc<crate::json_schema::SchemaMask>> = None;
+    // W2-EXL3: the constant became the opt-in `--json-schema-enforce on`; the EXL3 serve
+    // path now arms the mask too (exl3_serve.rs), so the flag is meaningful on every server.
+    let json_schema_enforcement_enabled = crate::opts::on(crate::opt!("json-schema-enforce"));
+    // The mask is finalised (think deferral) after the prompt is rendered, below.
+    let mut schema_pending: Option<crate::json_schema::SchemaMask> = None;
     let mut schema_unenforced: Option<String> = None;
     if let Some(rf) = req.response_format.as_ref() {
         match crate::json_schema::compile_response_format(rf) {
             Ok(None) => {}
-            Ok(Some(mut m)) if JSON_SCHEMA_ENFORCEMENT_ENABLED => {
-                m.set_vocab(state.tokenizer.vocab_pieces());
+            Ok(Some(mut m)) if json_schema_enforcement_enabled => {
+                m.set_vocab_table(&schema_vocab_table(&state.tokenizer));
                 crate::reprintln!("[req] response_format: constrained decoding armed ({})", m.summary());
-                schema_mask = Some(std::sync::Arc::new(m));
+                schema_pending = Some(m);
             }
             Ok(Some(m)) => {
                 schema_unenforced = Some(format!(
@@ -2161,6 +2207,35 @@ async fn chat_completions(
     // Sampling: explicit request values win; anything left out takes the server's default for
     // THIS request's mode (the rendered prompt opens a <think> block or it does not).
     let thinking_on = prompt.trim_end().ends_with(state.tokenizer.think_tags().0);
+    // W2-EXL3: a prompt that opens a think block reasons first; the schema applies to the answer
+    // after the think-close token (a single token in the supported tokenizers; if it is not, the
+    // constraint starts at the first token, the previous behaviour).
+    // A schema that cannot be deferred past the reasoning block is not enforced at all (applied
+    // from the first token it would constrain the reasoning instead of the answer).
+    let schema_mask: Option<std::sync::Arc<crate::json_schema::SchemaMask>> = schema_pending.take().and_then(|mut m| {
+        if thinking_on {
+            let close = state.tokenizer.think_tags().1;
+            let why = if !state.schema_defer {
+                Some("this engine cannot start the constraint after the reasoning block (send enable_thinking=false)".to_string())
+            } else {
+                match state.tokenizer.encode(close, false).as_deref() {
+                    Ok([id]) => { m.set_defer_until(Some(*id)); None }
+                    _ => Some(format!("the think-close tag {close:?} is not one token")),
+                }
+            };
+            if let Some(why) = why {
+                crate::reprintln!("[req] response_format: not enforced: {why}");
+                warn_unenforced_schema_once(&why);
+                schema_unenforced = Some(why);
+                return None;
+            }
+        }
+        Some(std::sync::Arc::new(m))
+    });
+    // A constrained answer is a JSON document taken literally: no tool-call parsing, and think
+    // markers inside its strings are text (see `split_constrained`).
+    let literal_content = schema_mask.is_some();
+    let parse_as_tool_calls = parse_as_tool_calls && !literal_content;
     let (d_temp, d_top_p, d_top_k) = if thinking_on { state.sampling_defaults.think }
                                      else { state.sampling_defaults.no_think };
     let temperature = req.temperature.unwrap_or(d_temp);
@@ -2308,7 +2383,7 @@ async fn chat_completions(
             role_chunk: role_chunk(&completion_id, created, &model_name), // S8: esc(model)
             completion_id, created, model_name, stops,
             think_open, think_close, starts_in_reasoning, tool_hold, parse_as_tool_calls,
-            req_tools, include_usage, prompt_len, t0,
+            literal_content, req_tools, include_usage, prompt_len, t0,
             tool_trace, scrub,
             gen_log: Some(GenLog {
                 tokenizer: Arc::clone(&state.tokenizer), stop_ids: state.stop_ids.clone(),
@@ -2324,7 +2399,7 @@ async fn chat_completions(
             move |t| dec.push(t)
         });
         let mut resp = sse_with_keepalive(stream, sse_keepalive(), ka_frame);
-        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some());
+        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some(), schema_mask.is_some());
         resp
     } else {
         crate::reprintln!("[req] sync   prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
@@ -2390,7 +2465,11 @@ async fn chat_completions(
         // (the same rule as the streaming branch's `starts_in_reasoning`)
         let think_closed = text.contains(think_close);
         let starts_in_reasoning = stream_starts_in_reasoning(&prompt, think_open, family_primed, effort);
-        let (reasoning, content) = split_think_in(&text, think_open, think_close, starts_in_reasoning);
+        let (reasoning, content) = if literal_content {
+            split_constrained(&text, think_close, starts_in_reasoning)
+        } else {
+            split_think_in(&text, think_open, think_close, starts_in_reasoning)
+        };
         // SURFACE2 item 8: the generation ended inside the block (budget exhausted while reasoning,
         // or a stop string hit there) — the text is reasoning, as the streaming branch sends it.
         // The RENDERED PROMPT decides, never the effort arm of `starts_in_reasoning`: with
@@ -2496,7 +2575,7 @@ async fn chat_completions(
             session_id: otel_session,
         };
         let mut resp = Json(response).into_response();
-        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some());
+        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some(), schema_mask.is_some());
         resp
     }
 }
@@ -3095,7 +3174,21 @@ mod prompt_token_id_tests {
 
 #[cfg(test)]
 mod reasoning_start_tests {
-    use super::{split_think_in, stream_starts_in_reasoning};
+    use super::{split_constrained, split_think_in, stream_starts_in_reasoning};
+
+    #[test]
+    fn constrained_reply_keeps_think_markers_literal() {
+        // thinking off: the whole reply is the document, markers inside its strings are text
+        let doc = r#"{"s":"</think>","t":"<think>x"}"#;
+        assert_eq!(split_constrained(doc, "</think>", false), (None, doc.to_string()));
+        // the generic splitter would cut it at the embedded tag
+        assert_ne!(split_think_in(doc, "<think>", "</think>", false).1, doc);
+        // thinking on: reasoning ends at the first close tag; later tags are document text
+        let r = format!("plan it\n</think>\n\n{doc}");
+        assert_eq!(split_constrained(&r, "</think>", true), (Some("plan it".into()), doc.to_string()));
+        // budget exhausted while reasoning: no document
+        assert_eq!(split_constrained("still thinking", "</think>", true), (Some("still thinking".into()), String::new()));
+    }
 
     /// ISSUES 149: a Qwen no-think render (the 0.8B/2B template default) with reasoning_effort
     /// low|high starts in CONTENT; only an open think tag (or hy_v3's effort arm) starts in reasoning.
@@ -4222,6 +4315,7 @@ pub(crate) mod benchfix_sse_tests {
             stops: Vec::new(), think_open: "<think>", think_close: "</think>",
             starts_in_reasoning: sh.thinking,
             tool_hold: sh.tools.then_some(TOOL_OPEN), parse_as_tool_calls: sh.tools,
+            literal_content: false,
             req_tools: sh.tools.then(|| vec![weather]),
             include_usage: sh.usage, prompt_len: 7, t0: std::time::Instant::now(), gen_log: None,
             tool_trace: None,

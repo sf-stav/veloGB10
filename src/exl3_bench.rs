@@ -268,6 +268,8 @@ pub(crate) const MODULE_FNS: &[&str] = &[
     // WP15: device penalties (decode/verify rows + draft mirror)
     "xq_pen_rows",
     "xq_pen_draft",
+    // W2-EXL3: JSON-schema token mask (decode / seam rows)
+    "xq_vmask_rows",
     // WP24: real-q speculative sampling (draft top-32 + sample; ratio verify rows)
     "xq_rq_draft",
     "xq_sample_rows_rq",
