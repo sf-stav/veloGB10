@@ -264,6 +264,29 @@ impl QwenTokenizer {
         self.tokenizer.get_vocab(true).into_iter().map(|(s, id)| (id as u32, s.into_bytes())).collect()
     }
 
+    /// The exact output bytes of ONE token: the ordinary-token piece bytes (the same tables the
+    /// stream decoder and the JSON-schema mask use), else what `decode(&[id], skip_special)`
+    /// prints for it (an added token's literal text; nothing for a skipped special token). A
+    /// piece is not always valid UTF-8 on its own (a multi-byte character can span tokens), so
+    /// the bytes of a token sequence concatenate to its decoded text.
+    pub fn token_bytes(&self, id: u32, skip_special: bool) -> Vec<u8> {
+        match &self.cache {
+            Some(c) => {
+                if let Some(b) = c.stream.piece(id) { return b.to_vec(); }
+            }
+            // without the load-time tables: the same raw piece bytes, derived from the vocab
+            // piece directly (a single-token `decode` would replace a partial UTF-8 character)
+            None => {
+                if !self.tokenizer.get_added_tokens_decoder().contains_key(&id) {
+                    if let Some(p) = self.tokenizer.id_to_token(id) {
+                        return piece_bytes(&p, &bytes_to_unicode_inverse());
+                    }
+                }
+            }
+        }
+        self.decode(&[id], skip_special).unwrap_or_default().into_bytes()
+    }
+
     pub fn stop_token_ids(&self, config_eos: u32) -> Vec<u32> {
         let vocab = self.tokenizer.get_vocab(true);
         let mut ids: Vec<u32> = vec![config_eos];
@@ -1170,6 +1193,21 @@ mod tests {
     ///       specials, out-of-range ids), every push and the final finish identical;
     ///   (d) emoji / CJK / mixed-script texts stream-decode identically AND round-trip.
     /// Skips when no model tokenizer is present (GB10_TEST_TOKENIZER overrides the fixture).
+    #[test]
+    fn token_bytes_match_without_the_load_time_tables() {
+        let Some((tok, path)) = fixture_tokenizer() else {
+            eprintln!("skip: no model tokenizer fixture"); return;
+        };
+        let (mut bare, _) = fixture_tokenizer().unwrap();
+        bare.cache = None;
+        let n = tok.vocab_size() as u32;
+        for id in 0..n {
+            for skip in [true, false] {
+                assert_eq!(tok.token_bytes(id, skip), bare.token_bytes(id, skip), "{path}: id={id} skip={skip}");
+            }
+        }
+    }
+
     #[test]
     fn wp01_stream_tables_match_legacy() {
         let Some((tok, path)) = fixture_tokenizer() else {

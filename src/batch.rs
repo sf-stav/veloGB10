@@ -66,6 +66,13 @@ pub enum TokEvent {
     /// Log-only: it feeds `stop_p` / `stop_rank` / `stop_p_law` of the `[gen]` line. An engine
     /// that never sends it logs `na` for all three.
     StopInfo { p: f32, rank: u32, sampled: bool },
+    /// Sent right BEFORE the `Tok` it describes, only for a request that asked for log
+    /// probabilities (`BatchRequest::logprobs`) on an engine that computes them: the natural log
+    /// of the emitted token's probability and the `top` most likely alternatives (token id,
+    /// logprob; most likely first). Computed by a log-softmax over the step's logits row after
+    /// the repetition / presence / frequency penalties and any JSON-schema mask, before
+    /// temperature and top-k / top-p / min-p truncation.
+    Logprob { logprob: f32, top: Vec<(u32, f32)> },
 }
 
 /// A request submitted to the scheduler.
@@ -106,6 +113,10 @@ pub struct BatchRequest {
     /// Compiled ONCE by the server from `response_format`; the scheduler advances it per committed
     /// token and hands the sampler a per-step vocabulary mask.
     pub schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
+    /// Log probabilities for every emitted token: `Some(n)` = send a `TokEvent::Logprob` before
+    /// each `Tok`, with the n (0..=20) most likely alternatives. `None` = none (no extra work).
+    /// Honoured by the EXL3 serve path at TP=1 (such a lane decodes plain, no speculation).
+    pub logprobs: Option<u8>,
 }
 
 struct Lane {
@@ -1926,7 +1937,8 @@ impl BatchScheduler {
                     let projected = self.num_active() + pending.len() + usize::from(self.pf.is_some());
                     if projected >= self.max_batch || self.lanes[projected].is_some() { break; }
                     match self.rx.try_recv() {
-                        Ok(req) => pending.push(req),
+                        // rejected here, before any `Admit` is shipped: the mirror would admit it
+                        Ok(req) => pending.extend(Self::refuse_logprobs(req)),
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => { closed = true; break; }
                     }
@@ -1936,7 +1948,7 @@ impl BatchScheduler {
                 if self.num_active() == 0 && pending.is_empty() && self.pf.is_none() && !closed {
                     crate::metrics::sched_idle(); // H3: about to block for work (busy must not stick at 1)
                     match self.rx.recv().await {
-                        Some(req) => pending.push(req),
+                        Some(req) => pending.extend(Self::refuse_logprobs(req)),
                         None => closed = true,
                     }
                 }
@@ -2126,6 +2138,7 @@ impl BatchScheduler {
                 image_embeds: None,
                 image_spans: Vec::new(),
                 schema: None,
+                logprobs: None,
             });
             // The bench harness has no scheduler loop of its own, so it drains the cursor inline —
             // the SAME window sequence (one window per call), just without interleaving. This keeps
@@ -2151,6 +2164,7 @@ impl BatchScheduler {
                     // #8.2: admission telemetry — no action for a bench drain.
                     TokEvent::Admitted { .. } => {}
                     TokEvent::StopInfo { .. } => {} // [gen]-line data only
+                    TokEvent::Logprob { .. } => {} // not requested by this drain
                 }
             }
             // Keep the source set for the next job's ADMIT (the lane priming consults it).
@@ -2174,7 +2188,18 @@ impl BatchScheduler {
     /// (the TP node mirror — the flag arrives via TpConfig; on the head it is implied by the dump).
     pub fn set_cov_trace(&mut self, on: bool) { self.cov_trace = on; }
 
+    /// This scheduler does not compute log probabilities (the EXL3 serve path does): finish a
+    /// request that asks for them with an error and return None; pass any other request through.
+    fn refuse_logprobs(req: BatchRequest) -> Option<BatchRequest> {
+        if req.logprobs.is_none() { return Some(req); }
+        let _ = req.tx.send(TokEvent::Finish {
+            reason: "error: bad request: logprobs are not supported by this engine".into(),
+        });
+        None
+    }
+
     fn admit(&mut self, req: BatchRequest) {
+        let Some(req) = Self::refuse_logprobs(req) else { return };
         // W2: the request's compiled schema (moved into the lane below).
         let req_schema = req.schema.clone();
         // R9: register the live gpu+state once so net::agree's mismatch path can dump GDN state.

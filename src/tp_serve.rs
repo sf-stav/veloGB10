@@ -208,6 +208,8 @@ impl WireRequest {
             // W2: the schema FSM lives on the HEAD (that is where the sampler runs); the node's
             // mirror lane is unconstrained by construction.
             schema: None,
+            // log probabilities are computed on the head only (the TP path does not send them)
+            logprobs: None,
         }
     }
 }

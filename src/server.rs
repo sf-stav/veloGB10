@@ -946,6 +946,14 @@ struct ChatCompletionRequest {
     /// Optional PRNG seed for reproducible sampling (used by stochastic MTP path).
     #[serde(default)]
     seed: Option<u64>,
+    /// OpenAI `logprobs`: return the log probability of every output token
+    /// (`choices[].logprobs.content`).
+    #[serde(default)]
+    logprobs: Option<bool>,
+    /// OpenAI `top_logprobs` (0..=20): the most likely alternatives listed per output token.
+    /// Requires `logprobs: true`.
+    #[serde(default)]
+    top_logprobs: Option<u32>,
     /// Stop sequences: accept either a string or a list of strings (OpenAI spec).
     #[serde(default, deserialize_with = "deserialize_stop")]
     stop: Vec<String>,
@@ -1109,6 +1117,115 @@ struct ChatChoice {
     /// here only "loop_detected" (WP08). Omitted otherwise, so normal replies are unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_reason: Option<String>,
+    /// `{"content": [...]}` when the request asked for `logprobs`; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<serde_json::Value>,
+}
+
+/// Max alternatives per token for `top_logprobs` (chat) / `logprobs` (completions).
+const MAX_TOP_LOGPROBS: u32 = 20;
+
+/// One output token's log probabilities as received from the engine (`TokEvent::Logprob`),
+/// aligned with the token list; `None` = the engine sent none for that token.
+type TokLp = Option<(f32, Vec<(u32, f32)>)>;
+
+/// The chat request's logprobs setting -> the engine's `BatchRequest::logprobs`.
+fn chat_logprobs_param(logprobs: Option<bool>, top: Option<u32>, stream: bool) -> Result<Option<u8>, String> {
+    let n = match (logprobs.unwrap_or(false), top) {
+        (false, None) => return Ok(None),
+        (false, Some(_)) => return Err("top_logprobs requires logprobs to be true".into()),
+        (true, Some(n)) if n > MAX_TOP_LOGPROBS =>
+            return Err(format!("top_logprobs must be between 0 and {MAX_TOP_LOGPROBS} (got {n})")),
+        (true, n) => n.unwrap_or(0) as u8,
+    };
+    if stream { return Err("logprobs are not supported with stream=true yet".into()); }
+    Ok(Some(n))
+}
+
+/// The completions request's legacy `logprobs` -> the engine's `BatchRequest::logprobs`.
+fn completion_logprobs_param(logprobs: Option<u32>, stream: bool) -> Result<Option<u8>, String> {
+    match logprobs {
+        None => Ok(None),
+        Some(n) if n > MAX_TOP_LOGPROBS => Err(format!("logprobs must be between 0 and {MAX_TOP_LOGPROBS} (got {n})")),
+        Some(_) if stream => Err("logprobs are not supported with stream=true yet".into()),
+        Some(n) => Ok(Some(n as u8)),
+    }
+}
+
+/// The output tokens that carry log probabilities for bytes `range` of the decoded text: every
+/// generated token except stop tokens that overlaps the range (a token that prints nothing counts
+/// when its position lies inside it). Returns (index, byte offset of the token in the decoded
+/// text, the token's bytes clipped to the range).
+fn logprob_token_span(bytes_of: impl Fn(u32) -> Vec<u8>, stop_ids: &[u32], tokens: &[u32],
+                      range: std::ops::Range<usize>) -> Vec<(usize, usize, Vec<u8>)> {
+    let mut off = 0usize;
+    let mut out = Vec::with_capacity(tokens.len());
+    for (i, &t) in tokens.iter().enumerate() {
+        if off >= range.end { break; }
+        let b = bytes_of(t);
+        let end = off + b.len();
+        let inside = if b.is_empty() { off >= range.start } else { end > range.start };
+        if inside && !stop_ids.contains(&t) {
+            let lo = range.start.saturating_sub(off).min(b.len());
+            let hi = (range.end - off).min(b.len());
+            out.push((i, off, b[lo..hi].to_vec()));
+        }
+        off = end;
+    }
+    out
+}
+
+/// The byte range of the decoded `text` that the response's `content` came from: `content` as
+/// found after the reasoning block (after the first `think_close`, when one was generated).
+/// None when the content is not one contiguous span of the text.
+fn content_byte_range(text: &str, content: &str, think_close: &str) -> Option<std::ops::Range<usize>> {
+    let from = text.find(think_close).map_or(0, |p| p + think_close.len());
+    if content.is_empty() { return Some(from..from); }
+    let p = from + text[from..].find(content)?;
+    Some(p..p + content.len())
+}
+
+/// OpenAI chat `logprobs`: `{"content": [{token, logprob, bytes, top_logprobs: [...]}]}` for the
+/// tokens of bytes `range` of the decoded text (the response's `content`); a token cut by the
+/// range edge is listed with only its bytes inside the range, its probabilities unchanged. None
+/// when a kept token has no engine entry (a readback failure: reported as null, never guessed).
+fn chat_logprobs_json(tok: &QwenTokenizer, stop_ids: &[u32], tokens: &[u32], lps: &[TokLp],
+                      range: std::ops::Range<usize>) -> Option<serde_json::Value> {
+    let entry = |b: Vec<u8>, lp: f32| {
+        serde_json::json!({"token": String::from_utf8_lossy(&b), "logprob": lp, "bytes": b})
+    };
+    let mut content = Vec::new();
+    for (i, _, b) in logprob_token_span(|t| tok.token_bytes(t, true), stop_ids, tokens, range) {
+        let (lp, top) = lps.get(i)?.as_ref()?;
+        let mut e = entry(b, *lp);
+        e["top_logprobs"] = serde_json::Value::Array(
+            top.iter().map(|&(id, l)| entry(tok.token_bytes(id, false), l)).collect());
+        content.push(e);
+    }
+    Some(serde_json::json!({"content": content}))
+}
+
+/// Legacy completions `logprobs`: `{tokens, token_logprobs, top_logprobs, text_offset}` with
+/// character offsets into `text` (the decoded completion). A `top_logprobs` object keeps the
+/// most likely entry when two alternatives print the same string.
+fn completion_logprobs_json(tok: &QwenTokenizer, stop_ids: &[u32], tokens: &[u32], lps: &[TokLp],
+                            text: &str) -> Option<serde_json::Value> {
+    let (mut ts, mut tl, mut tt, mut to) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (i, off, _) in logprob_token_span(|t| tok.token_bytes(t, true), stop_ids, tokens, 0..usize::MAX) {
+        let (lp, top) = lps.get(i)?.as_ref()?;
+        ts.push(String::from_utf8_lossy(&tok.token_bytes(tokens[i], false)).into_owned());
+        tl.push(*lp);
+        let mut m = serde_json::Map::new();
+        for &(id, l) in top {
+            let k = String::from_utf8_lossy(&tok.token_bytes(id, false)).into_owned();
+            m.entry(k).or_insert(serde_json::json!(l));
+        }
+        tt.push(serde_json::Value::Object(m));
+        let mut b = off.min(text.len());
+        while !text.is_char_boundary(b) { b -= 1; }
+        to.push(text[..b].chars().count());
+    }
+    Some(serde_json::json!({"tokens": ts, "token_logprobs": tl, "top_logprobs": tt, "text_offset": to}))
 }
 
 /// The scheduler's internal backstop reason (batch.rs) is not an OpenAI value — the spec is
@@ -1723,6 +1840,7 @@ where
                     if stop_hit { break; }
                 }
                 TokEvent::StopInfo { p, rank, sampled } => { stop_info = Some((p, rank, sampled)); }
+                TokEvent::Logprob { .. } => {} // refused with stream=true (chat_logprobs_param)
                 TokEvent::Finish { reason } => { sched_reason = Some(reason.clone()); finish = reason; break; }
             }
         }
@@ -1957,6 +2075,15 @@ async fn chat_completions(
     // W1: `chat_template_kwargs` (arbitrary dict → the model's own template). Validate LOUDLY
     // before any render: a malformed value used to be invisible (serde dropped the field), and
     // the customer was left with a model that ignored the request. 400, never accept-and-ignore.
+    let logprobs_n = match chat_logprobs_param(req.logprobs, req.top_logprobs, req.stream) {
+        Ok(n) => n,
+        Err(msg) => return bad_param(msg),
+    };
+    // Per-token entries carry the generated bytes; a secret the response scrubber removes from
+    // the text can span several tokens, so the two cannot be combined safely.
+    if logprobs_n.is_some() && crate::tool_scrub::Mode::from_opt() != crate::tool_scrub::Mode::Off {
+        return bad_param("logprobs are not available while --scrub-tool-secrets is enabled".into());
+    }
     if let Err(e) = crate::tokenizer::enable_thinking_kwarg(req.chat_template_kwargs.as_ref()) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
             "message": e.to_string(), "type": "invalid_request_error", "code": "invalid_chat_template_kwargs",
@@ -2223,6 +2350,7 @@ async fn chat_completions(
         image_embeds,
         image_spans,
         schema: schema_mask.clone(),
+        logprobs: logprobs_n,
     };
     if admit_gate_busy() { return server_busy(); } // LR-4: --max-waiting
     // WP02: a DEAD engine or a gone scheduler is a 503, never a request that hangs or reads "length"
@@ -2330,6 +2458,10 @@ async fn chat_completions(
         crate::reprintln!("[req] sync   prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
         let t0 = std::time::Instant::now();
         let mut tokens = Vec::new();
+        // log probabilities (logprobs requested): one entry per token, from the Logprob event
+        // the engine sends right before the token
+        let mut lps: Vec<TokLp> = Vec::new();
+        let mut pending_lp: TokLp = None;
         // WP02: a channel closed without a Finish is an engine failure, not "length"
         let mut finish = "error: engine stopped".to_string();
         let mut first_tok: Option<std::time::Instant> = None;
@@ -2346,6 +2478,7 @@ async fn chat_completions(
                 }
                 TokEvent::Tok(t) => {
                     tokens.push(t);
+                    if logprobs_n.is_some() { lps.push(pending_lp.take()); }
                     mt.tok();
                     if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                     // Apply stop strings LIVE, not just post-hoc: on a hit, break AND let rx drop —
@@ -2363,6 +2496,7 @@ async fn chat_completions(
                     }
                 }
                 TokEvent::StopInfo { p, rank, sampled } => { stop_info = Some((p, rank, sampled)); }
+                TokEvent::Logprob { logprob, top } => { pending_lp = Some((logprob, top)); }
                 TokEvent::Finish { reason } => { sched_reason = Some(reason.clone()); finish = reason; break; }
             }
         }
@@ -2453,6 +2587,10 @@ async fn chat_completions(
             }
         }
         let tool_calls = if tool_calls.is_empty() { None } else { Some(tool_calls) };
+        // the decoded-text span `content` came from (reasoning, tool-call markup and trimmed
+        // whitespace carry no content logprobs)
+        let content_range = logprobs_n
+            .and_then(|_| content_byte_range(&text, content.as_deref().unwrap_or(""), think_close));
 
         // TOOLSCRUB1: emission-side scrub - AFTER the raw-args log above (the server log
         // stays raw, same class as --tool-trace / --dump-tools) and after the trace; only
@@ -2472,6 +2610,16 @@ async fn chat_completions(
                        effort, presence_penalty, pp_source,
                        stop_kind(sched_reason.as_deref(), stop_string_hit), stop_info);
         dump_tokens(&completion_id, &tokens);
+        let logprobs_json = logprobs_n.map(|_| {
+            let Some(range) = content_range.clone() else {
+                crate::reprintln!("[req] logprobs: the content is not one span of the generated text; returning null");
+                return serde_json::Value::Null;
+            };
+            chat_logprobs_json(&state.tokenizer, &state.stop_ids, &tokens, &lps, range).unwrap_or_else(|| {
+                crate::reprintln!("[req] logprobs: the engine sent no entry for some output token(s); returning null");
+                serde_json::Value::Null
+            })
+        });
         let response = ChatCompletionResponse {
             id: completion_id,
             object: "chat.completion".to_string(),
@@ -2485,6 +2633,7 @@ async fn chat_completions(
                 },
                 finish_reason: spec_finish_reason(&finish).to_string(),
                 stop_reason: stop_reason_of(&finish),
+                logprobs: logprobs_json,
             }],
             usage: Usage {
                 prompt_tokens: prompt_len,
@@ -2819,6 +2968,10 @@ struct CompletionRequest {
     ignore_eos: Option<bool>,
     #[serde(default)]
     seed: Option<u64>,
+    /// Legacy completions `logprobs` (0..=20): return per-token log probabilities with this many
+    /// alternatives (`choices[].logprobs` = tokens / token_logprobs / top_logprobs / text_offset).
+    #[serde(default)]
+    logprobs: Option<u32>,
     /// S-B9-REL-SMALLFIXES item 6: OpenAI streaming options. `include_usage: true` adds the final
     /// usage chunk to a streamed completion (it was accepted and dropped: a known v0.7.3 gap).
     #[serde(default)]
@@ -2844,6 +2997,10 @@ async fn completions(
                                          req.frequency_penalty, req.min_p) {
         return bad_param(msg);
     }
+    let logprobs_n = match completion_logprobs_param(req.logprobs, req.stream) {
+        Ok(n) => n,
+        Err(msg) => return bad_param(msg),
+    };
     let prompt_tokens: Vec<u32> = match req.prompt.as_ref() {
         Some(serde_json::Value::String(t)) => match encode_off_thread(&state.tokenizer, t, true).await {
             Ok(v) => v,
@@ -2888,6 +3045,7 @@ async fn completions(
         image_embeds: None,
         image_spans: Vec::new(),
         schema: None,
+        logprobs: logprobs_n,
     };
     if admit_gate_busy() { return server_busy(); } // LR-4: --max-waiting
     let (_mn, _ie) = (request.min_new, request.ignore_eos);
@@ -2922,6 +3080,7 @@ async fn completions(
                         mt.cached(cached_tokens as u64);
                     }
                     TokEvent::StopInfo { .. } => {} // [gen]-line data; this path prints no [gen] line
+                    TokEvent::Logprob { .. } => {} // refused with stream=true (completion_logprobs_param)
                     TokEvent::Tok(t) => {
                         if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                         ntok += 1;
@@ -2968,6 +3127,8 @@ async fn completions(
     }
     // non-streaming: collect everything, detokenize once, single response.
     let mut toks: Vec<u32> = Vec::with_capacity(req_max);
+    let mut lps: Vec<TokLp> = Vec::new();
+    let mut pending_lp: TokLp = None;
     // WP02: an engine error (or a channel closed without a Finish) is an HTTP error, not 200 "stop"
     let mut finish = "error: engine stopped".to_string();
     let mut stop_reason: Option<String> = None;
@@ -2979,7 +3140,8 @@ async fn completions(
                 mt.cached(cached_tokens as u64); // /metrics counter
             }
             TokEvent::StopInfo { .. } => {} // [gen]-line data; this path prints no [gen] line
-            TokEvent::Tok(t) => { toks.push(t); mt.tok(); }
+            TokEvent::Logprob { logprob, top } => { pending_lp = Some((logprob, top)); }
+            TokEvent::Tok(t) => { toks.push(t); lps.push(pending_lp.take()); mt.tok(); }
             TokEvent::Finish { reason } => {
                 stop_reason = stop_reason_of(&reason); // WP08
                 finish = reason;
@@ -3007,6 +3169,13 @@ async fn completions(
     });
     if let Some(r) = stop_reason {
         json["choices"][0]["stop_reason"] = serde_json::json!(r); // WP08
+    }
+    if logprobs_n.is_some() {
+        json["choices"][0]["logprobs"] = completion_logprobs_json(&state.tokenizer, &state.stop_ids, &toks, &lps, &text)
+            .unwrap_or_else(|| {
+                crate::reprintln!("[req] logprobs: the engine sent no entry for some output token(s); returning null");
+                serde_json::Value::Null
+            });
     }
     (StatusCode::OK, axum::Json(json)).into_response()
 }
@@ -3074,6 +3243,73 @@ mod top_k_parse_tests {
         assert_eq!(chat("18446744073709551615"), Ok(Some(u64::MAX as usize)));
         assert_eq!(chat("-9223372036854775808"), Ok(Some(0)));
         assert!(chat("18446744073709551616").is_err());
+    }
+}
+
+#[cfg(test)]
+mod logprobs_span_tests {
+    use super::{content_byte_range, logprob_token_span};
+
+    // ids 0..: "Hel", "lo", " wor", "ld", <stop>
+    fn bytes_of(t: u32) -> Vec<u8> {
+        ["Hel", "lo", " wor", "ld", ""][t as usize].as_bytes().to_vec()
+    }
+
+    #[test]
+    fn span_clips_tokens_at_the_range_edges() {
+        let toks = [0u32, 1, 2, 3, 4];
+        // a stop string "lo" cut the text to "Hel"
+        let v = logprob_token_span(bytes_of, &[4], &toks, 0..3);
+        assert_eq!(v, vec![(0, 0, b"Hel".to_vec())]);
+        // a stop string starting inside "lo" ("o w"): "Hello w" -> "Hell"
+        let v = logprob_token_span(bytes_of, &[4], &toks, 0..4);
+        assert_eq!(v, vec![(0, 0, b"Hel".to_vec()), (1, 3, b"l".to_vec())]);
+        // content "world" of "Hello world": starts inside " wor"
+        let v = logprob_token_span(bytes_of, &[4], &toks, 6..11);
+        assert_eq!(v, vec![(2, 5, b"wor".to_vec()), (3, 9, b"ld".to_vec())]);
+        // the whole text; the stop token is not listed
+        assert_eq!(logprob_token_span(bytes_of, &[4], &toks, 0..usize::MAX).len(), 4);
+        // empty content: nothing
+        assert!(logprob_token_span(bytes_of, &[4], &toks, 11..11).is_empty());
+    }
+
+    #[test]
+    fn content_range_skips_reasoning_and_trim() {
+        let t = "thinking about it</think>\n\nThe answer.";
+        let r = content_byte_range(t, "The answer.", "</think>").unwrap();
+        assert_eq!(&t[r], "The answer.");
+        // the same words inside the reasoning are not matched
+        let t = "The answer. maybe</think> The answer.";
+        let r = content_byte_range(t, "The answer.", "</think>").unwrap();
+        assert_eq!(r.start, 26);
+        // no reasoning block
+        assert_eq!(content_byte_range("  hi ", "hi", "</think>"), Some(2..4));
+        // tool-only reply: empty content
+        let t = "<tool_call>x</tool_call>";
+        assert_eq!(content_byte_range(t, "", "</think>"), Some(0..0));
+        // content not one span of the text
+        assert_eq!(content_byte_range("a b", "ab", "</think>"), None);
+    }
+}
+
+#[cfg(test)]
+mod logprobs_param_tests {
+    use super::{chat_logprobs_param, completion_logprobs_param};
+
+    #[test]
+    fn chat_and_completion_logprobs_params() {
+        assert_eq!(chat_logprobs_param(None, None, false), Ok(None));
+        assert_eq!(chat_logprobs_param(Some(false), None, false), Ok(None));
+        assert_eq!(chat_logprobs_param(Some(true), None, false), Ok(Some(0)));
+        assert_eq!(chat_logprobs_param(Some(true), Some(20), false), Ok(Some(20)));
+        assert!(chat_logprobs_param(Some(true), Some(21), false).is_err());
+        assert!(chat_logprobs_param(None, Some(5), false).is_err(), "top_logprobs needs logprobs");
+        assert!(chat_logprobs_param(Some(true), Some(5), true).is_err(), "not with stream=true yet");
+        assert_eq!(chat_logprobs_param(None, None, true), Ok(None));
+        assert_eq!(completion_logprobs_param(None, true), Ok(None));
+        assert_eq!(completion_logprobs_param(Some(5), false), Ok(Some(5)));
+        assert!(completion_logprobs_param(Some(21), false).is_err());
+        assert!(completion_logprobs_param(Some(1), true).is_err());
     }
 }
 
