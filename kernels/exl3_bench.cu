@@ -10135,6 +10135,45 @@ __device__ __forceinline__ void xq_pf_tables(int lane, int (&s_i0m)[8], int (&s_
     }
 }
 
+// Per-lane decode sources. The 8 trellis windows a lane decodes (jj = 0..7) sit at 8 consecutive
+// trellis positions, so together they touch only TWO ring words (checked for BITS 3 and 4). The
+// decode used to fetch the (lo, hi) pair of every window with its own __shfl_sync (16 per block);
+// fetching the two words once and selecting per window moves exactly the same bits with 2 shuffles.
+// ia / ib = the two source lanes, mlo / mhi bit jj = "window jj's lo / hi word is ia's".
+struct XqPfSel { int ia, ib; unsigned mlo, mhi; };
+__device__ __forceinline__ XqPfSel xq_pf_sel(const int (&s_i0m)[8], const int (&s_i1m)[8]) {
+    XqPfSel q;
+    q.ia = s_i0m[0] & 31;
+    q.ib = q.ia;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int a = s_i0m[j] & 31, b = s_i1m[j] & 31;
+        if (a != q.ia) q.ib = a;
+        if (b != q.ia) q.ib = b;
+    }
+    q.mlo = 0u; q.mhi = 0u;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int a = s_i0m[j] & 31, b = s_i1m[j] & 31;
+        if (a != q.ia && a != q.ib) __trap();     // more than two source words: never for BITS 3 / 4
+        if (b != q.ia && b != q.ib) __trap();
+        q.mlo |= (unsigned)(b == q.ia) << j;
+        q.mhi |= (unsigned)(a == q.ia) << j;
+    }
+    return q;
+}
+// One 16x16 A fragment (a0..a3 of m16n8k16, row-major f16 at `base`, row stride LD halves,
+// k16 column offset cs) with one ldmatrix.x4 instead of four 32-bit shared loads. Matrix m of the
+// x4 = rows (m & 1) * 8.., k (m >> 1) * 8..: the same four registers the scalar loads produced.
+template <int LD>
+__device__ __forceinline__ void xq_pf_ldsm_a(uint32_t (&a)[4], const __half* __restrict__ base, const int cs, const int lane) {
+    const int m = lane >> 3, r = lane & 7;
+    const __half* p = base + ((m & 1) * 8 + r) * LD + cs + (m >> 1) * 8;
+    const uint32_t ad = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(ad));
+}
+
 // One k16 step of one warp: decode its NH 16x16 trellis blocks from the lane's ring words w0[]
 // (== exl3_gemm_body_wide BITS <= 4) and run the MT m16n8k16 chains on the staged A columns
 // [cs, cs + 16) of `cur` (row stride LD); NH = 2 (A5-L2 v2, paired gate|up warps) shares one set
@@ -10142,19 +10181,21 @@ __device__ __forceinline__ void xq_pf_tables(int lane, int (&s_i0m)[8], int (&s_
 // K-ascending mma chain (NH = 1 is the served body's inline step).
 template <int MT, int LD, int NH>
 __device__ __forceinline__ void xq_pf_step(const unsigned (&w0)[NH], const __half* __restrict__ cur, const int cs,
-        const int gid, const int tig, const int (&s_i0m)[8], const int (&s_i1m)[8], const int (&s_sf)[8],
+        const int gid, const int tig, const int lane, const XqPfSel& sel, const int (&s_sf)[8],
         float (&acc)[NH][MT][2][4]) {
     uint32_t bfrag[NH][2][2];
     #pragma unroll
     for (int hh = 0; hh < NH; ++hh) {
+        const unsigned wa = __shfl_sync(0xFFFFFFFFu, w0[hh], sel.ia);
+        const unsigned wb = __shfl_sync(0xFFFFFFFFu, w0[hh], sel.ib);
         #pragma unroll
         for (int h = 0; h < 2; ++h) {
             uint16_t rv[4];
             #pragma unroll
             for (int q = 0; q < 4; ++q) {
                 const int jj = h * 4 + q;
-                const unsigned lo = __shfl_sync(0xFFFFFFFFu, w0[hh], s_i1m[jj] & 31);
-                const unsigned hi = __shfl_sync(0xFFFFFFFFu, w0[hh], s_i0m[jj] & 31);
+                const unsigned lo = ((sel.mlo >> jj) & 1u) ? wa : wb;
+                const unsigned hi = ((sel.mhi >> jj) & 1u) ? wa : wb;
                 const unsigned idx = __funnelshift_r(lo, hi, (unsigned)s_sf[jj]) & 0xFFFFu;
                 const unsigned sum = __dp4a(idx * EXL3_MUL1, 0x01010101u, 0x00006400u);
                 rv[q] = (uint16_t)__half_as_ushort(__hfma(__ushort_as_half((unsigned short)sum),
@@ -10167,10 +10208,9 @@ __device__ __forceinline__ void xq_pf_step(const unsigned (&w0)[NH], const __hal
     #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
         const __half* sm = cur + (mt * 16) * LD;
-        const uint32_t a0 = *(const uint32_t*)&sm[gid * LD + cs + 2 * tig];
-        const uint32_t a1 = *(const uint32_t*)&sm[(gid + 8) * LD + cs + 2 * tig];
-        const uint32_t a2 = *(const uint32_t*)&sm[gid * LD + cs + 2 * tig + 8];
-        const uint32_t a3 = *(const uint32_t*)&sm[(gid + 8) * LD + cs + 2 * tig + 8];
+        uint32_t af[4];
+        xq_pf_ldsm_a<LD>(af, sm, cs, lane);
+        const uint32_t a0 = af[0], a1 = af[1], a2 = af[2], a3 = af[3];
         #pragma unroll
         for (int hh = 0; hh < NH; ++hh) {
             #pragma unroll
@@ -10345,6 +10385,7 @@ __device__ __forceinline__ void xq_moe_pf_body(
         }
     }
 
+    const XqPfSel sel = xq_pf_sel(s_i0m, s_i1m);
     float acc[MT][2][4];
     #pragma unroll
     for (int mt = 0; mt < MT; ++mt)
@@ -10407,14 +10448,16 @@ __device__ __forceinline__ void xq_moe_pf_body(
                 // ---- decode this warp's 16x16 block (== exl3_gemm_body_wide BITS <= 4) ----
                 const unsigned w0 = wc[s];
                 uint32_t bfrag[2][2];
+                const unsigned wa = __shfl_sync(0xFFFFFFFFu, w0, sel.ia);
+                const unsigned wb = __shfl_sync(0xFFFFFFFFu, w0, sel.ib);
                 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
                     uint16_t rv[4];
                     #pragma unroll
                     for (int q = 0; q < 4; ++q) {
                         const int jj = h * 4 + q;
-                        const unsigned lo = __shfl_sync(0xFFFFFFFFu, w0, s_i1m[jj] & 31);
-                        const unsigned hi = __shfl_sync(0xFFFFFFFFu, w0, s_i0m[jj] & 31);
+                        const unsigned lo = ((sel.mlo >> jj) & 1u) ? wa : wb;
+                        const unsigned hi = ((sel.mhi >> jj) & 1u) ? wa : wb;
                         const unsigned idx = __funnelshift_r(lo, hi, (unsigned)s_sf[jj]) & 0xFFFFu;
                         const unsigned sum = __dp4a(idx * EXL3_MUL1, 0x01010101u, 0x00006400u);
                         rv[q] = (uint16_t)__half_as_ushort(__hfma(__ushort_as_half((unsigned short)sum),
@@ -10427,10 +10470,9 @@ __device__ __forceinline__ void xq_moe_pf_body(
                 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
                     const __half* sm = cur + (mt * 16) * LD;
-                    const uint32_t a0 = *(const uint32_t*)&sm[gid * LD + cs + 2 * tig];
-                    const uint32_t a1 = *(const uint32_t*)&sm[(gid + 8) * LD + cs + 2 * tig];
-                    const uint32_t a2 = *(const uint32_t*)&sm[gid * LD + cs + 2 * tig + 8];
-                    const uint32_t a3 = *(const uint32_t*)&sm[(gid + 8) * LD + cs + 2 * tig + 8];
+                    uint32_t af[4];
+                    xq_pf_ldsm_a<LD>(af, sm, cs, lane);
+                    const uint32_t a0 = af[0], a1 = af[1], a2 = af[2], a3 = af[3];
                     #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         asm volatile(
@@ -10588,6 +10630,7 @@ __device__ __forceinline__ void xq_moe_pf2_body(
 
     int s_i0m[8], s_i1m[8], s_sf[8];
     xq_pf_tables<BITS>(lane, s_i0m, s_i1m, s_sf);
+    const XqPfSel sel = xq_pf_sel(s_i0m, s_i1m);
 
     float acc[NH][MT][2][4];
     #pragma unroll
@@ -10658,7 +10701,7 @@ __device__ __forceinline__ void xq_moe_pf2_body(
                 unsigned w0[NH];
                 #pragma unroll
                 for (int hh = 0; hh < NH; ++hh) w0[hh] = lane < WW ? tw[s * (NSEG * 8 * WW) + hh * (8 * WW)] : 0u;
-                xq_pf_step<MT, LD, NH>(w0, cur, s * 16, gid, tig, s_i0m, s_i1m, s_sf, acc);
+                xq_pf_step<MT, LD, NH>(w0, cur, s * 16, gid, tig, lane, sel, s_sf, acc);
             }
         }
         sl = (sl + 1 == NSL) ? 0 : sl + 1;

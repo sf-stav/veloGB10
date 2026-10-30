@@ -2165,6 +2165,23 @@ impl PleDev {
         self.prefetch_rows(&uids);
     }
 
+    /// `prefetch_h3s` split over up to `nt` scoped threads (each advise call is independent; at most one
+    /// thread per 64 histories so short chunks stay on the calling thread). Workers re-pin to the worker
+    /// CPU mask, as in `rows_par`.
+    fn prefetch_h3s_par(&self, h3s: &[[i32; 3]], nt: usize) {
+        if self.ram.get().is_some() || h3s.is_empty() { return; }
+        let nt = nt.min(h3s.len().div_ceil(64)).max(1);
+        if nt <= 1 { return self.prefetch_h3s(h3s); }
+        let per = h3s.len().div_ceil(nt);
+        // Re-pin to the worker mask like rows_par: a pinned scheduler thread (TP serve) would otherwise
+        // confine every spawned prefetch thread to its own core.
+        std::thread::scope(|s| {
+            for c in h3s.chunks(per) {
+                s.spawn(move || { crate::cpu_affinity::pin_worker(); self.prefetch_h3s(c) });
+            }
+        });
+    }
+
     /// One 102-byte trellis row (RAM table or pread) — the pre-WP05 fetch, unchanged.
     fn fetch_row(&self, uid: i64, raw: &mut [u8; PLE_ROW_MAX]) -> Result<()> {
         use std::os::unix::fs::FileExt;
@@ -14557,6 +14574,11 @@ impl FwdModel {
             if st.inflight_ple { self.dev.synchronize()?; st.inflight_ple = false; } // only after an error path
             let off = st.off_ple();
             let rows = st.pin.u16s(off, c * 2560);
+            // Queue every SSD row of the chunk before the row build (same PERFFIX1 advise as the decode and
+            // verify paths): the build's synchronous preads then find the pages cached instead of each
+            // waiting for its own drive round trip while the GPU idles at the layer-1 boundary. Advisory
+            // only, so the rows are unchanged; no-op for the RAM table.
+            ple.prefetch_h3s_par(&h3s, 8);
             ple.rows_par(&h3s, rows, false)?;
             if ple_xcheck_on() {
                 let mut refr = vec![0u16; c * 2560];
