@@ -290,6 +290,12 @@ tables above stay the measured reference; the 4.05 rows are untuned smoke tests,
   prints the arithmetic and the fix (`--ple-ram ssd`, a smaller `--max-batch` or `--max-seq-len`, or
   `--tp 2`). Rule of thumb on one 128 GB Spark at `--max-seq-len 131072`: one lane with the table in RAM;
   up to about 16 lanes with the table on SSD.
+- **`--kv-cache q4k` halves the KV row.** q4k stores K and V at 4 bits on the q8 H32 basis: one f16
+  scale per 32-dim group, two dims per byte, 144 B per row at head_dim 256 instead of q8's 272.
+  Perplexity is unchanged within the noise of the three texts measured on the 3.05 pack, and prefill
+  and decode run the same kernels as q8. At 262,144 tokens the trunk KV is 7.25 GB per four lanes
+  instead of 13.69 GB, which serves 8 lanes instead of 5 on one 128 GB machine. Decode is within
+  2–4 % of q8 at one and two streams and equal at four on short prompts; the CHANGELOG has the table.
 - **Monitoring and binding.** `GET /metrics` serves Prometheus text format (requests, tokens, requests
   running/waiting, time-to-first-token and decode-rate histograms, speculation, engine health).
   `--host 127.0.0.1` binds the API to the local machine only (default: all interfaces).

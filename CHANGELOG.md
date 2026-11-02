@@ -1,3 +1,66 @@
+## Unreleased — q4k: a 4-bit packed KV cache on the EXL3 path
+
+*Placeholder under Unreleased: fold into the next release heading.*
+
+`--kv-cache q4k` stores both K and V at 4 bits on the q8 H32 basis: one f16 scale
+per 32-dim group and 4-bit codes two dims per byte. A row is 144 B at hd=256
+instead of q8's 272.
+
+Measured on a Flash-Next 3.05 pack (8 windows x 2,048 tokens, three texts, vs q8):
+
+| text | q8 | q4k | delta |
+|---|---|---|---|
+| code | 3.9768 | 3.9792 | +0.06% |
+| prose | 6.8758 | 6.8727 | -0.05% |
+| json | 1.4098 | 1.4098 | 0.00% |
+
+At 262K on this box the trunk cache drops from 13.69 GB to 7.25 GB per four lanes
+(1.89x), which moves the lane count from 5 to 8 (3.76 GB/lane). The probe's
+synthetic-row SNR is 22.98 dB (q8 47.07, the 4-bit q4x control 22.93).
+
+What changed:
+
+- `KV_Q4K = 5`; `kv_fmt_from_opts`/`name`/`rowbytes` learn q4k; the option bridge,
+  both server parse sites, the perplexity tool and the lane-fit estimate (0.5625
+  B/elem) accept it.
+- `xq_kv_rowb`/`put`/`ld`/`ld8` handle the packed row; `--probe-exl3-kvq
+  --kv-cache q4k --model-dir <pack>` matches the host reference bit for bit.
+- `flash256` stages q4k through its own case, so prefill keeps the fast path.
+- `dense-v3` handles q4k: `xq_dv3_stage_v` takes the row's scale offset and a new
+  `xq_dv3_ldv_q4k` unpacks the staged nibbles, so decode and verify run the same
+  kernels as q8. `--exl3-dense-xcheck=1` reports 0 mismatching halves on lone
+  verifies and decode steps; PPL is identical with dense-v3 on and off.
+- Every QSA/W4S fast path runs q4k. The head-grouped (`xq_attn_sel_hg1/_hg3`) and
+  union (`xq_attn_sel_union`) gathers and the W4S draft attention (`xq_attn_dense_splitk4_w4`)
+  stage whole rows by `rb` in 16 B cp.async chunks and read through `xq_kv_ld8`, so they
+  take the packed row unchanged; the pq8 prefill gather uses a raw twin
+  (`xq_q4k_raw`/`xq_q4k_deq8`, == `xq_kv_ld8`'s q4k branch) and the W4S accumulate twin
+  (`xq_w4a_*`) takes the row's scale offset like dense-v3. `--pq8-gather=0` = splitk4,
+  `--w4s-off=dattn|draft` = the v3/old kernels. `--probe-exl3-binv` now lists q4k in both
+  attention sections and passes on the 4.05 pack (EXL3-ATTN 300 cells, EXL3-ATTN-SPARSE
+  460 cells: union == hg3 == hg1 == splitk4); `--w4s-xcheck=dattn,draft` on q4k reports
+  bad 0 of 49152 (dattn) and bad 0 of 408576 (draft), and `--pq8-xcheck=1` no MISMATCH.
+- Lane packing works on q4k. `--probe-exl3-pack2` / `--probe-exl3-packstate` pass
+  on q8 and q4k: on the 3.05 pack q4k measured r_mean 1.48-1.51 over three runs with
+  0 live-state words differing on all three pairs (a single rep's ratio ranged 1.09-1.44).
+- Throughput (one GB10, ~80-token prompts, `--max-seq-len 8192`, prefix cache off, 128 output
+  tokens, 1/2/4 streams): q8 66.0 / 88.3 / 92.3 tok/s, q4k 63.7 / 84.7 / 92.9, re-run after
+  the fast paths came off their gates: 63.6 / 84.7 / 92.7. The 4-stream ceiling is
+  weight-bandwidth bound and format-independent. The 1/2-stream gap is the 4-bit unpack in the
+  dense path, which was never gated; the gathers and twins only fire past the 2,051-token QSA
+  switch, so their cost does not show on short prompts. At 5,312 tokens (hg1, union/hg3 and the
+  pq8 gather all run) decode is 79.3 / 39.2 tok/s per request against q8's 75.9 / 36.8 at 1 / 2
+  streams, prompt ingest equal at ~1,624 / ~1,208 tok/s.
+
+Known limitation (upstream, kept deliberately): `xq_attn_decode_group` assumes one KV
+slot for the whole group. A packed verify spans two slots, so it must run dense-v3
+(the default); `--lane-pack on` with `--exl3-dense-v3=0` now fails that posture at
+boot, which runs with packed rounds inactive and carries the reason in
+`/metrics velogb10_lane_pack_active{reason=...}` (the line that explains it prints on the
+debug log). Before this change that pairing read and wrote the second lane's K/V in the
+first lane's slot; q8 has the same latent assumption and now falls back the same way. The
+kernel is untouched: fixing it changes a kernel q8 shares. Filed as #35.
+
 ## v0.7.8 — fix: `top_k` client compatibility (PR #29 by @andersc) + the NVFP4 sampler cap made explicit
 
 Fixes the client-compatibility blocker reported in [#29](https://github.com/sf-stav/veloGB10/pull/29):

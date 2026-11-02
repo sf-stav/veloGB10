@@ -161,7 +161,7 @@ node's own command line carries only the per-box options (scope `local`).
 | `GB10_HC_RB` | `--hc-rb` | on/off | on | spmd | row-batched int8 hc mixer (tunable override) |
 | `GB10_HC_STEP_CHECK` | `--hc-step-check` | flag | off | spmd | EXL3 hc step eager check |
 | `GB10_INJECT_PANIC_STEPS` | `--inject-panic-steps` | int | unset | spmd | test drill: inject a scheduler panic at decode step N |
-| `GB10_KV_CACHE` | set by `--kv-cache f32/f16/fp8/q8` | internal | default | spmd | EXL3 KV cache format (set by --kv-cache) |
+| `GB10_KV_CACHE` | set by `--kv-cache f32/f16/fp8/q8/q4k` | internal | default | spmd | EXL3 KV cache format (set by --kv-cache); q4k = the q8 H32 basis at 4 bits, 2 dims per byte |
 | `GB10_KV_K8V4` | set by `--kv-cache k8v4` | internal | off | spmd | NVFP4 int8-K + q4-V KV cache (set by --kv-cache k8v4) |
 | `GB10_KV_K8V8` | set by `--kv-cache k8v8` | internal | off | spmd | NVFP4 int8 K+V KV cache (set by --kv-cache k8v8) |
 | `GB10_KV_MIRROR_BUDGET` | `--kv-mirror-budget` | int | 32768 | spmd | packed-KV mirror budget (positions) |
