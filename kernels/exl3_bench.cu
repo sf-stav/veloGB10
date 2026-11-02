@@ -7798,8 +7798,8 @@ __device__ __forceinline__ void xq_k_norm_rope(float* kbuf, float* red, const __
 // Probe-only positive control (WP25 rung 1: "a deliberately broken 4-bit arm, which must fail"):
 // the q8 layout and readers with the reference implementation's 4-bit midpoint grid (code q4*16+8). Never served.
 #define XQ_KV_Q4X 4
-// q4k: 4-bit K/V (docs/KV_CACHE_Q4K.md): the q8 H32 basis and per-32 f16 scale,
-// 4-bit codes two dims per byte (144 B per row at hd=256).
+// q4k: 4-bit K/V (docs/KV_CACHE_Q4K.md) — the q8 H32 basis and per-32 f16 scale, 4-bit codes two
+// dims per byte (144 B per row at hd=256).
 #define XQ_KV_Q4K 5
 #define XQ_R32 0.17677669529663688110f   // 1/sqrt(32), the reference implementation's r32
 struct XqKv { char* k; char* v; long long rb; int fmt; int hd; };
@@ -16803,6 +16803,19 @@ __device__ __forceinline__ void xq_q8_deq8(float* o, const XqQ8Raw& r) {
     #pragma unroll
     for (int i = 0; i < 4; i++) o[4 + i] = xq_q8v(r.u.y, i, sm, hs);
 }
+// q4k dims d0..d0+7 as raw bytes in the SAME register pair (u.x = the 4 code bytes, h = the
+// 32-group's f16 scale bits at row + hd/2; d0 % 8 == 0). == xq_kv_ld8's q4k branch: sm =
+// fl(f16(scale) * 2^-3), hs = 0.5 * sm, o = fma(code - 8, sm, hs).
+__device__ __forceinline__ void xq_q4k_raw(XqQ8Raw& r, const char* row, int hd, int d0) {
+    r.u.x = *reinterpret_cast<const unsigned*>(row + (d0 >> 1));
+    r.h = reinterpret_cast<const unsigned short*>(row + hd / 2)[d0 >> 5];
+}
+__device__ __forceinline__ void xq_q4k_deq8(float* o, const XqQ8Raw& r) {
+    const float sm = __fmul_rn(__half2float(__ushort_as_half(r.h)), 0.125f);
+    const float hs = 0.5f * sm;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) o[i] = __fmaf_rn((float)((int)((r.u.x >> (4 * i)) & 0xF) - 8), sm, hs);
+}
 extern "C" __global__ void __launch_bounds__(XQ_PQ8_NW * 32, 4)
 xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc,
                 const float* __restrict__ qstage, const float* __restrict__ kcvc, const int* __restrict__ sel,
@@ -16829,6 +16842,7 @@ xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restric
     const int begin = sp * split_len;
     const int end = min((sp + 1) * split_len, nsel);
     const float rsq = rsqrtf((float)hd);
+    const bool is4 = kc.fmt == XQ_KV_Q4K;      // block-uniform: the packed 4-bit row (raw twin loaders)
     float qv[XQ_PQ8_HPW][8], acc[XQ_PQ8_HPW][8], mx[XQ_PQ8_HPW], lx[XQ_PQ8_HPW];
     #pragma unroll
     for (int g = 0; g < XQ_PQ8_HPW; g++) {
@@ -16841,7 +16855,8 @@ xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restric
         *reinterpret_cast<float4*>(qv[g] + 4) = reinterpret_cast<const float4*>(qrow + lane * 8)[1];
     }
     // thread item k of a tile: row-slot rs = warp + NW*k -> entry rs >> 1, K|V = rs & 1, dims lane*8..+7
-    // (a warp reads one row's 256 contiguous code bytes + its 16 scale bytes per item: coalesced).
+    // (a warp reads one row's 256 contiguous code bytes + its 16 scale bytes per item: coalesced;
+    //  q4k: the 128 code bytes of the packed row + the same 16 scale bytes).
     XqQ8Raw raw[XQ_PQ8_IPT];
     for (int cb = begin; cb < end; cb += XQ_PQ8_CH) {
         const int n = min(XQ_PQ8_CH, end - cb);
@@ -16852,7 +16867,11 @@ xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restric
         for (int k = 0; k < XQ_PQ8_IPT; k++) {             // prefetch tile 0 (warp-uniform branches)
             const int rs = warp + XQ_PQ8_NW * k, e = rs >> 1;
             const int t = e < n ? s_t[e] : -1;
-            if (t >= 0) xq_q8_raw(raw[k], ((rs & 1) ? kc.v : kc.k) + (long long)t * kc.rb, hd, lane * 8);
+            if (t >= 0) {
+                const char* row = ((rs & 1) ? kc.v : kc.k) + (long long)t * kc.rb;
+                if (is4) xq_q4k_raw(raw[k], row, hd, lane * 8);
+                else     xq_q8_raw(raw[k], row, hd, lane * 8);
+            }
         }
         for (int e0 = 0; e0 < n; e0 += XQ_PQ8_TE) {
             const int ne = min(XQ_PQ8_TE, n - e0);
@@ -16862,7 +16881,8 @@ xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restric
                 const int rs = warp + XQ_PQ8_NW * k, e = rs >> 1;
                 if (e < ne && s_t[e0 + e] >= 0) {
                     float o[8];
-                    xq_q8_deq8(o, raw[k]);
+                    if (is4) xq_q4k_deq8(o, raw[k]);
+                    else     xq_q8_deq8(o, raw[k]);
                     tile[e][rs & 1][lane] = make_float4(o[0], o[1], o[2], o[3]);
                     tile[e][rs & 1][32 + lane] = make_float4(o[4], o[5], o[6], o[7]);
                 }
@@ -16873,7 +16893,11 @@ xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restric
                 for (int k = 0; k < XQ_PQ8_IPT; k++) {
                     const int rs = warp + XQ_PQ8_NW * k, e = e0 + XQ_PQ8_TE + (rs >> 1);
                     const int t = e < n ? s_t[e] : -1;
-                    if (t >= 0) xq_q8_raw(raw[k], ((rs & 1) ? kc.v : kc.k) + (long long)t * kc.rb, hd, lane * 8);
+                    if (t >= 0) {
+                        const char* row = ((rs & 1) ? kc.v : kc.k) + (long long)t * kc.rb;
+                        if (is4) xq_q4k_raw(raw[k], row, hd, lane * 8);
+                        else     xq_q8_raw(raw[k], row, hd, lane * 8);
+                    }
                 }
             }
             for (int e = 0; e < ne; e++) {
@@ -17453,14 +17477,14 @@ xq_gdn_commit_all_w4(const unsigned long long* __restrict__ lptr, int L,
 // BIT CONTRACT (== xq_attn_dense_acc4 / _acc1 == v2): mx = the same fmaxf over the row's chunk
 // maxima; w = __expf(__fmaf_rn(raw, scale, -mx)) per (head, position) (a tile only regroups
 // WHICH thread evaluates it); denom = __fadd_rn(denom, w) and acc = __fmaf_rn(w, v, acc) over t
-// ascending from 0, through the same V readers (xq_dv3_ldv / xq_dv3_ldv_q8) on the same staged
-// raw bytes; the closing expressions (f32/f16/fp8: f16((acc/denom)*sig(g)); q8: the in-warp H32
-// un-rotation) are xq_dv3_acc_body's verbatim.
+// ascending from 0, through the same V readers (xq_dv3_ldv / xq_dv3_ldv_q8 / xq_dv3_ldv_q4k) on the
+// same staged raw bytes; the closing expressions (f32/f16/fp8: f16((acc/denom)*sig(g)); q8 and q4k:
+// the in-warp H32 un-rotation) are xq_dv3_acc_body's verbatim.
 #define XQ_W4A_T   32
 #define XQ_W4A_NST 5
 template <int SD, int N16, bool SCH, int RS>
 __device__ __forceinline__ void xq_w4a_stage_v(char* vbt, float* vsct, const XqKv& kc, int t0,
-                                               int npos, int d0b, int tid) {
+                                               int npos, int d0b, int scoff, int tid) {
     constexpr int NPER = N16 + (SCH ? 1 : 0);
     for (int i = tid; i < XQ_W4A_T * NPER; i += blockDim.x) {
         const int tr = i / NPER;
@@ -17469,7 +17493,7 @@ __device__ __forceinline__ void xq_w4a_stage_v(char* vbt, float* vsct, const XqK
         if (t < npos) {
             const char* src = kc.v + (long long)t * kc.rb;
             if (c < N16) moe_coop_cp16(vbt + tr * RS + c * 16, src + d0b + c * 16, 16);
-            else         moe_coop_cp16(vsct + tr * 4, src + kc.hd, 16);
+            else         moe_coop_cp16(vsct + tr * 4, src + scoff, 16);
         }
     }
 }
@@ -17479,12 +17503,15 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
                                             const __half* __restrict__ qg, int nh, int hd,
                                             int kvh, int row, int npos, char* vb, float* vsc, float* wb) {
     constexpr int T = XQ_W4A_T, NST = XQ_W4A_NST, SD = 16 * DPT, WST = XQ_W4A_T + 4;
-    constexpr int EB = FMT == XQ_KV_F32 ? 4 : (FMT == XQ_KV_F16 ? 2 : 1);
-    constexpr int N16 = SD * EB / 16;
+    constexpr bool P4 = FMT == XQ_KV_Q4K;
+    constexpr int EB = P4 ? 1 : (FMT == XQ_KV_F32 ? 4 : (FMT == XQ_KV_F16 ? 2 : 1));
+    // q4k: SD/2 code bytes per smem row (2 dims per byte); q8: SD; f32/f16/fp8: SD*4.
+    constexpr int N16 = P4 ? SD / 32 : SD * EB / 16;
+    // The closing un-rotation runs the q8 branch for q4k too (same H32, same rotated basis).
     constexpr bool Q8 = FMT >= XQ_KV_Q8;
-    constexpr int RS = Q8 ? SD : SD * 4;
+    constexpr int RS = P4 ? SD / 2 : (Q8 ? SD : SD * 4);
     constexpr bool SCH = FMT == XQ_KV_FP8 || Q8;
-    static_assert(!Q8 || DPT >= 2, "q8: a thread's 16-dgl slice must hold whole 32-groups");
+    static_assert(!Q8 || DPT >= 2, "q8/q4k: a thread's 16-dgl slice must hold whole 32-groups");
     static_assert(T == 32, "the weight tile below maps 16 threads x 2 positions");
     const int tid = threadIdx.x;
     const int h = tid >> 4;
@@ -17494,11 +17521,12 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
     const float* srow = sc + hrow * XQ_DV3_TS;
     const float scale = xq_dv3_scale(hd);
     const int ntile = (npos + T - 1) / T;
-    const int d0b = blockIdx.x * SD * EB;
+    const int d0b = blockIdx.x * (P4 ? SD / 2 : SD * EB);
+    const int scoff = P4 ? hd / 2 : hd;
     // prologue: tiles 0..NST-2, one cp.async group each (empty groups keep the count aligned)
     #pragma unroll
     for (int p = 0; p < NST - 1; p++) {
-        if (p < ntile) xq_w4a_stage_v<SD, N16, SCH, RS>(vb + p * (T * RS), vsc + p * (T * 4), kc, p * T, npos, d0b, tid);
+        if (p < ntile) xq_w4a_stage_v<SD, N16, SCH, RS>(vb + p * (T * RS), vsc + p * (T * 4), kc, p * T, npos, d0b, scoff, tid);
         asm volatile("cp.async.commit_group;\n" ::: "memory");
     }
     float2 rw = *reinterpret_cast<const float2*>(srow + dgl * 2);
@@ -17527,7 +17555,7 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
         const int pf = ti + NST - 1;
         if (pf < ntile)
             xq_w4a_stage_v<SD, N16, SCH, RS>(vb + (pf % NST) * (T * RS), vsc + (pf % NST) * (T * 4),
-                                             kc, pf * T, npos, d0b, tid);
+                                             kc, pf * T, npos, d0b, scoff, tid);
         asm volatile("cp.async.commit_group;\n" ::: "memory");
         if (ti + 1 < ntile) rw = *reinterpret_cast<const float2*>(srow + t0 + T + dgl * 2);
         asm volatile("cp.async.wait_group %0;\n" :: "n"(XQ_W4A_NST - 1) : "memory");   // tile ti (this thread)
@@ -17543,8 +17571,9 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
             #pragma unroll
             for (int u = 0; u < 4; u++) {
                 float v[DPT];
-                if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t + u, dgl, d0 >> 5);
-                else              xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t + u, dgl);
+                if constexpr (P4)      xq_dv3_ldv_q4k<DPT, RS>(v, vcur, scur, t + u, dgl, d0);
+                else if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t + u, dgl, d0 >> 5);
+                else                   xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t + u, dgl);
                 denom = __fadd_rn(denom, ws[u]);
                 #pragma unroll
                 for (int e = 0; e < DPT; e++) acc[e] = __fmaf_rn(ws[u], v[e], acc[e]);
@@ -17553,8 +17582,9 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
         for (; t < tn; t++) {
             const float w = wh[t];
             float v[DPT];
-            if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t, dgl, d0 >> 5);
-            else              xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t, dgl);
+            if constexpr (P4)      xq_dv3_ldv_q4k<DPT, RS>(v, vcur, scur, t, dgl, d0);
+            else if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t, dgl, d0 >> 5);
+            else                   xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t, dgl);
             denom = __fadd_rn(denom, w);
             #pragma unroll
             for (int e = 0; e < DPT; e++) acc[e] = __fmaf_rn(w, v[e], acc[e]);
@@ -17631,6 +17661,16 @@ __device__ __forceinline__ void xq_w4a_entry(__half* __restrict__ attn, const fl
         case XQ_KV_F32: xq_w4a_body<G, XQ_KV_F32, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
         case XQ_KV_F16: xq_w4a_body<G, XQ_KV_F16, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
         case XQ_KV_FP8: xq_w4a_body<G, XQ_KV_FP8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
+        case XQ_KV_Q4K:
+            // q4k: xq_dv3_acc_entry's rule (the single-row acc1_w4 runs the DPT=2 body on its
+            // first hd/32 CTAs; RS = SD/2 keeps it inside acc1_w4's vb)
+            if constexpr (DPT >= 2) {
+                xq_w4a_body<G, XQ_KV_Q4K, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+            } else {
+                if ((int)blockIdx.x < hd / 32)   // block-uniform
+                    xq_w4a_body<G, XQ_KV_Q4K, 2>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+            }
+            break;
         default:
             // q8 / probe-only q4x: xq_dv3_acc_entry's rule (the single-row acc1 runs the DPT=2 body on
             // its first hd/32 CTAs; RS = SD bytes keeps it inside acc1's vb)

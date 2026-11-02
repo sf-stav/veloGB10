@@ -391,8 +391,8 @@ impl FwdModel {
 
     /// (9) The dense v3 accumulate kernel for this width: the W4 twin when on.
     pub(super) fn w4s_dattn_kname(&self, old: &'static str) -> &'static str {
-        // The W4S twin stages V with q8's row layout; q4k keeps the v3 accumulate kernel.
-        if !w4s_on(W4S_DATTN) || kv_is_packed4(self.kv_fmt) { return old; }
+        // The W4 twin stages V with the row's own scale offset (scoff), so q4k runs the ring kernel.
+        if !w4s_on(W4S_DATTN) { return old; }
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| crate::dprintln!("W4S dattn: xq_attn_dense_acc4_w4 / _acc1_w4 ON (5-stage V ring; --w4s-off=dattn = v3 acc)"));
         super::dv3_w4_twin(old)   // TP-4G: includes the G=6 (W=4) twins
@@ -427,7 +427,7 @@ impl FwdModel {
         let nkv = cfg.num_kv_heads;
         let gqa = if nkv > 0 { cfg.num_heads / nkv } else { 0 };
         let rb = kv_rowbytes(self.kv_fmt, cfg.head_dim);
-        if !w4s_on(W4S_DRAFT) || kv_is_packed4(self.kv_fmt) || cfg.head_dim != 256 || nkv == 0 || gqa == 0 || gqa > 16 || gqa * nkv != cfg.num_heads
+        if !w4s_on(W4S_DRAFT) || cfg.head_dim != 256 || nkv == 0 || gqa == 0 || gqa > 16 || gqa * nkv != cfg.num_heads
             || rb > 1024 || rb % 16 != 0 || DRAFT_ATTN_SPLITS > 256 {
             return Ok(false);
         }

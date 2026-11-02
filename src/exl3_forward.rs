@@ -10630,7 +10630,7 @@ impl FwdModel {
         // rows (one slot, consecutive positions). Bit-identical partials; the old dispatch serves
         // by default and always for decode steps (one row per lane/slot), m = 1 and the
         // --w4qsa-off=1 escape.
-        let union_smem = if one_slot && m >= 2 && w4qsa_on() && !kv_is_packed4(self.kv_fmt) {
+        let union_smem = if one_slot && m >= 2 && w4qsa_on() {
             qsa_union_fits(self.kv_fmt, cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, m, split_len)
         } else { None };
         if let Some(smem) = union_smem {
@@ -10678,7 +10678,6 @@ impl FwdModel {
         let hpw = sel_gather_hpw(m);
         let gqa = cfg.num_heads / cfg.num_kv_heads.max(1);
         let hg = hpw > 0 && cfg.head_dim == 256 && gqa >= 1 && gqa <= 12
-            && !kv_is_packed4(self.kv_fmt)
             && gqa * cfg.num_kv_heads == cfg.num_heads
             && kv_rowbytes(self.kv_fmt, cfg.head_dim) <= 1024 && split_len < 0x10000;
         if hg {
@@ -15351,12 +15350,15 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         // --exl3-sel-xcheck=1 runs both and diffs.
         let vec4 = tune::get_cur(&T_SEL_VEC) != 0;
         let xcheck = vec4 && crate::opts::var(crate::opt!("exl3-sel-xcheck")).is_ok();
-        // PQ8 item 3: the 8-bit-cache prefill gather (xq_attn_sel_pq8 — bit-identical partials to
+        // PQ8 item 3: the 4/8-bit-cache prefill gather (xq_attn_sel_pq8 — bit-identical partials to
         // splitk4: same grid/splits/order; each selected row unpacked ONCE per CTA into an f32 smem
-        // tile, 4 warps x 3 heads, next tile's bytes prefetched). Its shape contract: hd 256 (lane
-        // owns 8 dims), gqa exactly 12, split_len < 2^16. --pq8-gather=0 = splitk4.
+        // tile, 4 warps x 3 heads, next tile's bytes prefetched). q8 and the probe-only q4x keep the
+        // q8-layout raw path; q4k runs the same kernel on its raw twin (xq_q4k_raw/xq_q4k_deq8: 4
+        // code bytes + the group's f16 scale at hd/2), == xq_kv_ld8's q4k branch. Its shape
+        // contract: hd 256 (lane owns 8 dims), gqa exactly 12, split_len < 2^16. --pq8-gather=0 =
+        // splitk4.
         let gqa = cfg.num_heads / cfg.num_kv_heads.max(1);
-        let pq8 = vec4 && !xcheck && pq8_item(2) && self.kv_fmt == KV_Q8 && cfg.head_dim == 256
+        let pq8 = vec4 && !xcheck && pq8_item(2) && self.kv_fmt >= KV_Q8 && cfg.head_dim == 256
             && gqa == 12 && gqa * cfg.num_kv_heads == cfg.num_heads && split_len < 0x10000;
         if pq8 {
             let pq8x = pq8_xcheck() && !self.stream_capturing();
@@ -17153,8 +17155,9 @@ pub fn kv_fmt_name(fmt: u32) -> &'static str {
         _ => "q4x",
     }
 }
-/// True for the packed 4-bit format: its row is 144 B at hd=256 (not q8's 272), so the
-/// single-FMT fast paths that stage q8 rows stay off.
+/// True for the packed 4-bit format: its row is 144 B at hd=256 (not q8's 272) — 2 dims per byte,
+/// with the same per-32-group f16 scales, so its readers take a row's scale offset (hd/2) and a
+/// packed slice (4 code bytes for 8 dims) instead of q8's byte-per-dim.
 pub fn kv_is_packed4(fmt: u32) -> bool {
     fmt == KV_Q4K
 }
@@ -17212,7 +17215,7 @@ pub(crate) const T_DENSE_V3: tune::TunableDef = tune::TunableDef {
     slot: 37, id: "attn.dense_v3", class: tune::Class::S, scope: tune::Scope::Width,
     fams: &[tune::Fam::Step, tune::Fam::Verify, tune::Fam::Util],
     domain: &[0, 1], default: 1, valid: tune::valid_any,
-    xcheck: "--probe-exl3-binv EXL3-ATTN (v3 vs v2, f32/f16/fp8/q8) + --exl3-dense-xcheck",
+    xcheck: "--probe-exl3-binv EXL3-ATTN (v3 vs v2, f32/f16/fp8/q8/q4k) + --exl3-dense-xcheck",
     env: "--exl3-dense-v3", env_parse: || tune::env_on_unless_0(crate::opt!("exl3-dense-v3")), rev: 1, wp: "WP13",
 };
 /// WP13 XCHECK (diagnostic, --exl3-dense-xcheck=1): after every v3 dense attention the
@@ -17851,7 +17854,7 @@ pub(crate) fn qsa_union_smem(fmt: u32, hd: usize, m: usize, l: usize) -> usize {
 pub(crate) fn qsa_union_fits(fmt: u32, nh: usize, nkv: usize, hd: usize, m: usize, l: usize) -> Option<usize> {
     let gqa = nh / nkv.max(1);
     let smem = qsa_union_smem(fmt, hd, m, l);
-    (!kv_is_packed4(fmt) && hd == 256 && nkv >= 1 && gqa * nkv == nh && gqa % QU_HPW == 0 && (1..=QU_MAXR).contains(&m)
+    (hd == 256 && nkv >= 1 && gqa * nkv == nh && gqa % QU_HPW == 0 && (1..=QU_MAXR).contains(&m)
         && (1..=QU_MAXL).contains(&l) && kv_rowbytes(fmt, hd) <= 1024 && smem <= 48 * 1024).then_some(smem)
 }
 /// PQ8 (prefill q8 diet + SURPASS_PLAN WP06 item 1) — three bit-identical twins in the chunked
@@ -17867,7 +17870,7 @@ pub(crate) fn qsa_union_fits(fmt: u32, nh: usize, nkv: usize, hd: usize, m: usiz
 ///                         `=causal` (opt-in, NOT bitwise): xq_attn_prefill_flash256c instead,
 ///                         and (w5/PFIX) xq_attn_prefill_flash128c for hd=128 dense rows t >= 16
 ///                         (default hd=128: the sweep xq_attn_prefill_q, unchanged);
-///   2 = --pq8-gather : xq_attn_sel_pq8 for xq_attn_sel_splitk4 (8-bit layouts only; the
+///   2 = --pq8-gather : xq_attn_sel_pq8 for xq_attn_sel_splitk4 (the q8 and q4k layouts; the
 ///                         QSA-sparse rows).
 /// `=0` turns one item off; --pq8-off=1 turns all three off (= the pre-PQ8 kernels exactly).
 /// TUNE T0c (p5e): the three items are registry entries per prefill chunk class (pq8.kvw /

@@ -4346,7 +4346,7 @@ fn probe_attn_shape<const NH: usize, const NKV: usize>(dev: &std::sync::Arc<Cuda
         }
     }
     println!("EXL3-ATTN{shape_tag}: PASS ({checked} cells: v2 warp-tree scan bitwise vs xq_attn_softmax class; \
-              WP13 dense v3 bitwise vs v2 in f32/f16/fp8/q8; W4S dense acc4_w4/acc1_w4 bitwise vs v2; \
+              WP13 dense v3 bitwise vs v2 in f32/f16/fp8/q8/q4k; W4S dense acc4_w4/acc1_w4 bitwise vs v2; \
               W4S draft chain bitwise vs the old draft chain in {draft_checked} cells)");
 
     // ---- WP13 timing (synthetic, f32 + q8, warm, 50 launches each; K/V rewrites are identical words)
@@ -4447,14 +4447,14 @@ fn probe_attn_sparse(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
     let (mut cells, mut fb_cells) = (0usize, 0usize);
     let mut union_stat: Vec<String> = Vec::new();
     let widths = [1usize, 2, 3, 4, 5, 6, 7, 8, 12, 16];
-    for &(ctx, fmts) in &[(8192usize, &[0usize, 1, 2, 3][..]), (32768, &[0, 1, 2, 3][..]), (131072, &[0, 3][..])] {
+    for &(ctx, fmts) in &[(8192usize, &[0usize, 1, 2, 3, 5][..]), (32768, &[0, 1, 2, 3, 5][..]), (131072, &[0, 3][..])] {
         let modes: &[&str] = if ctx == 8192 { &["overlap", "identical", "disjoint", "two-slot", "fallback"] }
                              else { &["overlap", "identical", "disjoint"] };
         let nslot = if ctx == 8192 { 2usize } else { 1 };
         let maxp = ctx + 64;
         let p0 = ctx - 16;                       // rows at p0..p0+m-1 (QSA regime: > 2,051)
         for &fmt in fmts {
-            let fname = ["f32", "f16", "fp8", "q8"][fmt];
+            let fname = crate::exl3_forward::kv_fmt_name(fmt as u32);   // 5 = q4k (packed row)
             let rb = kv_rowbytes(fmt as u32, HD);
             let mpf = (maxp as i32) | ((fmt as i32) << 28);
             let d_cache = dev.alloc_zeros::<u8>(nslot * 2 * NKV * maxp * rb)?;
@@ -4621,11 +4621,11 @@ fn probe_attn_sparse(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
         }
     }
     println!("EXL3-ATTN-SPARSE: PASS ({cells} cells incl. {fb_cells} fallback-path cells: W4/QSA union gather bitwise vs \
-              hg3 / hg1 / splitk4 in f32/f16/fp8/q8 at 8K/32K and f32/q8 at 128K)");
+              hg3 / hg1 / splitk4 in f32/f16/fp8/q8/q4k at 8K/32K and f32/q8 at 128K)");
     println!("    union stats (overlap mode, m=8): {}", union_stat.join("; "));
 
     // ---- timing (synthetic, isolated, warm; 20 launches each after 3 warm-ups)
-    for &(ctx, fmt, m) in &[(32768usize, 0usize, 8usize), (32768, 0, 4), (32768, 3, 8), (131072, 0, 8), (131072, 3, 8)] {
+    for &(ctx, fmt, m) in &[(32768usize, 0usize, 8usize), (32768, 0, 4), (32768, 3, 8), (32768, 5, 8), (131072, 0, 8), (131072, 3, 8)] {
         let maxp = ctx + 64;
         let p0 = ctx - 16;
         let rb = kv_rowbytes(fmt as u32, HD);
