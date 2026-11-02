@@ -5978,6 +5978,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
             row_regime: crate::exl3_forward::row_regime_on(),
             a_ctrl_old: crate::exl3_forward::a_flags().ctrl == 2,
             fcfs: LaneOrder::parse(crate::opt_or_arg(args, "--lane-order").as_deref().map(str::trim).filter(|v| !v.is_empty()))? == LaneOrder::Fcfs,
+            dense_v3: crate::exl3_forward::dense_v3_on(),
         }));
     }
     // --reasoning-effort / --thinking: the server-wide thinking defaults, as on the NVFP4 server.

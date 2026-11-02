@@ -17206,7 +17206,7 @@ fn draft_attn_legacy() -> bool {
 /// WP13: dense-regime trunk attention v3 (xq_attn_dense_prep -> _dots -> _acc{1,4}), bitwise
 /// to xq_attn_decode_group (verify) / xq_attn_decode (decode step). Default ON;
 /// --exl3-dense-v3=0 restores the old per-(head, row) two-pass scan (A/B + bisect escape).
-fn dense_v3_on() -> bool {
+pub(crate) fn dense_v3_on() -> bool {
     tune::get_cur(&T_DENSE_V3) != 0
 }
 /// TUNE T0 (p3c): WP13's switch. Its geometry (DV3_TS / DV3_NCH / DV3_G) is compile-time, mirrored

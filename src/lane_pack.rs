@@ -157,6 +157,9 @@ pub(crate) struct Posture<'a> {
     pub a_ctrl_old: bool,
     /// `--lane-order fcfs`: one lane per scheduler step; a pack steps two
     pub fcfs: bool,
+    /// `--exl3-dense-v3=0`: `xq_attn_decode_group` resolves ONE slot for the whole group, so a
+    /// packed verify's segment B would read and write segment A's K/V (q8 and q4k alike)
+    pub dense_v3: bool,
 }
 
 /// F1 (owner 2026-10-10, AGENTS §1b-bis item 8 — "support things properly or gracefully fall back"):
@@ -184,6 +187,9 @@ pub(crate) fn posture_fallbacks(p: &Posture) -> Vec<String> {
     }
     if p.a_ctrl_old {
         v.push("--a-ctrl old: a lane whose last step was a control round drafts from a clobbered residual — acceptance moves, and the pair's control cadence arithmetic assumes the default".to_string());
+    }
+    if !p.dense_v3 {
+        v.push("--exl3-dense-v3 0: xq_attn_decode_group resolves one KV slot for the whole group, so a packed verify's second segment would read and write the first lane's K/V (dense-v3 resolves a slot per row)".to_string());
     }
     v
 }
@@ -936,7 +942,7 @@ mod tests {
     /// FALLBACK with its plain-word reason; the default posture packs.
     #[test]
     fn ungated_postures_fall_back_at_boot() {
-        let ok = Posture { kv: "q8", mtp_k: MTP_MAX_K, row_regime: true, a_ctrl_old: false, fcfs: false };
+        let ok = Posture { kv: "q8", mtp_k: MTP_MAX_K, row_regime: true, a_ctrl_old: false, fcfs: false, dense_v3: true };
         assert!(posture_fallbacks(&ok).is_empty(), "the default posture packs");
         let q4k = Posture { kv: "q4k", ..ok };
         assert!(posture_fallbacks(&q4k).is_empty(), "--kv-cache q4k packs");
@@ -947,6 +953,7 @@ mod tests {
             ("depth 5", Posture { mtp_k: 5, ..ok }, "--exl3-mtp-k 5"),
             ("row regime off", Posture { row_regime: false, ..ok }, "--qsa-row-regime 0"),
             ("a-ctrl old", Posture { a_ctrl_old: true, ..ok }, "--a-ctrl old"),
+            ("dense v3 off", Posture { dense_v3: false, ..ok }, "--exl3-dense-v3 0"),
         ] {
             let v = posture_fallbacks(&p);
             assert_eq!(v.len(), 1, "{name}: one reason per fallback, got {v:?}");
