@@ -7798,10 +7798,14 @@ __device__ __forceinline__ void xq_k_norm_rope(float* kbuf, float* red, const __
 // Probe-only positive control (WP25 rung 1: "a deliberately broken 4-bit arm, which must fail"):
 // the q8 layout and readers with the reference implementation's 4-bit midpoint grid (code q4*16+8). Never served.
 #define XQ_KV_Q4X 4
+// q4k: 4-bit K/V (docs/KV_CACHE_Q4K.md): the q8 H32 basis and per-32 f16 scale,
+// 4-bit codes two dims per byte (144 B per row at hd=256).
+#define XQ_KV_Q4K 5
 #define XQ_R32 0.17677669529663688110f   // 1/sqrt(32), the reference implementation's r32
 struct XqKv { char* k; char* v; long long rb; int fmt; int hd; };
 __device__ __forceinline__ int xq_kv_fmt(int mpf) { return (int)(((unsigned)mpf) >> 28); }
 __device__ __forceinline__ long long xq_kv_rowb(int fmt, int hd) {
+    if (fmt == XQ_KV_Q4K) return (long long)(((hd / 2 + hd / 16) + 15) & ~15);
     return fmt == XQ_KV_F32 ? 4LL * hd : (fmt == XQ_KV_F16 ? 2LL * hd : (fmt == XQ_KV_FP8
         ? (long long)hd + 16 : (long long)hd + (long long)(((hd >> 4) + 15) & ~15)));
 }
@@ -7840,6 +7844,11 @@ __device__ __forceinline__ float xq_q8_sm(const char* row, int hd, int g) {
 __device__ __forceinline__ float xq_kv_ld(const char* row, int fmt, int hd, int d) {
     if (fmt == XQ_KV_F32) return reinterpret_cast<const float*>(row)[d];
     if (fmt == XQ_KV_F16) return __half2float(reinterpret_cast<const __half*>(row)[d]);
+    if (fmt == XQ_KV_Q4K) {
+        const float sm = __fmul_rn(__half2float(reinterpret_cast<const __half*>(row + hd / 2)[d >> 5]), 0.125f);
+        const int c = (reinterpret_cast<const unsigned char*>(row)[d >> 1] >> ((d & 1) * 4)) & 0xF;
+        return __fmaf_rn((float)(c - 8), sm, 0.5f * sm);
+    }
     if (fmt >= XQ_KV_Q8) {
         const float sm = xq_q8_sm(row, hd, d >> 5);
         return xq_q8v((unsigned)reinterpret_cast<const unsigned char*>(row)[d], 0, sm, 0.5f * sm);
@@ -7859,6 +7868,12 @@ __device__ __forceinline__ void xq_kv_ld8(float* o, const char* row, int fmt, in
         const __half* h = reinterpret_cast<const __half*>(&u);
         #pragma unroll
         for (int i = 0; i < 8; i++) o[i] = __half2float(h[i]);
+    } else if (fmt == XQ_KV_Q4K) {
+        const unsigned u = *reinterpret_cast<const unsigned*>(row + (d0 >> 1));
+        const float sm = __fmul_rn(__half2float(reinterpret_cast<const __half*>(row + hd / 2)[d0 >> 5]), 0.125f);
+        const float hs = 0.5f * sm;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) o[i] = __fmaf_rn((float)((int)((u >> (4 * i)) & 0xF) - 8), sm, hs);
     } else if (fmt >= XQ_KV_Q8) {
         const uint2 u = *reinterpret_cast<const uint2*>(row + d0);
         const float sm = xq_q8_sm(row, hd, d0 >> 5);
@@ -7885,6 +7900,13 @@ __device__ __forceinline__ void xq_kv_put_q8(char* row, int fmt, int hd, int tid
     for (int o = 1; o < 32; o <<= 1) s = fmaxf(s, __shfl_xor_sync(0xffffffffu, s, o));
     s = __fadd_rn(s, 1e-10f);             // == max over lanes of (|v| + 1e-10): fl(.) is monotone
     const float vs = __fmul_rn(v, __fdiv_rn(1.0f, s));
+    if (fmt == XQ_KV_Q4K) {
+        const int q = max(min(__float2int_rd(__fmaf_rn(vs, 8.0f, 8.0f)), 15), 0);
+        const unsigned p = __shfl_xor_sync(0xffffffffu, (unsigned)q, 1);
+        if ((lane & 1) == 0) reinterpret_cast<unsigned char*>(row)[tid >> 1] = (unsigned char)(q | (p << 4));
+        if (lane == 0) reinterpret_cast<__half*>(row + hd / 2)[tid >> 5] = __float2half_rn(s);
+        return;
+    }
     int q;
     if (fmt == XQ_KV_Q8) {
         q = max(min(__float2int_rd(__fmaf_rn(vs, 128.0f, 128.0f)), 255), 0);

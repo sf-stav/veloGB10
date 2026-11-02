@@ -178,7 +178,7 @@ pub fn probe_kv_q8_selftest() -> Result<()> {
     let x = kvq_rows(n, hd);
     let x_d = dev.htod_sync_copy(&x)?;
     let mut all_ok = true;
-    for fmt in [KV_F32, KV_F16, KV_FP8, KV_Q8, KV_Q4X] {
+    for fmt in [KV_F32, KV_F16, KV_FP8, KV_Q8, KV_Q4X, KV_Q4K] {
         let rb = kv_rowbytes(fmt, hd);
         let mut rows_d = dev.alloc_zeros::<u8>(n * rb)?;
         let mut deq_d = dev.alloc_zeros::<f32>(n * hd)?;
@@ -224,6 +224,26 @@ pub fn probe_kv_q8_selftest() -> Result<()> {
                 }
                 ok &= byte_ne == 0 && deq_ne == 0 && rec_ne == 0;
                 // the zero row must read back exactly zero (scale f16(1e-10) underflows to 0)
+                let zero_ok = rec[..hd].iter().all(|&v| v == 0.0);
+                ok &= zero_ok;
+                extra = format!("host-ref mismatches: bytes {byte_ne} deq {deq_ne} rec {rec_ne}; zero-row exact {zero_ok}");
+            }
+            KV_Q4K => {
+                let code_bytes = q4k_code_bytes(hd);
+                let (mut byte_ne, mut deq_ne, mut rec_ne) = (0usize, 0usize, 0usize);
+                for r in 0..n {
+                    let xr = &x[r * hd..(r + 1) * hd];
+                    let href = q4k_quant_row(xr);
+                    let drow = &rows[r * rb..(r + 1) * rb];
+                    byte_ne += href[..code_bytes + hd / 16].iter()
+                        .zip(&drow[..code_bytes + hd / 16]).filter(|(a, b)| a != b).count();
+                    let hdq = q4k_dequant_row(drow, hd);
+                    deq_ne += bits_ne(&hdq, &deq[r * hd..(r + 1) * hd]);
+                    let mut hrec = hdq.clone();
+                    h32r(&mut hrec);
+                    rec_ne += bits_ne(&hrec, &rec[r * hd..(r + 1) * hd]);
+                }
+                ok &= byte_ne == 0 && deq_ne == 0 && rec_ne == 0;
                 let zero_ok = rec[..hd].iter().all(|&v| v == 0.0);
                 ok &= zero_ok;
                 extra = format!("host-ref mismatches: bytes {byte_ne} deq {deq_ne} rec {rec_ne}; zero-row exact {zero_ok}");
