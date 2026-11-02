@@ -14063,7 +14063,7 @@ xq_attn_dense_dots_g6(float* __restrict__ sc, float* __restrict__ pmx, const flo
 // scales) into one smem buffer as ONE cp.async group. RS = smem row stride (bytes).
 template <int SD, int N16, bool FP8, int RS = SD * 4>
 __device__ __forceinline__ void xq_dv3_stage_v(char* vbt, float* vsct, const XqKv& kc, int t0,
-                                               int npos, int d0b, int tid) {
+                                               int npos, int d0b, int scoff, int tid) {
     constexpr int NPER = N16 + (FP8 ? 1 : 0);
     for (int i = tid; i < XQ_DV3_T * NPER; i += blockDim.x) {
         const int tr = i / NPER;
@@ -14072,7 +14072,7 @@ __device__ __forceinline__ void xq_dv3_stage_v(char* vbt, float* vsct, const XqK
         if (t < npos) {
             const char* src = kc.v + (long long)t * kc.rb;
             if (c < N16) moe_coop_cp16(vbt + tr * RS + c * 16, src + d0b + c * 16, 16);
-            else         moe_coop_cp16(vsct + tr * 4, src + kc.hd, 16);
+            else         moe_coop_cp16(vsct + tr * 4, src + scoff, 16);
         }
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
@@ -14132,6 +14132,23 @@ __device__ __forceinline__ void xq_dv3_ldv_q8(float* v, const char* vbt, const f
     for (int e = 0; e < DPT; e++) v[e] = xq_q8v(u, e, sm, hs);
 }
 
+// q4k V elements d0..d0+DPT-1 at smem row tr (codes packed RS = SD/2 bytes per row, the row's
+// 16-B group-scale chunk at vsct + tr*4): the SAME values xq_kv_ld returns — sm = f16 scale of
+// group d0>>5 * 1/8, hs = 0.5*sm, v = fma(code - 8, sm, hs).
+template <int DPT, int RS>
+__device__ __forceinline__ void xq_dv3_ldv_q4k(float* v, const char* vbt, const float* vsct, int tr, int dgl, int d0) {
+    static_assert(DPT == 2 || DPT == 4, "q4k dense v3 slices hold whole 32-groups");
+    const char* r = vbt + tr * RS;
+    const float sm = __fmul_rn(__half2float(reinterpret_cast<const __half*>(vsct + tr * 4)[d0 >> 5]), 0.125f);
+    const float hs = 0.5f * sm;
+    unsigned u;
+    if constexpr (DPT == 4) u = (unsigned)*reinterpret_cast<const unsigned short*>(r + dgl * 2);
+    else                    u = (unsigned)*reinterpret_cast<const unsigned char*>(r + dgl);
+    #pragma unroll
+    for (int e = 0; e < DPT; e++)
+        v[e] = __fmaf_rn((float)((int)((u >> (4 * e)) & 0xF) - 8), sm, hs);
+}
+
 // ---- 3. accumulate: grid (hd/SD, nkv, m), block 192 = 12 heads x 16 dim-groups of DPT dims.
 // Thread (h = tid>>4, dgl = tid&15) owns dims d0..d0+DPT-1 of head kvh*12+h.
 template <int G, int FMT, int DPT>
@@ -14140,13 +14157,15 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
                                                 const __half* __restrict__ qg, int nh, int hd,
                                                 int kvh, int row, int npos, char* vb, float* vsc, float* wb) {
     constexpr int T = XQ_DV3_T, SD = 16 * DPT, WST = XQ_DV3_T + 4;
-    constexpr int EB = FMT == XQ_KV_F32 ? 4 : (FMT == XQ_KV_F16 ? 2 : 1);
-    constexpr int N16 = SD * EB / 16;
+    constexpr bool P4 = FMT == XQ_KV_Q4K;
+    constexpr int EB = P4 ? 1 : (FMT == XQ_KV_F32 ? 4 : (FMT == XQ_KV_F16 ? 2 : 1));
+    // q4k: SD/2 code bytes per row (2 dims per byte); q8: SD; f32/f16/fp8: SD*4.
+    constexpr int N16 = P4 ? SD / 32 : SD * EB / 16;
     // q8 (WP25): codes packed SD bytes per smem row (so the DPT=2 body fits acc1's buffer);
     // f32/f16/fp8 keep the SD*4-byte stride (their code is unchanged). SCH = the row carries a
-    // 16-B scale chunk (fp8 row scale | q8 hd/32 f16 group scales, hd == 256).
+    // 16-B scale chunk (fp8 row scale | q8/q4k group scales, hd == 256).
     constexpr bool Q8 = FMT >= XQ_KV_Q8;
-    constexpr int RS = Q8 ? SD : SD * 4;
+    constexpr int RS = P4 ? SD / 2 : (Q8 ? SD : SD * 4);
     constexpr bool SCH = FMT == XQ_KV_FP8 || Q8;
     static_assert(!Q8 || DPT >= 2, "q8: a thread's 16-dgl slice must hold whole 32-groups");
     const int tid = threadIdx.x;
@@ -14157,9 +14176,10 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
     const float* srow = sc + hrow * XQ_DV3_TS;
     const float scale = xq_dv3_scale(hd);
     const int ntile = (npos + T - 1) / T;
-    const int d0b = blockIdx.x * SD * EB;
+    const int d0b = blockIdx.x * (P4 ? SD / 2 : SD * EB);
+    const int scoff = P4 ? hd / 2 : hd;
     // tile 0's V copies and raw scores go out first so their latency overlaps the mx loads
-    xq_dv3_stage_v<SD, N16, SCH, RS>(vb, vsc, kc, 0, npos, d0b, tid);
+    xq_dv3_stage_v<SD, N16, SCH, RS>(vb, vsc, kc, 0, npos, d0b, scoff, tid);
     float4 rw = *reinterpret_cast<const float4*>(srow + dgl * 4);
     // mx: fmaxf over the row's chunk maxima (exactly the set {fl(raw*scale) : t < npos})
     const int nch = (npos + XQ_DV3_CH - 1) / XQ_DV3_CH;
@@ -14189,7 +14209,7 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
         if (ti + 1 < ntile) {
             xq_dv3_stage_v<SD, N16, SCH, RS>(vb + ((ti + 1) & 1) * (T * RS),
                                                       vsc + ((ti + 1) & 1) * (T * 4),
-                                                      kc, t0 + T, npos, d0b, tid);
+                                                      kc, t0 + T, npos, d0b, scoff, tid);
             rw = *reinterpret_cast<const float4*>(srow + t0 + T + dgl * 4);
         } else {
             asm volatile("cp.async.commit_group;\n" ::: "memory");   // keep the group count aligned
@@ -14205,8 +14225,9 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
             #pragma unroll
             for (int u = 0; u < 4; u++) {
                 float v[DPT];
-                if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t + u, dgl, d0 >> 5);
-                else              xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t + u, dgl);
+                if constexpr (P4)      xq_dv3_ldv_q4k<DPT, RS>(v, vcur, scur, t + u, dgl, d0);
+                else if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t + u, dgl, d0 >> 5);
+                else                   xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t + u, dgl);
                 denom = __fadd_rn(denom, ws[u]);
                 #pragma unroll
                 for (int e = 0; e < DPT; e++) acc[e] = __fmaf_rn(ws[u], v[e], acc[e]);
@@ -14215,8 +14236,9 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
         for (; t < tn; t++) {
             const float w = wh[t];
             float v[DPT];
-            if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t, dgl, d0 >> 5);
-            else              xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t, dgl);
+            if constexpr (P4)      xq_dv3_ldv_q4k<DPT, RS>(v, vcur, scur, t, dgl, d0);
+            else if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t, dgl, d0 >> 5);
+            else                   xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t, dgl);
             denom = __fadd_rn(denom, w);
             #pragma unroll
             for (int e = 0; e < DPT; e++) acc[e] = __fmaf_rn(w, v[e], acc[e]);
@@ -14298,6 +14320,14 @@ __device__ __forceinline__ void xq_dv3_acc_entry(__half* __restrict__ attn, cons
         case XQ_KV_F32: xq_dv3_acc_body<G, XQ_KV_F32, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
         case XQ_KV_F16: xq_dv3_acc_body<G, XQ_KV_F16, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
         case XQ_KV_FP8: xq_dv3_acc_body<G, XQ_KV_FP8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
+        case XQ_KV_Q4K:
+            if constexpr (DPT >= 2) {
+                xq_dv3_acc_body<G, XQ_KV_Q4K, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+            } else {
+                if ((int)blockIdx.x < hd / 32)   // block-uniform
+                    xq_dv3_acc_body<G, XQ_KV_Q4K, 2>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+            }
+            break;
         default:
             // q8 / probe-only q4x (same layout + reader). The output un-rotation needs a whole
             // 32-group per thread-16 slice, so the single-row acc1 (DPT=1, 16-dim slices) runs

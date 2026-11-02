@@ -10879,9 +10879,6 @@ impl FwdModel {
     fn dense_v3_ok(&self, a: &AttnLayer) -> bool {
         let cfg = self.acfg(a); // TP-B
         dense_v3_on()
-            // q4k: the dense-v3 bodies take ONE compile-time FMT and stage q8 rows, so the
-            // packed 4-bit cache keeps the v2 scalar path (xq_attn_decode).
-            && !kv_is_packed4(self.kv_fmt)
             && cfg.head_dim == 256
             && cfg.num_kv_heads > 0
             && dv3_group(cfg.num_heads, cfg.num_kv_heads).is_some()
@@ -17175,6 +17172,7 @@ pub fn kv_rowbytes(fmt: u32, hd: usize) -> usize {
 #[path = "exl3_kvnll.rs"]
 mod kvnll;
 pub use kvnll::{probe_kv_nll, probe_kv_q8_selftest, KvNllArgs};
+pub(crate) use kvnll::q4k_quant_row;
 // S-B9-REL-PPL: `--perplexity` on an EXL3 pack — the served chunked prefill with an all-rows lm_head.
 #[path = "exl3_ppl.rs"]
 mod ppl;

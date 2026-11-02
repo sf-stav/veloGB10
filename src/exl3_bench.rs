@@ -4182,10 +4182,10 @@ fn probe_attn_shape<const NH: usize, const NKV: usize>(dev: &std::sync::Arc<Cuda
         Ok(())
     };
     let mut checked = 0usize;
-    for fmt in 0..4usize {
-        let fname = ["f32", "f16", "fp8", "q8"][fmt];
+    for (fmt, fname) in [(0u32, "f32"), (1, "f16"), (2, "fp8"), (3, "q8"), (5, "q4k")] {
         // q8 (WP25): hd codes + hd/32 f16 group scales padded to 16 B (= HD + 16 at hd 256)
-        let rb = match fmt { 0 => 4 * HD, 1 => 2 * HD, _ => HD + 16 };
+        // q4k: hd/2 packed 4-bit codes + the same scales (144 B at hd 256)
+        let rb = match fmt { 0 => 4 * HD, 1 => 2 * HD, 5 => (HD / 2 + HD / 16).next_multiple_of(16), _ => HD + 16 };
         let mpf = (MAXP as i32) | ((fmt as i32) << 28);
         let cache_bytes = 2 * NKV * MAXP * rb;
         let p0s: &[usize] = if full { &[0, 5, 63, 300, 1100, 2036] } else { &[0, 63, 1100, 2036] };
@@ -4214,7 +4214,7 @@ fn probe_attn_shape<const NH: usize, const NKV: usize>(dev: &std::sync::Arc<Cuda
                                 let scl = 0.004f32 + (rnd(1.0) + 1.0) * 0.008;
                                 cache0[base + HD..base + HD + 4].copy_from_slice(&scl.to_le_bytes());
                             }
-                            _ => {
+                            3 => {
                                 // q8: any code byte is valid; one positive f16 scale per 32-group
                                 for d in 0..HD {
                                     cache0[base + d] = ((rnd(1.0) + 1.0) * 127.9) as u8;
@@ -4224,6 +4224,13 @@ fn probe_attn_shape<const NH: usize, const NKV: usize>(dev: &std::sync::Arc<Cuda
                                     cache0[base + HD + 2 * g..base + HD + 2 * g + 2].copy_from_slice(&scl.to_bits().to_le_bytes());
                                 }
                             }
+                            5 => {
+                                // q4k: a real quantized row (same bytes the served writer produces)
+                                let row: Vec<f32> = (0..HD).map(|_| rnd(amp)).collect();
+                                let q = crate::exl3_forward::q4k_quant_row(&row);
+                                cache0[base..base + rb].copy_from_slice(&q);
+                            }
+                            _ => unreachable!(),
                         }
                     }
                 }
