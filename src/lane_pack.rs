@@ -147,7 +147,7 @@ pub(crate) fn fam_of(samp_live: bool, rq_live: bool) -> PackFam {
 /// model load, so a refused boot costs nothing (the `--lane-order fcfs` refusal used to fire after
 /// the 414 MB packed scratch and the 26 captures).
 pub(crate) struct Posture<'a> {
-    /// the resolved `--kv-cache` name (q8 is the default and the only gated format)
+    /// the resolved `--kv-cache` name (q8 is the default; q8 and q4k are the gated formats)
     pub kv: &'a str,
     /// the resolved speculation depth ceiling (`--exl3-mtp-k`; MTP_MAX_K is the default and the gated one)
     pub mtp_k: usize,

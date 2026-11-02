@@ -521,8 +521,9 @@ fn print_help() {
     println!();
     println!("  --kv-cache bf16|q4|tq|tq3|k8v4|k8v8  KV cache format (q4 = 4-bit; tq = 3.5-bit");
     println!("                           TurboQuant; k8v4 = int8-K + q4-V; k8v8 = int8 K+V; bf16 = default)");
-    println!("  --kv-cache f32|f16|fp8|q8  EXL3 packs: attention KV format (default q8 = H32-rotated int8");
-    println!("                           + f16 per-32 scale, the reference implementation's -cq 8; f32 = exact)");
+    println!("  --kv-cache f32|f16|fp8|q8|q4k  EXL3 packs: attention KV format (default q8 = H32-rotated int8");
+    println!("                           + f16 per-32 scale, the reference implementation's -cq 8; q4k = the");
+    println!("                           same basis at 4 bits, 2 dims per byte; f32 = exact)");
     println!("  --reasoning-effort <e>   reasoning level in the chat template (no_think|low|high|medium|xhigh)");
     println!("  --thinking <mode>        server: engine's thinking override — auto (default: pass nothing, the");
     println!("                           model's own chat_template.jinja decides) | on | off. Per-request");

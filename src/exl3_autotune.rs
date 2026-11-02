@@ -3140,7 +3140,7 @@ fn tune_cli(args: &[String]) -> Result<bool> {
     };
     anyhow::ensure!((0.0..1.0).contains(&draft_conf), "--draft-confidence must be in [0, 1)");
     if let Some(v) = arg(args, "--kv-cache") {
-        anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8"), "--kv-cache must be f32, f16, fp8 or q8");
+        anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8" | "q4k"), "--kv-cache must be f32, f16, fp8, q8 or q4k");
         crate::opts::set(crate::opt!("kv-cache"), v);
     }
     if !matches!(arg(args, "--prefix-cache"), Some("off")) { crate::opts::set(crate::opt!("exl3-prefix"), "1"); }

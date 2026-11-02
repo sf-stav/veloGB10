@@ -417,7 +417,10 @@ mod h5_direct_print_baseline_tests {
             ("src/exl3_forward/w4s.rs", 8),
             ("src/exl3_forward/wp16.rs", 12),
             ("src/exl3_forward/xtp.rs", 75), // S-B9-REL-INTEG A5: +1, the harness's RANK_IDENTITY FAIL line when pass 1 errors (a probe, not a served path)
-            ("src/exl3_kvnll.rs", 9),
+            ("src/exl3_kvnll.rs", 10),
+            // Q4K: 9 -> 10, the Q4K_HOST line of --probe-exl3-kvq (the q4k host reference's own
+            // verdict line: probe-only, one-shot, the same class as the KVQ_SELFTEST lines above;
+            // conscious update).
             // S-B9-REL-PPL: the one-shot `--perplexity` EXL3 tool prints its identity / per-window /
             // reference / RESULT lines directly (a CLI measurement tool, not a served path; the order
             // and immediacy of its output is the product, like exl3_kvnll.rs above).
@@ -505,7 +508,8 @@ mod h5_direct_print_baseline_tests {
             // help lines above); re-pinned to the count of the MERGED tree (1547 + 33 + 15 = 1595, counted with this
             // module's counter on the merged main.rs before the build). The row below is OPERATIVE (find() takes the
             // first); naive-n05's original row is kept verbatim after it for the port's line-identity check.
-            ("src/main.rs", 1603), // TOPKM1 hygiene (2026-10-28): 1595 -> 1603, the --quantize recipe help text (b612145e: +9/-1 println! in the usage printer; conscious update). Earlier: OPERATIVE at the port merge: 1547 + 33 (naive) + 15 (master) = 1595 on the merged tree. (A second, stale `src/main.rs` row of 1580 sat below this one; `find` takes the first row, so it never applied — removed.)
+            ("src/main.rs", 1604), // Q4K: 1603 -> 1604, the q4k clause of the --kv-cache help line (one-time
+                                   // help class; conscious update). TOPKM1 hygiene (2026-10-28): 1595 -> 1603, the --quantize recipe help text (b612145e: +9/-1 println! in the usage printer; conscious update). Earlier: OPERATIVE at the port merge: 1547 + 33 (naive) + 15 (master) = 1595 on the merged tree. (A second, stale `src/main.rs` row of 1580 sat below this one; `find` takes the first row, so it never applied — removed.)
             // NAIVE history of src/main.rs: +33, the --probe-naive-* dispatches' NAIVE_*_FAIL exit-path lines, their usage expect()s' siblings, and the head/node Naive TP boot lines (probe/boot classes)
             // Conscious updates, not conversion misses.
         ("src/tp.rs", 12),
