@@ -145,7 +145,7 @@ pub(crate) fn refuse_unknown_ppl_names(args: &[String]) -> Result<()> {
 /// run would measure the default q8 while the command line claimed another format.
 pub(crate) fn check_kv_flag(v: Option<&str>) -> Result<()> {
     match v {
-        None | Some("f32" | "f16" | "fp8" | "q8") => Ok(()),
+        None | Some("f32" | "f16" | "fp8" | "q8" | "q4k") => Ok(()),
         Some("q4x") => bail!("--kv-cache q4x is the WP25 kvnll probe's deliberately broken control; it is never \
                               served and a perplexity taken on it is wrong by construction (use f32, f16, fp8 or q8)"),
         Some(n @ ("bf16" | "q4" | "tq" | "tq3" | "k8v4" | "k8v8")) =>

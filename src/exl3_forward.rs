@@ -17117,6 +17117,9 @@ pub const KV_FP8: u32 = 2;
 pub const KV_Q8: u32 = 3;
 /// WP25 probe-only positive control: the q8 layout at 4-bit resolution ([kv-cache]=q4x).
 pub const KV_Q4X: u32 = 4;
+/// 4-bit packed K/V (docs/KV_CACHE_Q4K.md): the q8 H32 basis with one f16 scale per
+/// 32-dim group and a 4-bit midpoint grid, two dims per byte. 144 B per row at hd=256.
+pub const KV_Q4K: u32 = 5;
 /// The format when neither --kv-cache nor [kv-cache] names one. Owner decision 2026-09-26:
 /// q8 becomes the default AFTER the WP25 GPU quality gate passes — it passed on .14 (quality
 /// holds vs the noise floor), so the default is now the reference implementation's q8 cache. `--kv-cache f32`
@@ -17129,22 +17132,37 @@ pub fn kv_fmt_from_opts() -> u32 {
         Ok("fp8") => KV_FP8,
         Ok("q8") => KV_Q8,
         Ok("q4x") => KV_Q4X,
+        Ok("q4k") => KV_Q4K,
         Ok("") | Err(_) => KV_FMT_DEFAULT,
         Ok(other) => {
-            crate::deprintln!("[exl3] [kv-cache]={other} is not f32|f16|fp8|q8; using the default {}",
+            crate::deprintln!("[exl3] [kv-cache]={other} is not f32|f16|fp8|q8|q4k; using the default {}",
                       kv_fmt_name(KV_FMT_DEFAULT));
             KV_FMT_DEFAULT
         }
     }
 }
 pub fn kv_fmt_name(fmt: u32) -> &'static str {
-    match fmt { KV_F32 => "f32", KV_F16 => "f16", KV_FP8 => "fp8", KV_Q8 => "q8", _ => "q4x" }
+    match fmt {
+        KV_F32 => "f32",
+        KV_F16 => "f16",
+        KV_FP8 => "fp8",
+        KV_Q8 => "q8",
+        KV_Q4X => "q4x",
+        KV_Q4K => "q4k",
+        _ => "q4x",
+    }
+}
+/// True for the packed 4-bit format: its row is 144 B at hd=256 (not q8's 272), so the
+/// single-FMT fast paths that stage q8 rows stay off.
+pub fn kv_is_packed4(fmt: u32) -> bool {
+    fmt == KV_Q4K
 }
 pub fn kv_rowbytes(fmt: u32, hd: usize) -> usize {
     match fmt {
         KV_F32 => 4 * hd,
         KV_F16 => 2 * hd,
         KV_FP8 => hd + 16,
+        KV_Q4K => (hd / 2 + hd / 16).next_multiple_of(16),
         _ => hd + (hd / 16).next_multiple_of(16),
     }
 }
