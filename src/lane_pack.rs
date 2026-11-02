@@ -170,8 +170,11 @@ pub(crate) fn posture_fallbacks(p: &Posture) -> Vec<String> {
     if p.fcfs {
         v.push("--lane-order fcfs: fcfs steps ONE lane per scheduler step, a pack steps two (the rr order steps both)".to_string());
     }
-    if p.kv != "q8" {
-        v.push(format!("--kv-cache {}: the packed verify's per-segment attention and commit were never run on another KV format (gated: q8)", p.kv));
+    // q4k is admitted: its rows are symmetric (144 B) and the packed arm reaches KV only through
+    // xq_kv_make, with attention on xq_attn_decode_group (per-row slot). The older formats stay
+    // gated until they are run here.
+    if !matches!(p.kv, "q8" | "q4k") {
+        v.push(format!("--kv-cache {}: the packed verify's per-segment attention and commit were never run on this KV format (gated: q8, q4k)", p.kv));
     }
     if p.mtp_k != MTP_MAX_K {
         v.push(format!("--exl3-mtp-k {}: the packed widths and the control-cadence arithmetic were never run at another depth (gated: {MTP_MAX_K})", p.mtp_k));
@@ -935,6 +938,8 @@ mod tests {
     fn ungated_postures_fall_back_at_boot() {
         let ok = Posture { kv: "q8", mtp_k: MTP_MAX_K, row_regime: true, a_ctrl_old: false, fcfs: false };
         assert!(posture_fallbacks(&ok).is_empty(), "the default posture packs");
+        let q4k = Posture { kv: "q4k", ..ok };
+        assert!(posture_fallbacks(&q4k).is_empty(), "--kv-cache q4k packs");
         for (name, p, want) in [
             ("fcfs", Posture { fcfs: true, ..ok }, "--lane-order fcfs"),
             ("kv f16", Posture { kv: "f16", ..ok }, "--kv-cache f16"),

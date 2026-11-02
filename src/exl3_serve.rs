@@ -5930,7 +5930,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // f16 per-32 scale, WP25) quarter the long-context KV bytes. Transported to the loader via
     // [kv-cache] (an explicit env value wins when the flag is absent).
     if let Some(v) = arg(args, "--kv-cache") {
-        anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8"), "--kv-cache must be f32, f16, fp8 or q8");
+        anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8" | "q4k"), "--kv-cache must be f32, f16, fp8, q8 or q4k");
         crate::opts::set(crate::opt!("kv-cache"), v);
     }
     // --spec-source <s> (ISSUES[94]): the mirror of the trunk resolve_spec_source (main.rs) —
@@ -6006,7 +6006,14 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // CF-P1d keeps its teeth: the refusal remains when not even ONE lane fits, with the
     // arithmetic and what to change (that boot could not serve anything at all).
     {
-        let kvb = match kv_name { "f32" => 4.0, "f16" => 2.0, "fp8" => 1.0, _ => 1.0625 };
+        // Bytes per element per K/V channel: q4k's row is 144 B at hd 256, q8's 272.
+        let kvb = match kv_name {
+            "f32" => 4.0,
+            "f16" => 2.0,
+            "fp8" => 1.0,
+            "q4k" => 0.5625,
+            _ => 1.0625,
+        };
         let mode = match crate::opts::var(crate::opt!("ple-ram")).as_deref() { Ok("on") | Ok("ram") => "ram", Ok("off") | Ok("ssd") => "ssd", _ => "auto" };
         let world = tp_world.max(1) as usize;
         if let Some(parts) = fit_parts(model_dir, max_pos, world, tp_rank.map_or(true, |r| r == 0), kvb, wp16_gb) {
@@ -6932,7 +6939,7 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
     // from --kv-cache / [kv-cache] / the default, graphs precaptured like the server boot
     crate::opts::set(crate::opt!("exl3-prefix"), "1");
     if let Some(v) = arg(args, "--kv-cache") {
-        anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8"), "--kv-cache must be f32, f16, fp8 or q8");
+        anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8" | "q4k"), "--kv-cache must be f32, f16, fp8, q8 or q4k");
         crate::opts::set(crate::opt!("kv-cache"), v);
     }
     if let Some(off) = crate::exl3_forward::mtp_off_by_opt() {
