@@ -4396,7 +4396,7 @@ fn probe_attn_shape<const NH: usize, const NKV: usize>(dev: &std::sync::Arc<Cuda
         }
         println!("    EXL3-ATTN-V3{shape_tag} timing {} m={m} p0={p0}: old {} {t_old:.1} us, v3 {t_new:.1} us, W4S v3+acc_w4 {t_w4:.1} us \
                   per layer call ({:.1}x / {:.1}x; synthetic, launch-inclusive, harness-only)",
-                 ["f32", "f16", "fp8", "q8"][fmt], if m == 1 { "xq_attn_decode" } else { "xq_attn_decode_group" },
+                 crate::exl3_forward::kv_fmt_name(fmt as u32), if m == 1 { "xq_attn_decode" } else { "xq_attn_decode_group" },
                  t_old / t_new.max(1e-9), t_old / t_w4.max(1e-9));
     }
     Ok(())
@@ -4692,7 +4692,7 @@ fn probe_attn_sparse(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
         }
         println!("    EXL3-ATTN-SPARSE timing {} ctx={ctx} m={m}: hg3 {:.1} us, union {:.1} us per layer call ({:.2}x; synthetic \
                   back-to-back launches of one layer's KV — L2-warm, launch-inclusive; ranks the kernels, does not price in-round)",
-                 ["f32", "f16", "fp8", "q8"][fmt], t[0], t[1], t[0] / t[1].max(1e-9));
+                 crate::exl3_forward::kv_fmt_name(fmt as u32), t[0], t[1], t[0] / t[1].max(1e-9));
     }
     Ok(())
 }
