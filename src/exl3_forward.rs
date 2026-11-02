@@ -10630,7 +10630,7 @@ impl FwdModel {
         // rows (one slot, consecutive positions). Bit-identical partials; the old dispatch serves
         // by default and always for decode steps (one row per lane/slot), m = 1 and the
         // --w4qsa-off=1 escape.
-        let union_smem = if one_slot && m >= 2 && w4qsa_on() {
+        let union_smem = if one_slot && m >= 2 && w4qsa_on() && !kv_is_packed4(self.kv_fmt) {
             qsa_union_fits(self.kv_fmt, cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, m, split_len)
         } else { None };
         if let Some(smem) = union_smem {
@@ -10678,6 +10678,7 @@ impl FwdModel {
         let hpw = sel_gather_hpw(m);
         let gqa = cfg.num_heads / cfg.num_kv_heads.max(1);
         let hg = hpw > 0 && cfg.head_dim == 256 && gqa >= 1 && gqa <= 12
+            && !kv_is_packed4(self.kv_fmt)
             && gqa * cfg.num_kv_heads == cfg.num_heads
             && kv_rowbytes(self.kv_fmt, cfg.head_dim) <= 1024 && split_len < 0x10000;
         if hg {
@@ -10878,6 +10879,9 @@ impl FwdModel {
     fn dense_v3_ok(&self, a: &AttnLayer) -> bool {
         let cfg = self.acfg(a); // TP-B
         dense_v3_on()
+            // q4k: the dense-v3 bodies take ONE compile-time FMT and stage q8 rows, so the
+            // packed 4-bit cache keeps the v2 scalar path (xq_attn_decode).
+            && !kv_is_packed4(self.kv_fmt)
             && cfg.head_dim == 256
             && cfg.num_kv_heads > 0
             && dv3_group(cfg.num_heads, cfg.num_kv_heads).is_some()
@@ -15355,7 +15359,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         // tile, 4 warps x 3 heads, next tile's bytes prefetched). Its shape contract: hd 256 (lane
         // owns 8 dims), gqa exactly 12, split_len < 2^16. --pq8-gather=0 = splitk4.
         let gqa = cfg.num_heads / cfg.num_kv_heads.max(1);
-        let pq8 = vec4 && !xcheck && pq8_item(2) && self.kv_fmt >= KV_Q8 && cfg.head_dim == 256
+        let pq8 = vec4 && !xcheck && pq8_item(2) && self.kv_fmt == KV_Q8 && cfg.head_dim == 256
             && gqa == 12 && gqa * cfg.num_kv_heads == cfg.num_heads && split_len < 0x10000;
         if pq8 {
             let pq8x = pq8_xcheck() && !self.stream_capturing();
@@ -17849,7 +17853,7 @@ pub(crate) fn qsa_union_smem(fmt: u32, hd: usize, m: usize, l: usize) -> usize {
 pub(crate) fn qsa_union_fits(fmt: u32, nh: usize, nkv: usize, hd: usize, m: usize, l: usize) -> Option<usize> {
     let gqa = nh / nkv.max(1);
     let smem = qsa_union_smem(fmt, hd, m, l);
-    (hd == 256 && nkv >= 1 && gqa * nkv == nh && gqa % QU_HPW == 0 && (1..=QU_MAXR).contains(&m)
+    (!kv_is_packed4(fmt) && hd == 256 && nkv >= 1 && gqa * nkv == nh && gqa % QU_HPW == 0 && (1..=QU_MAXR).contains(&m)
         && (1..=QU_MAXL).contains(&l) && kv_rowbytes(fmt, hd) <= 1024 && smem <= 48 * 1024).then_some(smem)
 }
 /// PQ8 (prefill q8 diet + SURPASS_PLAN WP06 item 1) — three bit-identical twins in the chunked

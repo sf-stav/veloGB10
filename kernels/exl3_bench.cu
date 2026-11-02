@@ -9755,6 +9755,7 @@ __device__ __forceinline__ void a3fg_flash_body(
                 case XQ_KV_F32: a3fg_stage_v<XQ_KV_F32, HD, BT, BKV, KPAD, VEC == 2>(Ks, Vs, kc, jt, pbase, tid); break;
                 case XQ_KV_F16: a3fg_stage_v<XQ_KV_F16, HD, BT, BKV, KPAD, VEC == 2>(Ks, Vs, kc, jt, pbase, tid); break;
                 case XQ_KV_FP8: a3fg_stage_v<XQ_KV_FP8, HD, BT, BKV, KPAD, VEC == 2>(Ks, Vs, kc, jt, pbase, tid); break;
+                case XQ_KV_Q4K: a3fg_stage_v<XQ_KV_Q4K, HD, BT, BKV, KPAD, VEC == 2>(Ks, Vs, kc, jt, pbase, tid); break;
                 default:        a3fg_stage_v<XQ_KV_Q8, HD, BT, BKV, KPAD, VEC == 2>(Ks, Vs, kc, jt, pbase, tid); break;
             }
         } else {

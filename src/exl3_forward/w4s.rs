@@ -426,7 +426,7 @@ impl FwdModel {
         let nkv = cfg.num_kv_heads;
         let gqa = if nkv > 0 { cfg.num_heads / nkv } else { 0 };
         let rb = kv_rowbytes(self.kv_fmt, cfg.head_dim);
-        if !w4s_on(W4S_DRAFT) || cfg.head_dim != 256 || nkv == 0 || gqa == 0 || gqa > 16 || gqa * nkv != cfg.num_heads
+        if !w4s_on(W4S_DRAFT) || kv_is_packed4(self.kv_fmt) || cfg.head_dim != 256 || nkv == 0 || gqa == 0 || gqa > 16 || gqa * nkv != cfg.num_heads
             || rb > 1024 || rb % 16 != 0 || DRAFT_ATTN_SPLITS > 256 {
             return Ok(false);
         }
