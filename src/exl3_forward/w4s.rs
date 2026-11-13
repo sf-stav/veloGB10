@@ -175,6 +175,7 @@ impl FwdModel {
     /// (5) The routing fold through xq_router_fold_w4 (same outputs as xq_router_fold, bitwise).
     /// Ok(false) = item off or not eligible: the caller launches the old fold.
     pub(super) fn w4s_router_fold(&self, l: &Launcher, sc: &mut Scratch, moe: &MoeLayer, m: usize) -> Result<bool> {
+        if moe.router_bf { return Ok(false); } // FP4L stored-bf16 router: only the stored-bf16 GEMM may read it
         let h = self.cfg.hidden_size;
         let ne = self.cfg.num_experts;
         let topk = self.cfg.num_experts_per_tok;
@@ -391,6 +392,7 @@ impl FwdModel {
 
     /// (9) The dense v3 accumulate kernel for this width: the W4 twin when on.
     pub(super) fn w4s_dattn_kname(&self, old: &'static str) -> &'static str {
+        // The W4 twin stages V with the row's own scale offset (scoff), so q4k runs the ring kernel.
         if !w4s_on(W4S_DATTN) { return old; }
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| crate::dprintln!("W4S dattn: xq_attn_dense_acc4_w4 / _acc1_w4 ON (5-stage V ring; --w4s-off=dattn = v3 acc)"));

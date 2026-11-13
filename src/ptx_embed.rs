@@ -37,6 +37,9 @@ pub const GPU_DFLASH: &str = include_str!("ptx/gpu_dflash.ptx");
 pub const GPU_DSPARK: &str = include_str!("ptx/gpu_dspark.ptx");
 /// `gpu_vision.cu` (sm_121): FP32 vision-tower kernels.
 pub const GPU_VISION: &str = include_str!("ptx/gpu_vision.ptx");
+/// `gpu_fp4l.cu` (sm_121a): FP4L weight kernels (MXFP8 / f16 / NVFP4 experts) for the EXL3 trunk,
+/// loaded only for an nvidia/Qwen3.8-Flash-Next-FP4-Local pack (src/exl3_forward/fp4l_fwd.rs).
+pub const GPU_FP4L: &str = include_str!("ptx/gpu_fp4l.ptx");
 /// `mxfp4_bench.cu` (sm_121a): standalone OMMA microbench (probe-only, lazy).
 pub const MXFP4_BENCH: &str = include_str!("ptx/mxfp4_bench.ptx");
 /// `gpu_mxfp4.cu` (sm_121a): NVFP4 native GEMV kernels.
@@ -48,16 +51,8 @@ pub const GPU_W4A4: &str = include_str!("ptx/gpu_w4a4.ptx");
 /// `exl3_bench.cu` (sm_121): EXL3 weight-path GEMM -- the SERVING module of the EXL3
 /// trunk (raw copy for xq_* / PDL + cudarc copy), not probe-only.
 pub const EXL3_BENCH: &str = include_str!("ptx/exl3_bench.ptx");
-/// `exl3_bench_k6.cu` (sm_121): the K=6 variant (4.05-bpw packs), selected per process by
-/// `exl3_bench::set_k6_module` from the pack header.
-pub const EXL3_BENCH_K6: &str = include_str!("ptx/exl3_bench_k6.ptx");
-
 /// `gpu_naive.cu` (sm_121): the Naive-N0.5-Flash family kernels (half-K trellis GEMM, ...; PLAN/NAIVE_N05_PORT.md).
 pub const GPU_NAIVE: &str = include_str!("ptx/gpu_naive.ptx");
 /// `gpu_naive_draft.cu` (sm_121): the Naive DSpark drafter round (src/naive/drafter_gpu.rs).
 pub const GPU_NAIVE_DRAFT: &str = include_str!("ptx/gpu_naive_draft.ptx");
 
-/// The EXL3 kernel source this process loads: the standard module, or the K=6 one.
-pub fn exl3_bench_src(k6: bool) -> &'static str {
-    if k6 { EXL3_BENCH_K6 } else { EXL3_BENCH }
-}

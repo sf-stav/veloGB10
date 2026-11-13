@@ -59,6 +59,32 @@ impl SamplingDefaults {
     }
 }
 
+/// LOOPFIX (2026-11-06): what the Qwen3.5 model cards recommend, for a pack WITHOUT a
+/// `generation_config.json` (Qwen's own 0.8B-9B checkpoints ship none, nor do our packs of them).
+/// Keyed on the model's IDENTITY in config.json (model_type + text size), never the folder name.
+/// Returns (unsent-field sampler defaults, presence-penalty default) for a Qwen3.5 / 3.6 / 3.8
+/// trunk model (`qwen3_5`, `qwen3_5_moe`), None for anything else (callers keep their values).
+///   0.8B / 2B (non-thinking by default; card "non-thinking mode for text tasks"):
+///       non-thinking 1.0 / 1.00 / 20, thinking 1.0 / 0.95 / 20, presence 2.0
+///   every larger Qwen3.5 / 3.6 / 3.8 (thinking by default; card "thinking mode for general tasks"
+///   and "instruct mode for general tasks"): thinking 1.0 / 0.95 / 20, non-thinking 0.7 / 0.8 / 20,
+///   presence 1.5
+pub fn qwen35_card(model_dir: &str) -> Option<(SamplingDefaults, f32)> {
+    let path = format!("{}/config.json", model_dir.trim_end_matches('/'));
+    let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    let mt = j.get("model_type").and_then(|v| v.as_str())?;
+    if mt != "qwen3_5" && mt != "qwen3_5_moe" { return None; }
+    let t = j.get("text_config").unwrap_or(&j);
+    let hidden = t.get("hidden_size").and_then(|v| v.as_u64())?;
+    let layers = t.get("num_hidden_layers").and_then(|v| v.as_u64())?;
+    let small = mt == "qwen3_5" && hidden <= 2048 && layers <= 24;   // Qwen3.5-0.8B (1024) / 2B (2048)
+    Some(if small {
+        (SamplingDefaults { think: (1.0, 0.95, 20), no_think: (1.0, 1.0, 20) }, 2.0)
+    } else {
+        (SamplingDefaults { think: (1.0, 0.95, 20), no_think: (0.7, 0.8, 20) }, 1.5)
+    })
+}
+
 #[derive(Clone)]
 pub struct AppState {
     /// Per-mode fallback sampling (a request's explicit values always win).
@@ -94,6 +120,15 @@ pub struct AppState {
     /// (batch.rs filters it again); gating its render+tokenize here saves the double
     /// template work on every request when the cache is off (TTFT fix (e)).
     pub prefix_cache: bool,
+    /// The scheduler can start a `response_format` constraint after the reasoning block
+    /// (`SchemaMask::defer_until`). When false, a thinking request's schema is not enforced.
+    pub schema_defer: bool,
+    /// PR #30 port: the scheduler returns per-token log probabilities (`TokEvent::Logprob`). When false a
+    /// request that asks for them is served with `logprobs: null`, said once and counted (owner rule: no refusals).
+    pub logprobs_ok: bool,
+    /// PR #31 port: the scheduler applies a `response_format` token mask (`BatchRequest::schema`). When false the
+    /// request is served unconstrained with `x-json-schema-enforced: none` (never a `full` it did not get).
+    pub schema_ok: bool,
     /// Vision tower (visual trunk) loaded at server start, for image requests. `None` if the
     /// build/model has no vision (text-only server behaves exactly as before).
     pub vision_tower: Option<std::sync::Arc<crate::vision_tower::VisualTower>>,
@@ -915,6 +950,21 @@ fn split_think_in(s: &str, think_open: &str, think_close: &str, starts_in_reason
     }
 }
 
+/// `split_think_in` for a schema-constrained reply: the reasoning (only when the prompt opened a
+/// think block) ends at the first close tag, where the constraint starts; everything after it is
+/// the constrained document, taken literally (a think tag inside one of its strings is text).
+fn split_constrained(s: &str, think_close: &str, starts_in_reasoning: bool) -> (Option<String>, String) {
+    if !starts_in_reasoning {
+        return (None, s.to_string());
+    }
+    let (r, c) = match s.find(think_close) {
+        Some(i) => (&s[..i], s[i + think_close.len()..].trim_start_matches(['\n', '\r', ' ', '\t'])),
+        None => (s, ""),
+    };
+    let r = r.trim();
+    (if r.is_empty() { None } else { Some(r.to_string()) }, c.to_string())
+}
+
 #[derive(Deserialize)]
 struct ChatCompletionRequest {
     /// OpenAI spec requires `model`, but single-model agent clients sometimes omit it. Accept
@@ -946,6 +996,14 @@ struct ChatCompletionRequest {
     /// Optional PRNG seed for reproducible sampling (used by stochastic MTP path).
     #[serde(default)]
     seed: Option<u64>,
+    /// OpenAI `logprobs`: return the log probability of every output token
+    /// (`choices[].logprobs.content`).
+    #[serde(default)]
+    logprobs: Option<bool>,
+    /// OpenAI `top_logprobs` (0..=20): the most likely alternatives listed per output token.
+    /// Requires `logprobs: true`.
+    #[serde(default)]
+    top_logprobs: Option<u32>,
     /// Stop sequences: accept either a string or a list of strings (OpenAI spec).
     #[serde(default, deserialize_with = "deserialize_stop")]
     stop: Vec<String>,
@@ -974,6 +1032,12 @@ struct ChatCompletionRequest {
     /// dropped it, so the documented escape hatch could not actually rescue an over-length chat.)
     #[serde(default)]
     truncate_prompt_tokens: Option<usize>,
+    /// THINKBUDGET1: vLLM's `thinking_token_budget` — the most tokens this request may spend inside
+    /// its reasoning block; at the budget the server emits the end-of-thinking marker and the model
+    /// answers. A non-negative integer, or -1 = unlimited; anything else is a 400 with vLLM's
+    /// message (crate::think_budget). Absent = no budget: the request is served exactly as before.
+    #[serde(default, deserialize_with = "crate::think_budget::deserialize")]
+    thinking_token_budget: Option<usize>,
     /// OpenAI streaming options. Only meaningful with stream=true; serde used to drop it silently,
     /// so a client asking for include_usage got nothing and no [DONE] sentinel either.
     #[serde(default)]
@@ -1109,6 +1173,149 @@ struct ChatChoice {
     /// here only "loop_detected" (WP08). Omitted otherwise, so normal replies are unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_reason: Option<String>,
+    /// `{"content": [...]}` when the request asked for `logprobs`; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<serde_json::Value>,
+}
+
+/// Max alternatives per token for `top_logprobs` (chat) / `logprobs` (completions).
+const MAX_TOP_LOGPROBS: u32 = 20;
+
+/// One output token's log probabilities as received from the engine (`TokEvent::Logprob`),
+/// aligned with the token list; `None` = the engine sent none for that token.
+type TokLp = Option<(f32, Vec<(u32, f32)>)>;
+
+/// The chat request's logprobs setting -> the engine's `BatchRequest::logprobs`.
+fn chat_logprobs_param(logprobs: Option<bool>, top: Option<u32>) -> Result<Option<u8>, String> {
+    let n = match (logprobs.unwrap_or(false), top) {
+        (false, None) => return Ok(None),
+        (false, Some(_)) => return Err("top_logprobs requires logprobs to be true".into()),
+        (true, Some(n)) if n > MAX_TOP_LOGPROBS =>
+            return Err(format!("top_logprobs must be between 0 and {MAX_TOP_LOGPROBS} (got {n})")),
+        (true, n) => n.unwrap_or(0) as u8,
+    };
+    Ok(Some(n))
+}
+
+/// The completions request's legacy `logprobs` -> the engine's `BatchRequest::logprobs`.
+fn completion_logprobs_param(logprobs: Option<u32>) -> Result<Option<u8>, String> {
+    match logprobs {
+        None => Ok(None),
+        Some(n) if n > MAX_TOP_LOGPROBS => Err(format!("logprobs must be between 0 and {MAX_TOP_LOGPROBS} (got {n})")),
+        Some(n) => Ok(Some(n as u8)),
+    }
+}
+
+/// PR #30 port, owner rule (support it or fall back, never refuse): why THIS server cannot return the log
+/// probabilities a valid request asked for, as (disposition, reason); None = it can. Pure (unit-tested).
+fn logprobs_fallback(engine_ok: bool, scrub_on: bool, stream: bool) -> Option<(&'static str, &'static str)> {
+    if !engine_ok {
+        Some(("unsupported", "this serving engine does not compute them (the EXL3 server at TP=1, 2 and 4 does)"))
+    } else if scrub_on {
+        Some(("withheld", "--scrub-tool-secrets is on, and per-token bytes could rebuild text the scrubber removed"))
+    } else if stream {
+        Some(("stream", "stream=true is not wired for them yet"))
+    } else {
+        None
+    }
+}
+
+/// The logprobs to ask the engine for: the request's, or None when `logprobs_fallback` says this server cannot
+/// return them; the reply then carries `logprobs: null`, the reason prints once per boot, and every request is
+/// counted on velogb10_logprobs_requests_total.
+fn logprobs_gate(n: Option<u8>, state: &AppState, stream: bool) -> Option<u8> {
+    n?;
+    let scrub_on = crate::tool_scrub::Mode::from_opt() != crate::tool_scrub::Mode::Off;
+    match logprobs_fallback(state.logprobs_ok, scrub_on, stream) {
+        None => { crate::metrics::logprobs_request("served"); n }
+        Some((disp, why)) => {
+            crate::metrics::logprobs_request(disp);
+            static SAID: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+            let mut g = SAID.lock().unwrap_or_else(|p| p.into_inner());
+            if !g.contains(&disp) {
+                g.push(disp);
+                crate::reprintln!("[serve] logprobs: {why}: such requests are served with logprobs null \
+(velogb10_logprobs_requests_total{{disposition=\"{disp}\"}}; this line prints once per boot)");
+            }
+            None
+        }
+    }
+}
+
+/// The output tokens that carry log probabilities for bytes `range` of the decoded text: every
+/// generated token except stop tokens that overlaps the range (a token that prints nothing counts
+/// when its position lies inside it). Returns (index, byte offset of the token in the decoded
+/// text, the token's bytes clipped to the range).
+fn logprob_token_span(bytes_of: impl Fn(u32) -> Vec<u8>, stop_ids: &[u32], tokens: &[u32],
+                      range: std::ops::Range<usize>) -> Vec<(usize, usize, Vec<u8>)> {
+    let mut off = 0usize;
+    let mut out = Vec::with_capacity(tokens.len());
+    for (i, &t) in tokens.iter().enumerate() {
+        if off >= range.end { break; }
+        let b = bytes_of(t);
+        let end = off + b.len();
+        let inside = if b.is_empty() { off >= range.start } else { end > range.start };
+        if inside && !stop_ids.contains(&t) {
+            let lo = range.start.saturating_sub(off).min(b.len());
+            let hi = (range.end - off).min(b.len());
+            out.push((i, off, b[lo..hi].to_vec()));
+        }
+        off = end;
+    }
+    out
+}
+
+/// The byte range of the decoded `text` that the response's `content` came from: `content` as
+/// found after the reasoning block (after the first `think_close`, when one was generated).
+/// None when the content is not one contiguous span of the text.
+fn content_byte_range(text: &str, content: &str, think_close: &str) -> Option<std::ops::Range<usize>> {
+    let from = text.find(think_close).map_or(0, |p| p + think_close.len());
+    if content.is_empty() { return Some(from..from); }
+    let p = from + text[from..].find(content)?;
+    Some(p..p + content.len())
+}
+
+/// OpenAI chat `logprobs`: `{"content": [{token, logprob, bytes, top_logprobs: [...]}]}` for the
+/// tokens of bytes `range` of the decoded text (the response's `content`); a token cut by the
+/// range edge is listed with only its bytes inside the range, its probabilities unchanged. None
+/// when a kept token has no engine entry (a readback failure: reported as null, never guessed).
+fn chat_logprobs_json(tok: &QwenTokenizer, stop_ids: &[u32], tokens: &[u32], lps: &[TokLp],
+                      range: std::ops::Range<usize>) -> Option<serde_json::Value> {
+    let entry = |b: Vec<u8>, lp: f32| {
+        serde_json::json!({"token": String::from_utf8_lossy(&b), "logprob": lp, "bytes": b})
+    };
+    let mut content = Vec::new();
+    for (i, _, b) in logprob_token_span(|t| tok.token_bytes(t, true), stop_ids, tokens, range) {
+        let (lp, top) = lps.get(i)?.as_ref()?;
+        let mut e = entry(b, *lp);
+        e["top_logprobs"] = serde_json::Value::Array(
+            top.iter().map(|&(id, l)| entry(tok.token_bytes(id, false), l)).collect());
+        content.push(e);
+    }
+    Some(serde_json::json!({"content": content}))
+}
+
+/// Legacy completions `logprobs`: `{tokens, token_logprobs, top_logprobs, text_offset}` with
+/// character offsets into `text` (the decoded completion). A `top_logprobs` object keeps the
+/// most likely entry when two alternatives print the same string.
+fn completion_logprobs_json(tok: &QwenTokenizer, stop_ids: &[u32], tokens: &[u32], lps: &[TokLp],
+                            text: &str) -> Option<serde_json::Value> {
+    let (mut ts, mut tl, mut tt, mut to) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (i, off, _) in logprob_token_span(|t| tok.token_bytes(t, true), stop_ids, tokens, 0..usize::MAX) {
+        let (lp, top) = lps.get(i)?.as_ref()?;
+        ts.push(String::from_utf8_lossy(&tok.token_bytes(tokens[i], false)).into_owned());
+        tl.push(*lp);
+        let mut m = serde_json::Map::new();
+        for &(id, l) in top {
+            let k = String::from_utf8_lossy(&tok.token_bytes(id, false)).into_owned();
+            m.entry(k).or_insert(serde_json::json!(l));
+        }
+        tt.push(serde_json::Value::Object(m));
+        let mut b = off.min(text.len());
+        while !text.is_char_boundary(b) { b -= 1; }
+        to.push(text[..b].chars().count());
+    }
+    Some(serde_json::json!({"tokens": ts, "token_logprobs": tl, "top_logprobs": tt, "text_offset": to}))
 }
 
 /// The scheduler's internal backstop reason (batch.rs) is not an OpenAI value — the spec is
@@ -1350,17 +1557,32 @@ fn warn_unenforced_schema_once(why: &str) {
     }
     {
         eprintln!(
-            "[schema] WARNING: response_format is NOT enforced by this build — the reply is \
+            "[schema] WARNING: response_format is NOT enforced by this server — the reply is \
              unconstrained and may not match the requested schema (responses carry \
              'x-json-schema-enforced: none'). Reason: {why}"
         );
     }
 }
 
-/// Marks a served response whose `response_format` was not enforced (see above).
-fn attach_schema_unenforced_header(resp: &mut Response, unenforced: bool) {
-    if !unenforced { return; }
-    if let Ok(v) = HeaderValue::from_str("none") {
+/// W2-EXL3: the vocabulary table every constrained request shares (built once per process from
+/// the tokenizer's output-byte tables; the server serves one tokenizer).
+fn schema_vocab_table(tok: &crate::tokenizer::QwenTokenizer) -> crate::json_schema::VocabTable {
+    static T: std::sync::OnceLock<crate::json_schema::VocabTable> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let t0 = std::time::Instant::now();
+        let t = crate::json_schema::VocabTable::build(tok.vocab_pieces());
+        crate::reprintln!("[schema] vocabulary table built: {} ids ({:.0} ms, once per process)",
+                          t.len(), t0.elapsed().as_secs_f64() * 1e3);
+        t
+    }).clone()
+}
+
+/// Marks a served response whose `response_format` was not enforced (see above) with
+/// `x-json-schema-enforced: none`, and (W2-EXL3, `--json-schema-enforce on`) one whose schema
+/// WAS armed as a token mask with `x-json-schema-enforced: full`. No header without a schema.
+fn attach_schema_unenforced_header(resp: &mut Response, unenforced: bool, enforced: bool) {
+    let val = if unenforced { "none" } else if enforced { "full" } else { return };
+    if let Ok(v) = HeaderValue::from_str(val) {
         resp.headers_mut().insert("x-json-schema-enforced", v);
     }
 }
@@ -1440,6 +1662,9 @@ pub(crate) struct ChatSse {
     pub starts_in_reasoning: bool,
     pub tool_hold: Option<&'static str>,
     pub parse_as_tool_calls: bool,
+    /// The content is a schema-constrained document: never re-enter reasoning on a think tag
+    /// inside it (`split_constrained`).
+    pub literal_content: bool,
     pub req_tools: Option<Vec<serde_json::Value>>,
     pub include_usage: bool,
     pub prompt_len: usize,
@@ -1535,8 +1760,13 @@ where
     let ChatSse {
         mut rx, bl, mut mt, otel_req, otel_session, role_chunk, completion_id, created, model_name,
         stops, think_open, think_close, starts_in_reasoning, tool_hold, parse_as_tool_calls,
-        req_tools, include_usage, prompt_len, t0, gen_log, tool_trace, mut scrub,
+        literal_content, req_tools, include_usage, prompt_len, t0, gen_log, tool_trace, mut scrub,
     } = cx;
+    let split = move |acc: &str| if literal_content {
+        split_constrained(acc, think_close, starts_in_reasoning)
+    } else {
+        split_think_in(acc, think_open, think_close, starts_in_reasoning)
+    };
     // B2: an empty stop string matches at offset 0 of every text (it would empty the reply); the request
     // deserializer drops it already, this keeps the stream itself safe for any caller.
     let stops: Vec<String> = stops.into_iter().filter(|s| !s.is_empty()).collect();
@@ -1577,7 +1807,8 @@ where
         // think-open tag (content sites) and the request's stop strings (every site). A stop
         // string ends the reply BEFORE itself, so a tail that could be the start of one is held.
         let reason_marks: Vec<&str> = stops.iter().map(String::as_str).collect();
-        let content_marks: Vec<&str> = std::iter::once(think_open).chain(reason_marks.iter().copied()).collect();
+        let content_marks: Vec<&str> = std::iter::once(think_open).filter(|_| !literal_content)
+            .chain(reason_marks.iter().copied()).collect();
         while let Some(ev) = recv_counted(&mut rx, &bl).await { // LR-5: the one decrement (H0)
             match ev {
                 TokEvent::Admitted { cached_tokens } => {
@@ -1692,7 +1923,8 @@ where
                                     // reasoning, then the correct call): only a hit before the marker
                                     // is a think block.
                                     let tool_at = tool_hold.and_then(|m| f_tool_c.find(&acc, cs, m));
-                                    if let Some(upto) = f_open.find(&acc, cs, think_open).filter(|&u| tool_at.map_or(true, |t| u < t)) {
+                                    if let Some(upto) = f_open.find(&acc, cs, think_open)
+                                        .filter(|&u| !literal_content && tool_at.map_or(true, |t| u < t)) {
                                         if upto > content_emitted {
                                             let c = content_chunk(&completion_id, created, &model_name, &scrub.push_content(&acc[content_emitted..upto]));
                                             if let Some(r) = &otel_req { r.delta(&c); }
@@ -1723,6 +1955,7 @@ where
                     if stop_hit { break; }
                 }
                 TokEvent::StopInfo { p, rank, sampled } => { stop_info = Some((p, rank, sampled)); }
+                TokEvent::Logprob { .. } => {} // refused with stream=true (chat_logprobs_param)
                 TokEvent::Finish { reason } => { sched_reason = Some(reason.clone()); finish = reason; break; }
             }
         }
@@ -1742,7 +1975,7 @@ where
         // held_tail, so streaming can never silently drop text the JSON
         // mode returns (2026-08-27 user report: a malformed `function=NAME>` block with the
         // `<` missing vanished from the SSE stream while the JSON response leaked it).
-        let (_, done_content) = split_think_in(&acc, think_open, think_close, starts_in_reasoning);
+        let (_, done_content) = split(&acc);
         // parse_as_tool_calls == false (keep-tools "none"): never parse — the reply is plain
         // content; finalize_parsed then returns the raw text with finish stop/length.
         let parsed = if parse_as_tool_calls {
@@ -1832,7 +2065,7 @@ where
             content_emitted = acc.len();
         }
         {
-            let (r_txt, c_txt) = split_think_in(&acc, think_open, think_close, starts_in_reasoning);
+            let (r_txt, c_txt) = split(&acc);
             let (r_log, c_log) = gen_log_spans(r_txt.as_deref(), &c_txt, acc.contains(think_close), starts_in_reasoning);
             if let Some(g) = &gen_log {
                 log_generation(&g.tokenizer, &g.stop_ids, &completion_id, &finish,
@@ -1880,10 +2113,10 @@ async fn chat_completions(
     let Json(mut req) = match payload { Ok(j) => j, Err(e) => return bad_json(e) };
     // Log the request parameters the client sent (useful for debugging OpenWebUI behavior)
     crate::dreprintln!(
-        "[req] params  temp={:?} top_p={:?} top_k={:?} max_tok={:?} max_completion_tok={:?} rep_pen={:?} presence={:?} freq={:?} stream={} effort={:?} ctk={}",
+        "[req] params  temp={:?} top_p={:?} top_k={:?} max_tok={:?} max_completion_tok={:?} rep_pen={:?} presence={:?} freq={:?} stream={} effort={:?} think_budget={:?} ctk={}",
         req.temperature, req.top_p, req.top_k,
         req.max_tokens, req.max_completion_tokens, req.repetition_penalty, req.presence_penalty, req.frequency_penalty,
-        req.stream, req.reasoning_effort,
+        req.stream, req.reasoning_effort, req.thinking_token_budget,
         req.chat_template_kwargs.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "-".into())
     );
     if !req.unused_fields.is_empty() {
@@ -1932,16 +2165,26 @@ async fn chat_completions(
     // Flip JSON_SCHEMA_ENFORCEMENT_ENABLED to true only when the emission path is proven
     // end-to-end: `cargo test --lib json_schema::tests` green AND the W2 probe 6/6 enforced
     // across temperature × TP × spec source. Until then, serving + advertising beats refusing.
-    const JSON_SCHEMA_ENFORCEMENT_ENABLED: bool = false;
-    let mut schema_mask: Option<std::sync::Arc<crate::json_schema::SchemaMask>> = None;
+    // W2-EXL3: the constant became the opt-in `--json-schema-enforce on`; the EXL3 serve
+    // path now arms the mask too (exl3_serve.rs), so the flag is meaningful on every server.
+    let json_schema_enforcement_enabled = crate::opts::on(crate::opt!("json-schema-enforce"));
+    // The mask is finalised (think deferral) after the prompt is rendered, below.
+    let mut schema_pending: Option<crate::json_schema::SchemaMask> = None;
     let mut schema_unenforced: Option<String> = None;
     if let Some(rf) = req.response_format.as_ref() {
         match crate::json_schema::compile_response_format(rf) {
             Ok(None) => {}
-            Ok(Some(mut m)) if JSON_SCHEMA_ENFORCEMENT_ENABLED => {
-                m.set_vocab(state.tokenizer.vocab_pieces());
+            Ok(Some(m)) if json_schema_enforcement_enabled && !state.schema_ok => {
+                // PR #31 port, owner rule (fall back, never refuse): an engine that applies no schema mask (the EXL3
+                // TP head, the Naive server) serves the request unconstrained and says so in the header
+                schema_unenforced = Some(format!(
+                    "schema compiled ({}) but this serving engine applies no schema mask (the EXL3 server at TP=1 \
+and the NVFP4 server do)", m.summary()));
+            }
+            Ok(Some(mut m)) if json_schema_enforcement_enabled => {
+                m.set_vocab_table(&schema_vocab_table(&state.tokenizer));
                 crate::reprintln!("[req] response_format: constrained decoding armed ({})", m.summary());
-                schema_mask = Some(std::sync::Arc::new(m));
+                schema_pending = Some(m);
             }
             Ok(Some(m)) => {
                 schema_unenforced = Some(format!(
@@ -1957,6 +2200,14 @@ async fn chat_completions(
     // W1: `chat_template_kwargs` (arbitrary dict → the model's own template). Validate LOUDLY
     // before any render: a malformed value used to be invisible (serde dropped the field), and
     // the customer was left with a model that ignored the request. 400, never accept-and-ignore.
+    let logprobs_n = match chat_logprobs_param(req.logprobs, req.top_logprobs) {
+        Ok(n) => n,
+        Err(msg) => return bad_param(msg),
+    };
+    // Per-token entries carry the generated bytes; a secret the response scrubber removes from the text can
+    // span several tokens, so with the scrubber on (and on an engine without them) the request is served with
+    // logprobs null instead (logprobs_gate: said once, counted).
+    let logprobs_n = logprobs_gate(logprobs_n, &state, req.stream);
     if let Err(e) = crate::tokenizer::enable_thinking_kwarg(req.chat_template_kwargs.as_ref()) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
             "message": e.to_string(), "type": "invalid_request_error", "code": "invalid_chat_template_kwargs",
@@ -2161,6 +2412,37 @@ async fn chat_completions(
     // Sampling: explicit request values win; anything left out takes the server's default for
     // THIS request's mode (the rendered prompt opens a <think> block or it does not).
     let thinking_on = prompt.trim_end().ends_with(state.tokenizer.think_tags().0);
+    // W2-EXL3: a prompt that opens a think block reasons first; the schema applies to the answer
+    // after the think-close token (a single token in the supported tokenizers; if it is not, the
+    // constraint starts at the first token, the previous behaviour).
+    // A schema that cannot be deferred past the reasoning block is not enforced at all (applied
+    // from the first token it would constrain the reasoning instead of the answer).
+    let schema_mask: Option<std::sync::Arc<crate::json_schema::SchemaMask>> = schema_pending.take().and_then(|mut m| {
+        if thinking_on {
+            let close = state.tokenizer.think_tags().1;
+            let why = if !state.schema_defer {
+                Some("this engine cannot start the constraint after the reasoning block (send enable_thinking=false)".to_string())
+            } else {
+                match state.tokenizer.encode(close, false).as_deref() {
+                    Ok([id]) => { m.set_defer_until(Some(*id)); None }
+                    _ => Some(format!("the think-close tag {close:?} is not one token")),
+                }
+            };
+            if let Some(why) = why {
+                crate::reprintln!("[req] response_format: not enforced: {why}");
+                warn_unenforced_schema_once(&why);
+                schema_unenforced = Some(why);
+                return None;
+            }
+        }
+        Some(std::sync::Arc::new(m))
+    });
+    // A constrained answer is a JSON document taken literally: no tool-call parsing, and think
+    // markers inside its strings are text (see `split_constrained`).
+    let literal_content = schema_mask.is_some();
+    // PR #31 port: every json_schema / json_object request counted, enforced or served unconstrained
+    if schema_mask.is_some() || schema_unenforced.is_some() { crate::metrics::schema_request(schema_mask.is_some()); }
+    let parse_as_tool_calls = parse_as_tool_calls && !literal_content;
     let (d_temp, d_top_p, d_top_k) = if thinking_on { state.sampling_defaults.think }
                                      else { state.sampling_defaults.no_think };
     let temperature = req.temperature.unwrap_or(d_temp);
@@ -2223,6 +2505,8 @@ async fn chat_completions(
         image_embeds,
         image_spans,
         schema: schema_mask.clone(),
+        thinking_budget: req.thinking_token_budget,
+        logprobs: logprobs_n,
     };
     if admit_gate_busy() { return server_busy(); } // LR-4: --max-waiting
     // WP02: a DEAD engine or a gone scheduler is a 503, never a request that hangs or reads "length"
@@ -2308,7 +2592,7 @@ async fn chat_completions(
             role_chunk: role_chunk(&completion_id, created, &model_name), // S8: esc(model)
             completion_id, created, model_name, stops,
             think_open, think_close, starts_in_reasoning, tool_hold, parse_as_tool_calls,
-            req_tools, include_usage, prompt_len, t0,
+            literal_content, req_tools, include_usage, prompt_len, t0,
             tool_trace, scrub,
             gen_log: Some(GenLog {
                 tokenizer: Arc::clone(&state.tokenizer), stop_ids: state.stop_ids.clone(),
@@ -2324,12 +2608,16 @@ async fn chat_completions(
             move |t| dec.push(t)
         });
         let mut resp = sse_with_keepalive(stream, sse_keepalive(), ka_frame);
-        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some());
+        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some(), schema_mask.is_some());
         resp
     } else {
         crate::reprintln!("[req] sync   prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
         let t0 = std::time::Instant::now();
         let mut tokens = Vec::new();
+        // log probabilities (logprobs requested): one entry per token, from the Logprob event
+        // the engine sends right before the token
+        let mut lps: Vec<TokLp> = Vec::new();
+        let mut pending_lp: TokLp = None;
         // WP02: a channel closed without a Finish is an engine failure, not "length"
         let mut finish = "error: engine stopped".to_string();
         let mut first_tok: Option<std::time::Instant> = None;
@@ -2346,6 +2634,7 @@ async fn chat_completions(
                 }
                 TokEvent::Tok(t) => {
                     tokens.push(t);
+                    if logprobs_n.is_some() { lps.push(pending_lp.take()); }
                     mt.tok();
                     if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                     // Apply stop strings LIVE, not just post-hoc: on a hit, break AND let rx drop —
@@ -2363,6 +2652,7 @@ async fn chat_completions(
                     }
                 }
                 TokEvent::StopInfo { p, rank, sampled } => { stop_info = Some((p, rank, sampled)); }
+                TokEvent::Logprob { logprob, top } => { pending_lp = Some((logprob, top)); }
                 TokEvent::Finish { reason } => { sched_reason = Some(reason.clone()); finish = reason; break; }
             }
         }
@@ -2390,7 +2680,11 @@ async fn chat_completions(
         // (the same rule as the streaming branch's `starts_in_reasoning`)
         let think_closed = text.contains(think_close);
         let starts_in_reasoning = stream_starts_in_reasoning(&prompt, think_open, family_primed, effort);
-        let (reasoning, content) = split_think_in(&text, think_open, think_close, starts_in_reasoning);
+        let (reasoning, content) = if literal_content {
+            split_constrained(&text, think_close, starts_in_reasoning)
+        } else {
+            split_think_in(&text, think_open, think_close, starts_in_reasoning)
+        };
         // SURFACE2 item 8: the generation ended inside the block (budget exhausted while reasoning,
         // or a stop string hit there) — the text is reasoning, as the streaming branch sends it.
         // The RENDERED PROMPT decides, never the effort arm of `starts_in_reasoning`: with
@@ -2453,6 +2747,10 @@ async fn chat_completions(
             }
         }
         let tool_calls = if tool_calls.is_empty() { None } else { Some(tool_calls) };
+        // the decoded-text span `content` came from (reasoning, tool-call markup and trimmed
+        // whitespace carry no content logprobs)
+        let content_range = logprobs_n
+            .and_then(|_| content_byte_range(&text, content.as_deref().unwrap_or(""), think_close));
 
         // TOOLSCRUB1: emission-side scrub - AFTER the raw-args log above (the server log
         // stays raw, same class as --tool-trace / --dump-tools) and after the trace; only
@@ -2472,6 +2770,16 @@ async fn chat_completions(
                        effort, presence_penalty, pp_source,
                        stop_kind(sched_reason.as_deref(), stop_string_hit), stop_info);
         dump_tokens(&completion_id, &tokens);
+        let logprobs_json = logprobs_n.map(|_| {
+            let Some(range) = content_range.clone() else {
+                crate::reprintln!("[req] logprobs: the content is not one span of the generated text; returning null");
+                return serde_json::Value::Null;
+            };
+            chat_logprobs_json(&state.tokenizer, &state.stop_ids, &tokens, &lps, range).unwrap_or_else(|| {
+                crate::reprintln!("[req] logprobs: the engine sent no entry for some output token(s); returning null");
+                serde_json::Value::Null
+            })
+        });
         let response = ChatCompletionResponse {
             id: completion_id,
             object: "chat.completion".to_string(),
@@ -2485,6 +2793,7 @@ async fn chat_completions(
                 },
                 finish_reason: spec_finish_reason(&finish).to_string(),
                 stop_reason: stop_reason_of(&finish),
+                logprobs: logprobs_json,
             }],
             usage: Usage {
                 prompt_tokens: prompt_len,
@@ -2496,7 +2805,7 @@ async fn chat_completions(
             session_id: otel_session,
         };
         let mut resp = Json(response).into_response();
-        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some());
+        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some(), schema_mask.is_some());
         resp
     }
 }
@@ -2819,6 +3128,16 @@ struct CompletionRequest {
     ignore_eos: Option<bool>,
     #[serde(default)]
     seed: Option<u64>,
+    /// THINKBUDGET1: vLLM's `thinking_token_budget` — the most tokens this request may spend inside
+    /// its reasoning block; at the budget the server emits the end-of-thinking marker and the model
+    /// answers. A non-negative integer, or -1 = unlimited; anything else is a 400 with vLLM's
+    /// message (crate::think_budget). Absent = no budget: the request is served exactly as before.
+    #[serde(default, deserialize_with = "crate::think_budget::deserialize")]
+    thinking_token_budget: Option<usize>,
+    /// Legacy completions `logprobs` (0..=20): return per-token log probabilities with this many
+    /// alternatives (`choices[].logprobs` = tokens / token_logprobs / top_logprobs / text_offset).
+    #[serde(default)]
+    logprobs: Option<u32>,
     /// S-B9-REL-SMALLFIXES item 6: OpenAI streaming options. `include_usage: true` adds the final
     /// usage chunk to a streamed completion (it was accepted and dropped: a known v0.7.3 gap).
     #[serde(default)]
@@ -2844,6 +3163,10 @@ async fn completions(
                                          req.frequency_penalty, req.min_p) {
         return bad_param(msg);
     }
+    let logprobs_n = match completion_logprobs_param(req.logprobs) {
+        Ok(n) => logprobs_gate(n, &state, req.stream),
+        Err(msg) => return bad_param(msg),
+    };
     let prompt_tokens: Vec<u32> = match req.prompt.as_ref() {
         Some(serde_json::Value::String(t)) => match encode_off_thread(&state.tokenizer, t, true).await {
             Ok(v) => v,
@@ -2888,6 +3211,8 @@ async fn completions(
         image_embeds: None,
         image_spans: Vec::new(),
         schema: None,
+        thinking_budget: req.thinking_token_budget,
+        logprobs: logprobs_n,
     };
     if admit_gate_busy() { return server_busy(); } // LR-4: --max-waiting
     let (_mn, _ie) = (request.min_new, request.ignore_eos);
@@ -2922,6 +3247,7 @@ async fn completions(
                         mt.cached(cached_tokens as u64);
                     }
                     TokEvent::StopInfo { .. } => {} // [gen]-line data; this path prints no [gen] line
+                    TokEvent::Logprob { .. } => {} // refused with stream=true (completion_logprobs_param)
                     TokEvent::Tok(t) => {
                         if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                         ntok += 1;
@@ -2968,6 +3294,8 @@ async fn completions(
     }
     // non-streaming: collect everything, detokenize once, single response.
     let mut toks: Vec<u32> = Vec::with_capacity(req_max);
+    let mut lps: Vec<TokLp> = Vec::new();
+    let mut pending_lp: TokLp = None;
     // WP02: an engine error (or a channel closed without a Finish) is an HTTP error, not 200 "stop"
     let mut finish = "error: engine stopped".to_string();
     let mut stop_reason: Option<String> = None;
@@ -2979,7 +3307,8 @@ async fn completions(
                 mt.cached(cached_tokens as u64); // /metrics counter
             }
             TokEvent::StopInfo { .. } => {} // [gen]-line data; this path prints no [gen] line
-            TokEvent::Tok(t) => { toks.push(t); mt.tok(); }
+            TokEvent::Logprob { logprob, top } => { pending_lp = Some((logprob, top)); }
+            TokEvent::Tok(t) => { toks.push(t); lps.push(pending_lp.take()); mt.tok(); }
             TokEvent::Finish { reason } => {
                 stop_reason = stop_reason_of(&reason); // WP08
                 finish = reason;
@@ -3007,6 +3336,13 @@ async fn completions(
     });
     if let Some(r) = stop_reason {
         json["choices"][0]["stop_reason"] = serde_json::json!(r); // WP08
+    }
+    if logprobs_n.is_some() {
+        json["choices"][0]["logprobs"] = completion_logprobs_json(&state.tokenizer, &state.stop_ids, &toks, &lps, &text)
+            .unwrap_or_else(|| {
+                crate::reprintln!("[req] logprobs: the engine sent no entry for some output token(s); returning null");
+                serde_json::Value::Null
+            });
     }
     (StatusCode::OK, axum::Json(json)).into_response()
 }
@@ -3044,6 +3380,48 @@ pub(crate) fn prompt_token_ids(items: &[serde_json::Value], vocab: usize) -> Res
 }
 
 #[cfg(test)]
+mod thinking_budget_parse_tests {
+    use super::{ChatCompletionRequest, CompletionRequest};
+
+    fn chat(v: &str) -> Result<Option<usize>, String> {
+        let body = format!(r#"{{"messages":[],"thinking_token_budget":{v}}}"#);
+        serde_json::from_str::<ChatCompletionRequest>(&body).map(|r| r.thinking_token_budget).map_err(|e| e.to_string())
+    }
+
+    fn completion(v: &str) -> Result<Option<usize>, String> {
+        let body = format!(r#"{{"prompt":"x","thinking_token_budget":{v}}}"#);
+        serde_json::from_str::<CompletionRequest>(&body).map(|r| r.thinking_token_budget).map_err(|e| e.to_string())
+    }
+
+    /// THINKBUDGET1: vLLM's validate_thinking_token_budget, on both endpoints.
+    #[test]
+    fn both_endpoints_follow_vllm() {
+        for f in [chat as fn(&str) -> Result<Option<usize>, String>, completion] {
+            assert_eq!(f("0"), Ok(Some(0)));
+            assert_eq!(f("2048"), Ok(Some(2048)));
+            assert_eq!(f("-1"), Ok(None), "-1 = unlimited");
+            assert_eq!(f("null"), Ok(None));
+            for bad in ["-2", "1.5", "2.0", "true", "\"512\""] {
+                let e = f(bad).unwrap_err();
+                assert!(e.contains(crate::think_budget::INVALID), "{bad}: {e}");
+            }
+        }
+        let c: ChatCompletionRequest = serde_json::from_str(r#"{"messages":[]}"#).unwrap();
+        assert_eq!(c.thinking_token_budget, None, "absent = no budget");
+        let c: CompletionRequest = serde_json::from_str(r#"{"prompt":"x"}"#).unwrap();
+        assert_eq!(c.thinking_token_budget, None);
+    }
+
+    /// Before THINKBUDGET1 the chat struct's catch-all swallowed the field; it must be a real field now.
+    #[test]
+    fn the_field_is_not_an_unused_field_any_more() {
+        let c: ChatCompletionRequest = serde_json::from_str(r#"{"messages":[],"thinking_token_budget":64}"#).unwrap();
+        assert!(!c.unused_fields.contains_key("thinking_token_budget"));
+        assert_eq!(c.thinking_token_budget, Some(64));
+    }
+}
+
+#[cfg(test)]
 mod top_k_parse_tests {
     use super::{ChatCompletionRequest, CompletionRequest};
 
@@ -3078,6 +3456,76 @@ mod top_k_parse_tests {
 }
 
 #[cfg(test)]
+mod logprobs_span_tests {
+    use super::{content_byte_range, logprob_token_span};
+
+    // ids 0..: "Hel", "lo", " wor", "ld", <stop>
+    fn bytes_of(t: u32) -> Vec<u8> {
+        ["Hel", "lo", " wor", "ld", ""][t as usize].as_bytes().to_vec()
+    }
+
+    #[test]
+    fn span_clips_tokens_at_the_range_edges() {
+        let toks = [0u32, 1, 2, 3, 4];
+        // a stop string "lo" cut the text to "Hel"
+        let v = logprob_token_span(bytes_of, &[4], &toks, 0..3);
+        assert_eq!(v, vec![(0, 0, b"Hel".to_vec())]);
+        // a stop string starting inside "lo" ("o w"): "Hello w" -> "Hell"
+        let v = logprob_token_span(bytes_of, &[4], &toks, 0..4);
+        assert_eq!(v, vec![(0, 0, b"Hel".to_vec()), (1, 3, b"l".to_vec())]);
+        // content "world" of "Hello world": starts inside " wor"
+        let v = logprob_token_span(bytes_of, &[4], &toks, 6..11);
+        assert_eq!(v, vec![(2, 5, b"wor".to_vec()), (3, 9, b"ld".to_vec())]);
+        // the whole text; the stop token is not listed
+        assert_eq!(logprob_token_span(bytes_of, &[4], &toks, 0..usize::MAX).len(), 4);
+        // empty content: nothing
+        assert!(logprob_token_span(bytes_of, &[4], &toks, 11..11).is_empty());
+    }
+
+    #[test]
+    fn content_range_skips_reasoning_and_trim() {
+        let t = "thinking about it</think>\n\nThe answer.";
+        let r = content_byte_range(t, "The answer.", "</think>").unwrap();
+        assert_eq!(&t[r], "The answer.");
+        // the same words inside the reasoning are not matched
+        let t = "The answer. maybe</think> The answer.";
+        let r = content_byte_range(t, "The answer.", "</think>").unwrap();
+        assert_eq!(r.start, 26);
+        // no reasoning block
+        assert_eq!(content_byte_range("  hi ", "hi", "</think>"), Some(2..4));
+        // tool-only reply: empty content
+        let t = "<tool_call>x</tool_call>";
+        assert_eq!(content_byte_range(t, "", "</think>"), Some(0..0));
+        // content not one span of the text
+        assert_eq!(content_byte_range("a b", "ab", "</think>"), None);
+    }
+}
+
+#[cfg(test)]
+mod logprobs_param_tests {
+    use super::{chat_logprobs_param, completion_logprobs_param, logprobs_fallback};
+
+    #[test]
+    fn chat_and_completion_logprobs_params() {
+        assert_eq!(chat_logprobs_param(None, None), Ok(None));
+        assert_eq!(chat_logprobs_param(Some(false), None), Ok(None));
+        assert_eq!(chat_logprobs_param(Some(true), None), Ok(Some(0)));
+        assert_eq!(chat_logprobs_param(Some(true), Some(20)), Ok(Some(20)));
+        assert!(chat_logprobs_param(Some(true), Some(21)).is_err());
+        assert!(chat_logprobs_param(None, Some(5)).is_err(), "top_logprobs needs logprobs");
+        assert_eq!(completion_logprobs_param(None), Ok(None));
+        assert_eq!(completion_logprobs_param(Some(5)), Ok(Some(5)));
+        assert!(completion_logprobs_param(Some(21)).is_err());
+        // owner rule (no refusals): what the server cannot return falls back to logprobs null, with a reason
+        assert_eq!(logprobs_fallback(true, false, false), None);
+        assert_eq!(logprobs_fallback(false, false, false).map(|f| f.0), Some("unsupported"));
+        assert_eq!(logprobs_fallback(true, true, false).map(|f| f.0), Some("withheld"));
+        assert_eq!(logprobs_fallback(true, false, true).map(|f| f.0), Some("stream"));
+        assert_eq!(logprobs_fallback(false, true, true).map(|f| f.0), Some("unsupported"), "the engine reason wins");
+    }
+}
+
+#[cfg(test)]
 mod prompt_token_id_tests {
     use super::prompt_token_ids;
     use serde_json::json;
@@ -3095,7 +3543,21 @@ mod prompt_token_id_tests {
 
 #[cfg(test)]
 mod reasoning_start_tests {
-    use super::{split_think_in, stream_starts_in_reasoning};
+    use super::{split_constrained, split_think_in, stream_starts_in_reasoning};
+
+    #[test]
+    fn constrained_reply_keeps_think_markers_literal() {
+        // thinking off: the whole reply is the document, markers inside its strings are text
+        let doc = r#"{"s":"</think>","t":"<think>x"}"#;
+        assert_eq!(split_constrained(doc, "</think>", false), (None, doc.to_string()));
+        // the generic splitter would cut it at the embedded tag
+        assert_ne!(split_think_in(doc, "<think>", "</think>", false).1, doc);
+        // thinking on: reasoning ends at the first close tag; later tags are document text
+        let r = format!("plan it\n</think>\n\n{doc}");
+        assert_eq!(split_constrained(&r, "</think>", true), (Some("plan it".into()), doc.to_string()));
+        // budget exhausted while reasoning: no document
+        assert_eq!(split_constrained("still thinking", "</think>", true), (Some("still thinking".into()), String::new()));
+    }
 
     /// ISSUES 149: a Qwen no-think render (the 0.8B/2B template default) with reasoning_effort
     /// low|high starts in CONTENT; only an open think tag (or hy_v3's effort arm) starts in reasoning.
@@ -4222,6 +4684,7 @@ pub(crate) mod benchfix_sse_tests {
             stops: Vec::new(), think_open: "<think>", think_close: "</think>",
             starts_in_reasoning: sh.thinking,
             tool_hold: sh.tools.then_some(TOOL_OPEN), parse_as_tool_calls: sh.tools,
+            literal_content: false,
             req_tools: sh.tools.then(|| vec![weather]),
             include_usage: sh.usage, prompt_len: 7, t0: std::time::Instant::now(), gen_log: None,
             tool_trace: None,
@@ -5539,5 +6002,35 @@ pub(crate) mod benchfix_sse_tests {
         assert_eq!((n.calls.len(), n.content.as_str()), (1, "Checking."));
         let s = t8_stream(false, true, &t8_cut(hy, &[3])).await;
         assert_eq!((s.calls.len(), s.content.as_str()), (1, "Checking."));
+    }
+}
+
+#[cfg(test)]
+mod loopfix_card_tests {
+    use super::qwen35_card;
+
+    fn dir_with(cfg: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("loopfix_card_{}_{}", std::process::id(), rand::random::<u32>()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("config.json"), cfg).unwrap();
+        d
+    }
+
+    #[test]
+    fn card_by_identity_not_folder_name() {
+        let small = dir_with(r#"{"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","hidden_size":1024,"num_hidden_layers":24}}"#);
+        let two = dir_with(r#"{"model_type":"qwen3_5","text_config":{"hidden_size":2048,"num_hidden_layers":24}}"#);
+        let four = dir_with(r#"{"model_type":"qwen3_5","text_config":{"hidden_size":2560,"num_hidden_layers":32}}"#);
+        let moe = dir_with(r#"{"model_type":"qwen3_5_moe","text_config":{"hidden_size":2048,"num_hidden_layers":40}}"#);
+        let other = dir_with(r#"{"model_type":"hy_v3","hidden_size":1024,"num_hidden_layers":24}"#);
+        let (d, p) = qwen35_card(small.to_str().unwrap()).unwrap();
+        assert_eq!((d.no_think, d.think, p), ((1.0, 1.0, 20), (1.0, 0.95, 20), 2.0));
+        assert_eq!(qwen35_card(two.to_str().unwrap()).unwrap().1, 2.0);
+        let (d, p) = qwen35_card(four.to_str().unwrap()).unwrap();
+        assert_eq!((d.no_think, d.think, p), ((0.7, 0.8, 20), (1.0, 0.95, 20), 1.5));
+        assert_eq!(qwen35_card(moe.to_str().unwrap()).unwrap().1, 1.5);    // 35B-A3B: hidden 2048 but 40 layers
+        assert!(qwen35_card(other.to_str().unwrap()).is_none());
+        assert!(qwen35_card("/nonexistent/loopfix").is_none());
+        for d in [small, two, four, moe, other] { let _ = std::fs::remove_dir_all(d); }
     }
 }

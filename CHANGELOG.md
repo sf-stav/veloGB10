@@ -1,3 +1,170 @@
+## v0.7.9 — NVIDIA FP4-Local support, EXL3 long-context attention, prefix pool, and twelve community issues
+
+The largest release since v0.7.4. It adds a second model family (NVIDIA's
+[Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local)), rewrites
+the EXL3 long-context attention path, adds a cross-lane prefix pool, and closes twelve issues and
+pull requests from the community.
+
+**Thanks to [@andersc](https://github.com/andersc)** for pull requests
+[#30](https://github.com/sf-stav/veloGB10/pull/30) (per-token log probabilities),
+[#31](https://github.com/sf-stav/veloGB10/pull/31) (JSON-schema constrained decoding) and
+[#32](https://github.com/sf-stav/veloGB10/pull/32) (PLE prefill prefetch, fewer shuffles and
+`ldmatrix` in the prefill MoE kernels), all ported with authorship preserved.
+
+**Thanks to [@lesserevil](https://github.com/lesserevil)** for pull request
+[#27](https://github.com/sf-stav/veloGB10/pull/27) (6–8-bit generic trellises and 6-bit expert
+prefill).
+
+**Thanks to [@jeffpeng3](https://github.com/jeffpeng3)** for pull request
+[#36](https://github.com/sf-stav/veloGB10/pull/36) (`--kv-cache q4k`, a 4-bit packed KV cache) and
+for issues [#33](https://github.com/sf-stav/veloGB10/issues/33),
+[#34](https://github.com/sf-stav/veloGB10/issues/34) and
+[#35](https://github.com/sf-stav/veloGB10/issues/35).
+
+**Thanks to [@Gcool100](https://github.com/Gcool100)** for issue
+[#26](https://github.com/sf-stav/veloGB10/issues/26) — a detailed, reproducible TP=2 report that
+found three separate defects.
+
+**Thanks to [@YulRustem](https://github.com/YulRustem)** for issue
+[#28](https://github.com/sf-stav/veloGB10/issues/28) (grammar-constrained decoding).
+
+**Thanks to [@liorm0505](https://github.com/liorm0505)** for issues
+[#37](https://github.com/sf-stav/veloGB10/issues/37) (the OpenAI `developer` role) and
+[#38](https://github.com/sf-stav/veloGB10/issues/38) (PLE sidecar K=8 / turboderp's ng8 packs).
+
+### What this build does NOT do for the posture
+
+Read this first. The posture is `--max-seq-len 262144 --max-batch 4 --max-tokens 65536
+--prefix-cache on --mtp=auto`, thinking on, 1–4 concurrent streamed requests.
+
+- **FP4-Local is TP=1/2/4 on GB10 only.** It is a separate model family; nothing here changes the
+  EXL3 or NVFP4 paths' numerics.
+- **`--kv-cache q4k` is EXL3-only.** It is not available on the NVFP4/BF16/FP8 servers.
+- **q4k at TP=2/TP=4 was never run on hardware.** TP=1 is measured; the multi-machine cells are a
+  named gap (`docs/KV_CACHE_Q4K.md` §8).
+- **EXL3 fractional expert widths (K=2.5/3.5) are TP=1 for all four packs, TP=2 for 3.68+2.68
+  only.** TP=4 is owed.
+- **Fractional-width prefill runs on the wide-tiles HALF body** — there is no fractional
+  `xq_moe_pf` body yet. Correct, not optimal.
+- **`--json-schema-enforce` is a V1 subset** (EXL3 TP=1). An unsupported schema falls back with a
+  warning rather than refusing.
+- **`--chat-template` and `--model-dir <repo-id>` are new surfaces**; the repo-id form resolves
+  from the local HF cache only and never touches the network.
+- **Lane packing still never packs a request carrying a sampler penalty** (the v0.7.4 rule), and
+  TP=4 lane packing was exercised by hand, not by an automated gate chain.
+- **No long soak and no 262K-context cell was run for this release.**
+
+### New: NVIDIA Qwen3.8-Flash-Next-FP4-Local (NVFP4)
+
+A second model family on the EXL3 trunk: ModelOpt NVFP4 packs, CSF scale handling, a dedicated
+forward path (`src/fp4l/`, `src/exl3_forward/fp4l_fwd.rs`, `kernels/gpu_fp4l.cu`), and the shared
+n-gram (PLE) read-ahead. Flags: `--fp4l-plain`, `--fp4l-norms`, `--fp4l-e2m1`, `--fp4l-lm-head`,
+`--fp4l-draft-head`, `--fp4l-prefill-dense`, `--fp4l-mtp-sidecar` (`auto|off` — the pack decides;
+a sidecar is used exactly when the pack ships an `mtp-*.safetensors`). A ModelOpt pack with
+unserved formats is refused **before** TP shipping, with a plain message.
+
+Quality receipts: GSM8K-250 FP4-Local 96.8 % vs EXL3 4.05 96.0 %; against the reference the
+most-exact fraction is 0.0098, closer than NVIDIA's own recommended DGX Spark vLLM recipe
+(0.0155 / 0.0113) on the same samples.
+
+### New: EXL3 long-context attention (split-K dense, on by default)
+
+`--exl3-dense-splitk` is **on by default** for full-attention packs. It decodes q8 K/V once per
+block in the trunk split-K, verifies from 2 rows with a shared read, and pipelines prefill on
+tensor cores (`--exl3-dense-pf-tc`, cross-checked by `--exl3-pf-tc-xcheck`). `--exl3-dense-splitk
+off` keeps the old kernels for A/B.
+
+### New: prefix pool
+
+Prompt state is kept in device memory across lanes: when a lane is taken over, the outgoing
+conversation's positional rows, recurrent snapshot and draft-head planes are copied device-to-device
+into a pool shared by all lanes, and a later prompt starting with a kept prompt is restored with one
+copy instead of a re-prefill. Entries carry the lane's WP16 checkpoints; the memory floor shifts out
+one LRU entry at a time; the pool survives memory pressure and shares rows between related prompts.
+Flags: `--prefix-pool-gb`, `--prefix-pool-floor-gb`.
+
+### New: self-update and boot version notification
+
+`--update` downloads the latest release tarball, verifies it against `SHA256SUMS`, and atomically
+replaces the running binary (`.prev` backup kept). It refuses on a dirty tree or when the executable
+lives in a checkout or `target/`, and refuses on a TP `--node`. The boot banner now reports when a
+newer release exists; `--no-update-check` disables that. Zero new dependencies, zero environment
+reads.
+
+### New: CPU idle waits
+
+`--gpu-wait spin|hybrid` sleeps until just before each call site's predicted end and then spins
+(~0.1–0.2 core instead of a full core); `--proxy-idle-us` makes the TP proxy's idle tier actually
+wait (kernel WFE sequence) with deep sleep after 1 s. MTP calibration and bench timers always spin
+(`SpinScope`), so measurements are unaffected. Both features are opt-in.
+
+### New: EXL3 width coverage
+
+- **K=7 and K=8 routed and MTP experts** (`k2` 14/16) — this is what lets turboderp's ng8 packs
+  serve *with* speculation rather than with the draft head skipped.
+- **Fractional expert widths K=2.5/3.5** — turboderp 2.18 / 2.68 / 3.18 / 3.68 bpw.
+- **K=1.5 and K=2 experts** admitted (coop case-2 bodies).
+- **MTP draft sidecars** with plain-map mirrors and a mixer-patch fallback.
+
+### New: other surfaces
+
+- `--model-dir` accepts a **Hugging Face repo id**, resolved from the local cache (no network).
+- `--chat-template <PATH>` serves a custom chat template, winning over `chat_template.jinja` and
+  `tokenizer_config.json`.
+- `--kv-cache q4k` — 4-bit packed KV on the EXL3 path (144 B/row at head_dim 256 vs q8's 272),
+  admitted to lane packing.
+- `--seedless-seed` — a sampled request that sends no seed gets a fresh one drawn on the head so
+  every TP rank agrees.
+- `--reasoning-config` — vLLM-compatible `thinking_token_budget`.
+- `--version`, a configuration block and boot progress on the banner.
+- RDMA rails are auto-detected; `--rdma-dev` is needed only on a box with two active port pairs.
+
+### Fixes
+
+- **#26 — TP=2 packs with 5-bit experts failed at node boot.** Three separate defects: the
+  host-routed MoE prefill was not EP-wired (now unreachable under EP, with a graceful fallback);
+  the PLE sidecar rejected 3-bit n-gram tables (now `K = 1..=8`); and a boot failure double-panicked
+  in `cudarc`'s destructor (now a clean `eprintln` + exit). A TP head width preflight now refuses an
+  unservable pack in seconds, before the 57.5 GiB first ship. Verified on the reporter's own packs
+  at TP=2: 3.05 bpw 47.1 tok/s, 4.05 bpw 48.4 tok/s, both coherent.
+- **#27 — 6–8-bit generic trellises and 6-bit expert prefill** (PR by @lesserevil).
+- **#28 / #31 — grammar-constrained decoding** via `--json-schema-enforce`.
+- **#30 — per-token log probabilities** (`logprobs` / `top_logprobs`), keeping speculation.
+- **#32 — PLE prefill prefetch** and fewer shuffles / `ldmatrix` in the prefill MoE kernels.
+- **#33 — `--model-dir` accepts an HF repo id.**
+- **#34 — `--chat-template`.**
+- **#35 — `xq_attn_decode_group` resolved one KV slot for the whole group**, so a packed verify's
+  segment B read and wrote segment A's K/V. Now resolved per row.
+- **#36 — `--kv-cache q4k`** (PR by @jeffpeng3).
+- **#37 — HTTP 500 on the OpenAI `developer` role.** Normalized to `system` at request ingest; the
+  pack's template stays strict and unknown roles still fail loudly.
+- **#38 — PLE sidecar rejected K=8 rows**, blocking turboderp's self-calibrated ng8 packs. The
+  admission set is now `K = 1..=8` and pinned by a test so a narrowed check cannot return unnoticed.
+- **TP boot barrier before MTP calibration.** Ranks finish per-rank setup up to ~20 s apart, so the
+  calibration's first all-reduce ran under the 10 s per-step watchdog and fast ranks declared slow
+  ones dead. Seen on 27B-FP8+DF2 TP=4 and 122B-MIXED+DF2 TP=4.
+- **EXL3 packs now ship to TP nodes**; `--kv-cache bf16` falls back to f16 on EXL3; TP nodes install
+  the head's DFlash2 draft block.
+- **1.66 bpw k2=3 serving** fixed (no-op root cause plus fractional bodies), with a k2=16 width
+  guard.
+- **Single-node fit guard** now uses measured transient accounting; the 122B NVFP4 TP=1 loads
+  without `--load-force`.
+- **EXL3 TP=1 clamps the context** instead of refusing when not even one lane fits.
+- **Sampler fixes**: whole-output penalties, random seeds for seedless requests, Qwen3.5 card
+  defaults by model identity.
+- **Probe bitwidths** section 7 now compares against the unrounded f32 oracle.
+
+### Verified
+
+Unit suite 1112 passed / 0 failed. FP4-Local identity and quality checks at TP=1/2/4; EXL3
+split-K attention A/B on hardware; q4k pack probes (`--probe-exl3-pack2` r_mean 1.469 / 0 differing
+live-state words, `--probe-exl3-packstate` PASS) and a serving boot with 2 concurrent sampled
+requests showing `velogb10_lane_pack_active{reason=""} 1` over 70 packed lane rounds; #26 TP=2
+end-to-end on the reporter's packs. Not re-run: TP=4 lane packing under an automated gate chain, any
+262K-context cell, and q4k at TP=2/4.
+
+---
+
 ## v0.7.8 — fix: `top_k` client compatibility (PR #29 by @andersc) + the NVFP4 sampler cap made explicit
 
 Fixes the client-compatibility blocker reported in [#29](https://github.com/sf-stav/veloGB10/pull/29):

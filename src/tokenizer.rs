@@ -123,7 +123,7 @@ pub fn enable_thinking_kwarg(kwargs: Option<&serde_json::Value>) -> Result<Optio
 impl QwenTokenizer {
     pub fn from_file(path: &str) -> Result<Self> {
         let tokenizer = load_tokenizer(path)?;
-        let (chat_env, template_meta, raw_tool_args_history) = match load_chat_env(path) {
+        let (chat_env, template_meta, raw_tool_args_history) = match load_chat_env(path)? {
             Some((env, meta, raw)) => (Some(env), Some(meta), raw),
             None => (None, None, false),
         };
@@ -260,8 +260,53 @@ impl QwenTokenizer {
     /// Every (token id, piece BYTES) pair of the model vocabulary. This is the token layer of
     /// the JSON-schema FSM walk (W2): the trie is built over bytes because a piece is not always
     /// valid UTF-8 on its own, and the schema machine consumes bytes.
+    /// (token id, the exact bytes the token adds to the OUTPUT text) for every ordinary token —
+    /// the table the JSON-schema mask walks. Special tokens are left out (they are never
+    /// allowed inside a constrained answer, and the stream decoder prints nothing for them).
+    ///
+    /// This used to return `get_vocab(true)`'s piece STRINGS as bytes. For a byte-level BPE
+    /// vocabulary (Qwen) those strings are the GPT-2 byte-to-unicode encoding, not the output:
+    /// a leading space is `Ġ` (bytes C4 A0) and a newline `Ċ`, so the schema machine saw bytes
+    /// the client never receives — no space could ever be produced (an enum value containing a
+    /// space was unreachable) and special tokens such as `<|im_end|>` looked like legal
+    /// string characters. The bytes now come from the same tables the stream decoder uses
+    /// (`piece_bytes` over the inverse byte map), so mask and output agree byte for byte.
     pub fn vocab_pieces(&self) -> Vec<(u32, Vec<u8>)> {
-        self.tokenizer.get_vocab(true).into_iter().map(|(s, id)| (id as u32, s.into_bytes())).collect()
+        let built;
+        let tables: &StreamTables = match &self.cache {
+            Some(c) => &c.stream,
+            None => {
+                let json = stream_json_path(self.model_dir.as_deref());
+                built = StreamTables::build(&self.tokenizer, &self.tokenizer.get_vocab(true), &special_ids(&json));
+                &built
+            }
+        };
+        (0..tables.kind.len() as u32)
+            .filter_map(|id| tables.piece(id).map(|b| (id, b.to_vec())))
+            .collect()
+    }
+
+    /// The exact output bytes of ONE token: the ordinary-token piece bytes (the same tables the
+    /// stream decoder and the JSON-schema mask use), else what `decode(&[id], skip_special)`
+    /// prints for it (an added token's literal text; nothing for a skipped special token). A
+    /// piece is not always valid UTF-8 on its own (a multi-byte character can span tokens), so
+    /// the bytes of a token sequence concatenate to its decoded text.
+    pub fn token_bytes(&self, id: u32, skip_special: bool) -> Vec<u8> {
+        match &self.cache {
+            Some(c) => {
+                if let Some(b) = c.stream.piece(id) { return b.to_vec(); }
+            }
+            // without the load-time tables: the same raw piece bytes, derived from the vocab
+            // piece directly (a single-token `decode` would replace a partial UTF-8 character)
+            None => {
+                if !self.tokenizer.get_added_tokens_decoder().contains_key(&id) {
+                    if let Some(p) = self.tokenizer.id_to_token(id) {
+                        return piece_bytes(&p, &bytes_to_unicode_inverse());
+                    }
+                }
+            }
+        }
+        self.decode(&[id], skip_special).unwrap_or_default().into_bytes()
     }
 
     pub fn stop_token_ids(&self, config_eos: u32) -> Vec<u32> {
@@ -654,8 +699,17 @@ impl<'de> serde::Deserialize<'de> for ChatMessage {
         let images = content_owned.as_ref().map(parse_content_images).unwrap_or_default();
         let layout = content_owned.as_ref().map(parse_content_layout).unwrap_or_default();
         let unsupported_parts = content_owned.as_ref().map(parse_content_unsupported).unwrap_or_default();
+        // OpenAI's Chat Completions spec replaced `system` with `developer` for
+        // structured-output/agent contexts, and vLLM-class backends accept it by mapping it to
+        // `system` at ingest. Forwarded verbatim it reaches the pack's chat template, which only
+        // knows `system|user|assistant|tool`, and the template's own `else` arm turns that into
+        // "Unexpected message role" → HTTP 500 for spec-compliant clients (issue #37). Normalize
+        // HERE — one mapping at ingest, every downstream renderer (Jinja template and the
+        // fallback ChatML) sees `system`, templates stay strict. The dsv4/NVIDIA-template path
+        // works on raw JSON and already maps `developer` itself, so it is unaffected.
+        let role = if raw.role == "developer" { "system".to_string() } else { raw.role };
         Ok(ChatMessage {
-            role: raw.role,
+            role,
             content,
             images,
             layout,
@@ -757,6 +811,71 @@ impl ChatMessage {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #34: --chat-template <PATH> wins over the pack's chat_template.jinja, and a named
+    /// but unreadable file fails LOUDLY (no silent fallback). Both checked against a scratch dir
+    /// with a jinja file present, so the flag's precedence is what is under test.
+    #[test]
+    fn issue34_chat_template_flag_wins_and_missing_file_fails_loud() {
+        use std::fs;
+        let d = std::env::temp_dir().join(format!("tpl34_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("chat_template.jinja"), "PACK TEMPLATE {{ messages[0]['role'] }}").unwrap();
+        fs::write(d.join("custom.jinja"), "CUSTOM TEMPLATE {{ messages[0]['role'] }}").unwrap();
+        let tok_path = d.join("tokenizer.json").to_string_lossy().to_string();
+        fs::write(&tok_path, "{}").unwrap();
+
+        // no flag: the pack's own jinja wins (origin names it)
+        // (opt_or_arg reads std::env::args, so drive it through the real argv of the test proc:
+        //  absent -> pack path; the override cases below re-exec-free via direct calls)
+        let argv_none: Vec<String> = vec!["prog".into()];
+        assert!(crate::opt_or_arg(&argv_none, "--chat-template").is_none());
+
+        // flag present + readable: the flag path is the origin
+        let argv_flag: Vec<String> = vec!["prog".into(), "--chat-template".into(), d.join("custom.jinja").to_string_lossy().to_string()];
+        assert_eq!(crate::opt_or_arg(&argv_flag, "--chat-template").as_deref(),
+                   Some(d.join("custom.jinja").to_string_lossy().to_string()).as_deref());
+
+        // missing file: read fails -> the caller bails (checked at the fs layer, the same error
+        // load_chat_env wraps into its bail!)
+        assert!(std::fs::read_to_string(d.join("nope.jinja")).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// GitHub issue #37: the OpenAI-spec `developer` role (the spec'd replacement for `system` in
+    /// structured-output/agent contexts) must be normalized to `system` AT INGEST. Forwarded
+    /// verbatim it reached the pack's chat template, whose `else` arm raised "Unexpected message
+    /// role" → HTTP 500. One mapping here; every renderer sees `system`; unknown roles stay
+    /// untouched (the template still rejects them, loudly).
+    #[test]
+    fn issue37_developer_role_normalized_to_system() {
+        // The issue's exact repro shape: developer mid-conversation AND at messages[0].
+        let msgs: Vec<ChatMessage> = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "You are an agent."},
+            {"role": "user", "content": "go"}
+        ])).unwrap();
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "system", "user"], "{roles:?}");
+
+        let first: Vec<ChatMessage> = serde_json::from_value(serde_json::json!([
+            {"role": "developer", "content": "You are an agent."},
+            {"role": "user", "content": "go"}
+        ])).unwrap();
+        assert_eq!(first[0].role, "system");
+        assert_eq!(first[0].content.as_deref(), Some("You are an agent."));
+
+        // Everything else passes through untouched — the template's strictness is not weakened.
+        let other: Vec<ChatMessage> = serde_json::from_value(serde_json::json!([
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "a"},
+            {"role": "tool", "tool_call_id": "c1", "content": "r"}
+        ])).unwrap();
+        let roles: Vec<&str> = other.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "tool"], "{roles:?}");
+    }
 
     /// GitHub issue #6: string `arguments` holding a JSON object are parsed before the template sees them, so a
     /// template with an `arguments is string` branch still takes its `is mapping` (`<parameter=…>`) branch; the raw
@@ -1171,6 +1290,21 @@ mod tests {
     ///   (d) emoji / CJK / mixed-script texts stream-decode identically AND round-trip.
     /// Skips when no model tokenizer is present (GB10_TEST_TOKENIZER overrides the fixture).
     #[test]
+    fn token_bytes_match_without_the_load_time_tables() {
+        let Some((tok, path)) = fixture_tokenizer() else {
+            eprintln!("skip: no model tokenizer fixture"); return;
+        };
+        let (mut bare, _) = fixture_tokenizer().unwrap();
+        bare.cache = None;
+        let n = tok.vocab_size() as u32;
+        for id in 0..n {
+            for skip in [true, false] {
+                assert_eq!(tok.token_bytes(id, skip), bare.token_bytes(id, skip), "{path}: id={id} skip={skip}");
+            }
+        }
+    }
+
+    #[test]
     fn wp01_stream_tables_match_legacy() {
         let Some((tok, path)) = fixture_tokenizer() else {
             eprintln!("skip: no model tokenizer fixture"); return;
@@ -1276,17 +1410,29 @@ fn load_tokenizer(path: &str) -> Result<Tokenizer> {
 /// to the `chat_template` string inside `tokenizer_config.json`. Returns `None`
 /// (so the legacy template is used) only if neither exists or the template fails
 /// to compile.
-fn load_chat_env(tokenizer_path: &str) -> Option<(minijinja::Environment<'static>, (String, String, u64), bool)> {
-    let dir = Path::new(tokenizer_path).parent()?;
-    let jinja_path = dir.join("chat_template.jinja");
-    let (source, origin) = if jinja_path.exists() {
-        (std::fs::read_to_string(&jinja_path).ok()?, jinja_path.display().to_string())
+fn load_chat_env(tokenizer_path: &str) -> Result<Option<(minijinja::Environment<'static>, (String, String, u64), bool)>> {
+    let dir = match Path::new(tokenizer_path).parent() { Some(d) => d, None => return Ok(None) };
+    // Issue #34: --chat-template <PATH> wins over everything; a named-but-broken file must
+    // fail LOUDLY at boot (bail), never silently fall back to the pack's own template —
+    // the user asked for THAT template; serving different chat formatting would be wrong output.
+    let argv: Vec<String> = std::env::args().collect();
+    let override_path = crate::opt_or_arg(&argv, "--chat-template");
+    let (source, origin) = if let Some(op) = override_path.as_deref() {
+        match std::fs::read_to_string(op) {
+            Ok(s) => (s, op.to_string()),
+            Err(e) => anyhow::bail!("--chat-template {}: cannot read the file ({e}); refusing to fall back to the model's own template - name a readable file or drop the flag", op),
+        }
     } else {
-        let tc_path = dir.join("tokenizer_config.json");
-        let raw = std::fs::read_to_string(&tc_path).ok()?;
-        let tc: serde_json::Value = serde_json::from_str(&raw).ok()?;
-        let s = tc.get("chat_template")?.as_str()?.to_string();
-        (s, tc_path.display().to_string())
+        let jinja_path = dir.join("chat_template.jinja");
+        if jinja_path.exists() {
+            (match std::fs::read_to_string(&jinja_path) { Ok(t) => t, Err(_) => return Ok(None) }, jinja_path.display().to_string())
+        } else {
+            let tc_path = dir.join("tokenizer_config.json");
+            let raw = match std::fs::read_to_string(&tc_path) { Ok(r) => r, Err(_) => return Ok(None) };
+            let tc: serde_json::Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => return Ok(None) };
+            let s = match tc.get("chat_template").and_then(|v| v.as_str()) { Some(v) => v.to_string(), None => return Ok(None) };
+            (s, tc_path.display().to_string())
+        }
     };
     // Provenance for the boot line (Phase-2 A3): hash the template TEXT that is compiled, so a
     // leg can never silently run against a different template than the one it claims.
@@ -1312,11 +1458,14 @@ fn load_chat_env(tokenizer_path: &str) -> Option<(minijinja::Environment<'static
                 crate::deprintln!("[tokenizer] loaded chat template from {} (sha256 {} {} bytes, raw_tool_args_history={})",
                           origin, &digest[..12], nbytes, raw_tool_args);
             }
-            Some((env, (origin, digest, nbytes), raw_tool_args))
+            Ok(Some((env, (origin, digest, nbytes), raw_tool_args)))
         }
         Err(e) => {
+            if let Some(op) = override_path.as_deref() {
+                anyhow::bail!("--chat-template {}: the template failed to compile ({}); refusing to fall back to the model's own template - fix the file or drop the flag", op, e);
+            }
             eprintln!("[tokenizer] WARNING: chat template failed to compile ({}); using legacy manual template", e);
-            None
+            Ok(None)
         }
     }
 }

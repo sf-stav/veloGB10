@@ -72,6 +72,73 @@ static DF2_MASK_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 pub fn df2_round() { DF2_ROUNDS.fetch_add(1, Relaxed); }
 pub fn df2_mask_override(on: bool) { DF2_MASK_OVERRIDE.store(on as u64, Relaxed); }
 
+// TP2BIT5 (#26) / EXL3 width-closure: graceful-fallback engagement counters. AGENTS §1b-bis.2: a
+// feature is done only when its engagement counter is non-zero on the real posture; a counter that
+// never moves is a path that never runs.
+static EXL3_PLE_WIDTH_ACCEPTED: AtomicU64 = AtomicU64::new(0); // B9: a PLE width outside {5,6} loaded and served
+pub fn exl3_ple_width_accepted() { EXL3_PLE_WIDTH_ACCEPTED.fetch_add(1, Relaxed); }
+/// FP4L S5 (shared): the n-gram (PLE) table read-ahead — prefill chunks whose NEXT chunk's n-gram rows were read into
+/// the page cache on background threads while the current chunk ran (SSD-resident table only; 0 = never ran), the
+/// n-gram rows that covered and the deduplicated 4 KB page reads issued. scripts/owner_check.py prints them.
+static PLE_WARM_AHEAD_CHUNKS: AtomicU64 = AtomicU64::new(0);
+static PLE_WARM_AHEAD_ROWS: AtomicU64 = AtomicU64::new(0);
+static PLE_WARM_AHEAD_READS: AtomicU64 = AtomicU64::new(0);
+pub fn ple_warm_ahead(rows: u64, reads: u64) {
+    PLE_WARM_AHEAD_CHUNKS.fetch_add(1, Relaxed);
+    PLE_WARM_AHEAD_ROWS.fetch_add(rows, Relaxed);
+    PLE_WARM_AHEAD_READS.fetch_add(reads, Relaxed);
+}
+
+static EXL3_W4MOE_WIDTH_SERVED: AtomicU64 = AtomicU64::new(0); // B10: persistent grouped experts serving a non-3 width (2,4,5,6,7; 0 = never ran)
+pub fn exl3_w4moe_width_served() { EXL3_W4MOE_WIDTH_SERVED.fetch_add(1, Relaxed); }
+
+static EXL3_DEVROUTE_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static EXL3_FRAC_PF_BRIDGE_ROWS: AtomicU64 = AtomicU64::new(0); // LEG-B: prefill rows served by the fractional-k2 decode-moe bridge
+pub fn exl3_frac_pf_bridge_rows(add: u64) { EXL3_FRAC_PF_BRIDGE_ROWS.fetch_add(add, Relaxed); } // TP-B: host-routed arm asked under TP -> device-routed EP arm ran instead
+pub fn exl3_devroute_fallback() { EXL3_DEVROUTE_FALLBACK.fetch_add(1, Relaxed); }
+
+static EXL3_NGRAM_EMBED_ROWS: AtomicU64 = AtomicU64::new(0); // 1.66-class packs: token-embed rows decoded by the ngram codec at load (0 = plain embed path)
+pub fn exl3_ngram_embed_decoded(rows: u64) { EXL3_NGRAM_EMBED_ROWS.fetch_add(rows, Relaxed); }
+static EXL3_MTP_SKIPPED: AtomicU64 = AtomicU64::new(0); // #26 Fix 4: boots whose draft head exceeds the served width set -> served WITHOUT speculation
+pub fn exl3_mtp_skipped() { EXL3_MTP_SKIPPED.fetch_add(1, Relaxed); }
+static EXL3_PF_KERNEL_WIDTH_FALLBACK: AtomicU64 = AtomicU64::new(0);
+// TPSHIP (2026-11-07): EXL3 boots asked for --kv-cache bf16 (no EXL3 store) and served f16 instead (AGENTS 1b-bis.8).
+static EXL3_KV_CACHE_FALLBACK: AtomicU64 = AtomicU64::new(0);
+pub fn exl3_kv_cache_fallback() { EXL3_KV_CACHE_FALLBACK.fetch_add(1, Relaxed); } // #26 Fix 3: a prefill layer asked for the pipelined expert kernel (3/4-bit) and was served by the wide tiles kernel (3..5) instead
+pub fn exl3_pf_kernel_width_fallback() { EXL3_PF_KERNEL_WIDTH_FALLBACK.fetch_add(1, Relaxed); }
+
+// K35 (2026-10-31): fractional-width (K = 1.5 / 2.5 / 3.5 = k2 3 / 5 / 7) routed-expert serving receipts, by k2.
+// EXL3_FRAC_EXPERT_ROUNDS = MoE layer rounds whose experts ran the fractional grouped body (decode, verify, MTP draft,
+// the prefill bridge): eager calls plus graph replays x the rounds each captured graph holds (a capture executes
+// nothing and is not counted; the capture sites take the per-capture tally into the CudaGraph). EXL3_FRAC_PF_WIDE_ROWS
+// = prefill expert rows served by the fractional wide-tiles body (exl3_hmma_gemm_wide_tiles, EXL3_FRAC_BITS case).
+// 0 everywhere = the fractional path never ran (AGENTS §4: identical hashes are not a liveness receipt).
+// K8EXP (2026-11-07): the same tally also counts the newly admitted INTEGER widths K = 7 / 8 (k2 14 / 16), published as
+// velogb10_exl3_k78_expert_rounds_total; the arrays are indexed by k2 (0..=16), so EXL3_WIDTH_SLOTS = 17.
+pub const EXL3_WIDTH_SLOTS: usize = 17;
+static EXL3_FRAC_EXPERT_ROUNDS: [AtomicU64; EXL3_WIDTH_SLOTS] = [const { AtomicU64::new(0) }; EXL3_WIDTH_SLOTS];
+static EXL3_FRAC_PF_WIDE_ROWS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+// PFHALF (2026-11-06): prefill expert rows served by the PIPELINED kernel's HALF body (xq_moe_pf, EXL3_FRAC_BITS case).
+static EXL3_FRAC_PF_PIPE_ROWS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+thread_local! { static EXL3_FRAC_CAPTURE: std::cell::Cell<[u32; EXL3_WIDTH_SLOTS]> = const { std::cell::Cell::new([0; EXL3_WIDTH_SLOTS]) }; }
+pub fn exl3_frac_expert_round(k2: usize, capturing: bool) {
+    if k2 >= EXL3_WIDTH_SLOTS { return; }
+    if capturing {
+        EXL3_FRAC_CAPTURE.with(|c| { let mut v = c.get(); v[k2] += 1; c.set(v); });
+    } else {
+        EXL3_FRAC_EXPERT_ROUNDS[k2].fetch_add(1, Relaxed);
+    }
+}
+/// Capture bookkeeping: reset right after cuStreamBeginCapture, take at the instantiation (the rounds the graph holds).
+pub fn exl3_frac_capture_reset() { EXL3_FRAC_CAPTURE.with(|c| c.set([0; EXL3_WIDTH_SLOTS])); }
+pub fn exl3_frac_capture_take() -> [u32; EXL3_WIDTH_SLOTS] { EXL3_FRAC_CAPTURE.with(|c| c.replace([0; EXL3_WIDTH_SLOTS])) }
+pub fn exl3_frac_expert_rounds_replayed(n: &[u32; EXL3_WIDTH_SLOTS]) {
+    for (k2, v) in n.iter().enumerate() { if *v > 0 { EXL3_FRAC_EXPERT_ROUNDS[k2].fetch_add(*v as u64, Relaxed); } }
+}
+pub fn exl3_frac_pf_wide_rows(k2: usize, rows: u64) { if k2 < 8 { EXL3_FRAC_PF_WIDE_ROWS[k2].fetch_add(rows, Relaxed); } }
+pub fn exl3_frac_pf_pipe_rows(k2: usize, rows: u64) { if k2 < 8 { EXL3_FRAC_PF_PIPE_ROWS[k2].fetch_add(rows, Relaxed); } }
+pub fn exl3_frac_expert_rounds(k2: usize) -> u64 { if k2 < EXL3_WIDTH_SLOTS { EXL3_FRAC_EXPERT_ROUNDS[k2].load(Relaxed) } else { 0 } }
+
 // --draft-vocab (FR-Spec, opt-in): the reduced draft head's size (0 = not built: the drafter reads the
 // full vocabulary) and the MTP draft tokens it picked. scripts/owner_check.py prints both.
 static DRAFT_VOCAB_ROWS: AtomicU64 = AtomicU64::new(0);
@@ -88,6 +155,22 @@ static MAX_BATCH: AtomicU64 = AtomicU64::new(0);
 /// F2: the `--max-batch` the command line asked for, BEFORE the EXL3 server's 16-lane cap. A number
 /// here above `velogb10_max_batch` means the boot was capped (the boot log prints the line).
 static MAX_BATCH_REQUESTED: AtomicU64 = AtomicU64::new(0);
+/// DSPLITK (owner 2026-11-07): trunk dense split-K attention launches (eager calls and graph captures; replays
+/// of a captured graph are not counted). Absent = --exl3-dense-splitk off or no dense layer served.
+static EXL3_DENSE_SPLITK_CALLS: AtomicU64 = AtomicU64::new(0);
+/// PFTC (owner 2026-11-07): prefill rows whose dense attention ran on the tensor-core kernels (eager prefill;
+/// graph replays are not a prefill path). Absent = --exl3-dense-pf-tc off or no such layer served.
+static EXL3_PF_TC_ROWS: AtomicU64 = AtomicU64::new(0);
+pub fn exl3_pf_tc_rows(n: u64) { EXL3_PF_TC_ROWS.fetch_add(n, Relaxed); }
+pub fn exl3_dense_splitk_call() { EXL3_DENSE_SPLITK_CALLS.fetch_add(1, Relaxed); }
+/// CTXCLAMP (owner 2026-11-07): an EXL3 TP = 1 boot whose asked --max-seq-len did not fit even one lane booted with one
+/// lane at the longest context that fits; asked / served (0 / 0 = no context clamp on this boot).
+static EXL3_CTX_ASKED: AtomicU64 = AtomicU64::new(0);
+static EXL3_CTX_SERVED: AtomicU64 = AtomicU64::new(0);
+pub fn set_exl3_ctx_clamped(asked: usize, served: usize) {
+    EXL3_CTX_ASKED.store(asked as u64, Relaxed);
+    EXL3_CTX_SERVED.store(served as u64, Relaxed);
+}
 
 /// F2: record the uncapped `--max-batch` the argv asked for (next to the served lane capacity).
 pub fn set_max_batch_requested(n: usize) {
@@ -106,6 +189,74 @@ static OVER_CAP_REJECTED: AtomicU64 = AtomicU64::new(0);
 /// top-k truncation (0, or a negative value the server maps to 0) or a top_k above the kernels'
 /// 64-candidate limit; served with top_k 64 (`crate::sampler::gpu_top_k`).
 static TOP_K_CAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// THINKBUDGET1: requests that carried `thinking_token_budget` and had it applied (the server's model
+/// has reasoning markers and the serving path supports the budget).
+static THINK_BUDGET_APPLIED: AtomicU64 = AtomicU64::new(0);
+/// THINKBUDGET1: requests that carried a budget the serving path could not apply (another model
+/// family's scheduler, or a model without reasoning markers): served without it, said once per boot.
+static THINK_BUDGET_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+/// THINKBUDGET1: reasoning blocks the budget ended (the end-of-thinking marker forced).
+static THINK_BUDGET_FORCED: AtomicU64 = AtomicU64::new(0);
+
+/// PR #30 port: requests that asked for log probabilities, by outcome (`logprobs_request`).
+static LOGPROBS_SERVED: AtomicU64 = AtomicU64::new(0);
+static LOGPROBS_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+static LOGPROBS_WITHHELD: AtomicU64 = AtomicU64::new(0);
+static LOGPROBS_STREAM: AtomicU64 = AtomicU64::new(0);
+/// PR #31 port: `response_format` json_schema requests: enforced (token mask armed) / unenforced (served with
+/// `x-json-schema-enforced: none`: enforcement off, schema not compiled, engine or reasoning mode cannot apply it).
+static SCHEMA_ENFORCED: AtomicU64 = AtomicU64::new(0);
+static SCHEMA_UNENFORCED: AtomicU64 = AtomicU64::new(0);
+/// PR #30 / #31 ports: EXL3 lanes that decoded WITHOUT speculation because the request asked for log probabilities
+/// or a schema mask (the verify rows are not read back / masked yet): the speed those requests pay.
+static SPEC_OFF_LOGPROBS: AtomicU64 = AtomicU64::new(0);
+static SPEC_OFF_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+/// PR #30 port: one logprobs request's outcome: "served", "unsupported" (engine), "withheld" (scrubber), "stream".
+pub fn logprobs_request(disposition: &str) {
+    let c = match disposition {
+        "served" => &LOGPROBS_SERVED,
+        "unsupported" => &LOGPROBS_UNSUPPORTED,
+        "withheld" => &LOGPROBS_WITHHELD,
+        _ => &LOGPROBS_STREAM,
+    };
+    c.fetch_add(1, Relaxed);
+}
+
+/// Logprobs with speculation (owner 2026-11-02): emitted tokens whose log probabilities came from a speculative round's
+/// verify rows (the liveness receipt of the path: zero while no logprobs request ran a speculative round).
+static LOGPROBS_SPEC_ROWS: AtomicU64 = AtomicU64::new(0);
+pub fn logprobs_spec_rows(n: u64) {
+    LOGPROBS_SPEC_ROWS.fetch_add(n, Relaxed);
+}
+
+/// PR #31 port: one json_schema request, enforced or served unconstrained.
+pub fn schema_request(enforced: bool) {
+    let c = if enforced { &SCHEMA_ENFORCED } else { &SCHEMA_UNENFORCED };
+    c.fetch_add(1, Relaxed);
+}
+
+/// PR #30 / #31 ports: one lane admitted without speculation for log probabilities (`schema` false) or a schema.
+pub fn spec_off_lane(schema: bool) {
+    let c = if schema { &SPEC_OFF_SCHEMA } else { &SPEC_OFF_LOGPROBS };
+    c.fetch_add(1, Relaxed);
+}
+
+/// THINKBUDGET1: a request's thinking budget was applied.
+pub fn think_budget_applied() {
+    THINK_BUDGET_APPLIED.fetch_add(1, Relaxed);
+}
+
+/// THINKBUDGET1: a request's thinking budget could not be applied (served without it).
+pub fn think_budget_unsupported() {
+    THINK_BUDGET_UNSUPPORTED.fetch_add(1, Relaxed);
+}
+
+/// THINKBUDGET1: the budget ended one reasoning block.
+pub fn think_budget_forced() {
+    THINK_BUDGET_FORCED.fetch_add(1, Relaxed);
+}
 
 /// TOPKM1: count one request whose top_k the batched GPU samplers capped at 64 (owner_check prints it).
 pub fn top_k_capped() {
@@ -129,7 +280,7 @@ pub fn over_cap_rejected() {
 }
 
 /// F3: EXL3 prefill-chain GEMMs that a module the wide trellis kernel cannot decode (bit width
-/// outside 3..=5) served through the reconstruct + cuBLASLt arm instead of the arm the option asked
+/// outside 3..=7 since P7 B5) served through the reconstruct + cuBLASLt arm instead of the arm the option asked
 /// for, by the module's bit width (`velogb10_exl3_recon_forced_total`).
 static RECON_FORCED: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
@@ -138,6 +289,33 @@ pub fn exl3_recon_forced(bits: i32) {
     let b = bits as usize;
     if (1..RECON_FORCED.len()).contains(&b) {
         RECON_FORCED[b].fetch_add(1, Relaxed);
+    }
+}
+
+/// P7 B6: PSK grids refused by the width guard in `psk_grid` (bit width outside 2..=6): the
+/// chain falls back to the plain split-K grid (`exl3_hmma_gemm_ks`), correct but without the
+/// persistent-grid scheduling. By bit width (`velogb10_exl3_psk_width_fallback_total`).
+static PSK_WIDTH_FALLBACK: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// P7 B6: count one PSK width-guard fallback for a module of this bit width (1..=9; others ignored).
+pub fn exl3_psk_width_fallback(bits: i32) {
+    let b = bits as usize;
+    if (1..PSK_WIDTH_FALLBACK.len()).contains(&b) {
+        PSK_WIDTH_FALLBACK[b].fetch_add(1, Relaxed);
+    }
+}
+
+/// PCKG-ALL (2026-10-30): WP21 fused split-K (exl3_hmma_gemm_ks_fx*) refused for a module
+/// whose k2 is outside the fused bodies (3..=14; k2 16 = the 4.18bpw 8-bit MTP head):
+/// served by the plain 3-launch tail instead (which carries case 16). By k2
+/// (`velogb10_exl3_wp21_width_fallback_total`); the boot log prints one WARN, first time.
+static WP21_WIDTH_FALLBACK: [AtomicU64; 33] = [const { AtomicU64::new(0) }; 33];
+
+/// PCKG-ALL: count one WP21 width-guard refusal for a module of this k2 (1..=32; else ignored).
+pub fn exl3_wp21_width_fallback(k2: i32) {
+    let b = k2 as usize;
+    if (1..WP21_WIDTH_FALLBACK.len()).contains(&b) {
+        WP21_WIDTH_FALLBACK[b].fetch_add(1, Relaxed);
     }
 }
 static TTFT: Hist<12> = Hist::new(&TTFT_S);
@@ -291,6 +469,43 @@ pub fn kv_spill_hit(tokens: u64) {
     KV_SPILL_SAVED.fetch_add(tokens, Relaxed);
 }
 pub fn kv_spill_miss_recompute() { KV_SPILL_MISSES.fetch_add(1, Relaxed); }
+// PFXPOOL: the prefix pool (prompt states kept in memory across lanes, --prefix-pool-gb).
+pub static PFX_POOL_CAP: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_ENTRIES: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_CAPTURES: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_CAPTURE_US: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_SKIPS: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_REFUSED: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+/// PFXPOOL2: entry slabs one box freed on its own because it went under the pool's memory floor.
+pub static PFX_POOL_EMERGENCY: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_HITS: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_HIT_TOKENS: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_RESTORE_US: AtomicU64 = AtomicU64::new(0);
+pub static PFX_POOL_MISSES: AtomicU64 = AtomicU64::new(0);
+/// PFXPOOL: the pool's state after a change (bytes held, entries) and its cap.
+pub fn pfx_pool_state(cap: u64, bytes: u64, entries: u64) {
+    PFX_POOL_CAP.store(cap, Relaxed);
+    PFX_POOL_BYTES.store(bytes, Relaxed);
+    PFX_POOL_ENTRIES.store(entries, Relaxed);
+}
+/// PFXPOOL: a lane's outgoing prompt state was copied into the pool (`us` = the in-round copy time).
+pub fn pfx_pool_capture(us: u64) { PFX_POOL_CAPTURES.fetch_add(1, Relaxed); PFX_POOL_CAPTURE_US.fetch_add(us, Relaxed); }
+/// PFXPOOL: not captured because the pool already holds these tokens, or the prompt is too short to be worth it.
+pub fn pfx_pool_skip() { PFX_POOL_SKIPS.fetch_add(1, Relaxed); }
+/// PFXPOOL: not captured: larger than the cap, the memory floor (on any rank), or a copy that failed (on any rank).
+pub fn pfx_pool_refused() { PFX_POOL_REFUSED.fetch_add(1, Relaxed); }
+pub fn pfx_pool_evict(n: u64) { PFX_POOL_EVICTIONS.fetch_add(n, Relaxed); }
+pub fn pfx_pool_emergency(n: u64) { PFX_POOL_EMERGENCY.fetch_add(n, Relaxed); }
+/// PFXPOOL: a prompt resumed from a pool entry (`tokens` not prefilled again, `us` = the restore copy time).
+pub fn pfx_pool_hit(tokens: u64, us: u64) {
+    PFX_POOL_HITS.fetch_add(1, Relaxed);
+    PFX_POOL_HIT_TOKENS.fetch_add(tokens, Relaxed);
+    PFX_POOL_RESTORE_US.fetch_add(us, Relaxed);
+}
+/// PFXPOOL: the lane's own snapshot missed and no pool entry (deeper than the lane's WP16 checkpoint) matched.
+pub fn pfx_pool_miss() { PFX_POOL_MISSES.fetch_add(1, Relaxed); }
 /// LANERES3: a TP capture dropped because at least one rank's local write failed (agreed
 /// across ranks; the key is forgotten everywhere — the policy stays replicated-identical).
 pub fn kv_spill_capture_peer_drop() { KV_SPILL_CAPTURE_PEER_DROPS.fetch_add(1, Relaxed); }
@@ -352,6 +567,42 @@ pub fn set_graph_entries(n: u64) { GRAPH_ENTRIES.store(n, Relaxed); }
 static MIXED_STEP_GRAPHS: AtomicU64 = AtomicU64::new(0);
 pub fn mixed_step_graph_captured() -> u64 { MIXED_STEP_GRAPHS.fetch_add(1, Relaxed) + 1 }
 pub fn mixed_step_graphs() -> u64 { MIXED_STEP_GRAPHS.load(Relaxed) }
+
+/// FP4L (nvidia/Qwen3.8-Flash-Next-FP4-Local): host DISPATCHES of the FP4-Local weight kernels by
+/// weight class [mxfp8, f16, bf16 (stored bits), nvfp4-experts] x row class [decode m = 1, verify/packed 2..=16, prefill > 16].
+/// A CUDA-graph replay re-runs captured kernels without a host dispatch, so in graphed steady decode these
+/// grow at capture only; `velogb10_fp4l_pack` + the trunk's step / round counters are the served-traffic
+/// receipts (every linear of an FP4-Local model is an FP4L weight).
+static FP4L_DISPATCH: [[AtomicU64; 3]; 5] = [const { [const { AtomicU64::new(0) }; 3] }; 5];
+/// 1 once an FP4-Local pack is loaded (the feature marker the boot also prints).
+static FP4L_PACK: AtomicU64 = AtomicU64::new(0);
+/// FP4L precision levers (PLAN/FP4L_DESIGN.md §3a): the resolved values, set once at load.
+static FP4L_PREC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// FP4L: host dispatches of the exact-precision TWINS of trunk kernels, by op (same capture caveat as
+/// FP4L_DISPATCH): [hc_mixer, hc_norm, hc_mix, embed, shared_gate, ple, router].
+pub const FP4L_TWIN_OPS: [&str; 7] = ["hc_mixer", "hc_norm", "hc_mix", "embed", "shared_gate", "ple", "router"];
+static FP4L_TWIN: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+fn fp4l_row_class(m: usize) -> usize { if m <= 1 { 0 } else if m <= 16 { 1 } else { 2 } }
+/// FP4L: one dense GEMM dispatch of weight class `kind` ("mxfp8" | "f16" | "bf16") at `m` rows.
+pub fn fp4l_gemm(kind: &str, m: usize) {
+    let k = match kind { "mxfp8" => 0, "bf16" => 2, "trellis" => 4, _ => 1 };
+    FP4L_DISPATCH[k][fp4l_row_class(m)].fetch_add(1, Relaxed);
+}
+/// FP4L: one NVFP4 routed-expert layer dispatch at `m` rows (prefill passes m > 16).
+pub fn fp4l_moe(m: usize) { FP4L_DISPATCH[3][fp4l_row_class(m)].fetch_add(1, Relaxed); }
+/// FP4L: an FP4-Local pack was loaded.
+pub fn fp4l_pack_loaded() { FP4L_PACK.store(1, Relaxed); }
+/// FP4L: one dispatch of an exact-precision twin (`op` = one of FP4L_TWIN_OPS).
+pub fn fp4l_twin(op: &str) {
+    if let Some(i) = FP4L_TWIN_OPS.iter().position(|o| *o == op) { FP4L_TWIN[i].fetch_add(1, Relaxed); }
+}
+/// FP4L: the resolved precision levers (once, at load).
+pub fn fp4l_precision(plain_exact: bool, norms_f32: bool, lm_head: &str, draft_head: &str, prefill_exact: bool) {
+    let _ = FP4L_PREC.set(format!("plain=\"{}\",norms=\"{}\",lm_head=\"{lm_head}\",draft_head=\"{draft_head}\",prefill_dense=\"{}\"",
+                                  if plain_exact { "exact" } else { "f16" }, if norms_f32 { "f32" } else { "f16" },
+                                  if prefill_exact { "exact" } else { "lt" }));
+}
 /// S-B9-REL-VISIONFIX2 V2b: CUDA graph captures that produced no graph. A capture ends
 /// `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED` when a CUDA call that is illegal inside stream capture lands in
 /// the capture window: from another thread (the vision tower, measured in
@@ -787,6 +1038,62 @@ pub fn render(engine_alive: bool) -> String {
     }
     o.push_str("# HELP velogb10_df2_rounds_total DFlash2 draft rounds served on this boot (the --draft-dir speculator; nvfp4 trunk-path arm; scripts/owner_check.py prints it).\n# TYPE velogb10_df2_rounds_total counter\n");
     o.push_str(&format!("velogb10_df2_rounds_total {}\n", DF2_ROUNDS.load(Relaxed)));
+    o.push_str("# HELP velogb10_tp_proxy_parks_total CPUIDLE: times a TP proxy on this process left its spin for the idle tier (a WFE wait after --proxy-idle-us with no epoch owed). 0 on a TP server that has sat idle = the tier never ran; it should grow about once per quiet gap (between requests), not once per step.\n# TYPE velogb10_tp_proxy_parks_total counter\n");
+    o.push_str(&format!("velogb10_tp_proxy_parks_total {}\n", crate::net::proxy_parks()));
+    o.push_str("# HELP velogb10_tp_proxy_parked_seconds_total CPUIDLE: seconds TP proxies on this process spent in the idle tier instead of spinning a core.\n# TYPE velogb10_tp_proxy_parked_seconds_total counter\n");
+    o.push_str(&format!("velogb10_tp_proxy_parked_seconds_total {:.3}\n", crate::net::proxy_parked_secs()));
+    {
+        let (w, slept, early) = crate::host_wait::counters();
+        o.push_str("# HELP velogb10_gpu_wait_hybrid_waits_total CPUIDLE --gpu-wait hybrid: GPU waits that slept part of the wait instead of spinning (0 with requests served = the hybrid wait never ran: --gpu-wait spin, or no wait was long enough).\n# TYPE velogb10_gpu_wait_hybrid_waits_total counter\n");
+        o.push_str(&format!("velogb10_gpu_wait_hybrid_waits_total {w}\n"));
+        o.push_str("# HELP velogb10_gpu_wait_slept_seconds_total CPUIDLE: seconds the waiting thread slept instead of spinning a core.\n# TYPE velogb10_gpu_wait_slept_seconds_total counter\n");
+        o.push_str(&format!("velogb10_gpu_wait_slept_seconds_total {slept:.3}\n"));
+        o.push_str("# HELP velogb10_gpu_wait_early_total CPUIDLE: hybrid waits whose GPU finished before the spin window opened (each one woke up to one 200 us slice late; should stay a small fraction of the waits).\n# TYPE velogb10_gpu_wait_early_total counter\n");
+        o.push_str(&format!("velogb10_gpu_wait_early_total {early}\n"));
+    }
+    o.push_str("# HELP velogb10_exl3_ple_width_accepted_total PLE n-gram rows whose group width K was outside {5,6} but inside 1..=8, loaded and served (B9 width closure; 0 = never ran).\n# TYPE velogb10_exl3_ple_width_accepted_total counter\n");
+    o.push_str(&format!("velogb10_exl3_ple_width_accepted_total {}\n", EXL3_PLE_WIDTH_ACCEPTED.load(Relaxed)));
+    o.push_str("# HELP velogb10_ple_warm_ahead_chunks_total prefill chunks whose next chunk's n-gram (PLE) rows were read ahead into the page cache (SSD-resident table only; 0 = never ran).\n# TYPE velogb10_ple_warm_ahead_chunks_total counter\n");
+    o.push_str(&format!("velogb10_ple_warm_ahead_chunks_total {}\n", PLE_WARM_AHEAD_CHUNKS.load(Relaxed)));
+    o.push_str("# HELP velogb10_ple_warm_ahead_rows_total n-gram (PLE) rows covered by the read-ahead.\n# TYPE velogb10_ple_warm_ahead_rows_total counter\n");
+    o.push_str(&format!("velogb10_ple_warm_ahead_rows_total {}\n", PLE_WARM_AHEAD_ROWS.load(Relaxed)));
+    o.push_str("# HELP velogb10_ple_warm_ahead_reads_total deduplicated 4 KB page reads the read-ahead issued.\n# TYPE velogb10_ple_warm_ahead_reads_total counter\n");
+    o.push_str(&format!("velogb10_ple_warm_ahead_reads_total {}\n", PLE_WARM_AHEAD_READS.load(Relaxed)));
+    o.push_str("# HELP velogb10_exl3_w4moe_width_served_total persistent grouped-expert (--w4moe) launches at a non-3 expert width (B10 width closure; 0 = never ran).\n# TYPE velogb10_exl3_w4moe_width_served_total counter\n");
+    o.push_str(&format!("velogb10_exl3_w4moe_width_served_total {}\n", EXL3_W4MOE_WIDTH_SERVED.load(Relaxed)));
+    o.push_str("# HELP velogb10_exl3_devroute_fallback_total #26 TP-B: prefill rounds that asked for the host-routed MoE arm under TP and were served by the device-routed EP arm instead (one clear line at boot; this counter moves when it ran).\n# TYPE velogb10_exl3_devroute_fallback_total counter\n");
+    o.push_str(&format!("velogb10_exl3_devroute_fallback_total {}\n", EXL3_DEVROUTE_FALLBACK.load(Relaxed)));
+    o.push_str("# HELP velogb10_exl3_pf_kernel_width_fallback_total #26 Fix 3: prefill layers whose width the pipelined expert kernel (xq_moe_pf*: K 2..7 and 1.5/2.5/3.5) cannot decode, served by the wide tiles kernel instead (one clear line per boot; 0 = never ran).\n# TYPE velogb10_exl3_pf_kernel_width_fallback_total counter\n");
+    o.push_str(&format!("velogb10_exl3_pf_kernel_width_fallback_total {}\n", EXL3_PF_KERNEL_WIDTH_FALLBACK.load(Relaxed)));
+    o.push_str("# HELP velogb10_exl3_kv_cache_fallback_total EXL3 boots that were asked for --kv-cache bf16 (the EXL3 engine has no bf16 KV store) and served f16 instead (the same 2 bytes per value; one clear line at boot). 0 = never happened.\n# TYPE velogb10_exl3_kv_cache_fallback_total counter\n");
+    o.push_str(&format!("velogb10_exl3_kv_cache_fallback_total {}\n", EXL3_KV_CACHE_FALLBACK.load(Relaxed)));
+
+    o.push_str("# HELP velogb10_exl3_mtp_skipped_total #26 Fix 4: boots whose draft head exceeded the served width set and were served WITHOUT speculation\n# TYPE velogb10_exl3_mtp_skipped_total counter\n");
+    o.push_str(&format!("velogb10_exl3_mtp_skipped_total {}\n", EXL3_MTP_SKIPPED.load(Relaxed)));
+    o.push_str("# HELP velogb10_exl3_ngram_embed_rows_total Token-embedding rows decoded from ngram trellis rings at load (exl3 1.6.3 packs; 0 = the plain embed path ran).\n# TYPE velogb10_exl3_ngram_embed_rows_total counter\n");
+    o.push_str(&format!("velogb10_exl3_ngram_embed_rows_total {}\n", EXL3_NGRAM_EMBED_ROWS.load(Relaxed)));
+    o.push_str("# HELP velogb10_exl3_frac_pf_bridge_rows_total Prefill rows served by the fractional-k2 decode-moe bridge (LEG-B; no pf kernel decodes k2=3/5/7).\n# TYPE velogb10_exl3_frac_pf_bridge_rows_total counter\n");
+    o.push_str(&format!("velogb10_exl3_frac_pf_bridge_rows_total {}\n", EXL3_FRAC_PF_BRIDGE_ROWS.load(Relaxed)));
+    o.push_str("# HELP velogb10_exl3_frac_expert_rounds_total K35: MoE layer rounds whose routed experts ran the fractional-width grouped body (K = 1.5/2.5/3.5, label k2 = 3/5/7; decode, verify, MTP draft and the prefill bridge; eager calls plus graph replays — a capture executes nothing and is not counted). Absent = that width never served.\n# TYPE velogb10_exl3_frac_expert_rounds_total counter\n");
+    for k2 in 0..8usize {
+        let v = EXL3_FRAC_EXPERT_ROUNDS[k2].load(Relaxed);
+        if v > 0 { o.push_str(&format!("velogb10_exl3_frac_expert_rounds_total{{k2=\"{k2}\"}} {v}\n")); }
+    }
+    o.push_str("# HELP velogb10_exl3_k78_expert_rounds_total K8EXP: MoE layer rounds whose routed experts are K = 7 or K = 8 (label k2 = 14 / 16; decode, verify, MTP draft; eager calls plus graph replays). K = 7 runs the integer expert family (a1b7 / WP20 b7); K = 8 runs the plain grouped chain on its own entry (xq_gemm_grouped_b8). Absent = that width never served.\n# TYPE velogb10_exl3_k78_expert_rounds_total counter\n");
+    for k2 in [14usize, 16] {
+        let v = EXL3_FRAC_EXPERT_ROUNDS[k2].load(Relaxed);
+        if v > 0 { o.push_str(&format!("velogb10_exl3_k78_expert_rounds_total{{k2=\"{k2}\"}} {v}\n")); }
+    }
+    o.push_str("# HELP velogb10_exl3_frac_pf_wide_rows_total K35: prefill expert rows (token x top-k) served by the fractional-width wide-tiles body (exl3_hmma_gemm_wide_tiles, EXL3_FRAC_BITS case), by k2. Absent = no fractional prefill ran there (the bridge counter above covers the host-routed arm).\n# TYPE velogb10_exl3_frac_pf_wide_rows_total counter\n");
+    for k2 in 0..8usize {
+        let v = EXL3_FRAC_PF_WIDE_ROWS[k2].load(Relaxed);
+        if v > 0 { o.push_str(&format!("velogb10_exl3_frac_pf_wide_rows_total{{k2=\"{k2}\"}} {v}\n")); }
+    }
+    o.push_str("# HELP velogb10_exl3_frac_pf_pipelined_rows_total PFHALF: prefill expert rows (token x top-k) served by the pipelined kernel's fractional-width HALF body (xq_moe_pf, EXL3_FRAC_BITS case), by k2. Absent = no fractional layer prefilled on the pipelined kernel (it took the wide-tiles body above, or never ran).\n# TYPE velogb10_exl3_frac_pf_pipelined_rows_total counter\n");
+    for k2 in 0..8 {
+        let v = EXL3_FRAC_PF_PIPE_ROWS[k2].load(Relaxed);
+        if v > 0 { o.push_str(&format!("velogb10_exl3_frac_pf_pipelined_rows_total{{k2=\"{k2}\"}} {v}\n")); }
+    }
     o.push_str("# HELP velogb10_df2_mask_row_override 1 if the draft's mask row measured DAMAGED at load and the artifact's BF16 copy override is engaged (0 otherwise).\n# TYPE velogb10_df2_mask_row_override gauge\n");
     o.push_str(&format!("velogb10_df2_mask_row_override {}\n", DF2_MASK_OVERRIDE.load(Relaxed)));
     o.push_str("# HELP velogb10_draft_vocab_rows Token ids the MTP drafter may propose (--draft-vocab, FR-Spec); 0 = no reduced draft head, the drafter reads the full vocabulary.\n# TYPE velogb10_draft_vocab_rows gauge\n");
@@ -802,6 +1109,15 @@ pub fn render(engine_alive: bool) -> String {
     let req = MAX_BATCH_REQUESTED.load(Relaxed);
     o.push_str("# HELP velogb10_max_batch_requested The --max-batch the command line asked for, before the 16-lane serving cap (EXL3 and NVFP4 trunk servers; PREHARD1).\n# TYPE velogb10_max_batch_requested gauge\n");
     o.push_str(&format!("velogb10_max_batch_requested {req}\n"));
+    let dsk = EXL3_DENSE_SPLITK_CALLS.load(Relaxed);
+    o.push_str("# HELP velogb10_exl3_dense_splitk_calls_total DSPLITK: EXL3 trunk dense-attention calls served split-K over the context (--exl3-dense-splitk on; eager calls and graph captures, replays not counted). Absent = never.\n# TYPE velogb10_exl3_dense_splitk_calls_total counter\n");
+    if dsk > 0 { o.push_str(&format!("velogb10_exl3_dense_splitk_calls_total {dsk}\n")); }
+    let (ca, cs) = (EXL3_CTX_ASKED.load(Relaxed), EXL3_CTX_SERVED.load(Relaxed));
+    o.push_str("# HELP velogb10_exl3_ctx_clamped 1 when this EXL3 TP=1 boot could not fit even one lane at the asked --max-seq-len and booted one lane at the longest context that fits (CTXCLAMP, owner 2026-11-07); labels: asked, served. Absent = no context clamp.\n# TYPE velogb10_exl3_ctx_clamped gauge\n");
+    if ca > 0 { o.push_str(&format!("velogb10_exl3_ctx_clamped{{asked=\"{ca}\",served=\"{cs}\"}} 1\n")); }
+    let pft = EXL3_PF_TC_ROWS.load(Relaxed);
+    o.push_str("# HELP velogb10_exl3_pf_tc_rows_total PFTC: EXL3 prefill rows (per attention layer) whose dense attention ran on the tensor-core kernels (--exl3-dense-pf-tc on). Absent = never.\n# TYPE velogb10_exl3_pf_tc_rows_total counter\n");
+    if pft > 0 { o.push_str(&format!("velogb10_exl3_pf_tc_rows_total {pft}\n")); }
     o.push_str(&format!("# HELP velogb10_requests_running Requests holding a lane.\n# TYPE velogb10_requests_running gauge\nvelogb10_requests_running {running}\n"));
     o.push_str(&format!("# HELP velogb10_requests_waiting Requests queued for a lane.\n# TYPE velogb10_requests_waiting gauge\nvelogb10_requests_waiting {}\n",
                         inflight - running));
@@ -813,6 +1129,25 @@ pub fn render(engine_alive: bool) -> String {
     // TOPKM1: the batched GPU samplers' top_k cap (0 / negative / > 64 -> 64). scripts/owner_check.py prints it.
     o.push_str("# HELP velogb10_top_k_capped_total Sampled requests that asked for no top-k truncation (top_k 0 or negative) or more than 64 candidates on a model family whose GPU sampler keeps at most 64; served with top_k 64 (the EXL3 server and --cpu-sample apply no such limit).\n# TYPE velogb10_top_k_capped_total counter\n");
     o.push_str(&format!("velogb10_top_k_capped_total {}\n", TOP_K_CAPPED.load(Relaxed)));
+    // THINKBUDGET1: the per-request thinking budget (vLLM's thinking_token_budget). scripts/owner_check.py prints it.
+    o.push_str("# HELP velogb10_thinking_budget_requests_total Requests that sent thinking_token_budget: applied = the budget was enforced; unsupported = this model or serving path cannot enforce it, so the request ran without it.\n# TYPE velogb10_thinking_budget_requests_total counter\n");
+    o.push_str(&format!("velogb10_thinking_budget_requests_total{{disposition=\"applied\"}} {}\n", THINK_BUDGET_APPLIED.load(Relaxed)));
+    o.push_str(&format!("velogb10_thinking_budget_requests_total{{disposition=\"unsupported\"}} {}\n", THINK_BUDGET_UNSUPPORTED.load(Relaxed)));
+    o.push_str("# HELP velogb10_thinking_budget_forced_total Reasoning blocks the thinking budget ended (the end-of-thinking marker was emitted by the server at the budget).\n# TYPE velogb10_thinking_budget_forced_total counter\n");
+    o.push_str(&format!("velogb10_thinking_budget_forced_total {}\n", THINK_BUDGET_FORCED.load(Relaxed)));
+    // PR #30 / #31 ports: log probabilities, json_schema enforcement, and the lanes they ran without speculation.
+    o.push_str("# HELP velogb10_logprobs_requests_total Requests that asked for logprobs: served = returned; unsupported = this serving engine does not compute them; withheld = --scrub-tool-secrets is on; stream = stream=true, not wired yet. All but served get logprobs null.\n# TYPE velogb10_logprobs_requests_total counter\n");
+    for (d, c) in [("served", &LOGPROBS_SERVED), ("unsupported", &LOGPROBS_UNSUPPORTED), ("withheld", &LOGPROBS_WITHHELD), ("stream", &LOGPROBS_STREAM)] {
+        o.push_str(&format!("velogb10_logprobs_requests_total{{disposition=\"{d}\"}} {}\n", c.load(Relaxed)));
+    }
+    o.push_str("# HELP velogb10_logprobs_spec_rows_total Generated tokens whose log probabilities were read from a speculative round's verify rows (logprobs keep speculation).\n# TYPE velogb10_logprobs_spec_rows_total counter\n");
+    o.push_str(&format!("velogb10_logprobs_spec_rows_total {}\n", LOGPROBS_SPEC_ROWS.load(Relaxed)));
+    o.push_str("# HELP velogb10_json_schema_requests_total response_format json_schema requests: enforced = token mask armed (x-json-schema-enforced: full); unenforced = served unconstrained (x-json-schema-enforced: none).\n# TYPE velogb10_json_schema_requests_total counter\n");
+    o.push_str(&format!("velogb10_json_schema_requests_total{{disposition=\"enforced\"}} {}\n", SCHEMA_ENFORCED.load(Relaxed)));
+    o.push_str(&format!("velogb10_json_schema_requests_total{{disposition=\"unenforced\"}} {}\n", SCHEMA_UNENFORCED.load(Relaxed)));
+    o.push_str("# HELP velogb10_spec_off_lanes_total EXL3 lanes that decoded without speculation because the request asked for logprobs or a schema mask.\n# TYPE velogb10_spec_off_lanes_total counter\n");
+    o.push_str(&format!("velogb10_spec_off_lanes_total{{why=\"logprobs\"}} {}\n", SPEC_OFF_LOGPROBS.load(Relaxed)));
+    o.push_str(&format!("velogb10_spec_off_lanes_total{{why=\"schema\"}} {}\n", SPEC_OFF_SCHEMA.load(Relaxed)));
     // CLIPRUNE1: rendered since it was set (F7b) but never shown — scripts/owner_check.py
     // already reads it and tolerates absence; keep that guard working.
     o.push_str("# HELP velogb10_unknown_options Unknown '--' options seen at startup (warned and ignored; F7b).\n# TYPE velogb10_unknown_options gauge\n");
@@ -937,14 +1272,46 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str("# HELP velogb10_lane_pack_active 1 when lane packing (--lane-pack, on by default) is ACTIVE on this boot (packed rounds can run); 0 when this boot serves without packed rounds: reason = why (the boot line prints the same), or `--lane-pack off`.\n# TYPE velogb10_lane_pack_active gauge\n");
     o.push_str(&format!("velogb10_lane_pack_active{{reason=\"{}\"}} {}\n",
                         lpr.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"), lpa));
-    // F3: modules the wide trellis kernel cannot decode (widths outside 3..=5) served through the
+    // F3: modules the wide trellis kernel cannot decode (widths outside 3..=7 since P7 B5) served through the
     // reconstruct + cuBLASLt arm whatever --exl3-recon-min said; 0 on a 3-, 4- or 5-bit pack.
-    o.push_str("# HELP velogb10_exl3_recon_forced_total EXL3 prefill-chain GEMMs that a module the wide trellis kernel cannot decode (bit width outside 3..=5) served through the reconstruct + cuBLASLt arm instead of the arm --exl3-recon-min asked for, by the module's bit width. The boot log prints the once-per-boot line the first time it happens.\n# TYPE velogb10_exl3_recon_forced_total counter\n");
+    o.push_str("# HELP velogb10_exl3_recon_forced_total EXL3 prefill-chain GEMMs that a module the wide trellis kernel cannot decode (bit width outside 3..=7 since P7 B5) served through the reconstruct + cuBLASLt arm instead of the arm --exl3-recon-min asked for, by the module's bit width. The boot log prints the once-per-boot line the first time it happens.\n# TYPE velogb10_exl3_recon_forced_total counter\n");
+    o.push_str("# HELP velogb10_exl3_psk_width_fallback_total EXL3 split-K chains that asked for the persistent PSK grid (--psk=1) but whose module bit width is outside the persistent bodies (2..=6): served by the plain split-K grid instead, by bit width. The boot log prints the once-per-boot line the first time it happens.\n# TYPE velogb10_exl3_psk_width_fallback_total counter\n");
+    o.push_str("# HELP velogb10_exl3_wp21_width_fallback_total EXL3 split-K chains that were eligible for the WP21 fused kernel but whose module k2 is outside the fused bodies (3..=14, e.g. k2 16 = the 8-bit MTP-head class): served by the plain 3-launch tail instead, by k2. The boot log prints one WARN the first time it happens.\n# TYPE velogb10_exl3_wp21_width_fallback_total counter\n");
+    for (b, c) in PSK_WIDTH_FALLBACK.iter().enumerate().skip(1) {
+        let v = c.load(Relaxed);
+        if v > 0 {
+            o.push_str(&format!("velogb10_exl3_psk_width_fallback_total{{bits=\"{b}\"}} {v}\n"));
+        }
+    }
+    for (b, c) in WP21_WIDTH_FALLBACK.iter().enumerate().skip(1) {
+        let v = c.load(Relaxed);
+        if v > 0 {
+            o.push_str(&format!("velogb10_exl3_wp21_width_fallback_total{{k2=\"{b}\"}} {v}\n"));
+        }
+    }
     for b in 1..RECON_FORCED.len() {
         let v = RECON_FORCED[b].load(Relaxed);
         if v > 0 {
             o.push_str(&format!("velogb10_exl3_recon_forced_total{{bits=\"{b}\"}} {v}\n"));
         }
+    }
+    o.push_str("# HELP velogb10_fp4l_pack 1 when the served model is an FP4-Local (NVIDIA ModelOpt MXFP8 + NVFP4) pack.\n# TYPE velogb10_fp4l_pack gauge\n");
+    o.push_str(&format!("velogb10_fp4l_pack {}\n", FP4L_PACK.load(Relaxed)));
+    o.push_str("# HELP velogb10_fp4l_dispatch_total FP4-Local weight-kernel host dispatches by weight class (mxfp8 dense, f16 dense, bf16 = stored bf16 bits, nvfp4 experts, exl3_mtp_sidecar = the opt-in EXL3 trellis MTP-head linears of --fp4l-mtp-sidecar) and row class (decode = 1 row, verify = 2..16 rows incl. packed lanes, prefill = more). Graph replays do not dispatch from the host: in graphed decode these grow at capture.\n# TYPE velogb10_fp4l_dispatch_total counter\n");
+    for (ki, kn) in ["mxfp8", "f16", "bf16", "nvfp4_experts", "exl3_mtp_sidecar"].iter().enumerate() {
+        for (ri, rn) in ["decode", "verify", "prefill"].iter().enumerate() {
+            let v = FP4L_DISPATCH[ki][ri].load(Relaxed);
+            if v > 0 { o.push_str(&format!("velogb10_fp4l_dispatch_total{{weights=\"{kn}\",rows=\"{rn}\"}} {v}\n")); }
+        }
+    }
+    if let Some(p) = FP4L_PREC.get() {
+        o.push_str("# HELP velogb10_fp4l_precision The FP4-Local precision levers this boot resolved (--fp4l-plain, --fp4l-norms, --fp4l-lm-head, --fp4l-draft-head, --fp4l-prefill-dense); the value is always 1.\n# TYPE velogb10_fp4l_precision gauge\n");
+        o.push_str(&format!("velogb10_fp4l_precision{{{p}}} 1\n"));
+    }
+    o.push_str("# HELP velogb10_fp4l_twin_total Host dispatches of the FP4-Local exact-precision twins of trunk kernels by op (stored bf16 mixers / router / embedding / shared gate / n-gram weights, fp32 norms). 0 under --fp4l-plain f16 --fp4l-norms f16. Graph replays do not dispatch from the host: in graphed decode these grow at capture.\n# TYPE velogb10_fp4l_twin_total counter\n");
+    for (i, op) in FP4L_TWIN_OPS.iter().enumerate() {
+        let v = FP4L_TWIN[i].load(Relaxed);
+        if v > 0 { o.push_str(&format!("velogb10_fp4l_twin_total{{op=\"{op}\"}} {v}\n")); }
     }
     o.push_str("# HELP velogb10_log_lines_dropped_total Log lines dropped because whatever reads the server's output stalled (the log queue was full).\n# TYPE velogb10_log_lines_dropped_total counter\n");
     o.push_str(&format!("velogb10_log_lines_dropped_total {}\n", crate::logq::dropped()));
@@ -989,6 +1356,20 @@ pub fn render(engine_alive: bool) -> String {
             o.push_str(&format!("velogb10_naive_prefix_reused_tokens_total {}\n", NAIVE_PREFIX_REUSED.load(Relaxed)));
         }
     }
+    o.push_str("# HELP velogb10_prefix_pool Prefix pool: prompt states kept in memory across lanes (--prefix-pool-gb). cap/bytes/entries = now; captures = lane states copied in (capture_us_total = their in-round copy time); skips = already held or too short; refused = over the cap, under the memory floor, or a failed copy (any rank); hits = prompts resumed from an entry (hit_tokens = prompt tokens not read again; restore_us_total = the copy time); misses = no lane snapshot and no entry deeper than the lane's own checkpoint\n");
+    o.push_str(&format!("velogb10_prefix_pool_cap_bytes {}\n", PFX_POOL_CAP.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_bytes {}\n", PFX_POOL_BYTES.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_entries {}\n", PFX_POOL_ENTRIES.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_captures_total {}\n", PFX_POOL_CAPTURES.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_capture_us_total {}\n", PFX_POOL_CAPTURE_US.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_skips_total {}\n", PFX_POOL_SKIPS.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_refused_total {}\n", PFX_POOL_REFUSED.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_evictions_total {}\n", PFX_POOL_EVICTIONS.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_emergency_frees_total {}\n", PFX_POOL_EMERGENCY.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_hits_total {}\n", PFX_POOL_HITS.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_hit_tokens_total {}\n", PFX_POOL_HIT_TOKENS.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_restore_us_total {}\n", PFX_POOL_RESTORE_US.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefix_pool_misses_total {}\n", PFX_POOL_MISSES.load(Relaxed)));
     o.push_str("# HELP velogb10_kv_spill SSD spill tier for evicted lane snapshots (--kv-spill)\n");
     o.push_str(&format!("velogb10_kv_spill_writes_total {}\n", KV_SPILL_WRITES.load(Relaxed)));
     o.push_str("# HELP velogb10_prefill_interleave_steps_total Decode steps run between prefill chunks of joining prompts (--prefill-interleave)\n");

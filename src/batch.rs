@@ -66,6 +66,13 @@ pub enum TokEvent {
     /// Log-only: it feeds `stop_p` / `stop_rank` / `stop_p_law` of the `[gen]` line. An engine
     /// that never sends it logs `na` for all three.
     StopInfo { p: f32, rank: u32, sampled: bool },
+    /// Sent right BEFORE the `Tok` it describes, only for a request that asked for log
+    /// probabilities (`BatchRequest::logprobs`) on an engine that computes them: the natural log
+    /// of the emitted token's probability and the `top` most likely alternatives (token id,
+    /// logprob; most likely first). Computed by a log-softmax over the step's logits row after
+    /// the repetition / presence / frequency penalties and any JSON-schema mask, before
+    /// temperature and top-k / top-p / min-p truncation.
+    Logprob { logprob: f32, top: Vec<(u32, f32)> },
 }
 
 /// A request submitted to the scheduler.
@@ -106,6 +113,15 @@ pub struct BatchRequest {
     /// Compiled ONCE by the server from `response_format`; the scheduler advances it per committed
     /// token and hands the sampler a per-step vocabulary mask.
     pub schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
+    /// THINKBUDGET1: vLLM's `thinking_token_budget` (None = unlimited / not sent): the most tokens
+    /// the request may spend inside its reasoning block before the server forces the end marker.
+    /// Enforced by the EXL3 server (crate::think_budget); other schedulers serve without it and
+    /// say so once (velogb10_thinking_budget_requests_total{disposition="unsupported"}).
+    pub thinking_budget: Option<usize>,
+    /// Log probabilities for every emitted token: `Some(n)` = send a `TokEvent::Logprob` before
+    /// each `Tok`, with the n (0..=20) most likely alternatives. `None` = none (no extra work).
+    /// Honoured by the EXL3 serve path at TP=1 (such a lane decodes plain, no speculation).
+    pub logprobs: Option<u8>,
 }
 
 struct Lane {
@@ -126,6 +142,11 @@ struct Lane {
     min_new: usize,
     ignore_eos: bool,
     history: Vec<u32>,
+    /// LOOPFIX (2026-11-06): tokens ever pushed into `history` (monotonic) and how many of them the
+    /// device's whole-output penalty counts already hold (`BatchScheduler::pen_sync`). `history` is
+    /// trimmed, but never below the not-yet-counted tail (`hist_trim`).
+    pen_total: u64,
+    pen_synced: u64,
     /// W2 (Phase 13): the request's compiled JSON-schema FSM (None = unconstrained) and the
     /// machine's CURRENT state, advanced once per COMMITTED token.
     schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
@@ -169,9 +190,42 @@ struct Lane {
     tp_cancelled: bool,
 }
 
+/// LOOPFIX: how many of the oldest `history` entries `Lane::hist_trim` drops — the pre-LOOPFIX rule
+/// (drop 128 once past 256) but never into the `pending` tail the device counts still lack.
+fn hist_trim_cut(len: usize, pending: usize) -> usize {
+    if len > 256 { 128usize.min(len.saturating_sub(pending)) } else { 0 }
+}
+
+/// LOOPFIX: the per-column extra tokens of a chain verify penalty (`make_penalty_drafts`), [cap][pe]
+/// -1 padded: column c adds drafts[0..c] (what plain decode would have emitted before it); columns
+/// past the verify width n = drafts + 1 repeat the deepest prefix.
+fn pen_draft_extras(drafts: &[u32], cap: usize, pe: usize) -> Vec<i32> {
+    let n = (drafts.len() + 1).min(cap);
+    let mut extra = vec![-1i32; cap * pe];
+    for c in 0..cap {
+        let k = c.min(n - 1).min(pe);
+        for j in 0..k { extra[c * pe + j] = drafts[j] as i32; }
+    }
+    extra
+}
+
 impl Lane {
     fn has_penalty(&self) -> bool {
         self.rep_penalty > 1.0 || self.presence_penalty > 0.0 || self.frequency_penalty > 0.0
+    }
+    /// Commit `t` to the lane's output history (every emit site goes through here).
+    fn hist_push(&mut self, t: u32) {
+        self.history.push(t);
+        self.pen_total += 1;
+        // A lane without a penalty never reads the device counts: keep it "synced" so `pen_sync`
+        // has nothing to upload and the trim stays as before.
+        if !self.has_penalty() { self.pen_synced = self.pen_total; }
+    }
+    /// Bound `history` (it also feeds the MTP head's draft-side window) exactly as before — drop the
+    /// oldest 128 once it passes 256 — but never drop a token the whole-output counts lack.
+    fn hist_trim(&mut self) {
+        let cut = hist_trim_cut(self.history.len(), (self.pen_total - self.pen_synced) as usize);
+        if cut > 0 { self.history.drain(0..cut); }
     }
     /// A lane runs on the MTP path iff its MTP KV was primed at admit AND the policy is currently
     /// active. Whether it then verifies greedily (bitwise lossless) or stochastically
@@ -1120,8 +1174,8 @@ pub struct BatchScheduler {
     /// Persistent penalty buffers for the MTP verify path (depth positions). Filled per-step from
     /// the lane's committed history so greedy MTP lanes keep their repetition/presence/frequency
     /// penalty (no repetition). Stored on the compute stream's device.
-    mtp_pen_tokens: Option<cudarc::driver::CudaSlice<i32>>,  // [depth * MAX_PEN_TOKENS]
-    mtp_pen_counts: Option<cudarc::driver::CudaSlice<i16>>,  // [depth * MAX_PEN_TOKENS]
+    mtp_pen_slots: Option<cudarc::driver::CudaSlice<i32>>,   // [MAX_VERIFY] (LOOPFIX: column -> lane slot)
+    mtp_pen_extra: Option<cudarc::driver::CudaSlice<i32>>,   // [MAX_VERIFY * PEN_EXTRA] (preceding drafts)
     mtp_pen_rep: Option<cudarc::driver::CudaSlice<f32>>,     // [depth]
     mtp_pen_presence: Option<cudarc::driver::CudaSlice<f32>>, // [depth]
     mtp_pen_freq: Option<cudarc::driver::CudaSlice<f32>>,    // [depth]
@@ -1490,7 +1544,7 @@ impl BatchScheduler {
         // GPU garbage in unwritten MTP KV positions would yield nondeterministic drafts. Zero on the
         // COMPUTE stream (ordered with all later kernels), then sync.
         let (mtp_kc, mtp_vc, mtp_h_prev, mtp_h_save, mtp_h_scratch, mtp_cur_hidden,
-             mtp_pen_tokens, mtp_pen_counts, mtp_pen_rep, mtp_pen_presence, mtp_pen_freq,
+             mtp_pen_slots, mtp_pen_extra, mtp_pen_rep, mtp_pen_presence, mtp_pen_freq,
              mtp_draft_pen_tokens, mtp_draft_pen_counts, mtp_draft_pen_rep, mtp_draft_pen_presence,
              mtp_draft_pen_freq) =
             if mtp_has_head {
@@ -1534,8 +1588,10 @@ impl BatchScheduler {
                 // Sized to MAX_VERIFY (not just the chain depth): a FOREST verify has up to MAX_VERIFY
                 // columns spanning several lanes, each column carrying ITS lane's penalty (per-column).
                 let pcap = crate::gpu::MAX_VERIFY;
-                let pen_tokens = dev.alloc_zeros::<i32>(pcap * mp).unwrap();
-                let pen_counts = dev.alloc_zeros::<i16>(pcap * mp).unwrap();
+                // LOOPFIX: whole-output verify penalty = per-column (lane slot, preceding drafts);
+                // the per-slot state itself lives in DecodeBuffers (pen_cnt_dev / pen_pbits_dev).
+                let pen_tokens = dev.htod_sync_copy(&vec![-1i32; pcap]).unwrap();
+                let pen_counts = dev.htod_sync_copy(&vec![-1i32; pcap * crate::gpu::PEN_EXTRA]).unwrap();
                 let pen_rep = dev.alloc_zeros::<f32>(pcap).unwrap();
                 let pen_presence = dev.alloc_zeros::<f32>(pcap).unwrap();
                 let pen_freq = dev.alloc_zeros::<f32>(pcap).unwrap();
@@ -1614,8 +1670,8 @@ impl BatchScheduler {
             audit_bufs,
             audit_cur: (0..max_batch).map(|_| None).collect(),
             audit_req_n: 0,
-            mtp_pen_tokens,
-            mtp_pen_counts,
+            mtp_pen_slots,
+            mtp_pen_extra,
             mtp_pen_rep,
             mtp_pen_presence,
             mtp_pen_freq,
@@ -1732,6 +1788,19 @@ impl BatchScheduler {
     /// that iteration's `decode_step`), so a co-resident lane's next token waited for the whole
     /// prompt — measured at 25,370 ms across a 16,800-token admission (P0). Now it waits for at
     /// most one window (12.6 s), and the window formula itself is unchanged (§3.2).
+    /// LOOPFIX (2026-11-06): a request taken off the server channel (single node, or the TP head —
+    /// never a mirror, which replays the head's shipped WireRequest). A request without a `seed`
+    /// gets a fresh random one HERE, before the head ships its `Admit`, so every rank samples the
+    /// same stream (`--seedless-seed random`, the default; the EXL3 server's `entropy_seed` rule).
+    /// `--seedless-seed prompt-hash` keeps the old behaviour: `admit` derives the seed from a hash
+    /// of the prompt, so an identical request always returns identical text.
+    fn intake(mut req: BatchRequest) -> BatchRequest {
+        if req.seed.is_none() && !matches!(crate::opts::var(crate::opt!("seedless-seed")).as_deref(), Ok("prompt-hash")) {
+            req.seed = Some(rand::random::<u64>());
+        }
+        req
+    }
+
     pub async fn run(mut self) {
         self.tp_drill_notice();   // S-B9-CF-AGREE16B (W3): a lockstep drill flag at TP=1 is INERT, said once
         let mut oc_last: usize = 0; // PREHARD1 [ISSUES 104]: over-cap arrival accounting state
@@ -1751,14 +1820,14 @@ impl BatchScheduler {
                   && self.num_active() + usize::from(self.pf.is_some()) < self.max_batch
                   && self.lanes[self.num_active()].is_none() {
                 match self.rx.try_recv() {
-                    Ok(req) => self.admit(req),
+                    Ok(req) => self.admit(Self::intake(req)),
                     Err(_) => break,
                 }
             }
             if self.num_active() == 0 && self.pf.is_none() {
                 crate::metrics::sched_idle(); // v0.7.3 gauge: about to block for work
                 match self.rx.recv().await {
-                    Some(req) => self.admit(req),
+                    Some(req) => self.admit(Self::intake(req)),
                     // Fall THROUGH (no `continue`): the cursor just created must get its first
                     // window this iteration, or the loop blocks on an empty channel forever.
                     None => break,
@@ -1926,7 +1995,8 @@ impl BatchScheduler {
                     let projected = self.num_active() + pending.len() + usize::from(self.pf.is_some());
                     if projected >= self.max_batch || self.lanes[projected].is_some() { break; }
                     match self.rx.try_recv() {
-                        Ok(req) => pending.push(req),
+                        // rejected here, before any `Admit` is shipped: the mirror would admit it
+                        Ok(req) => pending.extend(Self::refuse_logprobs(Self::intake(req))),
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => { closed = true; break; }
                     }
@@ -1936,7 +2006,7 @@ impl BatchScheduler {
                 if self.num_active() == 0 && pending.is_empty() && self.pf.is_none() && !closed {
                     crate::metrics::sched_idle(); // H3: about to block for work (busy must not stick at 1)
                     match self.rx.recv().await {
-                        Some(req) => pending.push(req),
+                        Some(req) => pending.extend(Self::refuse_logprobs(Self::intake(req))),
                         None => closed = true,
                     }
                 }
@@ -2126,6 +2196,8 @@ impl BatchScheduler {
                 image_embeds: None,
                 image_spans: Vec::new(),
                 schema: None,
+                thinking_budget: None,
+                logprobs: None,
             });
             // The bench harness has no scheduler loop of its own, so it drains the cursor inline —
             // the SAME window sequence (one window per call), just without interleaving. This keeps
@@ -2151,6 +2223,7 @@ impl BatchScheduler {
                     // #8.2: admission telemetry — no action for a bench drain.
                     TokEvent::Admitted { .. } => {}
                     TokEvent::StopInfo { .. } => {} // [gen]-line data only
+                    TokEvent::Logprob { .. } => {} // not requested by this drain
                 }
             }
             // Keep the source set for the next job's ADMIT (the lane priming consults it).
@@ -2174,7 +2247,21 @@ impl BatchScheduler {
     /// (the TP node mirror — the flag arrives via TpConfig; on the head it is implied by the dump).
     pub fn set_cov_trace(&mut self, on: bool) { self.cov_trace = on; }
 
+    /// This scheduler does not compute log probabilities (the EXL3 serve path does). PR #30 port, owner rule
+    /// (fall back, never refuse): the request is served without them. The HTTP layer already decides this
+    /// (AppState logprobs_ok = false: `logprobs: null`, counted); this is the backstop for direct callers.
+    fn refuse_logprobs(mut req: BatchRequest) -> Option<BatchRequest> {
+        if req.logprobs.take().is_some() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::reprintln!("[serve] logprobs: this scheduler computes none; such requests are served \
+without them (this line prints once per boot)"));
+        }
+        Some(req)
+    }
+
     fn admit(&mut self, req: BatchRequest) {
+        crate::think_budget::note_unsupported(req.thinking_budget, "NVFP4"); // THINKBUDGET1: the EXL3 server enforces it
+        let Some(req) = Self::refuse_logprobs(req) else { return };
         // W2: the request's compiled schema (moved into the lane below).
         let req_schema = req.schema.clone();
         // R9: register the live gpu+state once so net::agree's mismatch path can dump GDN state.
@@ -2677,7 +2764,8 @@ impl BatchScheduler {
             }
             _ => None,
         };
-        // Seed: use the explicit seed from the request, or derive from prompt hash + counter.
+        // Seed: the request's (a seedless request got a random one at `intake`), else — only under
+        // --seedless-seed prompt-hash — a hash of the prompt (identical request => identical text).
         // (Kept at admission so the cursor owns the whole lane-install payload.)
         let seed = req.seed.unwrap_or_else(|| {
             use std::hash::{Hash, Hasher};
@@ -2955,6 +3043,14 @@ impl BatchScheduler {
                 d.job_start(&tag, &c.prompt, self.gpu.dev());
             }
         }
+        // LOOPFIX: a penalized lane starts its slot's whole-output penalty state from scratch —
+        // zero output counts, and the prompt's tokens marked when its repetition penalty is on
+        // (vLLM applies repetition to prompt + output). Unpenalized lanes never touch the state.
+        let pen_on = c.rep_penalty > 1.0 || c.presence_penalty > 0.0 || c.frequency_penalty > 0.0;
+        if pen_on {
+            let prompt: &[u32] = if c.rep_penalty > 1.0 { &c.prompt } else { &[] };
+            self.gpu.pen_slot_init(&mut self.bufs, phys, prompt);
+        }
         self.lanes[slot] = Some(Lane {
             phys, pos: c.plen, last_tok: c.first_tok, max_new: c.max_new,
             // W2: a schema lane emitted nothing yet (its prefill token is internal) — count from 0.
@@ -2964,6 +3060,8 @@ impl BatchScheduler {
             rep_penalty: c.rep_penalty, presence_penalty: c.presence_penalty,
             frequency_penalty: c.frequency_penalty, min_new: c.min_new, ignore_eos: c.ignore_eos,
             history: vec![c.first_tok], tx: c.tx,
+            // The prefill token is the first output token; a penalized lane counts it at its first sync.
+            pen_total: 1, pen_synced: if pen_on { 0 } else { 1 },
             schema_state: c.schema.as_ref().map(|sm| sm.start_state()).unwrap_or(0),
             schema: c.schema.clone(),
             mtp_pos: c.plen.saturating_sub(1),
@@ -3348,10 +3446,10 @@ impl BatchScheduler {
                 lane.last_tok = t;
                 lane.pos += 1;
                 lane.generated += 1;
-                lane.history.push(t);
+                lane.hist_push(t);
                 self.slot_cache[phys].push(fed);
                 debug_assert_eq!(self.slot_cache[phys].len(), lane.pos);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_trim();
                 let eos_hit = self.eos.contains(&t) && !lane.ignore_eos && lane.generated >= lane.min_new;
                 if eos_hit || lane.generated >= lane.max_new {
                     finished[i] = true;
@@ -3389,169 +3487,126 @@ impl BatchScheduler {
         crate::metrics::sched_touch(); // H3: round COMPLETE — the age gauge measures from here
     }
 
-    /// Build the per-position verify penalty from a lane's committed history (dedup, replicate to all
-    /// MAX_AUTO_DEPTH positions). Shared by the chain and tree MTP paths. Returns None if no penalty.
-    fn make_penalty(&mut self, history: &[u32], rep_pen: f32, presence_pen: f32, freq_pen: f32,
-                    has_penalty: bool) -> Option<crate::gpu::VerifyPenalty> {
-        if !has_penalty { return None; }
-        let mp = crate::gpu::MAX_PEN_TOKENS;
-        let cap = crate::gpu::MAX_VERIFY;   // buffers are MAX_VERIFY-sized (forest may span that many cols)
-        let mut pen_tokens = vec![-1i32; cap * mp];
-        let mut pen_counts = vec![0i16; cap * mp];
-        let mut idx = 0usize;
-        for &t in history.iter().rev().take(mp) {
-            let ti = t as i32;
-            match (0..idx).position(|j| pen_tokens[j] == ti) {
-                Some(j) => { pen_counts[j] += 1; }
-                None => { if idx < mp { pen_tokens[idx] = ti; pen_counts[idx] = 1; idx += 1; } }
+    /// LOOPFIX (2026-11-06): bring the device's whole-output penalty counts up to date for these
+    /// lanes — upload every token each penalized lane committed since its last sync. Called before
+    /// anything applies a penalty (batched decode, every verify builder). No-op for unpenalized lanes.
+    fn pen_sync(&mut self, lane_idx: &[usize]) {
+        let mut pairs: Vec<(i32, i32)> = Vec::new();
+        for &i in lane_idx {
+            let Some(l) = self.lanes[i].as_mut() else { continue };
+            if !l.has_penalty() { l.pen_synced = l.pen_total; continue; }
+            let pending = (l.pen_total - l.pen_synced) as usize;
+            if pending == 0 { continue; }
+            let n = l.history.len();
+            assert!(pending <= n, "pen_sync: {pending} uncounted tokens but history holds {n} (hist_trim invariant)");
+            for &t in &l.history[n - pending..] { pairs.push((l.phys as i32, t as i32)); }
+            l.pen_synced = l.pen_total;
+        }
+        if !pairs.is_empty() { self.gpu.pen_count_add(&mut self.bufs, &pairs); }
+    }
+
+    /// Upload a verify penalty's per-column descriptors (`slots`, `extra` = [cap][PEN_EXTRA]) and
+    /// VALUES (`uniform` = one (rep, presence, freq) for every column, cached by `pen_const_key`;
+    /// else per-column vectors) and return the descriptor the verify kernels read.
+    fn verify_pen_upload(&mut self, slots: &[i32], extra: &[i32], uniform: Option<(f32, f32, f32)>,
+                         per_col: Option<(Vec<f32>, Vec<f32>, Vec<f32>)>) -> crate::gpu::VerifyPenalty {
+        let cap = crate::gpu::MAX_VERIFY;
+        debug_assert_eq!(slots.len(), cap);
+        debug_assert_eq!(extra.len(), cap * crate::gpu::PEN_EXTRA);
+        self.gpu.dev().htod_sync_copy_into(slots, self.mtp_pen_slots.as_mut().unwrap()).unwrap();
+        self.gpu.dev().htod_sync_copy_into(extra, self.mtp_pen_extra.as_mut().unwrap()).unwrap();
+        match (uniform, per_col) {
+            (Some((rep_pen, presence_pen, freq_pen)), _) => {
+                // The VALUES are request-constant: upload them only when they (or the width) change.
+                let key = (rep_pen.to_bits(), presence_pen.to_bits(), freq_pen.to_bits(), cap);
+                if self.pen_const_key != Some(key) {
+                    self.gpu.dev().htod_sync_copy_into(&vec![rep_pen; cap], self.mtp_pen_rep.as_mut().unwrap()).unwrap();
+                    self.gpu.dev().htod_sync_copy_into(&vec![presence_pen; cap], self.mtp_pen_presence.as_mut().unwrap()).unwrap();
+                    self.gpu.dev().htod_sync_copy_into(&vec![freq_pen; cap], self.mtp_pen_freq.as_mut().unwrap()).unwrap();
+                    self.pen_const_key = Some(key);
+                }
             }
+            (None, Some((rv, pv, fv))) => {
+                self.gpu.dev().htod_sync_copy_into(&rv, self.mtp_pen_rep.as_mut().unwrap()).unwrap();
+                self.gpu.dev().htod_sync_copy_into(&pv, self.mtp_pen_presence.as_mut().unwrap()).unwrap();
+                self.gpu.dev().htod_sync_copy_into(&fv, self.mtp_pen_freq.as_mut().unwrap()).unwrap();
+                // Per-column values overwrote the cached uniform ones: the next uniform caller re-uploads.
+                self.pen_const_key = None;
+            }
+            (None, None) => unreachable!("verify_pen_upload: no values"),
         }
-        let head_t: Vec<i32> = pen_tokens[0..mp].to_vec();
-        let head_c: Vec<i16> = pen_counts[0..mp].to_vec();
-        for p in 1..cap {
-            pen_tokens[p*mp..p*mp+mp].copy_from_slice(&head_t);
-            pen_counts[p*mp..p*mp+mp].copy_from_slice(&head_c);
-        }
-        let (rv, pv, fv) = (vec![rep_pen; cap], vec![presence_pen; cap], vec![freq_pen; cap]);
-        self.gpu.dev().htod_sync_copy_into(&pen_tokens, self.mtp_pen_tokens.as_mut().unwrap()).unwrap();
-        self.gpu.dev().htod_sync_copy_into(&pen_counts, self.mtp_pen_counts.as_mut().unwrap()).unwrap();
-        // The VALUES are request-constant: upload them only when they (or the width) change, not
-        // every MTP step. The history token/count arrays above still go up per step.
-        let key = (rep_pen.to_bits(), presence_pen.to_bits(), freq_pen.to_bits(), cap);
-        if self.pen_const_key != Some(key) {
-            self.gpu.dev().htod_sync_copy_into(&rv, self.mtp_pen_rep.as_mut().unwrap()).unwrap();
-            self.gpu.dev().htod_sync_copy_into(&pv, self.mtp_pen_presence.as_mut().unwrap()).unwrap();
-            self.gpu.dev().htod_sync_copy_into(&fv, self.mtp_pen_freq.as_mut().unwrap()).unwrap();
-            self.pen_const_key = Some(key);
-        }
-        // NOTE: no dev().synchronize() here — the copies are host-blocking on the NULL stream and
-        // the compute stream is the blocking stream (invariant I1), so ordering is already
-        // guaranteed; the sync was a full pipeline drain of pure waste per penalized MTP step.
-        Some(crate::gpu::VerifyPenalty {
-            tokens_ptr: *self.mtp_pen_tokens.as_ref().unwrap().device_ptr(),
-            counts_ptr: *self.mtp_pen_counts.as_ref().unwrap().device_ptr(),
+        // No dev().synchronize(): host-blocking NULL-stream copies + the blocking compute stream
+        // already order these before the verify kernels that read them (invariant I1).
+        crate::gpu::VerifyPenalty {
+            slots_ptr: *self.mtp_pen_slots.as_ref().unwrap().device_ptr(),
+            extra_ptr: *self.mtp_pen_extra.as_ref().unwrap().device_ptr(),
+            cnt_ptr: *self.bufs.pen_cnt_dev.device_ptr(),
+            pbits_ptr: *self.bufs.pen_pbits_dev.device_ptr(),
             rep_pen_ptr: *self.mtp_pen_rep.as_ref().unwrap().device_ptr(),
             presence_ptr: *self.mtp_pen_presence.as_ref().unwrap().device_ptr(),
             freq_ptr: *self.mtp_pen_freq.as_ref().unwrap().device_ptr(),
-        })
+        }
+    }
+
+    /// Verify penalty where every column shares lane `i`'s committed output (no per-column extras) —
+    /// the chain/tree paths that predate per-column histories. Returns None if no penalty.
+    /// LOOPFIX: whole output (+ prompt for repetition), was the last <= 64 distinct tokens.
+    fn make_penalty(&mut self, i: usize, rep_pen: f32, presence_pen: f32, freq_pen: f32,
+                    has_penalty: bool) -> Option<crate::gpu::VerifyPenalty> {
+        if !has_penalty { return None; }
+        self.pen_sync(&[i]);
+        let phys = self.lanes[i].as_ref().unwrap().phys as i32;
+        let cap = crate::gpu::MAX_VERIFY;
+        let slots = vec![phys; cap];
+        let extra = vec![-1i32; cap * crate::gpu::PEN_EXTRA];
+        Some(self.verify_pen_upload(&slots, &extra, Some((rep_pen, presence_pen, freq_pen)), None))
     }
 
     /// S-B16: MTP verify penalty with PER-COLUMN histories. Plain decode penalizes with the
-    /// EVOLVING history (each emitted token enters it before the next argmax); the verify used
-    /// to share ONE stale (committed-only) history across all n columns — accepted drafts'
-    /// presence/frequency contributions were missed at every column > 0 — a real losslessness
-    /// break when penalties are active, with exposure growing with depth (A/B d2 PASS vs d3/d4
-    /// FAIL; run7 penalty-free was clean at every depth). Column t now gets H + drafts[0..t] —
-    /// exactly what plain decode would have penalized at that column. The kernel already reads
-    /// per-column slices (`pen_tokens[b * n_pen + i]`, per-column scalars), so this is a
-    /// host-side fill change only.
-    fn make_penalty_drafts(&mut self, history: &[u32], drafts: &[u32], rep_pen: f32,
+    /// EVOLVING history (each emitted token enters it before the next argmax); column t of the verify
+    /// therefore gets the committed output + drafts[0..t] — exactly what plain decode would have
+    /// penalized at that column (spec on/off byte identity for greedy penalized requests). Columns
+    /// >= n (unused: the launches use grid = n) repeat the deepest prefix.
+    /// LOOPFIX: the committed part is the whole output (+ prompt for repetition) on the device.
+    fn make_penalty_drafts(&mut self, i: usize, drafts: &[u32], rep_pen: f32,
                            presence_pen: f32, freq_pen: f32, has_penalty: bool)
                            -> Option<crate::gpu::VerifyPenalty> {
         if !has_penalty { return None; }
-        let mp = crate::gpu::MAX_PEN_TOKENS;
-        let cap = crate::gpu::MAX_VERIFY;   // buffers are MAX_VERIFY-sized (forest may span that many cols)
-        let n = (drafts.len() + 1).min(cap); // verify width = 1 committed column + drafts
-        let mut pen_tokens = vec![-1i32; cap * mp];
-        let mut pen_counts = vec![0i16; cap * mp];
-        // Column 0: the committed history (dedup, most-recent-first) — same as plain decode at
-        // the first verify position.
-        let mut idx = 0usize;
-        for &t in history.iter().rev().take(mp) {
-            let ti = t as i32;
-            match (0..idx).position(|j| pen_tokens[j] == ti) {
-                Some(j) => { pen_counts[j] += 1; }
-                None => { if idx < mp { pen_tokens[idx] = ti; pen_counts[idx] = 1; idx += 1; } }
-            }
-        }
-        // Column t = column t-1 + one accepted draft (the token plain decode just emitted and
-        // would penalize with before the next argmax).
-        for c in 1..n {
-            let (dst, src) = (c * mp, (c - 1) * mp);
-            pen_tokens.copy_within(src..src + mp, dst);
-            pen_counts.copy_within(src..src + mp, dst);
-            let ti = drafts[c - 1] as i32;
-            match pen_tokens[dst..dst + idx].iter().position(|&x| x == ti) {
-                Some(j) => { pen_counts[dst + j] += 1; }
-                None => { if idx < mp { pen_tokens[dst + idx] = ti; pen_counts[dst + idx] = 1; idx += 1; } }
-            }
-        }
-        // Columns ≥ n are unused (the verify launches grid = n) — fill with the deepest prefix
-        // so no stale head copies linger if a wider launch ever reads them.
-        for c in n..cap {
-            let (dst, src) = (c * mp, (n - 1) * mp);
-            pen_tokens.copy_within(src..src + mp, dst);
-            pen_counts.copy_within(src..src + mp, dst);
-        }
-        let (rv, pv, fv) = (vec![rep_pen; cap], vec![presence_pen; cap], vec![freq_pen; cap]);
-        self.gpu.dev().htod_sync_copy_into(&pen_tokens, self.mtp_pen_tokens.as_mut().unwrap()).unwrap();
-        self.gpu.dev().htod_sync_copy_into(&pen_counts, self.mtp_pen_counts.as_mut().unwrap()).unwrap();
-        let key = (rep_pen.to_bits(), presence_pen.to_bits(), freq_pen.to_bits(), cap);
-        if self.pen_const_key != Some(key) {
-            self.gpu.dev().htod_sync_copy_into(&rv, self.mtp_pen_rep.as_mut().unwrap()).unwrap();
-            self.gpu.dev().htod_sync_copy_into(&pv, self.mtp_pen_presence.as_mut().unwrap()).unwrap();
-            self.gpu.dev().htod_sync_copy_into(&fv, self.mtp_pen_freq.as_mut().unwrap()).unwrap();
-            self.pen_const_key = Some(key);
-        }
-        Some(crate::gpu::VerifyPenalty {
-            tokens_ptr: *self.mtp_pen_tokens.as_ref().unwrap().device_ptr(),
-            counts_ptr: *self.mtp_pen_counts.as_ref().unwrap().device_ptr(),
-            rep_pen_ptr: *self.mtp_pen_rep.as_ref().unwrap().device_ptr(),
-            presence_ptr: *self.mtp_pen_presence.as_ref().unwrap().device_ptr(),
-            freq_ptr: *self.mtp_pen_freq.as_ref().unwrap().device_ptr(),
-        })
+        self.pen_sync(&[i]);
+        let phys = self.lanes[i].as_ref().unwrap().phys as i32;
+        let cap = crate::gpu::MAX_VERIFY;
+        let pe = crate::gpu::PEN_EXTRA;
+        let slots = vec![phys; cap];
+        let extra = pen_draft_extras(drafts, cap, pe);
+        Some(self.verify_pen_upload(&slots, &extra, Some((rep_pen, presence_pen, freq_pen)), None))
     }
 
-    /// FOREST per-column penalty: column c gets ITS lane's rep/presence/freq penalty (from that lane's
-    /// deduped committed history). `lanes` is (start, len, rep, presence, freq, history) per packed lane;
-    /// columns outside any lane and past the packed width are no-ops (rep=1, presence=freq=0, tokens=-1).
-    /// Returns None if NO packed lane has a penalty. Buffers are MAX_VERIFY-sized.
-    fn make_forest_penalty(&mut self, lanes: &[(usize, usize, f32, f32, f32, Vec<u32>)])
+    /// FOREST per-column penalty: column c gets ITS lane's rep/presence/freq penalty over that lane's
+    /// committed output. `lanes` is (start, len, rep, presence, freq, lane index) per packed lane;
+    /// columns outside any lane and past the packed width are no-ops (slot -1, neutral values).
+    /// Returns None if NO packed lane has a penalty. LOOPFIX: whole output, was the last <= 64.
+    fn make_forest_penalty(&mut self, lanes: &[(usize, usize, f32, f32, f32, usize)])
                            -> Option<crate::gpu::VerifyPenalty> {
         let any = lanes.iter().any(|(_, _, r, pr, f, _)| *r > 1.0 || *pr > 0.0 || *f > 0.0);
         if !any { return None; }
-        let mp = crate::gpu::MAX_PEN_TOKENS;
+        let idx: Vec<usize> = lanes.iter().map(|l| l.5).collect();
+        self.pen_sync(&idx);
         let cap = crate::gpu::MAX_VERIFY;
-        let mut pen_tokens = vec![-1i32; cap * mp];
-        let mut pen_counts = vec![0i16; cap * mp];
+        let mut slots = vec![-1i32; cap];
+        let extra = vec![-1i32; cap * crate::gpu::PEN_EXTRA];
         let mut rep_v = vec![1.0f32; cap];
         let mut pres_v = vec![0.0f32; cap];
         let mut freq_v = vec![0.0f32; cap];
-        for (start, len, rep, pres, freq, history) in lanes {
-            // Dedup this lane's recent history into one [mp] block.
-            let mut ht = vec![-1i32; mp];
-            let mut hc = vec![0i16; mp];
-            let mut idx = 0usize;
-            for &t in history.iter().rev().take(mp) {
-                let ti = t as i32;
-                match (0..idx).position(|j| ht[j] == ti) {
-                    Some(j) => { hc[j] += 1; }
-                    None => { if idx < mp { ht[idx] = ti; hc[idx] = 1; idx += 1; } }
-                }
-            }
-            for c in *start..(*start + *len).min(cap) {
-                pen_tokens[c * mp..c * mp + mp].copy_from_slice(&ht);
-                pen_counts[c * mp..c * mp + mp].copy_from_slice(&hc);
-                rep_v[c] = *rep; pres_v[c] = *pres; freq_v[c] = *freq;
+        for &(start, len, rep, pres, freq, li) in lanes {
+            let lane = self.lanes[li].as_ref().unwrap();
+            if !lane.has_penalty() { continue; } // its counts are not maintained: leave its columns neutral
+            let phys = lane.phys as i32;
+            for c in start..(start + len).min(cap) {
+                slots[c] = phys;
+                rep_v[c] = rep; pres_v[c] = pres; freq_v[c] = freq;
             }
         }
-        self.gpu.dev().htod_sync_copy_into(&pen_tokens, self.mtp_pen_tokens.as_mut().unwrap()).unwrap();
-        self.gpu.dev().htod_sync_copy_into(&pen_counts, self.mtp_pen_counts.as_mut().unwrap()).unwrap();
-        self.gpu.dev().htod_sync_copy_into(&rep_v, self.mtp_pen_rep.as_mut().unwrap()).unwrap();
-        self.gpu.dev().htod_sync_copy_into(&pres_v, self.mtp_pen_presence.as_mut().unwrap()).unwrap();
-        self.gpu.dev().htod_sync_copy_into(&freq_v, self.mtp_pen_freq.as_mut().unwrap()).unwrap();
-        // The forest just overwrote the per-column penalty VALUES with per-lane ones — invalidate
-        // the const cache so the next chain make_penalty re-uploads instead of trusting stale data.
-        self.pen_const_key = None;
-        // No dev().synchronize(): host-blocking NULL-stream copies + the blocking compute stream
-        // already order these before the verify kernels that read them (invariant I1).
-        Some(crate::gpu::VerifyPenalty {
-            tokens_ptr: *self.mtp_pen_tokens.as_ref().unwrap().device_ptr(),
-            counts_ptr: *self.mtp_pen_counts.as_ref().unwrap().device_ptr(),
-            rep_pen_ptr: *self.mtp_pen_rep.as_ref().unwrap().device_ptr(),
-            presence_ptr: *self.mtp_pen_presence.as_ref().unwrap().device_ptr(),
-            freq_ptr: *self.mtp_pen_freq.as_ref().unwrap().device_ptr(),
-        })
+        Some(self.verify_pen_upload(&slots, &extra, None, Some((rep_v, pres_v, freq_v))))
     }
 
     /// One FORK-THEN-CHAIN tree MTP step (greedy). Drafts a k=2 fork, verifies the tree, walks the
@@ -3602,7 +3657,7 @@ impl BatchScheduler {
         let n = tokens.len();
 
         // ---- Verify the tree. ----
-        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let penalty = self.make_penalty(i, rep_pen, presence_pen, freq_pen, has_penalty);
         let topo = self.gpu.topo_from_parent(&parent, main_pos);
         let (preds, vout) = self.gpu.verify_forward_topo(
             &mut self.pool, &tokens, &mut self.state, phys, kv_stride, main_pos, Some(ckpt), penalty, Some(&topo));
@@ -3668,8 +3723,8 @@ impl BatchScheduler {
             let lane = self.lanes[i].as_mut().unwrap();
             for &t in &new_toks {
                 let _ = lane.tx.send(TokEvent::Tok(t));
-                lane.history.push(t);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_push(t);
+                lane.hist_trim();
             }
             lane.generated += emit_count;
             if !finished {
@@ -3827,8 +3882,8 @@ impl BatchScheduler {
 
         // Per-lane verify penalty: each column carries ITS lane's rep/presence/freq penalty (buffers are
         // MAX_VERIFY-sized). None if no packed lane has a penalty.
-        let ls_pen: Vec<(usize, usize, f32, f32, f32, Vec<u32>)> =
-            ls.iter().map(|l| (l.start, l.n, l.rep, l.pres, l.freq, l.history.clone())).collect();
+        let ls_pen: Vec<(usize, usize, f32, f32, f32, usize)> =
+            ls.iter().map(|l| (l.start, l.n, l.rep, l.pres, l.freq, l.i)).collect();
         let penalty = self.make_forest_penalty(&ls_pen);
 
         // ONE packed forest verify. ckpt writes column t's post-state to (snapshot + t); rollback reads
@@ -3893,8 +3948,8 @@ impl BatchScheduler {
                 let lane = self.lanes[l.i].as_mut().unwrap();
                 for &t in &new_toks {
                     let _ = lane.tx.send(TokEvent::Tok(t));
-                    lane.history.push(t);
-                    if lane.history.len() > 256 { lane.history.drain(0..128); }
+                    lane.hist_push(t);
+                    lane.hist_trim();
                 }
                 lane.generated += emit_count;
                 if !finished {
@@ -4110,7 +4165,7 @@ impl BatchScheduler {
         // penalty (the same one the normal decode path applies). This keeps greedy MTP lanes free of
         // repetition without slowing them. htod on the NULL stream, then sync before the compute-side
         // verify reads it.
-        let penalty = self.make_penalty_drafts(&history, &drafts, rep_pen, presence_pen, freq_pen, has_penalty);
+        let penalty = self.make_penalty_drafts(i, &drafts, rep_pen, presence_pen, freq_pen, has_penalty);
         // Ping-pong GDN: the verify snapshots S1 (post committed-token state) into the snapshot slot
         // via the kernel checkpoint, so a rejected draft restores S1 with a dtod copy — no reverify.
         let verify_t0 = std::time::Instant::now();
@@ -4276,8 +4331,8 @@ impl BatchScheduler {
             let lane = self.lanes[i].as_mut().unwrap();
             for &t in &new_toks {
                 let _ = lane.tx.send(TokEvent::Tok(t));
-                lane.history.push(t);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_push(t);
+                lane.hist_trim();
             }
             lane.generated += emit_count;
             // If the lane continues, it emitted all nacc drafts + bonus (emit_count == nacc+1).
@@ -4494,7 +4549,7 @@ impl BatchScheduler {
         let round_ms = step_t0.elapsed().as_secs_f32() * 1e3;
 
         // ---- Build verify penalty (same as greedy). ----
-        let verify_penalty = self.make_penalty_drafts(&history, &drafts, rep_pen, presence_pen, freq_pen, has_penalty);
+        let verify_penalty = self.make_penalty_drafts(i, &drafts, rep_pen, presence_pen, freq_pen, has_penalty);
 
         // ---- Build verify input + seeds for spec_verify_b. ----
         let mut verify_input = vec![committed_tok];
@@ -4595,8 +4650,8 @@ impl BatchScheduler {
             let lane = self.lanes[i].as_mut().unwrap();
             for &t in &to_emit {
                 let _ = lane.tx.send(TokEvent::Tok(t));
-                lane.history.push(t);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_push(t);
+                lane.hist_trim();
             }
             lane.generated += emit_count;
             lane.seed = splitmix64(step_key);
@@ -4805,7 +4860,7 @@ impl BatchScheduler {
         for k in 1..nb { parent[1 + drafts.len() + k] = (drafts.len() + k) as i32; }
 
         // ---- Verify the tree (per-node KV paths + per-node argmax). ----
-        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let penalty = self.make_penalty(i, rep_pen, presence_pen, freq_pen, has_penalty);
         let verify_t0 = std::time::Instant::now();
         let topo = self.gpu.topo_from_parent(&parent, main_pos);
         let (preds, vout) = self.gpu.verify_forward_topo(
@@ -4895,8 +4950,8 @@ impl BatchScheduler {
             let lane = self.lanes[i].as_mut().unwrap();
             for &t in &new_toks {
                 let _ = lane.tx.send(TokEvent::Tok(t));
-                lane.history.push(t);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_push(t);
+                lane.hist_trim();
             }
             lane.generated += emit_count;
             if !finished {
@@ -5012,7 +5067,7 @@ impl BatchScheduler {
         assert!(block <= crate::gpu::MAX_VERIFY,
                 "dflash block {block} exceeds MAX_VERIFY {}: the verify would fall to the prefill \
                  dequant path and the GDN checkpoint band would overflow", crate::gpu::MAX_VERIFY);
-        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let penalty = self.make_penalty(i, rep_pen, presence_pen, freq_pen, has_penalty);
         let verify_t0 = std::time::Instant::now();
         let (preds, vout) = self.gpu.verify_forward(&mut self.pool, &verify_input, &mut self.state,
                                                     phys, kv_stride, main_pos, Some(snapshot), penalty);
@@ -5062,8 +5117,8 @@ impl BatchScheduler {
             let lane = self.lanes[i].as_mut().unwrap();
             for &t in &new_toks {
                 let _ = lane.tx.send(TokEvent::Tok(t));
-                lane.history.push(t);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_push(t);
+                lane.hist_trim();
             }
             lane.generated += emit_count;
             if !finished {
@@ -5190,7 +5245,7 @@ impl BatchScheduler {
         // The chain verify captures its own CUDA graph (n=8 key) — the DFlash2 "verify pair".
         let mut verify_input = vec![committed_tok];
         verify_input.extend(drafts.iter().copied());
-        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let penalty = self.make_penalty(i, rep_pen, presence_pen, freq_pen, has_penalty);
         let verify_t0 = std::time::Instant::now();
         // PLAN/25 Phase 0 (cov_on): keep the verify logits and derive preds + the per-column
         // target top-4/p1/top1−top2 margin host-side (the bench_accept readback; the eager core
@@ -5331,8 +5386,8 @@ impl BatchScheduler {
             let lane = self.lanes[i].as_mut().unwrap();
             for &t in &new_toks {
                 let _ = lane.tx.send(TokEvent::Tok(t));
-                lane.history.push(t);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_push(t);
+                lane.hist_trim();
             }
             lane.generated += emit_count;
             if !finished {
@@ -5526,7 +5581,7 @@ impl BatchScheduler {
         // ---- Verify [committed_tok, drafts...] (M=8 buckets) on the trunk at main_pos.. ----
         let mut verify_input = vec![committed_tok];
         verify_input.extend(drafts.iter().copied());
-        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let penalty = self.make_penalty(i, rep_pen, presence_pen, freq_pen, has_penalty);
         let verify_t0 = std::time::Instant::now();
         let (preds, vout) = self.gpu.verify_forward(
             &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
@@ -5576,8 +5631,8 @@ impl BatchScheduler {
             let lane = self.lanes[i].as_mut().unwrap();
             for &t in &new_toks {
                 let _ = lane.tx.send(TokEvent::Tok(t));
-                lane.history.push(t);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_push(t);
+                lane.hist_trim();
             }
             lane.generated += emit_count;
             if !finished {
@@ -5717,7 +5772,7 @@ impl BatchScheduler {
         let verify_seeds: Vec<u32> =
             (0..crate::dflash2::block()).map(|j| rng_u32(step_key, RNG_DOM_VERIFY, j)).collect();
         let qprobs: Vec<f32> = vec![1.0; crate::dflash2::levels()];
-        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let penalty = self.make_penalty(i, rep_pen, presence_pen, freq_pen, has_penalty);
         let verify_t0 = std::time::Instant::now();
         let (vsample, vout) = self.gpu.verify_forward_sample(
             &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
@@ -5773,8 +5828,8 @@ impl BatchScheduler {
             let lane = self.lanes[i].as_mut().unwrap();
             for &t in &to_emit {
                 let _ = lane.tx.send(TokEvent::Tok(t));
-                lane.history.push(t);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_push(t);
+                lane.hist_trim();
             }
             lane.generated += emit_count;
             if !finished {
@@ -5877,7 +5932,7 @@ impl BatchScheduler {
         let qprobs: Vec<f32> = vec![1.0; crate::dflash2::levels()];   // greedy draft = point mass (S3T2 b1)
 
         // ---- Verify with stochastic output (the eager spec_verify_b path). ----
-        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let penalty = self.make_penalty(i, rep_pen, presence_pen, freq_pen, has_penalty);
         let verify_t0 = std::time::Instant::now();
         let mut t20: Vec<u64> = Vec::new();
         let (vsample, vout) = self.gpu.verify_forward_sample(
@@ -5940,8 +5995,8 @@ impl BatchScheduler {
             let lane = self.lanes[i].as_mut().unwrap();
             for &t in &to_emit {
                 let _ = lane.tx.send(TokEvent::Tok(t));
-                lane.history.push(t);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_push(t);
+                lane.hist_trim();
             }
             lane.generated += emit_count;
             lane.seed = splitmix64(step_key);
@@ -6100,7 +6155,7 @@ impl BatchScheduler {
             (0..crate::dflash2::block()).map(|j| rng_u32(step_key, RNG_DOM_VERIFY, j)).collect();
 
         // ---- Verify with the real-q kernel (exact relu(p-q) residual). ----
-        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let penalty = self.make_penalty(i, rep_pen, presence_pen, freq_pen, has_penalty);
         let verify_t0 = std::time::Instant::now();
         let mut t20: Vec<u64> = Vec::new();
         let (vsample, vout) = self.gpu.verify_forward_sample_rq(
@@ -6166,8 +6221,8 @@ impl BatchScheduler {
             let lane = self.lanes[i].as_mut().unwrap();
             for &t in &to_emit {
                 let _ = lane.tx.send(TokEvent::Tok(t));
-                lane.history.push(t);
-                if lane.history.len() > 256 { lane.history.drain(0..128); }
+                lane.hist_push(t);
+                lane.hist_trim();
             }
             lane.generated += emit_count;
             lane.seed = splitmix64(step_key);
@@ -6245,9 +6300,11 @@ impl BatchScheduler {
     /// (greedy graph / GPU-sample graph / CPU-sample / non-graph greedy), and returns the next token
     /// per lane (length = batch_idx.len()).
     fn batched_decode(&mut self, batch_idx: &[usize]) -> Vec<u32> {
+        // LOOPFIX: the step's penalty reads each penalized lane's whole-output counts — bring them up
+        // to date with everything committed since the last sync (any path: decode, MTP, DF2, ...).
+        self.pen_sync(batch_idx);
         let s = batch_idx.len();
         let mb = self.max_batch;
-        let mp = crate::gpu::MAX_PEN_TOKENS;
         // W2: a schema lane in this batch disables the resident loop AND the captured graphs —
         // both bake their kernel sequence (and the mask kernel's operands) at capture/admission
         // time, while the mask content changes every step. Schema batches take the eager core.
@@ -6270,8 +6327,6 @@ impl BatchScheduler {
                 let mut slot_ids: Vec<i32> = (0..s)
                     .map(|k| self.lanes[batch_idx[k]].as_ref().unwrap().phys as i32).collect();
                 slot_ids.resize(mb, 0);
-                let mut ring = vec![-1i32; mp * mb];
-                let mut ring_state = vec![0i32; mb];
                 let mut keys = vec![0u64; mb];
                 let mut rep_pen = vec![1.0f32; mb];
                 let mut presence_pen = vec![0.0f32; mb];
@@ -6285,26 +6340,18 @@ impl BatchScheduler {
                     toks[k] = lane.last_tok as i32;
                     pos[k] = lane.pos as i32 - 1;
                     // Per-lane penalty VALUES are request constants — upload on every dirty
-                    // event (they were silently never uploaded on the resident path: the
-                    // window kernel only rebuilds the token/count arrays, not these).
-                    rep_pen[k] = lane.rep_penalty;
-                    presence_pen[k] = lane.presence_penalty;
-                    frequency_pen[k] = lane.frequency_penalty;
-                    // Ring rebuild from lane.history, MRU-first: entry j (0 = most recent) lands at
-                    // ring[head-1-j], head = len % mp — the exact layout penalty_window_b reads.
-                    let hist: Vec<i32> = lane.history.iter().rev().take(mp).map(|&t| t as i32).collect();
-                    let len = hist.len();
-                    for (j, &t) in hist.iter().enumerate() {
-                        ring[k * mp + ((len + mp - 1 - j) % mp)] = t;
+                    // event. LOOPFIX: neutral for a lane without a penalty (its whole-output
+                    // counts are not maintained), the same rule as the non-resident path.
+                    if lane.has_penalty() {
+                        rep_pen[k] = lane.rep_penalty;
+                        presence_pen[k] = lane.presence_penalty;
+                        frequency_pen[k] = lane.frequency_penalty;
                     }
-                    ring_state[k] = (((len % mp) << 8) | len) as i32;
                     keys[k] = lane.seed;
                 }
                 self.gpu.dev().htod_sync_copy_into(&toks, &mut self.bufs.token_ids_dev).unwrap();
                 self.gpu.dev().htod_sync_copy_into(&pos, &mut self.bufs.pos_dev).unwrap();
                 self.gpu.dev().htod_sync_copy_into(&slot_ids, &mut self.bufs.slot_ids_dev).unwrap();
-                self.gpu.dev().htod_sync_copy_into(&ring, &mut self.bufs.pen_ring_dev).unwrap();
-                self.gpu.dev().htod_sync_copy_into(&ring_state, &mut self.bufs.pen_ring_state_dev).unwrap();
                 self.gpu.dev().htod_sync_copy_into(&rep_pen, &mut self.bufs.rep_pen_dev).unwrap();
                 self.gpu.dev().htod_sync_copy_into(&presence_pen, &mut self.bufs.presence_dev).unwrap();
                 self.gpu.dev().htod_sync_copy_into(&frequency_pen, &mut self.bufs.frequency_dev).unwrap();
@@ -6393,8 +6440,6 @@ impl BatchScheduler {
             // ---- today's path, VERBATIM (uploads + dispatch) ----
             let mut toks = vec![0i32; mb];
             let mut pos = vec![0i32; mb];
-            let mut pen_tokens = vec![-1i32; mp * mb];
-            let mut pen_counts = vec![0i16; mp * mb];
             let mut rep_pen = vec![1.0f32; mb];
             let mut presence_pen = vec![0.0f32; mb];
             let mut frequency_pen = vec![0.0f32; mb];
@@ -6402,24 +6447,12 @@ impl BatchScheduler {
                 let lane = self.lanes[i].as_ref().unwrap();
                 toks[k] = lane.last_tok as i32;
                 pos[k] = lane.pos as i32;
-                rep_pen[k] = lane.rep_penalty;
-                presence_pen[k] = lane.presence_penalty;
-                frequency_pen[k] = lane.frequency_penalty;
-                // Fill this lane's unique recent tokens (with counts) only if it has any penalty;
-                // lanes without penalty leave their slots as -1 sentinels (skipped by the kernel).
+                // LOOPFIX: the penalty itself is the slot's whole-output state (pen_sync above);
+                // only a penalized lane gets non-neutral VALUES (its counts are maintained).
                 if lane.has_penalty() {
-                    let base = k * mp;
-                    let mut idx = 0usize;
-                    for &t in lane.history.iter().rev().take(mp) {
-                        let t_i = t as i32;
-                        let found = (0..idx).position(|j| pen_tokens[base + j] == t_i);
-                        match found {
-                            Some(j) => { pen_counts[base + j] += 1; }
-                            None => {
-                                if idx < mp { pen_tokens[base + idx] = t_i; pen_counts[base + idx] = 1; idx += 1; }
-                            }
-                        }
-                    }
+                    rep_pen[k] = lane.rep_penalty;
+                    presence_pen[k] = lane.presence_penalty;
+                    frequency_pen[k] = lane.frequency_penalty;
                 }
             }
             let mut slot_ids: Vec<i32> = (0..s)
@@ -6428,13 +6461,11 @@ impl BatchScheduler {
             self.gpu.dev().htod_sync_copy_into(&toks, &mut self.bufs.tokens_dev).unwrap();
             self.gpu.dev().htod_sync_copy_into(&pos, &mut self.bufs.pos_dev).unwrap();
             self.gpu.dev().htod_sync_copy_into(&slot_ids, &mut self.bufs.slot_ids_dev).unwrap();
-            // The five penalty arrays are read by rep_penalty_b, which skips -1 sentinels — so they
-            // only need uploading when some lane is actually penalized, plus ONE clear when the last
-            // penalized lane departs (so its values cannot linger into an unpenalized successor).
+            // The three penalty VALUE arrays only need uploading when some lane is actually penalized,
+            // plus ONE clear when the last penalized lane departs (so its values cannot linger into an
+            // unpenalized successor — pen_apply_b returns at once on a neutral row).
             let any_pen = batch_idx.iter().any(|&i| self.lanes[i].as_ref().unwrap().has_penalty());
             if any_pen || self.pen_had {
-                self.gpu.dev().htod_sync_copy_into(&pen_tokens, &mut self.bufs.penalty_tokens_dev).unwrap();
-                self.gpu.dev().htod_sync_copy_into(&pen_counts, &mut self.bufs.penalty_counts_dev).unwrap();
                 self.gpu.dev().htod_sync_copy_into(&rep_pen, &mut self.bufs.rep_pen_dev).unwrap();
                 self.gpu.dev().htod_sync_copy_into(&presence_pen, &mut self.bufs.presence_dev).unwrap();
                 self.gpu.dev().htod_sync_copy_into(&frequency_pen, &mut self.bufs.frequency_dev).unwrap();
@@ -6820,5 +6851,41 @@ mod prehard1_serve_cap_tests {
             "the TP1 hook samples the channel backlog");
         assert!(self_src.contains("pending.len() + self.rx.len()"),
             "the TP hook adds the pending queue");
+    }
+}
+
+#[cfg(test)]
+mod loopfix_tests {
+    use super::{hist_trim_cut, pen_draft_extras};
+
+    #[test]
+    fn trim_matches_the_old_rule_when_nothing_is_pending() {
+        assert_eq!(hist_trim_cut(256, 0), 0);
+        assert_eq!(hist_trim_cut(257, 0), 128);   // was: len > 256 => drain(0..128)
+        assert_eq!(hist_trim_cut(400, 3), 128);
+    }
+
+    #[test]
+    fn trim_never_drops_uncounted_tokens() {
+        for len in 0..600usize {
+            for pending in 0..=len {
+                let cut = hist_trim_cut(len, pending);
+                assert!(len - cut >= pending, "len {len} pending {pending} cut {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn draft_extras_follow_plain_decode() {
+        let (cap, pe) = (16usize, 16usize);
+        let d = [11u32, 22, 33];
+        let e = pen_draft_extras(&d, cap, pe);
+        let col = |c: usize| -> Vec<i32> { e[c * pe..c * pe + pe].iter().copied().filter(|&t| t >= 0).collect() };
+        assert_eq!(col(0), Vec::<i32>::new());           // the committed column: output only
+        assert_eq!(col(1), vec![11]);
+        assert_eq!(col(2), vec![11, 22]);
+        assert_eq!(col(3), vec![11, 22, 33]);           // width n = 4: last real column
+        assert_eq!(col(15), vec![11, 22, 33]);          // unused columns repeat the deepest prefix
+        assert_eq!(pen_draft_extras(&[], cap, pe), vec![-1i32; cap * pe]);
     }
 }

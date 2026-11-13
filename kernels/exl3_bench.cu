@@ -115,6 +115,14 @@ __device__ __forceinline__ uint16_t exl3_dq_k2(const uint32_t* __restrict__ ring
     return (k2 & 1) ? exl3_dq_t_half(ring, t, k2 >> 1) : exl3_dq_t(ring, t, k2 >> 1);
 }
 
+// K35 (2026-10-31): the WIDTH CODE of the `bits` argument. The expert / wide-tile kernels switch on `bits`:
+// an integer K arrives as K (2..=8); a fractional K = KA + 0.5 (k2 odd) arrives as EXL3_FRAC_BITS(KA) =
+// 16 + KA (17 / 18 / 19), so a fractional width can never alias an integer one — k2 = 7 passed as k2/2 = 3
+// would take the 3-bit bodies on a 56-word ring (the silent-garbage class). The fractional bodies are the
+// HALF twins of exl3_gemm_body / exl3_gemm_body_a1 / exl3_gemm_body_wide (window math exl3_half_b1<KA>, ring
+// 4*(2*KA+1) words per 16x16 tile). Host twin: src/exl3_forward.rs exl3_kernel_bits().
+#define EXL3_FRAC_BITS(KA) (16 + (KA))
+
 // ---------------------------------------------------------------------------
 // Kernel 1: decode gate (G-A3-1 through the kernel path).
 // One warp per 16x16 trellis block; thread lane decodes t in {lane + 32*step}.
@@ -127,15 +135,8 @@ __device__ __forceinline__ uint16_t exl3_dq_k2(const uint32_t* __restrict__ ring
 // next grid becomes resident while this one's last wave drains (launch gap + tail overlap).
 // The dependent release fires only after ALL CTAs of a grid have started, so co-resident
 // grid-barrier kernels (xq_hc_fuse*) can never be starved by a waiting successor.
-// CF-P1g (4.05 bpw): the K=6 module. kernels/exl3_bench_k6.cu defines EXL3_K6_BUILD and includes this file, which adds a
-// `case 6` next to every K=5 bit-width switch below. The normal build leaves the macro empty, so the 3.05 / K <= 5
-// module is source-identical (and its PTX instruction-identical) to before; the K=6 PTX is loaded only for a pack that
-// stores a K=6 module (exl3_bench::bench_ptx_path).
-#ifdef EXL3_K6_BUILD
-#define EXL3_CASE6(...) __VA_ARGS__
-#else
-#define EXL3_CASE6(...)
-#endif
+// P7 B7: the K=6 arms below are always compiled in — ONE module serves every width;
+// the exl3_bench_k6.ptx per-process swap (4.05-bpw packs) is gone.
 #define XQ_PDL_ENTRY() do { asm volatile("griddepcontrol.wait;" ::: "memory"); \
                             asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); } while (0)
 
@@ -415,13 +416,19 @@ extern "C" __global__ void exl3_had_svh_x2(const __half* __restrict__ yraw0, con
 // ---------------------------------------------------------------------------
 // Kernel 4: the fused GEMM. Template on bits (compile-time ring width).
 // ---------------------------------------------------------------------------
+// B3 leg 2: file-scope so every exl3_gemm_body<BITS> instantiation inside one kernel
+// aliases a single 512 B block buffer (switch cases never run simultaneously). In-function
+// __shared__ gave one 512 B per instantiation: 6 widths = 3072 B static, which cut the
+// no-opt-in dynamic cap to 46080 B and rejected the m=9 gu launch (46224 B) outright
+// (cuLaunchKernel CUDA_ERROR_INVALID_VALUE; EPI-ATTR receipt 2026-10-29).
+__shared__ __half exl3_gemm_body_sa[16][16];
 template <int BITS, bool HALF = false>
 __device__ __forceinline__ void exl3_gemm_body(const uint16_t* __restrict__ trellis,
                                                const __half* __restrict__ xh,
                                                __half* __restrict__ yraw,
                                                int M, int K, int N, int cta_tile) {
     // CTA tile: m16 x N128; 256 threads = 8 warps.
-    __shared__ __half sa[16][16];
+    __half (&sa)[16][16] = exl3_gemm_body_sa;
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -550,12 +557,17 @@ __host__ __device__ __forceinline__ bool exl3_a1_fits(int M, int K) {
 #ifndef A1_SHFL
 #define A1_SHFL 1
 #endif
-template <int BITS>
+// K35: HALF = the fractional width K = BITS + 0.5 (window math exl3_half_b1<BITS>, ring WRING = 4*(2*BITS+1)
+// words per tile = 12 / 20 / 28 for KA 1 / 2 / 3, all <= 32 = one SHFL source word). HALF = false is the
+// integer body, instruction for instruction (WRING = 8*BITS, b1 = (t+257)*BITS): the a1bX entries are unchanged.
+template <int BITS, bool HALF = false>
 __device__ __forceinline__ void exl3_gemm_body_a1(const uint16_t* __restrict__ trellis,
                                                   const __half* __restrict__ xh,
                                                   __half* __restrict__ yraw,
                                                   int M, int K, int N, int cta_tile) {
     extern __shared__ __half a1_sa[];        // [M][K+8]
+    constexpr int WRING = HALF ? (4 * (2 * BITS + 1)) : (8 * BITS);   // ring words per 16x16 tile
+    constexpr int W16 = 2 * WRING;                                     // uint16 words per tile
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -583,11 +595,11 @@ __device__ __forceinline__ void exl3_gemm_body_a1(const uint16_t* __restrict__ t
             const int l = 8 * ((c >> 1) & 3) + ((r & 7) >> 1);
             const int t = 8 * l + (r & 1) + 2 * ((r >> 3) & 1)
                               + 4 * (c >> 3) + 32 * (c & 1);
-            const int b1 = (t + 257) * BITS;
+            const int b1 = HALF ? exl3_half_b1<BITS>(t) : (t + 257) * BITS;
             const int i0 = (b1 - 16) >> 5;
             const int i1 = (b1 - 1) >> 5;
-            s_i0m[h * 4 + s] = i0 % (BITS * 8);
-            s_i1m[h * 4 + s] = i1 % (BITS * 8);
+            s_i0m[h * 4 + s] = i0 % WRING;
+            s_i1m[h * 4 + s] = i1 % WRING;
             s_sf[h * 4 + s] = ((i1 + 1) << 5) - b1;
         }
     }
@@ -598,8 +610,8 @@ __device__ __forceinline__ void exl3_gemm_body_a1(const uint16_t* __restrict__ t
         for (int r = 0; r < 4; ++r) acc[h][r] = 0.0f;
 
     const uint32_t* __restrict__ ring =
-        (const uint32_t*)(trellis + ((size_t)nb_col) * (16 * BITS));
-    const size_t ring_kstride = (size_t)nb * 8u * BITS;
+        (const uint32_t*)(trellis + ((size_t)nb_col) * W16);
+    const size_t ring_kstride = (size_t)nb * (size_t)WRING;
     const int gid = lane >> 2, tig = lane & 3;
     const bool hi_rows = M > 8;
     const bool l0 = gid < M, l1 = (gid + 8) < M;
@@ -611,7 +623,7 @@ __device__ __forceinline__ void exl3_gemm_body_a1(const uint16_t* __restrict__ t
     // (one predicated instruction/step; no value change). The in-round expert
     // stream is DRAM-latency-bound at 24 warps/SM with one 96-B window in flight.
     constexpr int PF_D = 8;
-    const bool pf_lane = lane * 32 < BITS * 32;          // 3/4/5 lanes x 32 B
+    const bool pf_lane = lane * 32 < WRING * 4;          // 3/4/5 lanes x 32 B (window = WRING*4 bytes)
     const char* pf_ptr = (const char*)(ring + (size_t)PF_D * ring_kstride) + lane * 32;
     const size_t pf_step = ring_kstride * 4;              // bytes per k16 step
     // S-A3-o O1: prologue — the first PF_D windows were never prefetched (every CTA
@@ -632,7 +644,7 @@ __device__ __forceinline__ void exl3_gemm_body_a1(const uint16_t* __restrict__ t
         // S-A3-n F7: ONE coalesced load per lane per step (window words
         // lane, lane+32 < 8*BITS), decode words delivered by __shfl_sync —
         // replaces 16 scalar L1 loads per lane per step. Same words => same bits.
-        constexpr int WW = 8 * BITS;
+        constexpr int WW = WRING;
         const unsigned w0 = (lane < WW) ? __ldg(ring + lane) : 0u;
         const unsigned w1 = (WW > 32 && lane + 32 < WW) ? __ldg(ring + lane + 32) : 0u;
         #pragma unroll
@@ -705,10 +717,14 @@ extern "C" __global__ void exl3_hmma_gemm(const uint16_t* __restrict__ trellis,
     switch (bits) {
         case 3: exl3_gemm_body<1, true>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;  // K=1.5
         case 4: exl3_gemm_body<2>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;  // K=2.0
+        case 5: exl3_gemm_body<2, true>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;  // K=2.5 (K35: probe reference)
+        case 7: exl3_gemm_body<3, true>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;  // K=3.5 (K35: probe reference)
         case 6: exl3_gemm_body<3>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
         case 8: exl3_gemm_body<4>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
         case 10: exl3_gemm_body<5>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
-        EXL3_CASE6(case 12: exl3_gemm_body<6>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;)
+        case 12: exl3_gemm_body<6>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
+        case 14: exl3_gemm_body<7>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break; // P7 B5 (probe reference; K=7)
+        case 16: exl3_gemm_body<8>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break; // PR#27-D2: K=8 dense serve (compatibility cell)
         default: break; // loader refuses other rates before we ever get here
     }
 }
@@ -1083,12 +1099,16 @@ __device__ __forceinline__ uint16_t exl3_dq_at(const uint32_t* w0,
 }
 
 #define EXL3_WIDE_KS 8
-template <int BITS, int MT>
+// K35: HALF = the fractional width K = BITS + 0.5 (exl3_half_b1<BITS> windows, WRING = 4*(2*BITS+1) ring words
+// per tile, <= 28 so the one-word SHFL diet applies). HALF = false is the integer body instruction for instruction.
+template <int BITS, int MT, bool HALF = false>
 __device__ __forceinline__ void exl3_gemm_body_wide(
         const uint16_t* __restrict__ trellis,
         const __half* __restrict__ xh,
         __half* __restrict__ yraw,
         int M, int K, int N, int cta_tile, int m_sup, __half* __restrict__ sa_raw) {
+    constexpr int WRING = HALF ? (4 * (2 * BITS + 1)) : (8 * BITS);   // ring words per 16x16 tile
+    constexpr int W16 = 2 * WRING;                                     // uint16 words per tile
     // S-A3-u F: A staged EXL3_WIDE_KS k16 steps at a time into the WRAPPER-owned tile
     // (one max-size copy per kernel; per-instantiation __shared__ summed across the 12 (BITS,MT)
     // instantiations): one barrier pair per KS steps instead of per step, 16-B vector loads.
@@ -1115,11 +1135,11 @@ __device__ __forceinline__ void exl3_gemm_body_wide(
             const int l = 8 * ((c >> 1) & 3) + ((r & 7) >> 1);
             const int t = 8 * l + (r & 1) + 2 * ((r >> 3) & 1)
                               + 4 * (c >> 3) + 32 * (c & 1);
-            const int b1 = (t + 257) * BITS;
+            const int b1 = HALF ? exl3_half_b1<BITS>(t) : (t + 257) * BITS;
             const int i0 = (b1 - 16) >> 5;
             const int i1 = (b1 - 1) >> 5;
-            s_i0m[h * 4 + s] = i0 % (BITS * 8);
-            s_i1m[h * 4 + s] = i1 % (BITS * 8);
+            s_i0m[h * 4 + s] = i0 % WRING;
+            s_i1m[h * 4 + s] = i1 % WRING;
             s_sf[h * 4 + s] = ((i1 + 1) << 5) - b1;
         }
     }
@@ -1153,13 +1173,14 @@ __device__ __forceinline__ void exl3_gemm_body_wide(
 
         // ---- decode this warp's 16x16 block ONCE into two B fragments ----
         const uint32_t* ring =
-            (const uint32_t*)(trellis + ((size_t)kb * nb + nb_col) * (16 * BITS));
+            (const uint32_t*)(trellis + ((size_t)kb * nb + nb_col) * W16);
         uint32_t bfrag[2][2];
-        if constexpr (BITS <= 4) {
+        if constexpr (WRING <= 32) {
             // S-A3-u C: the S-A3-n F7 LSU diet in the wide body — ONE coalesced load per lane of
-            // the block's window words (8*BITS <= 32), decode words by __shfl_sync (was 16 scalar
-            // L1 loads per lane per k16 step). Same words, same funnel/dp4a/hfma => same bits.
-            constexpr int WW = 8 * BITS;
+            // the block's window words (WRING <= 32: integer BITS <= 4 and every HALF width), decode
+            // words by __shfl_sync (was 16 scalar L1 loads per lane per k16 step). Same words, same
+            // funnel/dp4a/hfma => same bits.
+            constexpr int WW = WRING;
             const unsigned w0 = (lane < WW) ? __ldg(ring + lane) : 0u;
             #pragma unroll
             for (int h = 0; h < 2; ++h) {
@@ -1326,7 +1347,15 @@ extern "C" __global__ void exl3_hmma_gemm_wide_tiles(const uint16_t* __restrict_
         case 4: exl3_gemm_body_wide<B, 4>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
         case 8: exl3_gemm_body_wide<B, 8>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
         default: break; } break;
-    switch (bits) { EXL3_WT_CASE(3) EXL3_WT_CASE(4) EXL3_WT_CASE(5) default: break; }
+    // K35: the fractional widths (EXL3_FRAC_BITS code) on the HALF twin — the device-routed prefill arm's body.
+#define EXL3_WT_CASE_H(KA) case EXL3_FRAC_BITS(KA): switch (mt) { \
+        case 1: exl3_gemm_body_wide<KA, 1, true>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
+        case 2: exl3_gemm_body_wide<KA, 2, true>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
+        case 4: exl3_gemm_body_wide<KA, 4, true>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
+        case 8: exl3_gemm_body_wide<KA, 8, true>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
+        default: break; } break;
+    switch (bits) { EXL3_WT_CASE(3) EXL3_WT_CASE(4) EXL3_WT_CASE(5) EXL3_WT_CASE(6) EXL3_WT_CASE(7) EXL3_WT_CASE(8) EXL3_WT_CASE_H(1) EXL3_WT_CASE_H(2) EXL3_WT_CASE_H(3) default: break; } // PR#27-D2: 8 joins; K35: 1.5/2.5/3.5
+#undef EXL3_WT_CASE_H
 #undef EXL3_WT_CASE
 }
 
@@ -1362,7 +1391,7 @@ extern "C" __global__ void exl3_hmma_gemm_wide_grouped(const uint16_t* __restric
         case 4: exl3_gemm_body_wide<B, 4>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
         case 8: exl3_gemm_body_wide<B, 8>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_wide_sa); break; \
         default: break; } break;
-    switch (bits) { EXL3_WG_CASE(3) EXL3_WG_CASE(4) EXL3_WG_CASE(5) default: break; }
+    switch (bits) { EXL3_WG_CASE(3) EXL3_WG_CASE(4) EXL3_WG_CASE(5) EXL3_WG_CASE(6) EXL3_WG_CASE(7) EXL3_WG_CASE(8) default: break; } // PR#27-D2: 8 joins
 #undef EXL3_WG_CASE
 }
 
@@ -1403,6 +1432,9 @@ extern "C" __global__ void exl3_hmma_gemm_wide(const uint16_t* __restrict__ trel
         EXL3_WIDE_CASE(3);
         EXL3_WIDE_CASE(4);
         EXL3_WIDE_CASE(5);
+        EXL3_WIDE_CASE(6);
+        EXL3_WIDE_CASE(7);
+        EXL3_WIDE_CASE(8); // PR#27-D2: K=8 dense/wide serve
         default: break; // loader refuses other rates before we ever get here
     }
 #undef EXL3_WIDE_CASE
@@ -1429,10 +1461,12 @@ extern "C" __global__ void exl3_hmma_gemm_grouped(const uint16_t* __restrict__ b
     // S-A3-n F3: A staged once when it fits (the launcher passes M*(K+8)*2 dyn smem).
     if (exl3_a1_fits(M, K)) {
         switch (bits) {
+            case 2: exl3_gemm_body_a1<2>(tr, xh, ye, M, K, N, tile); break;
             case 3: exl3_gemm_body_a1<3>(tr, xh, ye, M, K, N, tile); break;
             case 4: exl3_gemm_body_a1<4>(tr, xh, ye, M, K, N, tile); break;
             case 5: exl3_gemm_body_a1<5>(tr, xh, ye, M, K, N, tile); break;
-            EXL3_CASE6(case 6: exl3_gemm_body_a1<6>(tr, xh, ye, M, K, N, tile); break;)
+            case 6: exl3_gemm_body_a1<6>(tr, xh, ye, M, K, N, tile); break;
+            case 7: exl3_gemm_body_a1<7>(tr, xh, ye, M, K, N, tile); break;
             default: break;
         }
         return;
@@ -1441,7 +1475,7 @@ extern "C" __global__ void exl3_hmma_gemm_grouped(const uint16_t* __restrict__ b
         case 3: exl3_gemm_body<3>(tr, xh, ye, M, K, N, tile); break;
         case 4: exl3_gemm_body<4>(tr, xh, ye, M, K, N, tile); break;
         case 5: exl3_gemm_body<5>(tr, xh, ye, M, K, N, tile); break;
-        EXL3_CASE6(case 6: exl3_gemm_body<6>(tr, xh, ye, M, K, N, tile); break;)
+        case 6: exl3_gemm_body<6>(tr, xh, ye, M, K, N, tile); break;
         default: break;
     }
 }
@@ -3572,6 +3606,27 @@ extern "C" __global__ void __launch_bounds__(256) xq_pen_draft(
     const int R = 1 << rlog2;
     xq_pen_span(logits, Vd, blockIdx.x * XQ_PEN_SPAN, pen, hist + (long long)slot * R, R - 1,
                 p, b, d_dev, p + 1 + i, fmax, fsum);
+}
+
+// W2-EXL3: JSON-schema constrained decoding. grid = (ceil(V / 2048), m), block 256: row r
+// with flags[r] != 0 keeps only the ids whose bit is set in its allowed bitset
+// words[r * nw .. (r + 1) * nw) (bit t of word t >> 5); every other logit becomes -inf (f16 0xFC00),
+// which the argmax never picks and the sampler gives zero mass. Runs after xq_pen_rows and before
+// xq_argmax_rows / xq_sample_rows; launched only in steps that stage a mask.
+extern "C" __global__ void __launch_bounds__(256) xq_vmask_rows(
+        unsigned short* __restrict__ logits, int V, const unsigned int* __restrict__ words, int nw,
+        const int* __restrict__ flags) {
+    XQ_PDL_ENTRY();
+    const int row = blockIdx.y;
+    if (flags[row] == 0) return;
+    const unsigned int* W = words + (long long)row * nw;
+    unsigned short* L = logits + (long long)row * V;
+    const int base = blockIdx.x * 2048;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int t = base + k * 256 + (int)threadIdx.x;
+        if (t < V && ((W[t >> 5] >> (t & 31)) & 1u) == 0u) L[t] = (unsigned short)0xFC00u;
+    }
 }
 
 // =====================================================================
@@ -5846,22 +5901,42 @@ extern "C" __global__ void xq_gemm_grouped_xh(const uint16_t* __restrict__ base,
     const uint16_t* tr = base + (size_t)offs[expert];
     const __half* xe = xh + (long long)expert * M * K;
     __half* ye = y + (long long)expert * M * N;
+    // K35 (2026-10-31), after LEG-B 2026-10-30: the fractional widths K = 1.5 / 2.5 / 3.5 arrive as the
+    // EXL3_FRAC_BITS(KA) code (17 / 18 / 19; the host's MoeLayer::bits). The integer a1/xh bodies below
+    // cannot express the half-width ring (W16 = 8*(2*KA+1) u16 per tile), and a `default: break` here
+    // was a REACHABLE SILENT NO-OP once (LEG-B: k2=3 experts wrote NOTHING from L4 on, sentinel proof
+    // 5120/5120, tests/k23_golden_l4e7up.json). The HALF twins: A-once (dyn smem M*(K+8)*2, the
+    // launcher passes it exactly as for the integer widths) when it fits, else the barrier body (which
+    // stages A in the static exl3_gemm_body_sa; the dyn smem is simply unused).
+#define XQ_GXH_FRAC(KA) case EXL3_FRAC_BITS(KA): \
+        if (exl3_a1_fits(M, K)) exl3_gemm_body_a1<KA, true>(tr, xe, ye, M, K, N, tile); \
+        else                    exl3_gemm_body<KA, true>(tr, xe, ye, M, K, N, tile); \
+        return;
+    switch (bits) { XQ_GXH_FRAC(1) XQ_GXH_FRAC(2) XQ_GXH_FRAC(3) default: break; }
+#undef XQ_GXH_FRAC
     // S-A3-n F3: A staged once when it fits (the launcher passes M*(K+8)*2 dyn smem).
     if (exl3_a1_fits(M, K)) {
+        // P7 B3 leg 2: bits 2/7 join the switch — the old default: break was a REACHABLE silent
+        // no-op (the host K-generic fallback routes 2/7-bit packs here; the [K=2] rung-1 gate
+        // caught it as zeros-vs-a1b2, with the down GEMM a 0-vs-0 empty pass).
         switch (bits) {
+            case 2: exl3_gemm_body_a1<2>(tr, xe, ye, M, K, N, tile); break;
             case 3: exl3_gemm_body_a1<3>(tr, xe, ye, M, K, N, tile); break;
             case 4: exl3_gemm_body_a1<4>(tr, xe, ye, M, K, N, tile); break;
             case 5: exl3_gemm_body_a1<5>(tr, xe, ye, M, K, N, tile); break;
-            EXL3_CASE6(case 6: exl3_gemm_body_a1<6>(tr, xe, ye, M, K, N, tile); break;)
+            case 6: exl3_gemm_body_a1<6>(tr, xe, ye, M, K, N, tile); break;
+            case 7: exl3_gemm_body_a1<7>(tr, xe, ye, M, K, N, tile); break;
             default: break;
         }
         return;
     }
     switch (bits) {
+        case 2: exl3_gemm_body<2>(tr, xe, ye, M, K, N, tile); break;
         case 3: exl3_gemm_body<3>(tr, xe, ye, M, K, N, tile); break;
         case 4: exl3_gemm_body<4>(tr, xe, ye, M, K, N, tile); break;
         case 5: exl3_gemm_body<5>(tr, xe, ye, M, K, N, tile); break;
-        EXL3_CASE6(case 6: exl3_gemm_body<6>(tr, xe, ye, M, K, N, tile); break;)
+        case 6: exl3_gemm_body<6>(tr, xe, ye, M, K, N, tile); break;
+        case 7: exl3_gemm_body<7>(tr, xe, ye, M, K, N, tile); break;
         default: break;
     }
 }
@@ -6762,6 +6837,48 @@ NAME(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,      
 WP20_GU_ENTRY_B4(xq_moe_gu_epi_b4, 1)
 WP20_GU_ENTRY_B4(xq_moe_gu_epi_b4_c2, 2)
 WP20_GU_ENTRY_B4(xq_moe_gu_epi_b4_c4, 4)
+
+// P7 B3 (TP2BIT5 width closure, K = 5 experts — e.g. layer-0 of the 4bpw Flash-Next pack):
+// the SHFL twins at BITS = 5. The word diet is b3/b4-only by static_assert (ring = 8*BITS words
+// vs 32 lanes), so every 5-bit entry is SHFL; bodies and contracts are otherwise the b4 set's.
+#define WP20_GU_ENTRY_B5(NAME, KCH)                                                                 \
+extern "C" __global__ void __launch_bounds__(256, 3)                                              \
+NAME(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,                        \
+     const __half* __restrict__ xh, __half* __restrict__ ygu, int M, int K, int N,                \
+     const int* __restrict__ esel, const int* __restrict__ idxmap,                                \
+     const __half* __restrict__ svh_all, const __half* __restrict__ suh_d_all,                    \
+     __half* __restrict__ xhd, unsigned* __restrict__ cnt, const __half* __restrict__ x,          \
+     const __half* __restrict__ sg, float* __restrict__ sgv) {                                    \
+    XQ_PDL_ENTRY();                                                                                \
+    wp20_moe_gu<false, false, KCH, 5>(base, offs, xh, ygu, M, K, N, esel, idxmap, svh_all, suh_d_all, \
+                                     xhd, cnt, x, sg, sgv);                                        \
+}
+WP20_GU_ENTRY_B5(xq_moe_gu_epi_b5, 1)
+WP20_GU_ENTRY_B5(xq_moe_gu_epi_b5_c2, 2)
+WP20_GU_ENTRY_B5(xq_moe_gu_epi_b5_c4, 4)
+// P7 B3 leg 2 (K = 2/6/7 experts): the same SHFL twin shape at any width (the two-ring-word
+// select covers bits <= 7; the word diet stays b3/b4-only by static_assert). Top-10 down only.
+#define WP20_GU_ENTRY_BW(NAME, KCH, B)                                                              \
+extern "C" __global__ void __launch_bounds__(256, 3)                                              \
+NAME(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,                        \
+     const __half* __restrict__ xh, __half* __restrict__ ygu, int M, int K, int N,                \
+     const int* __restrict__ esel, const int* __restrict__ idxmap,                                \
+     const __half* __restrict__ svh_all, const __half* __restrict__ suh_d_all,                    \
+     __half* __restrict__ xhd, unsigned* __restrict__ cnt, const __half* __restrict__ x,          \
+     const __half* __restrict__ sg, float* __restrict__ sgv) {                                    \
+    XQ_PDL_ENTRY();                                                                                \
+    wp20_moe_gu<false, false, KCH, B>(base, offs, xh, ygu, M, K, N, esel, idxmap, svh_all, suh_d_all, \
+                                     xhd, cnt, x, sg, sgv);                                        \
+}
+WP20_GU_ENTRY_BW(xq_moe_gu_epi_b2, 1, 2)
+WP20_GU_ENTRY_BW(xq_moe_gu_epi_b2_c2, 2, 2)
+WP20_GU_ENTRY_BW(xq_moe_gu_epi_b2_c4, 4, 2)
+WP20_GU_ENTRY_BW(xq_moe_gu_epi_b6, 1, 6)
+WP20_GU_ENTRY_BW(xq_moe_gu_epi_b6_c2, 2, 6)
+WP20_GU_ENTRY_BW(xq_moe_gu_epi_b6_c4, 4, 6)
+WP20_GU_ENTRY_BW(xq_moe_gu_epi_b7, 1, 7)
+WP20_GU_ENTRY_BW(xq_moe_gu_epi_b7_c2, 2, 7)
+WP20_GU_ENTRY_BW(xq_moe_gu_epi_b7_c4, 4, 7)
 // A5-K7 (moe.gu_fold): xq_moe_gu_epi with xq_had_suh_multi folded into the prologue. Same 16
 // params (xh ignored) + suh_gu_all (the gate/up suh table, [experts][K]). Bitwise == the
 // xq_had_suh_multi -> xq_moe_gu_epi pair (--probe-exl3-binv EXL3-MOE-EPI, "fold" rows).
@@ -6808,6 +6925,148 @@ xq_moe_dn_epi_b4_k10(const uint16_t* __restrict__ base, const uint64_t* __restri
     XQ_PDL_ENTRY();
     wp20_moe_dn<true, 10, 4>(base, offs, xhd, yd, M, K, N, esel, idxmap, svh_all, cnt, ysh, ids,
                              wts, slotmap, sgv, out, topk);
+}
+// P7 B3: the 5-bit down epilogue (top-10, SHFL; no diet twin exists at K = 5).
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_moe_dn_epi_b5_k10(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,
+     const __half* __restrict__ xhd, __half* __restrict__ yd, int M, int K, int N,
+     const int* __restrict__ esel, const int* __restrict__ idxmap,
+     const __half* __restrict__ svh_all, unsigned* __restrict__ cnt,
+     const __half* __restrict__ ysh, const int* __restrict__ ids, const float* __restrict__ wts,
+     const int* __restrict__ slotmap, const float* __restrict__ sgv, __half* __restrict__ out,
+     int topk) {
+    XQ_PDL_ENTRY();
+    wp20_moe_dn<false, 10, 5>(base, offs, xhd, yd, M, K, N, esel, idxmap, svh_all, cnt, ysh, ids,
+                              wts, slotmap, sgv, out, topk);
+}
+// P7 B3 leg 2: the 2/6/7-bit down epilogues (top-10, SHFL; no diet twin exists there).
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_moe_dn_epi_b2_k10(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,
+     const __half* __restrict__ xhd, __half* __restrict__ yd, int M, int K, int N,
+     const int* __restrict__ esel, const int* __restrict__ idxmap,
+     const __half* __restrict__ svh_all, unsigned* __restrict__ cnt,
+     const __half* __restrict__ ysh, const int* __restrict__ ids, const float* __restrict__ wts,
+     const int* __restrict__ slotmap, const float* __restrict__ sgv, __half* __restrict__ out,
+     int topk) {
+    XQ_PDL_ENTRY();
+    wp20_moe_dn<false, 10, 2>(base, offs, xhd, yd, M, K, N, esel, idxmap, svh_all, cnt, ysh, ids,
+                                wts, slotmap, sgv, out, topk);
+}
+// P7 B3 leg 2: the 2/6/7-bit down epilogues (top-10, SHFL; no diet twin exists there).
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_moe_dn_epi_b6_k10(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,
+     const __half* __restrict__ xhd, __half* __restrict__ yd, int M, int K, int N,
+     const int* __restrict__ esel, const int* __restrict__ idxmap,
+     const __half* __restrict__ svh_all, unsigned* __restrict__ cnt,
+     const __half* __restrict__ ysh, const int* __restrict__ ids, const float* __restrict__ wts,
+     const int* __restrict__ slotmap, const float* __restrict__ sgv, __half* __restrict__ out,
+     int topk) {
+    XQ_PDL_ENTRY();
+    wp20_moe_dn<false, 10, 6>(base, offs, xhd, yd, M, K, N, esel, idxmap, svh_all, cnt, ysh, ids,
+                                wts, slotmap, sgv, out, topk);
+}
+// P7 B3 leg 2: the 2/6/7-bit down epilogues (top-10, SHFL; no diet twin exists there).
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_moe_dn_epi_b7_k10(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,
+     const __half* __restrict__ xhd, __half* __restrict__ yd, int M, int K, int N,
+     const int* __restrict__ esel, const int* __restrict__ idxmap,
+     const __half* __restrict__ svh_all, unsigned* __restrict__ cnt,
+     const __half* __restrict__ ysh, const int* __restrict__ ids, const float* __restrict__ wts,
+     const int* __restrict__ slotmap, const float* __restrict__ sgv, __half* __restrict__ out,
+     int topk) {
+    XQ_PDL_ENTRY();
+    wp20_moe_dn<false, 10, 7>(base, offs, xhd, yd, M, K, N, esel, idxmap, svh_all, cnt, ysh, ids,
+                                wts, slotmap, sgv, out, topk);
+}
+// P7 B3: rung-1 grouped entry for 5-bit experts (SHFL a1 body; bitwise == xq_gemm_grouped_xh).
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_gemm_grouped_a1b5(const uint16_t* __restrict__ base,
+                     const uint64_t* __restrict__ offs,
+                     const __half* __restrict__ xh,
+                     __half* __restrict__ y,
+                     int M, int K, int N, int bits,
+                     const int* __restrict__ esel) {
+    XQ_PDL_ENTRY();
+    const int tiles = N / 128;
+    const int expert = blockIdx.x / tiles;
+    const int tile = blockIdx.x - expert * tiles;
+    if (expert >= *esel) return;
+    exl3_gemm_body_a1<5>(base + (size_t)offs[expert], xh + (long long)expert * M * K,
+                         y + (long long)expert * M * N, M, K, N, tile);
+}
+// P7 B3 leg 2: rung-1 grouped entries for 2/6/7-bit experts (SHFL a1 body; bitwise == xq_gemm_grouped_xh).
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_gemm_grouped_a1b2(const uint16_t* __restrict__ base,
+                     const uint64_t* __restrict__ offs,
+                     const __half* __restrict__ xh,
+                     __half* __restrict__ y,
+                     int M, int K, int N, int bits,
+                     const int* __restrict__ esel) {
+    XQ_PDL_ENTRY();
+    const int tiles = N / 128;
+    const int expert = blockIdx.x / tiles;
+    const int tile = blockIdx.x - expert * tiles;
+    if (expert >= *esel) return;
+    exl3_gemm_body_a1<2>(base + (size_t)offs[expert], xh + (long long)expert * M * K,
+                         y + (long long)expert * M * N, M, K, N, tile);
+}
+// P7 B3 leg 2: rung-1 grouped entries for 2/6/7-bit experts (SHFL a1 body; bitwise == xq_gemm_grouped_xh).
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_gemm_grouped_a1b6(const uint16_t* __restrict__ base,
+                     const uint64_t* __restrict__ offs,
+                     const __half* __restrict__ xh,
+                     __half* __restrict__ y,
+                     int M, int K, int N, int bits,
+                     const int* __restrict__ esel) {
+    XQ_PDL_ENTRY();
+    const int tiles = N / 128;
+    const int expert = blockIdx.x / tiles;
+    const int tile = blockIdx.x - expert * tiles;
+    if (expert >= *esel) return;
+    exl3_gemm_body_a1<6>(base + (size_t)offs[expert], xh + (long long)expert * M * K,
+                         y + (long long)expert * M * N, M, K, N, tile);
+}
+// P7 B3 leg 2: rung-1 grouped entries for 2/6/7-bit experts (SHFL a1 body; bitwise == xq_gemm_grouped_xh).
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_gemm_grouped_a1b7(const uint16_t* __restrict__ base,
+                     const uint64_t* __restrict__ offs,
+                     const __half* __restrict__ xh,
+                     __half* __restrict__ y,
+                     int M, int K, int N, int bits,
+                     const int* __restrict__ esel) {
+    XQ_PDL_ENTRY();
+    const int tiles = N / 128;
+    const int expert = blockIdx.x / tiles;
+    const int tile = blockIdx.x - expert * tiles;
+    if (expert >= *esel) return;
+    exl3_gemm_body_a1<7>(base + (size_t)offs[expert], xh + (long long)expert * M * K,
+                         y + (long long)expert * M * N, M, K, N, tile);
+}
+// K8EXP (2026-11-07): the K = 8 (k2 16) grouped expert entry — the MTP head of the issue-#26 4bpw pack (mtp_bits 8)
+// and the SAGE tails. Its own entry, NOT a case in xq_gemm_grouped_xh: adding case 8 there re-allocated that kernel
+// (92 -> 87 registers, ptxas sm_121), and xh is the only decode body of the half-bit packs (1.66 / 2.68 / 3.68), so
+// it stays byte-for-byte as it was. Same 9-argument signature and grid as xh (grouped_fn returns this name for bits
+// 8 at every width); `bits` is unused. A-once body when M*(K+8)*2 fits the dynamic smem the launcher passes
+// (a1_smem): WRING = 64 ring words = exactly the two coalesced SHFL source words per lane (w0 = 0..31,
+// w1 = 32..63); otherwise the barrier body = the served dense K = 8 body (exl3_hmma_gemm case 16, PR#27-D2).
+// Gate: --probe-exl3-bitwidths section 7 (multi-expert, poisoned, vs the host oracle and the m16 reference).
+extern "C" __global__ void xq_gemm_grouped_b8(const uint16_t* __restrict__ base,
+                                              const uint64_t* __restrict__ offs,
+                                              const __half* __restrict__ xh,
+                                              __half* __restrict__ y,
+                                              int M, int K, int N, int bits,
+                                              const int* __restrict__ esel) {
+    XQ_PDL_ENTRY();
+    (void)bits;
+    const int tiles = N / 128;
+    const int expert = blockIdx.x / tiles;
+    const int tile = blockIdx.x - expert * tiles;
+    if (expert >= *esel) return;
+    const uint16_t* tr = base + (size_t)offs[expert];
+    const __half* xe = xh + (long long)expert * M * K;
+    __half* ye = y + (long long)expert * M * N;
+    if (exl3_a1_fits(M, K)) exl3_gemm_body_a1<8>(tr, xe, ye, M, K, N, tile);
+    else                    exl3_gemm_body<8>(tr, xe, ye, M, K, N, tile);
 }
 extern "C" __global__ void __launch_bounds__(256, 3)
 xq_gemm_grouped_a1b4(const uint16_t* __restrict__ base,
@@ -7065,6 +7324,486 @@ __device__ __forceinline__ void mpk_items(int n, int flags, int& i_beg, int& i_s
         i_end = (int)(((long long)(b + 1) * n) / G);
     }
     n_items = i_beg < i_end ? (i_end - i_beg + i_step - 1) / i_step : 0;
+}
+
+// ---- B10 (width closure): width-generic persistent grouped experts, BITS in {2,4,5,6,7}.
+// K=3 keeps the diet entries above BYTE-IDENTICAL (mpk_consume's 2-word window decode is
+// b3/b4-only by its own static_assert, wp20_a1_mainloop:6315); the generic bodies below are
+// adapted copies of mpk_gu_body / mpk_dn_body with (a) geometry per width (a 16x16 trellis
+// block is 32*BITS B: BB, KROW = 8*BB, STB per ring slot, NCH = 64*BITS issuer threads),
+// (b) the consumer = wp20_a1_mainloop's SHFL window-table decode (the all-widths reference
+// body: per-window (i0,i1,sf) tables + funnelshift), (c) THREADS = 256 at BITS<=3 else 512
+// (NCH must stay whole-warp and leave >= 64 A threads; 1024 % THREADS == 0 for the sigmoid
+// tree), and the >= 8-warp loops (stage_tile, svh epilogues, combine) pinned to warps 0..7.
+template <int BITS> struct MpkGeom {
+    static constexpr int BB = 32 * BITS, KROW = 8 * BB, STB = MPK_KSTEP * KROW,
+                         NCH = STB / 16, THREADS = (BITS <= 3) ? 256 : 512,
+                         ATHR = THREADS - NCH;
+    static_assert(BITS >= 1 && BITS <= 8, "MpkGeom: width out of range");
+    static_assert(NCH % 32 == 0 && NCH < THREADS, "MpkGeom: issuers must be whole warps below the block");
+};
+
+// Host-side smem mirror at width `bits` (MPK_STB == MpkGeom<3>::STB; bits 3 reproduces the
+// legacy numbers exactly). Mirrored by exl3_forward::mpk_smem_bytes(bits).
+__host__ __device__ __forceinline__ int mpk_smem_bytes_b(int nst, int M, int K, int gu, int fold, int bits) {
+    const int epi = gu ? (M * 256 > 4096 ? M * 256 : 4096) : M * 256;
+    return nst * (1024 * bits) + M * (K + 8) * 2 + ((gu && fold) ? K * 2 : 0) + epi;
+}
+
+// wp20_a1_mainloop's SHFL window tables, verbatim (W = 8*BITS words per k16 row).
+template <int BITS>
+__device__ __forceinline__ void mpk_shfl_consts(int lane, int (&s_i0m)[8], int (&s_i1m)[8], int (&s_sf)[8]) {
+    constexpr int W = 8 * BITS;
+    #pragma unroll
+    for (int h = 0; h < 2; ++h)
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const int r = 2 * (lane & 3) + (s & 1) + 8 * (s >> 1);
+            const int c = 8 * h + (lane >> 2);
+            const int l = 8 * ((c >> 1) & 3) + ((r & 7) >> 1);
+            const int t = 8 * l + (r & 1) + 2 * ((r >> 3) & 1) + 4 * (c >> 3) + 32 * (c & 1);
+            const int b1 = (t + 257) * BITS;
+            const int i0 = (b1 - 16) >> 5;
+            const int i1 = (b1 - 1) >> 5;
+            s_i0m[h * 4 + s] = i0 % W;
+            s_i1m[h * 4 + s] = i1 % W;
+            s_sf[h * 4 + s] = ((i1 + 1) << 5) - b1;
+        }
+}
+
+// Consumer, generic widths: the SHFL decode (wp20_a1_mainloop's A1_SHFL block, funnelshift
+// form) on one ring slot's words; bfrag/A-frag/mma exactly as mpk_consume's.
+template <int BITS>
+__device__ __forceinline__ void mpk_consume_g(const unsigned char* sw, const __half* sa, int SK, int kb0,
+                                              int lane, const int* s_i0m, const int* s_i1m, const int* s_sf,
+                                              int gid, int tig, bool l0, bool l1, bool hi_rows,
+                                              float (&acc)[2][4]) {
+    constexpr int W = 8 * BITS;
+    #pragma unroll
+    for (int g = 0; g < MPK_KSTEP; ++g) {
+        const uint32_t* wr = (const uint32_t*)(sw + g * MpkGeom<BITS>::KROW);
+        const unsigned w0 = (lane < W) ? wr[lane] : 0u;
+        const unsigned w1 = (W > 32 && lane + 32 < W) ? wr[lane + 32] : 0u;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint16_t rv[4];
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int j = h * 4 + q;
+                unsigned lo = __shfl_sync(0xFFFFFFFFu, w0, s_i1m[j] & 31);
+                unsigned hi = __shfl_sync(0xFFFFFFFFu, w0, s_i0m[j] & 31);
+                if (W > 32) {
+                    const unsigned lo2 = __shfl_sync(0xFFFFFFFFu, w1, s_i1m[j] & 31);
+                    const unsigned hi2 = __shfl_sync(0xFFFFFFFFu, w1, s_i0m[j] & 31);
+                    lo = s_i1m[j] >= 32 ? lo2 : lo;
+                    hi = s_i0m[j] >= 32 ? hi2 : hi;
+                }
+                const unsigned idx = __funnelshift_r(lo, hi, (unsigned)s_sf[j]) & 0xFFFFu;
+                const unsigned sum = __dp4a(idx * EXL3_MUL1, 0x01010101u, 0x00006400u);
+                rv[q] = (uint16_t)__half_as_ushort(__hfma(__ushort_as_half((unsigned short)sum),
+                            __ushort_as_half((unsigned short)0x1EEE), __ushort_as_half((unsigned short)0xC931)));
+            }
+            uint32_t bfrag[2];
+            bfrag[0] = (uint32_t)rv[0] | ((uint32_t)rv[1] << 16);
+            bfrag[1] = (uint32_t)rv[2] | ((uint32_t)rv[3] << 16);
+            const __half* ar0 = sa + gid * SK + (kb0 + g) * 16 + 2 * tig;
+            const uint32_t a0 = l0 ? *(const uint32_t*)ar0 : 0u;
+            const uint32_t a2 = l0 ? *(const uint32_t*)(ar0 + 8) : 0u;
+            uint32_t a1 = 0u, a3 = 0u;
+            if (hi_rows) {
+                a1 = l1 ? *(const uint32_t*)(ar0 + 8 * SK) : 0u;
+                a3 = l1 ? *(const uint32_t*)(ar0 + 8 * SK + 8) : 0u;
+            }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(acc[h][0]), "+f"(acc[h][1]), "+f"(acc[h][2]), "+f"(acc[h][3])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                  "r"(bfrag[0]), "r"(bfrag[1]));
+        }
+    }
+}
+
+// mpk_issue_a / mpk_wait_a / mpk_prod_seek / mpk_prod_step / mpk_fold_a, geometry-templated
+// (BITS=3 + THREADS=256 reproduces the helpers above exactly).
+template <int BITS>
+__device__ __forceinline__ void mpk_issue_a_g(unsigned sa_u, const __half* __restrict__ src, int M, int K,
+                                              unsigned su_u, const __half* __restrict__ suh) {
+    const int ta = (int)threadIdx.x - MpkGeom<BITS>::NCH;
+    if (ta < 0) return;                                   // warp-uniform (NCH = whole warps)
+    const int vpr = K >> 3, SK = K + 8;
+    for (int i = ta; i < M * vpr; i += MpkGeom<BITS>::ATHR) {
+        const int r = i / vpr, c = i - r * vpr;
+        lmh_cp16(sa_u + (unsigned)((r * SK + c * 8) * 2), src + (size_t)r * K + c * 8);
+    }
+    if (suh != nullptr)
+        for (int i = ta; i < vpr; i += MpkGeom<BITS>::ATHR)
+            lmh_cp16(su_u + (unsigned)(i * 16), suh + (size_t)i * 8);
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+template <int BITS>
+__device__ __forceinline__ void mpk_wait_a_g() {
+    if ((int)threadIdx.x >= MpkGeom<BITS>::NCH) asm volatile("cp.async.wait_all;\n" ::: "memory");
+    __syncthreads();
+}
+template <int BITS>
+__device__ __forceinline__ void mpk_fold_a_g(__half* sa, const __half* su, int M, int K) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nblk = K >> 7, SK = K + 8;
+    #pragma unroll 2
+    for (int bi = warp; bi < M * nblk; bi += MpkGeom<BITS>::THREADS / 32) {
+        const int r = bi / nblk, blk = bi - r * nblk;
+        __half* ap = sa + r * SK + blk * 128 + lane * 4;
+        float xs[4], ss[4], v[4];
+        wp20_unpack4(*(const uint2*)ap, xs);
+        wp20_unpack4(*(const uint2*)(su + blk * 128 + lane * 4), ss);
+        wp20_suh_had(xs, ss, v, lane);
+        __half o[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = xq_f2h(v[j]);
+        *(uint2*)ap = wp20_pack4(o);
+    }
+}
+struct MpkProdG { const unsigned char* src; int item, ks, slot, i; };
+template <int BITS>
+__device__ __forceinline__ void mpk_prod_seek_g(MpkProdG& p, const unsigned char* trb,
+                                                const unsigned long long* s_off, int T, long long c_src) {
+    const int e = p.item / T;
+    p.src = trb + s_off[e] * 2ull + (long long)(p.item - e * T) * MpkGeom<BITS>::KROW + c_src;
+}
+template <int BITS, int NST>
+__device__ __forceinline__ void mpk_prod_step_g(MpkProdG& p, unsigned ring_u, unsigned c_dst, bool c_live,
+                                                long long rowB, int NKS, int total, int i_step, int i_end,
+                                                const unsigned char* trb, const unsigned long long* s_off,
+                                                int T, long long c_src, unsigned long long pol) {
+    if (p.i < total) {
+        if (c_live)
+            lmh_cp16_ef(ring_u + (unsigned)(p.slot * MpkGeom<BITS>::STB) + c_dst,
+                        p.src + (long long)p.ks * MPK_KSTEP * rowB, pol);
+        ++p.i;
+        if (++p.ks == NKS) {
+            p.ks = 0;
+            p.item += i_step;
+            if (p.item < i_end) mpk_prod_seek_g<BITS>(p, trb, s_off, T, c_src);
+        }
+        if (++p.slot == NST) p.slot = 0;
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+// wp20_stage_tile assumes 8 warps (16-col blocks per warp); at 512 threads only warps 0..7
+// own columns — the guarded wrapper.
+__device__ __forceinline__ void mpk_stage_tile8(__half* yt, const float (&acc)[2][4], int M) {
+    if ((threadIdx.x >> 5) >= 8) return;
+    wp20_stage_tile(yt, acc, M);
+}
+
+// Generic gate/up body (adapted from mpk_gu_body; see the header comment).
+template <int BITS, int NST>
+__device__ __forceinline__ void mpk_gu_body_g(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,
+                                              const __half* __restrict__ ain, const __half* __restrict__ suh_all,
+                                              __half* __restrict__ ygu, int M, int K, int N,
+                                              const int* __restrict__ esel, const int* __restrict__ idxmap,
+                                              const __half* __restrict__ svh_all, const __half* __restrict__ suh_d_all,
+                                              __half* __restrict__ xhd, unsigned* __restrict__ cnt,
+                                              const __half* __restrict__ x, const __half* __restrict__ sg,
+                                              float* __restrict__ sgv, int flags) {
+    constexpr int THR = MpkGeom<BITS>::THREADS;
+    static_assert(NST >= 3, "ring needs >= 3 slots");
+    extern __shared__ __align__(16) unsigned char mpk_sm[];
+    __shared__ unsigned long long s_off[MPK_EMAX];
+    __shared__ int s_ix[MPK_EMAX];
+    __shared__ int s_flag;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int gid = lane >> 2, tig = lane & 3;
+    const bool fold = (flags & MPK_FOLD) != 0;
+    const int T = N >> 7, NKS = (K >> 4) / MPK_KSTEP, SK = K + 8, P = T >> 1;
+    unsigned char* ring = mpk_sm;
+    __half* sa = (__half*)(mpk_sm + NST * MpkGeom<BITS>::STB);
+    __half* su = (__half*)((unsigned char*)sa + M * SK * 2);
+    __half* epi = (__half*)((unsigned char*)su + (fold ? K * 2 : 0));
+    const int live = *esel;
+    if (tid == 0) {
+        unsigned dsz;
+        asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsz));
+        if (dsz < (unsigned)mpk_smem_bytes_b(NST, M, K, 1, fold ? 1 : 0, BITS)) __trap();
+        if (M < 1 || M > 16 || (N & 255) != 0 || (K & 127) != 0 || (K % (16 * MPK_KSTEP)) != 0) __trap();
+        if (live < 0 || live > MPK_EMAX) __trap();
+    }
+    for (int e = tid; e < live && e < MPK_EMAX; e += THR) { s_off[e] = offs[e]; s_ix[e] = idxmap[e]; }
+    int i_beg, i_step, i_end, n_items;
+    mpk_items(live * T, flags, i_beg, i_step, i_end, n_items);
+    const int total = n_items * NKS;
+    __syncthreads();
+
+    unsigned long long pol;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+    const unsigned ring_u = (unsigned)__cvta_generic_to_shared(ring);
+    const unsigned sa_u = (unsigned)__cvta_generic_to_shared(sa);
+    const unsigned su_u = (unsigned)__cvta_generic_to_shared(su);
+    const bool c_live = tid < MpkGeom<BITS>::NCH;
+    const int cg = tid / (MpkGeom<BITS>::KROW / 16), cr = tid - cg * (MpkGeom<BITS>::KROW / 16);
+    const long long rowB = (long long)(N >> 4) * MpkGeom<BITS>::BB;
+    const long long c_src = (long long)cg * rowB + cr * 16;
+    const unsigned c_dst = (unsigned)(cg * MpkGeom<BITS>::KROW + cr * 16);
+    const unsigned char* trb = (const unsigned char*)base;
+    MpkProdG pr;
+    pr.item = i_beg; pr.ks = 0; pr.slot = 0; pr.i = 0; pr.src = trb;
+    bool a_pend = false;
+    if (n_items > 0) {
+        mpk_prod_seek_g<BITS>(pr, trb, s_off, T, c_src);
+        #pragma unroll 1
+        for (int s = 0; s < NST - 1; ++s)
+            mpk_prod_step_g<BITS, NST>(pr, ring_u, c_dst, c_live, rowB, NKS, total, i_step, i_end, trb, s_off, T, c_src, pol);
+        const int e0 = i_beg / T;
+        mpk_issue_a_g<BITS>(sa_u, ain + (fold ? 0ll : (long long)e0 * M * K), M, K, su_u,
+                            fold ? suh_all + (long long)s_ix[e0] * K : nullptr);
+        a_pend = true;
+    }
+    // shared-expert gate sigmoid (mpk_gu_body's): the EXACT original 256-thread sequence —
+    // partials and halving tree written only by threads 0..255 (threads 256..511 idle through
+    // the tree; the B10 b5 bug was the unguarded (tid & 255) tree letting both halves of the
+    // CTA duplicate-write red[] concurrently — values identical, but empirically nondeterministic
+    // at 512 threads: sgv readback varied run-to-run while every input was fixed).
+    for (int r = (int)blockIdx.x; r < M; r += (int)gridDim.x) {
+        float* red = (float*)epi;
+        __syncthreads();
+        #pragma unroll 1
+        for (int q = 0; q < 4; ++q) {
+            const int vt = (tid & 255) + 256 * q;
+            float part = 0.0f;
+            #pragma unroll 1
+            for (int c = vt; c < K; c += 1024)
+                part = __fmaf_rn(xq_h2f(sg[c]), xq_h2f(x[(long long)r * K + c]), part);
+            if (tid < 256) red[vt] = part;
+        }
+        __syncthreads();
+        for (int s2 = 512; s2 > 0; s2 >>= 1) {
+            if (tid < 256)
+                for (int i = tid; i < s2; i += 256) red[i] = __fadd_rn(red[i], red[i + s2]);
+            __syncthreads();
+        }
+        if (tid == 0) sgv[r] = xq_sig(red[0]);
+    }
+    if (n_items == 0) return;
+
+    int s_i0m[8], s_i1m[8], s_sf[8];
+    mpk_shfl_consts<BITS>(lane, s_i0m, s_i1m, s_sf);
+    const bool l0 = gid < M, l1 = (gid + 8) < M, hi_rows = M > 8;
+    float acc[2][4];
+    #pragma unroll
+    for (int h = 0; h < 2; ++h)
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) acc[h][r] = 0.0f;
+    int c_item = i_beg, c_ks = 0, c_slot = 0;
+
+    #pragma unroll 1
+    for (int it = 0; it < total; ++it) {
+        if (a_pend) {
+            mpk_wait_a_g<BITS>();
+            if (fold) { mpk_fold_a_g<BITS>(sa, su, M, K); __syncthreads(); }
+            a_pend = false;
+        }
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(NST - 2) : "memory");
+        __syncthreads();
+        mpk_prod_step_g<BITS, NST>(pr, ring_u, c_dst, c_live, rowB, NKS, total, i_step, i_end, trb, s_off, T, c_src, pol);
+        if (warp < 8)
+            mpk_consume_g<BITS>(ring + c_slot * MpkGeom<BITS>::STB + warp * MpkGeom<BITS>::BB, sa, SK,
+                                c_ks * MPK_KSTEP, lane, s_i0m, s_i1m, s_sf, gid, tig, l0, l1, hi_rows, acc);
+        if (++c_slot == NST) c_slot = 0;
+        if (++c_ks == NKS) {
+            const int e = c_item / T, tile = c_item - e * T, ix = s_ix[e];
+            __half* yt = epi;
+            mpk_stage_tile8(yt, acc, M);
+            __syncthreads();
+            const int nx = c_item + i_step;
+            if (nx < i_end && nx / T != e) {
+                const int e2 = nx / T;
+                mpk_issue_a_g<BITS>(sa_u, ain + (fold ? 0ll : (long long)e2 * M * K), M, K, su_u,
+                                    fold ? suh_all + (long long)s_ix[e2] * K : nullptr);
+                a_pend = true;
+            }
+            const int cta_n = tile * 128;
+            __half* ye = ygu + (long long)e * M * N;
+            if (warp < 8)                               // single-writer, exact original
+                for (int r = warp; r < M; r += 8) {       // == xq_had_svh_multi
+                const uint2 o = wp20_svh_row(yt + r * 128, svh_all + (long long)ix * N + cta_n, lane);
+                *(uint2*)(yt + r * 128 + lane * 4) = o;
+                *(uint2*)(ye + (long long)r * N + cta_n + lane * 4) = o;
+            }
+            const int p = tile < P ? tile : tile - P;
+            if (wp20_arrive(cnt + e * P + p, 2u, &s_flag)) {
+                const int KD = N >> 1;
+                const int ptile = tile < P ? tile + P : tile - P;
+                const bool own_gate = tile < P;
+                if (warp < 8)                             // single-writer, exact original
+                    for (int r = warp; r < M; r += 8) {
+                    const uint2 pw = __ldcg((const uint2*)(ye + (long long)r * N + ptile * 128 + lane * 4));
+                    const uint2 ow = *(const uint2*)(yt + r * 128 + lane * 4);
+                    float g[4], u[4], sv[4], dv[4], v[4];
+                    wp20_unpack4(own_gate ? ow : pw, g);
+                    wp20_unpack4(own_gate ? pw : ow, u);
+                    wp20_unpack4(__ldg((const uint2*)(suh_d_all + (long long)ix * KD + p * 128 + lane * 4)), sv);
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        dv[j] = xq_h2f(xq_f2h(xq_silu(g[j]) * u[j]));
+                    wp20_suh_had(dv, sv, v, lane);
+                    __half o[4];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) o[j] = xq_f2h(v[j]);
+                    *(uint2*)(xhd + ((long long)e * M + r) * KD + p * 128 + lane * 4) = wp20_pack4(o);
+                }
+            }
+            #pragma unroll
+            for (int h = 0; h < 2; ++h)
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) acc[h][r] = 0.0f;
+            c_ks = 0;
+            c_item = nx;
+        }
+    }
+}
+
+// Generic down body (adapted from mpk_dn_body).
+template <int BITS, int NST, int TOPK>
+__device__ __forceinline__ void mpk_dn_body_g(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,
+                                              const __half* __restrict__ xhd, __half* __restrict__ yd,
+                                              int M, int K, int N, const int* __restrict__ esel,
+                                              const int* __restrict__ idxmap, const __half* __restrict__ svh_all,
+                                              unsigned* __restrict__ cnt, const __half* __restrict__ ysh,
+                                              const int* __restrict__ ids, const float* __restrict__ wts,
+                                              const int* __restrict__ slotmap, const float* __restrict__ sgv,
+                                              __half* __restrict__ out, int topk, int flags) {
+    constexpr int THR = MpkGeom<BITS>::THREADS;
+    static_assert(NST >= 3, "ring needs >= 3 slots");
+    static_assert(TOPK >= 1 && TOPK <= 16, "mpk_dn_body_g: TOPK instance out of the planned range");
+    extern __shared__ __align__(16) unsigned char mpk_sm[];
+    __shared__ unsigned long long s_off[MPK_EMAX];
+    __shared__ int s_ix[MPK_EMAX];
+    __shared__ int s_slot[MPK_RTMAX];
+    __shared__ float s_w[MPK_RTMAX];
+    __shared__ int s_flag;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int gid = lane >> 2, tig = lane & 3;
+    const int T = N >> 7, NKS = (K >> 4) / MPK_KSTEP, SK = K + 8;
+    unsigned char* ring = mpk_sm;
+    __half* sa = (__half*)(mpk_sm + NST * MpkGeom<BITS>::STB);
+    __half* epi = (__half*)((unsigned char*)sa + M * SK * 2);
+    const int live = *esel;
+    const int nrt = M * TOPK;
+    if (tid == 0) {
+        unsigned dsz;
+        asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsz));
+        if (dsz < (unsigned)mpk_smem_bytes_b(NST, M, K, 0, 0, BITS)) __trap();
+        if (M < 1 || M > 16 || (N & 127) != 0 || (K & 127) != 0 || (K % (16 * MPK_KSTEP)) != 0) __trap();
+        if (live < 0 || live > MPK_EMAX || nrt > MPK_RTMAX) __trap();
+        if (topk != TOPK) __trap();
+    }
+    for (int e = tid; e < live && e < MPK_EMAX; e += THR) { s_off[e] = offs[e]; s_ix[e] = idxmap[e]; }
+    for (int i = tid; i < nrt && i < MPK_RTMAX; i += THR) { s_slot[i] = slotmap[ids[i]]; s_w[i] = wts[i]; }
+    int i_beg, i_step, i_end, n_items;
+    mpk_items(live * T, flags, i_beg, i_step, i_end, n_items);
+    const int total = n_items * NKS;
+    __syncthreads();
+    if (n_items == 0) return;
+
+    unsigned long long pol;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+    const unsigned ring_u = (unsigned)__cvta_generic_to_shared(ring);
+    const unsigned sa_u = (unsigned)__cvta_generic_to_shared(sa);
+    const bool c_live = tid < MpkGeom<BITS>::NCH;
+    const int cg = tid / (MpkGeom<BITS>::KROW / 16), cr = tid - cg * (MpkGeom<BITS>::KROW / 16);
+    const long long rowB = (long long)(N >> 4) * MpkGeom<BITS>::BB;
+    const long long c_src = (long long)cg * rowB + cr * 16;
+    const unsigned c_dst = (unsigned)(cg * MpkGeom<BITS>::KROW + cr * 16);
+    const unsigned char* trb = (const unsigned char*)base;
+    MpkProdG pr;
+    pr.item = i_beg; pr.ks = 0; pr.slot = 0; pr.i = 0; pr.src = trb;
+    mpk_prod_seek_g<BITS>(pr, trb, s_off, T, c_src);
+    #pragma unroll 1
+    for (int s = 0; s < NST - 1; ++s)
+        mpk_prod_step_g<BITS, NST>(pr, ring_u, c_dst, c_live, rowB, NKS, total, i_step, i_end, trb, s_off, T, c_src, pol);
+    mpk_issue_a_g<BITS>(sa_u, xhd + (long long)(i_beg / T) * M * K, M, K, 0u, nullptr);
+    bool a_pend = true;
+
+    int s_i0m[8], s_i1m[8], s_sf[8];
+    mpk_shfl_consts<BITS>(lane, s_i0m, s_i1m, s_sf);
+    const bool l0 = gid < M, l1 = (gid + 8) < M, hi_rows = M > 8;
+    float acc[2][4];
+    #pragma unroll
+    for (int h = 0; h < 2; ++h)
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) acc[h][r] = 0.0f;
+    int c_item = i_beg, c_ks = 0, c_slot = 0;
+
+    #pragma unroll 1
+    for (int it = 0; it < total; ++it) {
+        if (a_pend) {
+            mpk_wait_a_g<BITS>();
+            a_pend = false;
+        }
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(NST - 2) : "memory");
+        __syncthreads();
+        mpk_prod_step_g<BITS, NST>(pr, ring_u, c_dst, c_live, rowB, NKS, total, i_step, i_end, trb, s_off, T, c_src, pol);
+        if (warp < 8)
+            mpk_consume_g<BITS>(ring + c_slot * MpkGeom<BITS>::STB + warp * MpkGeom<BITS>::BB, sa, SK,
+                                c_ks * MPK_KSTEP, lane, s_i0m, s_i1m, s_sf, gid, tig, l0, l1, hi_rows, acc);
+        if (++c_slot == NST) c_slot = 0;
+        if (++c_ks == NKS) {
+            const int e = c_item / T, tile = c_item - e * T, ix = s_ix[e];
+            __half* yt = epi;
+            mpk_stage_tile8(yt, acc, M);
+            __syncthreads();
+            const int nx = c_item + i_step;
+            if (nx < i_end && nx / T != e) {
+                mpk_issue_a_g<BITS>(sa_u, xhd + (long long)(nx / T) * M * K, M, K, 0u, nullptr);
+                a_pend = true;
+            }
+            const int cta_n = tile * 128;
+            if (warp < 8)                               // single-writer, exact original
+                for (int r = warp; r < M; r += 8)
+                    *(uint2*)(yd + ((long long)e * M + r) * N + cta_n + lane * 4) =
+                        wp20_svh_row(yt + r * 128, svh_all + (long long)ix * N + cta_n, lane);
+            if (wp20_arrive(cnt + tile, (unsigned)live, &s_flag)) {
+                if (tid < 256)                           // single-writer, exact original
+                    for (int q = tid; q < M * 32; q += 256) {
+                    const int r = q >> 5, i = cta_n + ((q & 31) << 2);
+                    const int* sl = s_slot + r * TOPK;
+                    const float* sw = s_w + r * TOPK;
+                    uint2 raw[TOPK];
+                    #pragma unroll
+                    for (int j = 0; j < TOPK; ++j) {
+                        const int s = sl[j] < 0 ? 0 : sl[j];
+                        raw[j] = __ldcg((const uint2*)(yd + ((long long)s * M + r) * N + i));
+                    }
+                    float ys[4], a[4];
+                    wp20_unpack4(__ldg((const uint2*)(ysh + (long long)r * N + i)), ys);
+                    const float gg = sgv[r];
+                    #pragma unroll
+                    for (int k4 = 0; k4 < 4; ++k4) a[k4] = __fmul_rn(gg, ys[k4]);
+                    #pragma unroll
+                    for (int j = 0; j < TOPK; ++j) {
+                        if (sl[j] >= 0) {
+                            float y[4];
+                            wp20_unpack4(raw[j], y);
+                            const float w = sw[j];
+                            #pragma unroll
+                            for (int k4 = 0; k4 < 4; ++k4) a[k4] = __fmaf_rn(w, y[k4], a[k4]);
+                        }
+                    }
+                    __half o[4];
+                    #pragma unroll
+                    for (int k4 = 0; k4 < 4; ++k4) o[k4] = xq_f2h(a[k4]);
+                    *(uint2*)(out + (long long)r * N + i) = wp20_pack4(o);
+                }
+            }
+            #pragma unroll
+            for (int h = 0; h < 2; ++h)
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) acc[h][r] = 0.0f;
+            c_ks = 0;
+            c_item = nx;
+        }
+    }
 }
 
 template <int NST>
@@ -7412,6 +8151,65 @@ MPK_DN_ENTRY(8, 4)
 MPK_DN_ENTRY(8, 8)
 MPK_DN_ENTRY(10, 4)
 MPK_DN_ENTRY(10, 8)
+// B10: width-generic entries (BITS 2,4,5,6,7 — K=3 keeps the diet entries above). The host
+// (exl3_forward::mpk_plan) picks THREADS by width; smem geometry via mpk_smem_bytes_b.
+#define MPK_GU_ENTRY_B(B, NS)                                                                        \
+extern "C" __global__ void __launch_bounds__((B <= 3 ? 256 : 512), 1)                                \
+xq_moe_gu_pk_b##B##_s##NS(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs,      \
+                   const __half* __restrict__ ain, const __half* __restrict__ suh_all,              \
+                   __half* __restrict__ ygu, int M, int K, int N,                                   \
+                   const int* __restrict__ esel, const int* __restrict__ idxmap,                    \
+                   const __half* __restrict__ svh_all, const __half* __restrict__ suh_d_all,        \
+                   __half* __restrict__ xhd, unsigned* __restrict__ cnt,                            \
+                   const __half* __restrict__ x, const __half* __restrict__ sg,                     \
+                   float* __restrict__ sgv, int flags) {                                            \
+    XQ_PDL_ENTRY();                                                                                 \
+    mpk_gu_body_g<B, NS>(base, offs, ain, suh_all, ygu, M, K, N, esel, idxmap, svh_all, suh_d_all,   \
+                    xhd, cnt, x, sg, sgv, flags);                                                   \
+}
+#define MPK_DN_ENTRY_B(B, TK, NS)                                                                    \
+extern "C" __global__ void __launch_bounds__((B <= 3 ? 256 : 512), 1)                                \
+xq_moe_dn_pk_b##B##_k##TK##_s##NS(const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs, \
+          const __half* __restrict__ xhd, __half* __restrict__ yd, int M, int K, int N,             \
+          const int* __restrict__ esel, const int* __restrict__ idxmap,                             \
+          const __half* __restrict__ svh_all, unsigned* __restrict__ cnt,                           \
+          const __half* __restrict__ ysh, const int* __restrict__ ids, const float* __restrict__ wts,\
+          const int* __restrict__ slotmap, const float* __restrict__ sgv,                           \
+          __half* __restrict__ out, int topk, int flags) {                                          \
+    XQ_PDL_ENTRY();                                                                                 \
+    mpk_dn_body_g<B, NS, TK>(base, offs, xhd, yd, M, K, N, esel, idxmap, svh_all, cnt, ysh, ids, wts,\
+                    slotmap, sgv, out, topk, flags);                                                \
+}
+MPK_GU_ENTRY_B(2, 4)
+MPK_GU_ENTRY_B(2, 8)
+MPK_GU_ENTRY_B(4, 4)
+MPK_GU_ENTRY_B(4, 8)
+MPK_GU_ENTRY_B(5, 4)
+MPK_GU_ENTRY_B(5, 8)
+MPK_GU_ENTRY_B(6, 4)
+MPK_GU_ENTRY_B(6, 8)
+MPK_GU_ENTRY_B(7, 4)
+MPK_GU_ENTRY_B(7, 8)
+MPK_DN_ENTRY_B(2, 8, 4)
+MPK_DN_ENTRY_B(2, 8, 8)
+MPK_DN_ENTRY_B(2, 10, 4)
+MPK_DN_ENTRY_B(2, 10, 8)
+MPK_DN_ENTRY_B(4, 8, 4)
+MPK_DN_ENTRY_B(4, 8, 8)
+MPK_DN_ENTRY_B(4, 10, 4)
+MPK_DN_ENTRY_B(4, 10, 8)
+MPK_DN_ENTRY_B(5, 8, 4)
+MPK_DN_ENTRY_B(5, 8, 8)
+MPK_DN_ENTRY_B(5, 10, 4)
+MPK_DN_ENTRY_B(5, 10, 8)
+MPK_DN_ENTRY_B(6, 8, 4)
+MPK_DN_ENTRY_B(6, 8, 8)
+MPK_DN_ENTRY_B(6, 10, 4)
+MPK_DN_ENTRY_B(6, 10, 8)
+MPK_DN_ENTRY_B(7, 8, 4)
+MPK_DN_ENTRY_B(7, 8, 8)
+MPK_DN_ENTRY_B(7, 10, 4)
+MPK_DN_ENTRY_B(7, 10, 8)
 
 // ---------------------------------------------------------------------------
 // S-A3-h item 3, rung 1: COOPERATIVE MoE expert-stream GEMM — a schedule port
@@ -7480,6 +8278,11 @@ MPK_DN_ENTRY(10, 8)
                             // of a buffer targets a slot computed >= 2 iters ago)
 #define MOE_COOP_PIPE    6   // committed pipeline groups kept in flight
 #define MOE_COOP_GST     4   // k16 steps staged per ring slot
+// PR#27-D1 (2026-10-30): the wrapper-owned staging ring must be sized for the WIDEST
+// case the switch below can dispatch (case 6), not the historical 5 -- the body casts
+// this storage to [2][8*BITS] views and the trellis stager writes 8*BITS words/slot,
+// so [8*5] + --moe-coop=1 on 6-bit experts overran shared memory by 8 words/slot.
+#define MOE_COOP_MAX_BITS 6
 
 // cp.async.cg 16B (bypass-L1 LDGSTS class). src_size 0 => full 16B zero fill,
 // no global read (row >= M predication; same +0.0 halves the old path staged).
@@ -7556,7 +8359,9 @@ __device__ __forceinline__ void xq_moe_coop_body(const uint16_t* __restrict__ ba
                                                  __half* s_a_raw) {
     // SMEM ring (owned by the WRAPPER — one max-size copy for all BITS
     // instantiations; per-instantiation __shared__ inside the body would
-    // allocate 3 copies, 73,728 B > the 48 KiB static cap).
+    // allocate one copy PER template instantiation (4 of them: BITS 3..6),
+    // 4 x 28,672 B = 114,688 B > the 48 KiB static cap — the single wrapper
+    // copy at MOE_COOP_MAX_BITS is sh_tr 12,288 + sh_a 16,384 = 28,672 B).
     typedef uint32_t (*TrView)[MOE_COOP_GST][2][8 * BITS];
     typedef __half   (*SaView)[MOE_COOP_GST][16][16];
     TrView s_tr = (TrView)s_tr_raw;
@@ -7717,13 +8522,14 @@ xq_moe_coop_a(const uint16_t* __restrict__ base,
               int M, int K, int N, int bits,
               const int* __restrict__ esel) {
     XQ_PDL_ENTRY();
-    __shared__ uint32_t sh_tr[MOE_COOP_STAGES][MOE_COOP_GST][2][8 * 5];
+    __shared__ uint32_t sh_tr[MOE_COOP_STAGES][MOE_COOP_GST][2][8 * MOE_COOP_MAX_BITS]; // PR#27-D1: was [8*5]
     __shared__ __half   sh_a [MOE_COOP_STAGES][MOE_COOP_GST][16][16];
     switch (bits) {
+        case 2: xq_moe_coop_body<2>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;  // PCKG-ALL: K=2 experts (1.66/2.05/2.18 packs)
         case 3: xq_moe_coop_body<3>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 4: xq_moe_coop_body<4>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 5: xq_moe_coop_body<5>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
-        EXL3_CASE6(case 6: xq_moe_coop_body<6>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;)
+        case 6: xq_moe_coop_body<6>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         default: break;
     }
 }
@@ -7736,13 +8542,14 @@ xq_moe_coop_b(const uint16_t* __restrict__ base,
               int M, int K, int N, int bits,
               const int* __restrict__ esel) {
     XQ_PDL_ENTRY();
-    __shared__ uint32_t sh_tr[MOE_COOP_STAGES][MOE_COOP_GST][2][8 * 5];
+    __shared__ uint32_t sh_tr[MOE_COOP_STAGES][MOE_COOP_GST][2][8 * MOE_COOP_MAX_BITS]; // PR#27-D1: was [8*5]
     __shared__ __half   sh_a [MOE_COOP_STAGES][MOE_COOP_GST][16][16];
     switch (bits) {
+        case 2: xq_moe_coop_body<2>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;  // PCKG-ALL: K=2 experts (1.66/2.05/2.18 packs)
         case 3: xq_moe_coop_body<3>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 4: xq_moe_coop_body<4>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         case 5: xq_moe_coop_body<5>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
-        EXL3_CASE6(case 6: xq_moe_coop_body<6>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;)
+        case 6: xq_moe_coop_body<6>(base, offs, xh, y, M, K, N, esel, &sh_tr[0][0][0][0], &sh_a[0][0][0][0]); break;
         default: break;
     }
 }
@@ -7798,10 +8605,14 @@ __device__ __forceinline__ void xq_k_norm_rope(float* kbuf, float* red, const __
 // Probe-only positive control (WP25 rung 1: "a deliberately broken 4-bit arm, which must fail"):
 // the q8 layout and readers with the reference implementation's 4-bit midpoint grid (code q4*16+8). Never served.
 #define XQ_KV_Q4X 4
+// q4k: 4-bit K/V (docs/KV_CACHE_Q4K.md) — the q8 H32 basis and per-32 f16 scale, 4-bit codes two
+// dims per byte (144 B per row at hd=256).
+#define XQ_KV_Q4K 5
 #define XQ_R32 0.17677669529663688110f   // 1/sqrt(32), the reference implementation's r32
 struct XqKv { char* k; char* v; long long rb; int fmt; int hd; };
 __device__ __forceinline__ int xq_kv_fmt(int mpf) { return (int)(((unsigned)mpf) >> 28); }
 __device__ __forceinline__ long long xq_kv_rowb(int fmt, int hd) {
+    if (fmt == XQ_KV_Q4K) return (long long)(((hd / 2 + hd / 16) + 15) & ~15);
     return fmt == XQ_KV_F32 ? 4LL * hd : (fmt == XQ_KV_F16 ? 2LL * hd : (fmt == XQ_KV_FP8
         ? (long long)hd + 16 : (long long)hd + (long long)(((hd >> 4) + 15) & ~15)));
 }
@@ -7840,6 +8651,11 @@ __device__ __forceinline__ float xq_q8_sm(const char* row, int hd, int g) {
 __device__ __forceinline__ float xq_kv_ld(const char* row, int fmt, int hd, int d) {
     if (fmt == XQ_KV_F32) return reinterpret_cast<const float*>(row)[d];
     if (fmt == XQ_KV_F16) return __half2float(reinterpret_cast<const __half*>(row)[d]);
+    if (fmt == XQ_KV_Q4K) {
+        const float sm = __fmul_rn(__half2float(reinterpret_cast<const __half*>(row + hd / 2)[d >> 5]), 0.125f);
+        const int c = (reinterpret_cast<const unsigned char*>(row)[d >> 1] >> ((d & 1) * 4)) & 0xF;
+        return __fmaf_rn((float)(c - 8), sm, 0.5f * sm);
+    }
     if (fmt >= XQ_KV_Q8) {
         const float sm = xq_q8_sm(row, hd, d >> 5);
         return xq_q8v((unsigned)reinterpret_cast<const unsigned char*>(row)[d], 0, sm, 0.5f * sm);
@@ -7859,6 +8675,12 @@ __device__ __forceinline__ void xq_kv_ld8(float* o, const char* row, int fmt, in
         const __half* h = reinterpret_cast<const __half*>(&u);
         #pragma unroll
         for (int i = 0; i < 8; i++) o[i] = __half2float(h[i]);
+    } else if (fmt == XQ_KV_Q4K) {
+        const unsigned u = *reinterpret_cast<const unsigned*>(row + (d0 >> 1));
+        const float sm = __fmul_rn(__half2float(reinterpret_cast<const __half*>(row + hd / 2)[d0 >> 5]), 0.125f);
+        const float hs = 0.5f * sm;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) o[i] = __fmaf_rn((float)((int)((u >> (4 * i)) & 0xF) - 8), sm, hs);
     } else if (fmt >= XQ_KV_Q8) {
         const uint2 u = *reinterpret_cast<const uint2*>(row + d0);
         const float sm = xq_q8_sm(row, hd, d0 >> 5);
@@ -7885,6 +8707,13 @@ __device__ __forceinline__ void xq_kv_put_q8(char* row, int fmt, int hd, int tid
     for (int o = 1; o < 32; o <<= 1) s = fmaxf(s, __shfl_xor_sync(0xffffffffu, s, o));
     s = __fadd_rn(s, 1e-10f);             // == max over lanes of (|v| + 1e-10): fl(.) is monotone
     const float vs = __fmul_rn(v, __fdiv_rn(1.0f, s));
+    if (fmt == XQ_KV_Q4K) {
+        const int q = max(min(__float2int_rd(__fmaf_rn(vs, 8.0f, 8.0f)), 15), 0);
+        const unsigned p = __shfl_xor_sync(0xffffffffu, (unsigned)q, 1);
+        if ((lane & 1) == 0) reinterpret_cast<unsigned char*>(row)[tid >> 1] = (unsigned char)(q | (p << 4));
+        if (lane == 0) reinterpret_cast<__half*>(row + hd / 2)[tid >> 5] = __float2half_rn(s);
+        return;
+    }
     int q;
     if (fmt == XQ_KV_Q8) {
         q = max(min(__float2int_rd(__fmaf_rn(vs, 128.0f, 128.0f)), 255), 0);
@@ -8468,7 +9297,7 @@ extern "C" __global__ void xq_gdn_step_chunk(__half* __restrict__ core, const __
 // The ring (nullable) receives the SAME rank-1 factors as xq_gdn_step_chunk's.
 #define XQ_GDNR_KD   128
 #define XQ_GDNR_VD   128
-#define XQ_GDNR_CMAX 8
+#define XQ_GDNR_CMAX 11
 __device__ __forceinline__ void xq_gdnr_gates(float bh, float ah, float dtb, float alog,
                                               float& beta, float& gt) {
     beta = 1.0f / (1.0f + __expf(-bh));
@@ -9733,6 +10562,7 @@ __device__ __forceinline__ void a3fg_flash_body(
                 case XQ_KV_F32: a3fg_stage_v<XQ_KV_F32, HD, BT, BKV, KPAD, VEC == 2>(Ks, Vs, kc, jt, pbase, tid); break;
                 case XQ_KV_F16: a3fg_stage_v<XQ_KV_F16, HD, BT, BKV, KPAD, VEC == 2>(Ks, Vs, kc, jt, pbase, tid); break;
                 case XQ_KV_FP8: a3fg_stage_v<XQ_KV_FP8, HD, BT, BKV, KPAD, VEC == 2>(Ks, Vs, kc, jt, pbase, tid); break;
+                case XQ_KV_Q4K: a3fg_stage_v<XQ_KV_Q4K, HD, BT, BKV, KPAD, VEC == 2>(Ks, Vs, kc, jt, pbase, tid); break;
                 default:        a3fg_stage_v<XQ_KV_Q8, HD, BT, BKV, KPAD, VEC == 2>(Ks, Vs, kc, jt, pbase, tid); break;
             }
         } else {
@@ -9856,6 +10686,488 @@ extern "C" __global__ void xq_attn_prefill_flash256c(__half* __restrict__ attn,
     XQ_PDL_ENTRY();
     a3fg_flash_body<256, 8, 16, 260, 8, 2>(attn, qg, kcvc, qnkn, cossin,
                                            nh_nkv, hd_rdim, max_pos, slot_pos0, C, eps);
+}
+
+// =====================================================================================
+// PFTC (owner 2026-11-07, #1 priority): tensor-core dense prefill attention for the EXL3 packs WITHOUT
+// sparse attention (Qwen 3.5/3.6 35B / 27B / 9B; hd = 256). The scalar flash256 body above does Q.K^T and
+// P.V on FP32 cores, 8 q rows x ONE head per block, so every K/V tile is staged once per head of its GQA
+// group: 35B TP1 128K TTFT 433 s, 27B TP2 128K 553 s. This is the trunk's attn_prefill_fa_b design
+// (gpu_batch.cu: 96 rows = Br_t tokens x g heads of ONE kv head per block, so the g heads share every
+// staged K/V tile; m16n8k16 MMA; online softmax in registers) on the EXL3 cache: K/V rows are read
+// through xq_kv_ld8 (f32 / f16 / fp8 / q8, cache basis) and staged as f16. Three launches:
+//   xq_attn_pf_qstage  q rows normed + roped (+ q8: into the cache's rotated basis) -> f16 [C][nh][hd]
+//   xq_attn_pf_tc256   attention -> un-gated f32 o/l [C][nh][hd] (cache basis)
+//   xq_attn_pf_tc_epi  q8 rotate back + gate: attn = f16(rot(o) * sig(g)), flash256's closing expression
+// Not bitwise to flash256 (f16 operands, P rounded to f16 before P.V, different summation order).
+// Flash-Next never takes it (the host gates it on a layer without an indexer).
+// =====================================================================================
+#define XQ_PFTC_BC 32
+#define XQ_PFTC_THREADS 192
+
+// grid (C*nh) 1-D, block hd (256 = 8 warps: warp w holds dims 32w..32w+31 = one H32 group, lane = dim & 31).
+extern "C" __global__ void xq_attn_pf_qstage(__half* __restrict__ qs, const __half* __restrict__ qg,
+                                             const __half* __restrict__ qnkn, const float* __restrict__ cossin,
+                                             int nh_nkv, int hd_rdim, int mpf, float eps) {
+    XQ_PDL_ENTRY();
+    __shared__ float red[32];
+    __shared__ float qn[512];
+    const int nh = ((unsigned)nh_nkv) >> 16;
+    const int hd = hd_rdim & 0xFFFF;
+    const int rdim = ((unsigned)hd_rdim) >> 16;
+    const int t = blockIdx.x / nh, head = blockIdx.x % nh;
+    const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
+    const long long qrow = (long long)t * nh * hd * 2 + (long long)head * hd * 2;
+    const float v = xq_h2f(qg[qrow + e]);
+    float ss = v * v;
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, off);
+    if (lane == 0) red[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float x = lane < (int)(blockDim.x >> 5) ? red[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) x += __shfl_down_sync(0xffffffffu, x, off);
+        if (lane == 0) red[0] = x;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(red[0] / (float)hd + eps);
+    qn[e] = v * inv * (1.0f + xq_h2f(qnkn[e]));
+    __syncthreads();
+    // rope: x1 at d (< rdim/2), partner x2 at d + rdim/2 (flash256's rotate-half); dims >= rdim pass through
+    const int h2 = rdim / 2;
+    const float* c = cossin + (long long)t * 2 * rdim;
+    const float* s = c + rdim;
+    float q = qn[e];
+    if (e < h2)        q = qn[e] * c[e] - qn[e + h2] * s[e];
+    else if (e < rdim) { const int d = e - h2; q = qn[e] * c[d] + qn[d] * s[d]; }
+    if (xq_kv_fmt(mpf) >= XQ_KV_Q8) q = xq_h32r(q, lane);   // WP25 q8: into the cache's rotated basis
+    qs[((long long)t * nh + head) * hd + e] = __float2half_rn(q);
+}
+
+__device__ __forceinline__ unsigned xq_pftc_h2(float lo, float hi) {
+    __half2 v = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<unsigned*>(&v);
+}
+__device__ __forceinline__ void xq_pftc_mma(float* d, const unsigned* a, const unsigned* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ void xq_pftc_ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+__device__ __forceinline__ void xq_pftc_ldm_x4_trans(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+// grid (ceil(C / Br_t), nkv), block 192 (6 warps x 16 rows = 96 rows = Br_t tokens x g heads, token-major),
+// static smem: one K and one V tile of 32 keys x 256 dims f16 (32 KB), Swizzle<3,3,3> as attn_prefill_fa_b.
+// Keys 0..=pos0+t per row (causal; the chunk's own K/V rows are already in the cache). g must divide 96.
+extern "C" __global__ void __launch_bounds__(XQ_PFTC_THREADS, 1)
+xq_attn_pf_tc256(float* __restrict__ of, const __half* __restrict__ qs, const float* __restrict__ kcvc,
+                 int nh_nkv, int mpf, int slot_pos0, int C) {
+    XQ_PDL_ENTRY();
+    constexpr int HD = 256;
+    __shared__ __align__(16) __half Ks[XQ_PFTC_BC * HD];
+    __shared__ __align__(16) __half Vs[XQ_PFTC_BC * HD];
+    const int nkv = nh_nkv & 0xFFFF;
+    const int nh = ((unsigned)nh_nkv) >> 16;
+    const int g = nh / nkv;
+    const int Br_t = 96 / g;
+    const int slot = slot_pos0 & 0xFFF;
+    const int pos0 = ((unsigned)slot_pos0) >> 12;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = (int)threadIdx.x;
+    const int kvh = blockIdx.y;
+    const int t0 = (int)(gridDim.x - 1 - blockIdx.x) * Br_t;      // longest blocks first
+    const int pc = pos0 + C;
+    const int kmax = min(pos0 + t0 + Br_t - 1, pc - 1);
+    const XqKv kc = xq_kv_make(kcvc, mpf, HD, nkv, slot, kvh);
+
+    const int rr0 = 16 * warp + (lane >> 2), rr1 = rr0 + 8;
+    const int ttok0 = t0 + rr0 / g, ttok1 = t0 + rr1 / g;
+    const int hed0 = kvh * g + rr0 % g, hed1 = kvh * g + rr1 % g;
+    const int ctok0 = min(ttok0, C - 1), ctok1 = min(ttok1, C - 1);  // dead rows: safe loads, no stores
+    const long long qb0 = ((long long)ctok0 * nh + hed0) * HD;
+    const long long qb1 = ((long long)ctok1 * nh + hed1) * HD;
+    const int qpos0 = pos0 + ttok0, qpos1 = pos0 + ttok1;
+
+    unsigned qf[HD / 16][4];
+    #pragma unroll
+    for (int ks = 0; ks < HD / 16; ks++) {
+        const int doff = 16 * ks + 2 * (lane & 3);
+        qf[ks][0] = *reinterpret_cast<const unsigned*>(qs + qb0 + doff);
+        qf[ks][1] = *reinterpret_cast<const unsigned*>(qs + qb1 + doff);
+        qf[ks][2] = *reinterpret_cast<const unsigned*>(qs + qb0 + doff + 8);
+        qf[ks][3] = *reinterpret_cast<const unsigned*>(qs + qb1 + doff + 8);
+    }
+    float o[HD / 8][4];
+    #pragma unroll
+    for (int j = 0; j < HD / 8; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+    float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
+    const float rsqrt_hd = rsqrtf((float)HD);
+
+    for (int s0 = 0; s0 <= kmax; s0 += XQ_PFTC_BC) {
+        __syncthreads();                                   // the previous tile's readers are done
+        for (int c = tid; c < XQ_PFTC_BC * (HD >> 3); c += XQ_PFTC_THREADS) {
+            const int key = c / (HD >> 3), chunk = c % (HD >> 3);
+            const int gkey = s0 + key;
+            float kf[8], vf[8];
+            if (gkey <= kmax) {
+                xq_kv_ld8(kf, kc.k + (long long)gkey * kc.rb, kc.fmt, HD, chunk << 3);
+                xq_kv_ld8(vf, kc.v + (long long)gkey * kc.rb, kc.fmt, HD, chunk << 3);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; i++) { kf[i] = 0.f; vf[i] = 0.f; }
+            }
+            const int cs = (chunk & 24) | ((chunk & 7) ^ (key & 7));  // Swizzle<3,3,3>
+            *reinterpret_cast<uint4*>(Ks + key * HD + (cs << 3)) =
+                make_uint4(xq_pftc_h2(kf[0], kf[1]), xq_pftc_h2(kf[2], kf[3]), xq_pftc_h2(kf[4], kf[5]), xq_pftc_h2(kf[6], kf[7]));
+            *reinterpret_cast<uint4*>(Vs + key * HD + (cs << 3)) =
+                make_uint4(xq_pftc_h2(vf[0], vf[1]), xq_pftc_h2(vf[2], vf[3]), xq_pftc_h2(vf[4], vf[5]), xq_pftc_h2(vf[6], vf[7]));
+        }
+        __syncthreads();
+
+        // ===== Q.K^T (K[key][d] is the B .col operand: ldmatrix without transpose) =====
+        float s[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+        #pragma unroll
+        for (int ks = 0; ks < HD / 16; ks++) {
+            #pragma unroll
+            for (int j2 = 0; j2 < 2; j2++) {
+                int lkey, ldim;
+                if (lane < 8)       { lkey = 16 * j2 + lane;            ldim = 16 * ks; }
+                else if (lane < 16) { lkey = 16 * j2 + lane - 8;        ldim = 16 * ks + 8; }
+                else if (lane < 24) { lkey = 16 * j2 + 8 + lane - 16;   ldim = 16 * ks; }
+                else                { lkey = 16 * j2 + 8 + lane - 24;   ldim = 16 * ks + 8; }
+                const int chunk = ldim >> 3;
+                const int cs = (chunk & 24) | ((chunk & 7) ^ (lkey & 7));
+                const unsigned addr = (unsigned)__cvta_generic_to_shared(Ks + lkey * HD + (cs << 3));
+                unsigned r0, r1, r2, r3;
+                xq_pftc_ldm_x4(r0, r1, r2, r3, addr);
+                const unsigned ba[2] = {r0, r1}, bb[2] = {r2, r3};
+                xq_pftc_mma(s[2 * j2], qf[ks], ba);
+                xq_pftc_mma(s[2 * j2 + 1], qf[ks], bb);
+            }
+        }
+
+        // ===== online softmax (attn_prefill_fa_b's guards) =====
+        const bool masked_tile = (s0 + XQ_PFTC_BC > pos0 + t0);
+        float mx0 = -1e30f, mx1 = -1e30f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                float v = s[j][e] * rsqrt_hd;
+                if (masked_tile) {
+                    const int key = s0 + 8 * j + 2 * (lane & 3) + (e & 1);
+                    if (key > (e < 2 ? qpos0 : qpos1)) v = -1e30f;
+                }
+                s[j][e] = v;
+                if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
+            }
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(~0u, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(~0u, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(~0u, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(~0u, mx1, 2));
+        const bool any0 = mx0 > -1e29f, any1 = mx1 > -1e29f;
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float al0 = (any0 && m0 > -1e29f) ? __expf(m0 - mn0) : (any0 ? 0.f : 1.f);
+        const float al1 = (any1 && m1 > -1e29f) ? __expf(m1 - mn1) : (any1 ? 0.f : 1.f);
+        float su0 = 0.f, su1 = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const float p = (s[j][e] > -1e29f) ? __expf(s[j][e] - (e < 2 ? mn0 : mn1)) : 0.f;
+                s[j][e] = p;
+                if (e < 2) su0 += p; else su1 += p;
+            }
+        }
+        su0 += __shfl_xor_sync(~0u, su0, 1); su0 += __shfl_xor_sync(~0u, su0, 2);
+        su1 += __shfl_xor_sync(~0u, su1, 1); su1 += __shfl_xor_sync(~0u, su1, 2);
+        l0 = l0 * al0 + su0;  m0 = mn0;
+        l1 = l1 * al1 + su1;  m1 = mn1;
+        if (al0 != 1.0f) {
+            #pragma unroll
+            for (int j = 0; j < HD / 8; j++) { o[j][0] *= al0; o[j][1] *= al0; }
+        }
+        if (al1 != 1.0f) {
+            #pragma unroll
+            for (int j = 0; j < HD / 8; j++) { o[j][2] *= al1; o[j][3] *= al1; }
+        }
+
+        // ===== P -> A in-register repack (f16) + P.V (V via ldmatrix .trans) =====
+        unsigned pa[2][4];
+        #pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+            pa[ks][0] = xq_pftc_h2(s[2 * ks][0], s[2 * ks][1]);
+            pa[ks][1] = xq_pftc_h2(s[2 * ks][2], s[2 * ks][3]);
+            pa[ks][2] = xq_pftc_h2(s[2 * ks + 1][0], s[2 * ks + 1][1]);
+            pa[ks][3] = xq_pftc_h2(s[2 * ks + 1][2], s[2 * ks + 1][3]);
+        }
+        #pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+            #pragma unroll
+            for (int jn = 0; jn < HD / 16; jn++) {
+                int lkey, ldim;
+                if (lane < 8)       { lkey = 16 * ks + lane;            ldim = 16 * jn; }
+                else if (lane < 16) { lkey = 16 * ks + 8 + lane - 8;    ldim = 16 * jn; }
+                else if (lane < 24) { lkey = 16 * ks + lane - 16;       ldim = 16 * jn + 8; }
+                else                { lkey = 16 * ks + 8 + lane - 24;   ldim = 16 * jn + 8; }
+                const int chunk = ldim >> 3;
+                const int cs = (chunk & 24) | ((chunk & 7) ^ (lkey & 7));
+                const unsigned addr = (unsigned)__cvta_generic_to_shared(Vs + lkey * HD + (cs << 3));
+                unsigned r0, r1, r2, r3;
+                xq_pftc_ldm_x4_trans(r0, r1, r2, r3, addr);
+                const unsigned ba[2] = {r0, r1}, bb[2] = {r2, r3};
+                xq_pftc_mma(o[2 * jn], pa[ks], ba);
+                xq_pftc_mma(o[2 * jn + 1], pa[ks], bb);
+            }
+        }
+    }
+
+    const float il0 = (l0 > 0.f) ? 1.f / l0 : 0.f;
+    const float il1 = (l1 > 0.f) ? 1.f / l1 : 0.f;
+    if (ttok0 < C) {
+        const long long ob = ((long long)ttok0 * nh + hed0) * HD;
+        #pragma unroll
+        for (int j = 0; j < HD / 8; j++)
+            *reinterpret_cast<float2*>(of + ob + 8 * j + 2 * (lane & 3)) = make_float2(o[j][0] * il0, o[j][1] * il0);
+    }
+    if (ttok1 < C) {
+        const long long ob = ((long long)ttok1 * nh + hed1) * HD;
+        #pragma unroll
+        for (int j = 0; j < HD / 8; j++)
+            *reinterpret_cast<float2*>(of + ob + 8 * j + 2 * (lane & 3)) = make_float2(o[j][2] * il1, o[j][3] * il1);
+    }
+}
+
+// ---- PFTC round 3 (owner 2026-11-08: prefill is the next priority after the long-context decode): the twin of
+// xq_attn_pf_tc256 whose K/V tile no longer waits on global memory. xq_attn_pf_tc256 loaded each 32-key tile with
+// synchronous global reads and only then ran the MMAs, so every tile paid the full DRAM/L2 latency with the tensor
+// cores idle (35B q8 at 48K: ~15 TFLOPS of causal attention, ~52% of the prefill). Here the raw cache bytes of the
+// NEXT tile are cp.async'ed into a one-tile smem buffer while the current tile computes; the convert to the f16
+// swizzled tile reads those bytes through the same xq_kv_ld8 -> the same tile values -> bitwise == xq_attn_pf_tc256.
+// Dynamic smem: Ks + Vs (32 KB) + 32 x 2 x rb raw bytes (q8 17 KB, f16 32 KB): the host opts in (> 48 KB).
+__device__ __forceinline__ void xq_pftc_stage_raw(char* raw, const XqKv& kc, int s0, int kmax, int rb, int nc16, int tid) {
+    const int per = 2 * nc16;                              // K row + V row, 16-B chunks
+    for (int i = tid; i < XQ_PFTC_BC * per; i += XQ_PFTC_THREADS) {
+        const int key = i / per, r = i - key * per;
+        const int gkey = s0 + key;
+        if (gkey <= kmax) {
+            const int kvsel = r >= nc16 ? 1 : 0;
+            const int c = r - kvsel * nc16;
+            const char* src = (kvsel ? kc.v : kc.k) + (long long)gkey * kc.rb + c * 16;
+            moe_coop_cp16(raw + (2 * key + kvsel) * rb + c * 16, src, 16);
+        }
+    }
+}
+extern "C" __global__ void __launch_bounds__(XQ_PFTC_THREADS, 1)
+xq_attn_pf_tc256p(float* __restrict__ of, const __half* __restrict__ qs, const float* __restrict__ kcvc,
+                  int nh_nkv, int mpf, int slot_pos0, int C) {
+    XQ_PDL_ENTRY();
+    constexpr int HD = 256;
+    extern __shared__ __align__(16) unsigned char xq_pftc_dyn[];
+    __half* Ks = reinterpret_cast<__half*>(xq_pftc_dyn);
+    __half* Vs = Ks + XQ_PFTC_BC * HD;
+    char* raw = reinterpret_cast<char*>(Vs + XQ_PFTC_BC * HD);       // [key][K|V][rb] raw cache bytes, one tile
+    const int nkv = nh_nkv & 0xFFFF;
+    const int nh = ((unsigned)nh_nkv) >> 16;
+    const int g = nh / nkv;
+    const int Br_t = 96 / g;
+    const int slot = slot_pos0 & 0xFFF;
+    const int pos0 = ((unsigned)slot_pos0) >> 12;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = (int)threadIdx.x;
+    const int kvh = blockIdx.y;
+    const int t0 = (int)(gridDim.x - 1 - blockIdx.x) * Br_t;      // longest blocks first
+    const int pc = pos0 + C;
+    const int kmax = min(pos0 + t0 + Br_t - 1, pc - 1);
+    const XqKv kc = xq_kv_make(kcvc, mpf, HD, nkv, slot, kvh);
+
+    const int rr0 = 16 * warp + (lane >> 2), rr1 = rr0 + 8;
+    const int ttok0 = t0 + rr0 / g, ttok1 = t0 + rr1 / g;
+    const int hed0 = kvh * g + rr0 % g, hed1 = kvh * g + rr1 % g;
+    const int ctok0 = min(ttok0, C - 1), ctok1 = min(ttok1, C - 1);  // dead rows: safe loads, no stores
+    const long long qb0 = ((long long)ctok0 * nh + hed0) * HD;
+    const long long qb1 = ((long long)ctok1 * nh + hed1) * HD;
+    const int qpos0 = pos0 + ttok0, qpos1 = pos0 + ttok1;
+
+    unsigned qf[HD / 16][4];
+    #pragma unroll
+    for (int ks = 0; ks < HD / 16; ks++) {
+        const int doff = 16 * ks + 2 * (lane & 3);
+        qf[ks][0] = *reinterpret_cast<const unsigned*>(qs + qb0 + doff);
+        qf[ks][1] = *reinterpret_cast<const unsigned*>(qs + qb1 + doff);
+        qf[ks][2] = *reinterpret_cast<const unsigned*>(qs + qb0 + doff + 8);
+        qf[ks][3] = *reinterpret_cast<const unsigned*>(qs + qb1 + doff + 8);
+    }
+    float o[HD / 8][4];
+    #pragma unroll
+    for (int j = 0; j < HD / 8; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+    float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
+    const float rsqrt_hd = rsqrtf((float)HD);
+
+    const int rb = (int)kc.rb;                             // host: rb % 16 == 0, rb <= 512
+    const int nc16 = rb >> 4;
+    xq_pftc_stage_raw(raw, kc, 0, kmax, rb, nc16, tid);
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    for (int s0 = 0; s0 <= kmax; s0 += XQ_PFTC_BC) {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        __syncthreads();                                   // raw tile s0 landed; the previous tile's readers are done
+        for (int c = tid; c < XQ_PFTC_BC * (HD >> 3); c += XQ_PFTC_THREADS) {
+            const int key = c / (HD >> 3), chunk = c % (HD >> 3);
+            const int gkey = s0 + key;
+            float kf[8], vf[8];
+            if (gkey <= kmax) {
+                xq_kv_ld8(kf, raw + (2 * key + 0) * rb, kc.fmt, HD, chunk << 3);
+                xq_kv_ld8(vf, raw + (2 * key + 1) * rb, kc.fmt, HD, chunk << 3);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; i++) { kf[i] = 0.f; vf[i] = 0.f; }
+            }
+            const int cs = (chunk & 24) | ((chunk & 7) ^ (key & 7));  // Swizzle<3,3,3>
+            *reinterpret_cast<uint4*>(Ks + key * HD + (cs << 3)) =
+                make_uint4(xq_pftc_h2(kf[0], kf[1]), xq_pftc_h2(kf[2], kf[3]), xq_pftc_h2(kf[4], kf[5]), xq_pftc_h2(kf[6], kf[7]));
+            *reinterpret_cast<uint4*>(Vs + key * HD + (cs << 3)) =
+                make_uint4(xq_pftc_h2(vf[0], vf[1]), xq_pftc_h2(vf[2], vf[3]), xq_pftc_h2(vf[4], vf[5]), xq_pftc_h2(vf[6], vf[7]));
+        }
+        __syncthreads();                                   // tiles ready; the raw buffer is free
+        if (s0 + XQ_PFTC_BC <= kmax)                       // the next tile's bytes fly while this one computes
+            xq_pftc_stage_raw(raw, kc, s0 + XQ_PFTC_BC, kmax, rb, nc16, tid);
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+
+        // ===== Q.K^T (K[key][d] is the B .col operand: ldmatrix without transpose) =====
+        float s[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+        #pragma unroll
+        for (int ks = 0; ks < HD / 16; ks++) {
+            #pragma unroll
+            for (int j2 = 0; j2 < 2; j2++) {
+                int lkey, ldim;
+                if (lane < 8)       { lkey = 16 * j2 + lane;            ldim = 16 * ks; }
+                else if (lane < 16) { lkey = 16 * j2 + lane - 8;        ldim = 16 * ks + 8; }
+                else if (lane < 24) { lkey = 16 * j2 + 8 + lane - 16;   ldim = 16 * ks; }
+                else                { lkey = 16 * j2 + 8 + lane - 24;   ldim = 16 * ks + 8; }
+                const int chunk = ldim >> 3;
+                const int cs = (chunk & 24) | ((chunk & 7) ^ (lkey & 7));
+                const unsigned addr = (unsigned)__cvta_generic_to_shared(Ks + lkey * HD + (cs << 3));
+                unsigned r0, r1, r2, r3;
+                xq_pftc_ldm_x4(r0, r1, r2, r3, addr);
+                const unsigned ba[2] = {r0, r1}, bb[2] = {r2, r3};
+                xq_pftc_mma(s[2 * j2], qf[ks], ba);
+                xq_pftc_mma(s[2 * j2 + 1], qf[ks], bb);
+            }
+        }
+
+        // ===== online softmax (attn_prefill_fa_b's guards) =====
+        const bool masked_tile = (s0 + XQ_PFTC_BC > pos0 + t0);
+        float mx0 = -1e30f, mx1 = -1e30f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                float v = s[j][e] * rsqrt_hd;
+                if (masked_tile) {
+                    const int key = s0 + 8 * j + 2 * (lane & 3) + (e & 1);
+                    if (key > (e < 2 ? qpos0 : qpos1)) v = -1e30f;
+                }
+                s[j][e] = v;
+                if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
+            }
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(~0u, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(~0u, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(~0u, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(~0u, mx1, 2));
+        const bool any0 = mx0 > -1e29f, any1 = mx1 > -1e29f;
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float al0 = (any0 && m0 > -1e29f) ? __expf(m0 - mn0) : (any0 ? 0.f : 1.f);
+        const float al1 = (any1 && m1 > -1e29f) ? __expf(m1 - mn1) : (any1 ? 0.f : 1.f);
+        float su0 = 0.f, su1 = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const float p = (s[j][e] > -1e29f) ? __expf(s[j][e] - (e < 2 ? mn0 : mn1)) : 0.f;
+                s[j][e] = p;
+                if (e < 2) su0 += p; else su1 += p;
+            }
+        }
+        su0 += __shfl_xor_sync(~0u, su0, 1); su0 += __shfl_xor_sync(~0u, su0, 2);
+        su1 += __shfl_xor_sync(~0u, su1, 1); su1 += __shfl_xor_sync(~0u, su1, 2);
+        l0 = l0 * al0 + su0;  m0 = mn0;
+        l1 = l1 * al1 + su1;  m1 = mn1;
+        if (al0 != 1.0f) {
+            #pragma unroll
+            for (int j = 0; j < HD / 8; j++) { o[j][0] *= al0; o[j][1] *= al0; }
+        }
+        if (al1 != 1.0f) {
+            #pragma unroll
+            for (int j = 0; j < HD / 8; j++) { o[j][2] *= al1; o[j][3] *= al1; }
+        }
+
+        // ===== P -> A in-register repack (f16) + P.V (V via ldmatrix .trans) =====
+        unsigned pa[2][4];
+        #pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+            pa[ks][0] = xq_pftc_h2(s[2 * ks][0], s[2 * ks][1]);
+            pa[ks][1] = xq_pftc_h2(s[2 * ks][2], s[2 * ks][3]);
+            pa[ks][2] = xq_pftc_h2(s[2 * ks + 1][0], s[2 * ks + 1][1]);
+            pa[ks][3] = xq_pftc_h2(s[2 * ks + 1][2], s[2 * ks + 1][3]);
+        }
+        #pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+            #pragma unroll
+            for (int jn = 0; jn < HD / 16; jn++) {
+                int lkey, ldim;
+                if (lane < 8)       { lkey = 16 * ks + lane;            ldim = 16 * jn; }
+                else if (lane < 16) { lkey = 16 * ks + 8 + lane - 8;    ldim = 16 * jn; }
+                else if (lane < 24) { lkey = 16 * ks + lane - 16;       ldim = 16 * jn + 8; }
+                else                { lkey = 16 * ks + 8 + lane - 24;   ldim = 16 * jn + 8; }
+                const int chunk = ldim >> 3;
+                const int cs = (chunk & 24) | ((chunk & 7) ^ (lkey & 7));
+                const unsigned addr = (unsigned)__cvta_generic_to_shared(Vs + lkey * HD + (cs << 3));
+                unsigned r0, r1, r2, r3;
+                xq_pftc_ldm_x4_trans(r0, r1, r2, r3, addr);
+                const unsigned ba[2] = {r0, r1}, bb[2] = {r2, r3};
+                xq_pftc_mma(o[2 * jn], pa[ks], ba);
+                xq_pftc_mma(o[2 * jn + 1], pa[ks], bb);
+            }
+        }
+    }
+
+    const float il0 = (l0 > 0.f) ? 1.f / l0 : 0.f;
+    const float il1 = (l1 > 0.f) ? 1.f / l1 : 0.f;
+    if (ttok0 < C) {
+        const long long ob = ((long long)ttok0 * nh + hed0) * HD;
+        #pragma unroll
+        for (int j = 0; j < HD / 8; j++)
+            *reinterpret_cast<float2*>(of + ob + 8 * j + 2 * (lane & 3)) = make_float2(o[j][0] * il0, o[j][1] * il0);
+    }
+    if (ttok1 < C) {
+        const long long ob = ((long long)ttok1 * nh + hed1) * HD;
+        #pragma unroll
+        for (int j = 0; j < HD / 8; j++)
+            *reinterpret_cast<float2*>(of + ob + 8 * j + 2 * (lane & 3)) = make_float2(o[j][2] * il1, o[j][3] * il1);
+    }
+}
+
+// grid (C*nh), block hd: q8 rotate back + gate — flash256's closing expression (element e = lane + 32*warp).
+extern "C" __global__ void xq_attn_pf_tc_epi(__half* __restrict__ attn, const float* __restrict__ of,
+                                             const __half* __restrict__ qg, int nh_nkv, int hd, int mpf) {
+    XQ_PDL_ENTRY();
+    const int nh = ((unsigned)nh_nkv) >> 16;
+    const int t = blockIdx.x / nh, head = blockIdx.x % nh, e = threadIdx.x;
+    const long long ob = ((long long)t * nh + head) * hd;
+    const float o = xq_kv_rot(of[ob + e], xq_kv_fmt(mpf), e & 31);
+    const float g = xq_h2f(qg[(long long)t * nh * hd * 2 + (long long)head * hd * 2 + hd + e]);
+    attn[ob + e] = xq_f2h(o * xq_sig(g));
 }
 
 // w5/PFIX OPT-IN (the SAME GB10_PQ8_FLASH=causal switch; output-changing): the hd=128 causal twin.
@@ -10135,26 +11447,108 @@ __device__ __forceinline__ void xq_pf_tables(int lane, int (&s_i0m)[8], int (&s_
     }
 }
 
+// PR #32 (andersc), generalized to every served width (BITS 2..7): the 8 trellis windows a lane decodes
+// sit at 8 consecutive trellis positions, so their 16 (lo, hi) ring words are N consecutive ring words
+// starting at window 0's hi word: N = 2 for BITS <= 4, 3 for BITS 5..7 (7 * BITS + 16 bits from a start
+// bit fixed by the lane; pinned for every lane and width by the host test xq_pf_ring_sources). Each of
+// the N words is fetched with one __shfl_sync (two for BITS > 4: the word may sit in the second ring
+// load) and every window selects its lo / hi among them: 2 / 6 shuffles per 16x16 block instead of
+// 16 / 32. The words are the same bits, so the decode and every output are bitwise unchanged.
+template <int BITS> struct XqPfSel {
+    static constexpr int N = (BITS <= 4) ? 2 : 3;
+    int src[N];             // ring word index (0 .. 8*BITS-1) of source k = (window 0's hi word + k) mod ring
+    unsigned mlo, mhi;      // 2 bits per window jj: the source holding its lo (i1) / hi (i0) word
+};
+template <int BITS>
+__device__ __forceinline__ XqPfSel<BITS> xq_pf_sel(const int (&s_i0m)[8], const int (&s_i1m)[8]) {
+    constexpr int RING = 8 * BITS;
+    XqPfSel<BITS> q;
+    const int base = s_i0m[0];
+    #pragma unroll
+    for (int k = 0; k < XqPfSel<BITS>::N; ++k) q.src[k] = (base + k) % RING;
+    q.mlo = 0u; q.mhi = 0u;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        q.mlo |= (unsigned)((s_i1m[j] - base + RING) % RING) << (2 * j);
+        q.mhi |= (unsigned)((s_i0m[j] - base + RING) % RING) << (2 * j);
+    }
+    return q;
+}
+// The N source words of one 16x16 block from the lane's ring words (w1 = ring words 32.., BITS > 4).
+template <int BITS>
+__device__ __forceinline__ void xq_pf_fetch(const XqPfSel<BITS>& q, const unsigned w0, const unsigned w1,
+                                            unsigned (&v)[XqPfSel<BITS>::N]) {
+    #pragma unroll
+    for (int k = 0; k < XqPfSel<BITS>::N; ++k) {
+        unsigned a = __shfl_sync(0xFFFFFFFFu, w0, q.src[k] & 31);
+        if constexpr (8 * BITS > 32) {
+            const unsigned b = __shfl_sync(0xFFFFFFFFu, w1, q.src[k] & 31);
+            a = q.src[k] >= 32 ? b : a;
+        }
+        v[k] = a;
+    }
+}
+// The pre-PR #32 per-window pair of shuffles (two more for BITS > 4: the word may sit in the second ring load).
+template <int BITS>
+__device__ __forceinline__ void xq_pf_win(const unsigned w0, const unsigned w1, const int i0, const int i1,
+                                          unsigned& lo, unsigned& hi) {
+    lo = __shfl_sync(0xFFFFFFFFu, w0, i1 & 31);
+    hi = __shfl_sync(0xFFFFFFFFu, w0, i0 & 31);
+    if constexpr (8 * BITS > 32) {
+        const unsigned lo2 = __shfl_sync(0xFFFFFFFFu, w1, i1 & 31);
+        const unsigned hi2 = __shfl_sync(0xFFFFFFFFu, w1, i0 & 31);
+        lo = i1 >= 32 ? lo2 : lo;
+        hi = i0 >= 32 ? hi2 : hi;
+    }
+}
+// Where the source-word selection pays (measured 2026-11-02, .14, --probe-exl3-bitwidths class rows, best of 3
+// alternating runs): BITS 2..4 and 6..7 at every MT, BITS 5 at MT >= 4 (-5..-13 %). BITS 5 at MT 1 / 2 (decode-bound
+// tiles) measured +4..+18 % with it, so those keep the per-window shuffles. Either way the same words: bitwise.
+template <int BITS, int MT> struct XqPfUseSel { static constexpr bool v = !(BITS == 5 && MT <= 2); };
+template <int N>
+__device__ __forceinline__ unsigned xq_pf_pick(const unsigned (&v)[N], const unsigned m, const int jj) {
+    const unsigned c = (m >> (2 * jj)) & 3u;
+    if constexpr (N == 2) return c ? v[1] : v[0];
+    else return c == 0u ? v[0] : (c == 1u ? v[1] : v[2]);
+}
+// PR #32 (andersc): one 16x16 A fragment (a0..a3 of m16n8k16, row-major f16 at `base`, row stride LD halves,
+// k16 column offset cs) with one ldmatrix.x4 instead of four 32-bit shared loads. Matrix m of the x4 =
+// rows (m & 1) * 8.., k (m >> 1) * 8..: the same four registers the scalar loads produced (bitwise).
+// LD = 40 / 72 / 136 halves: 16-byte rows, and 8 consecutive rows hit 8 disjoint 4-bank groups.
+template <int LD>
+__device__ __forceinline__ void xq_pf_ldsm_a(uint32_t (&a)[4], const __half* __restrict__ base, const int cs, const int lane) {
+    static_assert(LD % 8 == 0, "ldmatrix row addresses must be 16-byte aligned");
+    const int m = lane >> 3, r = lane & 7;
+    const __half* p = base + ((m & 1) * 8 + r) * LD + cs + (m >> 1) * 8;
+    const uint32_t ad = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(ad));
+}
+
 // One k16 step of one warp: decode its NH 16x16 trellis blocks from the lane's ring words w0[]
 // (== exl3_gemm_body_wide BITS <= 4) and run the MT m16n8k16 chains on the staged A columns
 // [cs, cs + 16) of `cur` (row stride LD); NH = 2 (A5-L2 v2, paired gate|up warps) shares one set
 // of A fragments between the two blocks. Per output element: the served decode + the same
 // K-ascending mma chain (NH = 1 is the served body's inline step).
-template <int MT, int LD, int NH>
-__device__ __forceinline__ void xq_pf_step(const unsigned (&w0)[NH], const __half* __restrict__ cur, const int cs,
-        const int gid, const int tig, const int (&s_i0m)[8], const int (&s_i1m)[8], const int (&s_sf)[8],
+template <int MT, int LD, int NH, int BITS = 4>
+__device__ __forceinline__ void xq_pf_step(const unsigned (&w0)[NH], const unsigned (&w1)[NH], const __half* __restrict__ cur, const int cs,
+        const int lane, const XqPfSel<BITS>& sel, const int (&s_i0m)[8], const int (&s_i1m)[8], const int (&s_sf)[8],
         float (&acc)[NH][MT][2][4]) {
+    constexpr bool SEL = XqPfUseSel<BITS, MT>::v;
     uint32_t bfrag[NH][2][2];
     #pragma unroll
     for (int hh = 0; hh < NH; ++hh) {
+        unsigned v[XqPfSel<BITS>::N];
+        if constexpr (SEL) xq_pf_fetch<BITS>(sel, w0[hh], w1[hh], v);
         #pragma unroll
         for (int h = 0; h < 2; ++h) {
             uint16_t rv[4];
             #pragma unroll
             for (int q = 0; q < 4; ++q) {
                 const int jj = h * 4 + q;
-                const unsigned lo = __shfl_sync(0xFFFFFFFFu, w0[hh], s_i1m[jj] & 31);
-                const unsigned hi = __shfl_sync(0xFFFFFFFFu, w0[hh], s_i0m[jj] & 31);
+                unsigned lo, hi;
+                if constexpr (SEL) { lo = xq_pf_pick(v, sel.mlo, jj); hi = xq_pf_pick(v, sel.mhi, jj); }
+                else xq_pf_win<BITS>(w0[hh], w1[hh], s_i0m[jj], s_i1m[jj], lo, hi);
                 const unsigned idx = __funnelshift_r(lo, hi, (unsigned)s_sf[jj]) & 0xFFFFu;
                 const unsigned sum = __dp4a(idx * EXL3_MUL1, 0x01010101u, 0x00006400u);
                 rv[q] = (uint16_t)__half_as_ushort(__hfma(__ushort_as_half((unsigned short)sum),
@@ -10166,11 +11560,9 @@ __device__ __forceinline__ void xq_pf_step(const unsigned (&w0)[NH], const __hal
     }
     #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
-        const __half* sm = cur + (mt * 16) * LD;
-        const uint32_t a0 = *(const uint32_t*)&sm[gid * LD + cs + 2 * tig];
-        const uint32_t a1 = *(const uint32_t*)&sm[(gid + 8) * LD + cs + 2 * tig];
-        const uint32_t a2 = *(const uint32_t*)&sm[gid * LD + cs + 2 * tig + 8];
-        const uint32_t a3 = *(const uint32_t*)&sm[(gid + 8) * LD + cs + 2 * tig + 8];
+        uint32_t af[4];
+        xq_pf_ldsm_a<LD>(af, cur + (mt * 16) * LD, cs, lane);
+        const uint32_t a0 = af[0], a1 = af[1], a2 = af[2], a3 = af[3];
         #pragma unroll
         for (int hh = 0; hh < NH; ++hh) {
             #pragma unroll
@@ -10299,20 +11691,25 @@ __device__ __forceinline__ void xq_pf_prof_put(long long w, long long c, long lo
 }
 #define XQ_PF_CLK(v) do { if constexpr (PROF > 0) (v) = clock64(); } while (0)
 
-template <int BITS, int MT, int NW, int EPI, int PROF>
+// PFHALF (2026-11-06): HALF = the fractional width K = BITS + 0.5 (BITS = KA 1..3; the exl3_gemm_body_wide HALF twin's
+// window math exl3_half_b1<KA> and ring WRING = 4*(2*KA+1) = 12 / 20 / 28 words per 16x16 tile, one ring word per
+// lane). The HALF path decodes with the per-window shuffles (the PR #32 source-word selection is built on the
+// integer 8*BITS ring); HALF = false is the integer body unchanged.
+template <int BITS, int MT, int NW, int EPI, int PROF, bool HALF = false>
 __device__ __forceinline__ void xq_moe_pf_body(
         const uint16_t* __restrict__ trellis, const __half* __restrict__ xh,
         __half* __restrict__ y, int M, int K, int N, int cta_tile, int m_sup,
         __half* __restrict__ smem, const __half* __restrict__ svh_e,
         const __half* __restrict__ suh_de) {
-    static_assert(BITS <= 4, "the one-load-per-lane ring decode needs 8*BITS <= 32");
+    static_assert(BITS <= 7, "P7 B4: K <= 7 loads a second ring word (lane + 32; index < 8*BITS <= 56 < 64), the B3 SHFL pattern");
+    static_assert(!HALF || (BITS >= 1 && BITS <= 3), "PFHALF: fractional K = 1.5 / 2.5 / 3.5 only");
     constexpr int KS = XqPfKs<MT>::v;
     constexpr int ROWS = MT * 16;
     constexpr int LD = KS * 16 + 8;
     constexpr int C8 = KS * 2;                 // 16-B chunks per staged row
     constexpr int NCH = ROWS * C8;             // 16-B chunks per stage
     constexpr int NT = NW * 32;
-    constexpr int WW = 8 * BITS;
+    constexpr int WW = HALF ? (4 * (2 * BITS + 1)) : (8 * BITS);   // ring words per 16x16 tile
     long long pt0 = 0, pta = 0, ptb = 0, pw = 0, pc = 0;
     XQ_PF_CLK(pt0);
     const int tid = threadIdx.x;
@@ -10336,14 +11733,15 @@ __device__ __forceinline__ void xq_moe_pf_body(
             const int l = 8 * ((c >> 1) & 3) + ((r & 7) >> 1);
             const int t = 8 * l + (r & 1) + 2 * ((r >> 3) & 1)
                               + 4 * (c >> 3) + 32 * (c & 1);
-            const int b1 = (t + 257) * BITS;
+            const int b1 = HALF ? exl3_half_b1<BITS>(t) : (t + 257) * BITS;
             const int i0 = (b1 - 16) >> 5;
             const int i1 = (b1 - 1) >> 5;
-            s_i0m[h * 4 + s] = i0 % (BITS * 8);
-            s_i1m[h * 4 + s] = i1 % (BITS * 8);
+            s_i0m[h * 4 + s] = i0 % WW;
+            s_i1m[h * 4 + s] = i1 % WW;
             s_sf[h * 4 + s] = ((i1 + 1) << 5) - b1;
         }
     }
+    const XqPfSel<BITS> sel = xq_pf_sel<BITS>(s_i0m, s_i1m);   // PR #32: the block's source ring words (unused when HALF)
 
     float acc[MT][2][4];
     #pragma unroll
@@ -10353,14 +11751,14 @@ __device__ __forceinline__ void xq_moe_pf_body(
             #pragma unroll
             for (int r = 0; r < 4; ++r) acc[mt][h][r] = 0.0f;
 
-    // lane's ring word of k16 block kb: word (kb * nb + nb_col) * 8*BITS + lane (lane < WW)
-    const uint32_t* ringl = (const uint32_t*)trellis + (size_t)nb_col * (8 * BITS) + lane;
-    const size_t kstr = (size_t)nb * (8 * BITS);
+    // lane's ring word of k16 block kb: word (kb * nb + nb_col) * WW + lane (lane < WW)
+    const uint32_t* ringl = (const uint32_t*)trellis + (size_t)nb_col * WW + lane;
+    const size_t kstr = (size_t)nb * WW;
     const int NS = (KB + KS - 1) / KS;
     __half* buf0 = smem;
     __half* buf1 = smem + ROWS * LD;
 
-    uint32_t wn[KS];
+    uint32_t wn[KS]; uint32_t wn2[KS];   // P7 B4: ring words 32..WW-1 (K = 5)
     // stage j -> dst: A[(ROWS) x (KS*16)] by cp.async (zero-fill outside [M) x [K))
     #define XQ_PF_STAGE(J, DST) do { \
         const int kc0_ = (J) * (KS * 16); \
@@ -10382,6 +11780,7 @@ __device__ __forceinline__ void xq_moe_pf_body(
         for (int s_ = 0; s_ < KS; ++s_) { \
             const int kb_ = (J) * KS + s_; \
             wn[s_] = (lane < WW && kb_ < KB) ? __ldg(ringl + (size_t)kb_ * kstr) : 0u; \
+            wn2[s_] = (WW > 32 && lane + 32 < WW && kb_ < KB) ? __ldg(ringl + (size_t)kb_ * kstr + 32) : 0u; \
         } \
     } while (0)
 
@@ -10389,9 +11788,9 @@ __device__ __forceinline__ void xq_moe_pf_body(
     XQ_PF_LOADW(0);
     const int gid = lane >> 2, tig = lane & 3;
     for (int j = 0; j < NS; ++j) {
-        uint32_t wc[KS];
+        uint32_t wc[KS]; uint32_t wc2[KS];
         #pragma unroll
-        for (int s = 0; s < KS; ++s) wc[s] = wn[s];
+        for (int s = 0; s < KS; ++s) { wc[s] = wn[s]; wc2[s] = wn2[s]; }
         XQ_PF_CLK(pta);
         asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();                       // stage j visible; everyone is past stage j-1
@@ -10405,16 +11804,20 @@ __device__ __forceinline__ void xq_moe_pf_body(
         for (int s = 0; s < KS; ++s) {
             if (j * KS + s < KB) {
                 // ---- decode this warp's 16x16 block (== exl3_gemm_body_wide BITS <= 4) ----
-                const unsigned w0 = wc[s];
+                const unsigned w0 = wc[s]; const unsigned w1 = wc2[s];
                 uint32_t bfrag[2][2];
+                constexpr bool SEL = !HALF && XqPfUseSel<BITS, MT>::v;   // HALF: per-window shuffles (WW <= 28: w0 only)
+                unsigned v[XqPfSel<BITS>::N];
+                if constexpr (SEL) xq_pf_fetch<BITS>(sel, w0, w1, v);   // P7 B4 (K >= 5): w1 = the second ring load
                 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
                     uint16_t rv[4];
                     #pragma unroll
                     for (int q = 0; q < 4; ++q) {
                         const int jj = h * 4 + q;
-                        const unsigned lo = __shfl_sync(0xFFFFFFFFu, w0, s_i1m[jj] & 31);
-                        const unsigned hi = __shfl_sync(0xFFFFFFFFu, w0, s_i0m[jj] & 31);
+                        unsigned lo, hi;
+                        if constexpr (SEL) { lo = xq_pf_pick(v, sel.mlo, jj); hi = xq_pf_pick(v, sel.mhi, jj); }
+                        else xq_pf_win<BITS>(w0, w1, s_i0m[jj], s_i1m[jj], lo, hi);
                         const unsigned idx = __funnelshift_r(lo, hi, (unsigned)s_sf[jj]) & 0xFFFFu;
                         const unsigned sum = __dp4a(idx * EXL3_MUL1, 0x01010101u, 0x00006400u);
                         rv[q] = (uint16_t)__half_as_ushort(__hfma(__ushort_as_half((unsigned short)sum),
@@ -10426,11 +11829,9 @@ __device__ __forceinline__ void xq_moe_pf_body(
                 const int cs = s * 16;
                 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
-                    const __half* sm = cur + (mt * 16) * LD;
-                    const uint32_t a0 = *(const uint32_t*)&sm[gid * LD + cs + 2 * tig];
-                    const uint32_t a1 = *(const uint32_t*)&sm[(gid + 8) * LD + cs + 2 * tig];
-                    const uint32_t a2 = *(const uint32_t*)&sm[gid * LD + cs + 2 * tig + 8];
-                    const uint32_t a3 = *(const uint32_t*)&sm[(gid + 8) * LD + cs + 2 * tig + 8];
+                    uint32_t af[4];
+                    xq_pf_ldsm_a<LD>(af, cur + (mt * 16) * LD, cs, lane);
+                    const uint32_t a0 = af[0], a1 = af[1], a2 = af[2], a3 = af[3];
                     #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         asm volatile(
@@ -10560,7 +11961,7 @@ __device__ __forceinline__ void xq_moe_pf2_body(
         __half* __restrict__ y, int M, int K, int N, int cta_tile, int m_sup,
         __half* __restrict__ smem, const __half* __restrict__ svh_e,
         const __half* __restrict__ suh_de) {
-    static_assert(BITS <= 4, "the one-load-per-lane ring decode needs 8*BITS <= 32");
+    static_assert(BITS <= 7, "P7 B4: K <= 7 loads a second ring word (lane + 32; index < 8*BITS <= 56 < 64), the B3 SHFL pattern");
     static_assert(P >= 1, "at least one stage in flight");
     constexpr int ROWS = MT * 16;
     constexpr int LD = KS * 16 + 8;
@@ -10588,6 +11989,7 @@ __device__ __forceinline__ void xq_moe_pf2_body(
 
     int s_i0m[8], s_i1m[8], s_sf[8];
     xq_pf_tables<BITS>(lane, s_i0m, s_i1m, s_sf);
+    const XqPfSel<BITS> sel = xq_pf_sel<BITS>(s_i0m, s_i1m);   // PR #32: the block's source ring words
 
     float acc[NH][MT][2][4];
     #pragma unroll
@@ -10655,10 +12057,13 @@ __device__ __forceinline__ void xq_moe_pf2_body(
         #pragma unroll
         for (int s = 0; s < KS; ++s) {
             if (j * KS + s < KB) {
-                unsigned w0[NH];
+                unsigned w0[NH], w1[NH];
                 #pragma unroll
-                for (int hh = 0; hh < NH; ++hh) w0[hh] = lane < WW ? tw[s * (NSEG * 8 * WW) + hh * (8 * WW)] : 0u;
-                xq_pf_step<MT, LD, NH>(w0, cur, s * 16, gid, tig, s_i0m, s_i1m, s_sf, acc);
+                for (int hh = 0; hh < NH; ++hh) {
+                    w0[hh] = lane < WW ? tw[s * (NSEG * 8 * WW) + hh * (8 * WW)] : 0u;
+                    w1[hh] = 8 * BITS > 32 && lane + 32 < WW ? tw[s * (NSEG * 8 * WW) + hh * (8 * WW) + 32] : 0u;
+                }
+                xq_pf_step<MT, LD, NH, BITS>(w0, w1, cur, s * 16, lane, sel, s_i0m, s_i1m, s_sf, acc);
             }
         }
         sl = (sl + 1 == NSL) ? 0 : sl + 1;
@@ -10697,9 +12102,21 @@ __device__ __forceinline__ void xq_moe_pf_entry(const uint16_t* __restrict__ bas
     if constexpr (V == 0) {
         if (bits == 3) xq_moe_pf_body<3, MT, NW, EPI, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
         else if (bits == 4) xq_moe_pf_body<4, MT, NW, EPI, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        else if (bits == 5) xq_moe_pf_body<5, MT, NW, EPI, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        else if (bits == 6) xq_moe_pf_body<6, MT, NW, EPI, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        else if (bits == 7) xq_moe_pf_body<7, MT, NW, EPI, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        else if (bits == 2) xq_moe_pf_body<2, MT, NW, EPI, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        // PFHALF: the fractional widths (EXL3_FRAC_BITS code; the host routes them to V 0 only — pf2 has no HALF body)
+        else if (bits == EXL3_FRAC_BITS(1)) xq_moe_pf_body<1, MT, NW, EPI, PROF, true>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        else if (bits == EXL3_FRAC_BITS(2)) xq_moe_pf_body<2, MT, NW, EPI, PROF, true>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        else if (bits == EXL3_FRAC_BITS(3)) xq_moe_pf_body<3, MT, NW, EPI, PROF, true>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
     } else {
         if (bits == 3) xq_moe_pf2_body<3, MT, NW, EPI, KS2, P2, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
         else if (bits == 4) xq_moe_pf2_body<4, MT, NW, EPI, KS2, P2, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        else if (bits == 5) xq_moe_pf2_body<5, MT, NW, EPI, KS2, P2, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        else if (bits == 6) xq_moe_pf2_body<6, MT, NW, EPI, KS2, P2, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        else if (bits == 7) xq_moe_pf2_body<7, MT, NW, EPI, KS2, P2, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
+        else if (bits == 2) xq_moe_pf2_body<2, MT, NW, EPI, KS2, P2, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
     }
 }
 
@@ -10792,6 +12209,28 @@ extern "C" __global__ void xq_moe_pf2_smem_query(int* out) {
     // v2 paired h1 / h2 (NW 8, 2 runs), bits 3 then 4
     out[16] = XqPf2Smem<1, 8, 4, 2, 3, 2>::halves * 2;  out[17] = XqPf2Smem<2, 8, 4, 2, 3, 2>::halves * 2;
     out[18] = XqPf2Smem<1, 8, 4, 2, 4, 2>::halves * 2;  out[19] = XqPf2Smem<2, 8, 4, 2, 4, 2>::halves * 2;
+    // P7 B4: bits 5 (h paired mt 1/2 at 20/21, then the 8 t/s/g instances in the bits-3 order)
+    out[20] = XqPf2Smem<1, 8, 4, 2, 5, 2>::halves * 2;  out[21] = XqPf2Smem<2, 8, 4, 2, 5, 2>::halves * 2;
+    out[22] = XqPf2Smem<1, 8, 4, 3, 5>::halves * 2;   out[23] = XqPf2Smem<2, 8, 4, 3, 5>::halves * 2;
+    out[24] = XqPf2Smem<4, 8, 4, 2, 5>::halves * 2;   out[25] = XqPf2Smem<8, 8, 2, 2, 5>::halves * 2;
+    out[26] = XqPf2Smem<1, 16, 4, 3, 5>::halves * 2;  out[27] = XqPf2Smem<2, 16, 4, 3, 5>::halves * 2;
+    out[28] = XqPf2Smem<4, 16, 4, 2, 5>::halves * 2;  out[29] = XqPf2Smem<8, 16, 2, 2, 5>::halves * 2;
+    // P7 B4 leg 2: bits 2/6/7 blocks of 10 (t/s, g, h-paired); host mirror reads 30..59
+    out[30] = XqPf2Smem<1, 8, 4, 3, 2>::halves * 2;   out[31] = XqPf2Smem<2, 8, 4, 3, 2>::halves * 2;
+    out[32] = XqPf2Smem<4, 8, 4, 2, 2>::halves * 2;   out[33] = XqPf2Smem<8, 8, 2, 2, 2>::halves * 2;
+    out[34] = XqPf2Smem<1, 16, 4, 3, 2>::halves * 2;   out[35] = XqPf2Smem<2, 16, 4, 3, 2>::halves * 2;
+    out[36] = XqPf2Smem<4, 16, 4, 2, 2>::halves * 2;   out[37] = XqPf2Smem<8, 16, 2, 2, 2>::halves * 2;
+    out[38] = XqPf2Smem<1, 8, 4, 2, 2, 2>::halves * 2;  out[39] = XqPf2Smem<2, 8, 4, 2, 2, 2>::halves * 2;
+    out[40] = XqPf2Smem<1, 8, 4, 3, 6>::halves * 2;   out[41] = XqPf2Smem<2, 8, 4, 3, 6>::halves * 2;
+    out[42] = XqPf2Smem<4, 8, 4, 2, 6>::halves * 2;   out[43] = XqPf2Smem<8, 8, 2, 2, 6>::halves * 2;
+    out[44] = XqPf2Smem<1, 16, 4, 3, 6>::halves * 2;   out[45] = XqPf2Smem<2, 16, 4, 3, 6>::halves * 2;
+    out[46] = XqPf2Smem<4, 16, 4, 2, 6>::halves * 2;   out[47] = XqPf2Smem<8, 16, 2, 2, 6>::halves * 2;
+    out[48] = XqPf2Smem<1, 8, 4, 2, 6, 2>::halves * 2;  out[49] = XqPf2Smem<2, 8, 4, 2, 6, 2>::halves * 2;
+    out[50] = XqPf2Smem<1, 8, 4, 3, 7>::halves * 2;   out[51] = XqPf2Smem<2, 8, 4, 3, 7>::halves * 2;
+    out[52] = XqPf2Smem<4, 8, 4, 2, 7>::halves * 2;   out[53] = XqPf2Smem<8, 8, 2, 2, 7>::halves * 2;
+    out[54] = XqPf2Smem<1, 16, 4, 3, 7>::halves * 2;   out[55] = XqPf2Smem<2, 16, 4, 3, 7>::halves * 2;
+    out[56] = XqPf2Smem<4, 16, 4, 2, 7>::halves * 2;   out[57] = XqPf2Smem<8, 16, 2, 2, 7>::halves * 2;
+    out[58] = XqPf2Smem<1, 8, 4, 2, 7, 2>::halves * 2;  out[59] = XqPf2Smem<2, 8, 4, 2, 7, 2>::halves * 2;
 }
 
 // the dynamic smem bytes of each (MT, NW) instance (host mirror: moe_pf_smem_bytes)
@@ -12385,7 +13824,9 @@ extern "C" __global__ void exl3_hmma_gemm_ks(const uint16_t* __restrict__ trelli
         case 4: exl3_gemm_body_ks<2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;  // K=2.0
         case 8: exl3_gemm_body_ks<4>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
         case 10: exl3_gemm_body_ks<5>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
-        EXL3_CASE6(case 12: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
+        case 12: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        case 14: exl3_gemm_body_ks<7>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;  // P7 B6: K=7 (k2=14)
+        case 16: exl3_gemm_body_ks<8>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; // PR#27-D2: K=8 (ks_p bits-guard 2..=6 falls back here)
         default: break;
     }
 }
@@ -12410,7 +13851,9 @@ extern "C" __global__ void exl3_hmma_gemm_ks_x2(const uint16_t* __restrict__ tr0
         case 4: exl3_gemm_body_ks<2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;  // K=2.0
         case 8: exl3_gemm_body_ks<4>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
         case 10: exl3_gemm_body_ks<5>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
-        EXL3_CASE6(case 12: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
+        case 12: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        case 14: exl3_gemm_body_ks<7>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;  // P7 B6: K=7 (k2=14)
+        case 16: exl3_gemm_body_ks<8>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; // PR#27-D2: K=8 (ks_p bits-guard 2..=6 falls back here)
         default: break;
     }
 }
@@ -12539,7 +13982,8 @@ __device__ __forceinline__ void exl3_ks_fixup(const float* __restrict__ ws,
             case 4: exl3_gemm_body_ks<2>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
             case 8: exl3_gemm_body_ks<4>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
             case 10: exl3_gemm_body_ks<5>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
-            EXL3_CASE6(case 12: exl3_gemm_body_ks<6>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;) \
+            case 12: exl3_gemm_body_ks<6>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
+            case 14: exl3_gemm_body_ks<7>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
             default: break;                                                                         \
         }                                                                                           \
         exl3_ks_fixup(WS, SVH, Y, CNT, M, N);                                                       \
@@ -12720,7 +14164,7 @@ extern "C" __global__ void __launch_bounds__(256) exl3_hmma_gemm_ks_fx_probe(con
             case 3: exl3_gemm_body_ks_probe<3,2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
             case 4: exl3_gemm_body_ks_probe<4,2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
             case 5: exl3_gemm_body_ks_probe<5,2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
-            EXL3_CASE6(case 6: exl3_gemm_body_ks_probe<6,2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;)
+            case 6: exl3_gemm_body_ks_probe<6,2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
             default: break;
         }
     } else {
@@ -12728,7 +14172,7 @@ extern "C" __global__ void __launch_bounds__(256) exl3_hmma_gemm_ks_fx_probe(con
             case 3: exl3_gemm_body_ks_probe<3,1>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
             case 4: exl3_gemm_body_ks_probe<4,1>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
             case 5: exl3_gemm_body_ks_probe<5,1>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
-            EXL3_CASE6(case 6: exl3_gemm_body_ks_probe<6,1>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;)
+            case 6: exl3_gemm_body_ks_probe<6,1>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
             default: break;
         }
     }
@@ -13010,10 +14454,11 @@ exl3_hmma_gemm_ks_p(const uint16_t* __restrict__ trellis, const __half* __restri
     __shared__ __align__(16) __half psk_sa[PSK_SMEM_HALVES];
     const int ks = PSK_CFG_KS(cfg), pf_d = PSK_CFG_PF(cfg);
     switch (PSK_CFG_BITS(cfg)) {
+        case 2: exl3_ks_p_body<2>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;  // P7 B6: K=2.0 (bits=2)
         case 3: exl3_ks_p_body<3>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;
         case 4: exl3_ks_p_body<4>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;
         case 5: exl3_ks_p_body<5>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;
-        EXL3_CASE6(case 6: exl3_ks_p_body<6>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;)
+        case 6: exl3_ks_p_body<6>(trellis, trellis, xh, xh, ws, ws, pf0, pf0, M, K, N, ks, 1, pf_d, psk_sa); break;
         default: break;
     }
 }
@@ -13026,10 +14471,11 @@ exl3_hmma_gemm_ks_p_x2(const uint16_t* __restrict__ tr0, const uint16_t* __restr
     __shared__ __align__(16) __half psk_sa[PSK_SMEM_HALVES];
     const int ks = PSK_CFG_KS(cfg), pf_d = PSK_CFG_PF(cfg);
     switch (PSK_CFG_BITS(cfg)) {
+        case 2: exl3_ks_p_body<2>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;  // P7 B6: K=2.0 (bits=2)
         case 3: exl3_ks_p_body<3>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;
         case 4: exl3_ks_p_body<4>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;
         case 5: exl3_ks_p_body<5>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;
-        EXL3_CASE6(case 6: exl3_ks_p_body<6>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;)
+        case 6: exl3_ks_p_body<6>(tr0, tr1, xh0, xh1, ws0, ws1, pf0, pf1, M, K, N, ks, 2, pf_d, psk_sa); break;
         default: break;
     }
 }
@@ -13638,12 +15084,15 @@ __device__ void xq_attn_decode_group_loop(__half* __restrict__ attn,
     const int m = gridDim.y;
     const int tid = threadIdx.x;
     const int kvh = head / (nh / nkv);
-    const int slot = slotpos[0 * 2 + 0];  // one slot for the whole group
+    // issue #35: rows of a packed verify can be DIFFERENT lanes — resolve the slot per row.
+    // (When every row shares one slot, as a plain verify does, this yields the same value
+    // the old single read produced, so decode/verify words are unchanged.)
     __shared__ float red[1024];
     __shared__ float qbuf[1024];
     __shared__ float kbuf[1024];
     for (int r = 0; r < m; r++) {
         const int p = slotpos[r * 2 + 1];
+        const int slot = slotpos[r * 2 + 0];
         const float* c = cossin + (long long)r * 2 * rdim;
         const float* s = c + rdim;
         const __half* qn_w = qnkn;
@@ -13706,8 +15155,9 @@ __device__ void xq_attn_decode_group_v2(__half* __restrict__ attn,
     const int r = blockIdx.y;
     const int tid = threadIdx.x;
     const int kvh = head / (nh / nkv);
-    const int slot = slotpos[0 * 2 + 0];  // one slot for the whole group
-    const XqKv kc = xq_kv_make(kcvc, max_pos, hd, nkv, slot, kvh);
+    // issue #35: rows of a packed verify can be DIFFERENT lanes, so phase 1 writes each
+    // row K/V into that row own slot and the scan reads row r slot. When every row shares
+    // one slot (a plain verify) every kc equals the old single kc: words unchanged.
     const __half* qn_w = qnkn;
     const __half* kn_w = qnkn + hd;
     __shared__ float red[1024];
@@ -13718,17 +15168,19 @@ __device__ void xq_attn_decode_group_v2(__half* __restrict__ attn,
     // ---- phase 1: K/V writes for rows 0..r (xq_k_norm_rope = the shared K words)
     for (int rr = 0; rr <= r; rr++) {
         const int p = slotpos[rr * 2 + 1];
+        const XqKv kcw = xq_kv_make(kcvc, max_pos, hd, nkv, slotpos[rr * 2 + 0], kvh);
         const float* c = cossin + (long long)rr * 2 * rdim;
         const float* s = c + rdim;
         xq_k_norm_rope(kbuf, red, kp + (long long)rr * nkv * hd + (long long)kvh * hd,
                        kn_w, c, s, tid, hd, rdim, eps);
         __syncthreads();
-        xq_kv_put(kc.k + (long long)p * kc.rb, kc.fmt, hd, tid, kbuf[tid]);
-        xq_kv_put(kc.v + (long long)p * kc.rb, kc.fmt, hd, tid, xq_h2f(vp[(long long)rr * nkv * hd + (long long)kvh * hd + tid]));
+        xq_kv_put(kcw.k + (long long)p * kcw.rb, kcw.fmt, hd, tid, kbuf[tid]);
+        xq_kv_put(kcw.v + (long long)p * kcw.rb, kcw.fmt, hd, tid, xq_h2f(vp[(long long)rr * nkv * hd + (long long)kvh * hd + tid]));
         __syncthreads();
     }
     // ---- row r's q: rmsnorm (1+w), rope (shared order with xq_attn_decode)
     const int p = slotpos[r * 2 + 1];
+    const XqKv kc = xq_kv_make(kcvc, max_pos, hd, nkv, slotpos[r * 2 + 0], kvh);
     const float* c = cossin + (long long)r * 2 * rdim;
     const float* s = c + rdim;
     float qv = xq_h2f(qg[(long long)r * nh * hd * 2 + (long long)head * hd * 2 + tid]);
@@ -14040,7 +15492,7 @@ xq_attn_dense_dots_g6(float* __restrict__ sc, float* __restrict__ pmx, const flo
 // scales) into one smem buffer as ONE cp.async group. RS = smem row stride (bytes).
 template <int SD, int N16, bool FP8, int RS = SD * 4>
 __device__ __forceinline__ void xq_dv3_stage_v(char* vbt, float* vsct, const XqKv& kc, int t0,
-                                               int npos, int d0b, int tid) {
+                                               int npos, int d0b, int scoff, int tid) {
     constexpr int NPER = N16 + (FP8 ? 1 : 0);
     for (int i = tid; i < XQ_DV3_T * NPER; i += blockDim.x) {
         const int tr = i / NPER;
@@ -14049,7 +15501,7 @@ __device__ __forceinline__ void xq_dv3_stage_v(char* vbt, float* vsct, const XqK
         if (t < npos) {
             const char* src = kc.v + (long long)t * kc.rb;
             if (c < N16) moe_coop_cp16(vbt + tr * RS + c * 16, src + d0b + c * 16, 16);
-            else         moe_coop_cp16(vsct + tr * 4, src + kc.hd, 16);
+            else         moe_coop_cp16(vsct + tr * 4, src + scoff, 16);
         }
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
@@ -14109,6 +15561,23 @@ __device__ __forceinline__ void xq_dv3_ldv_q8(float* v, const char* vbt, const f
     for (int e = 0; e < DPT; e++) v[e] = xq_q8v(u, e, sm, hs);
 }
 
+// q4k V elements d0..d0+DPT-1 at smem row tr (codes packed RS = SD/2 bytes per row, the row's
+// 16-B group-scale chunk at vsct + tr*4): the SAME values xq_kv_ld returns — sm = f16 scale of
+// group d0>>5 * 1/8, hs = 0.5*sm, v = fma(code - 8, sm, hs).
+template <int DPT, int RS>
+__device__ __forceinline__ void xq_dv3_ldv_q4k(float* v, const char* vbt, const float* vsct, int tr, int dgl, int d0) {
+    static_assert(DPT == 2 || DPT == 4, "q4k dense v3 slices hold whole 32-groups");
+    const char* r = vbt + tr * RS;
+    const float sm = __fmul_rn(__half2float(reinterpret_cast<const __half*>(vsct + tr * 4)[d0 >> 5]), 0.125f);
+    const float hs = 0.5f * sm;
+    unsigned u;
+    if constexpr (DPT == 4) u = (unsigned)*reinterpret_cast<const unsigned short*>(r + dgl * 2);
+    else                    u = (unsigned)*reinterpret_cast<const unsigned char*>(r + dgl);
+    #pragma unroll
+    for (int e = 0; e < DPT; e++)
+        v[e] = __fmaf_rn((float)((int)((u >> (4 * e)) & 0xF) - 8), sm, hs);
+}
+
 // ---- 3. accumulate: grid (hd/SD, nkv, m), block 192 = 12 heads x 16 dim-groups of DPT dims.
 // Thread (h = tid>>4, dgl = tid&15) owns dims d0..d0+DPT-1 of head kvh*12+h.
 template <int G, int FMT, int DPT>
@@ -14117,13 +15586,15 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
                                                 const __half* __restrict__ qg, int nh, int hd,
                                                 int kvh, int row, int npos, char* vb, float* vsc, float* wb) {
     constexpr int T = XQ_DV3_T, SD = 16 * DPT, WST = XQ_DV3_T + 4;
-    constexpr int EB = FMT == XQ_KV_F32 ? 4 : (FMT == XQ_KV_F16 ? 2 : 1);
-    constexpr int N16 = SD * EB / 16;
+    constexpr bool P4 = FMT == XQ_KV_Q4K;
+    constexpr int EB = P4 ? 1 : (FMT == XQ_KV_F32 ? 4 : (FMT == XQ_KV_F16 ? 2 : 1));
+    // q4k: SD/2 code bytes per row (2 dims per byte); q8: SD; f32/f16/fp8: SD*4.
+    constexpr int N16 = P4 ? SD / 32 : SD * EB / 16;
     // q8 (WP25): codes packed SD bytes per smem row (so the DPT=2 body fits acc1's buffer);
     // f32/f16/fp8 keep the SD*4-byte stride (their code is unchanged). SCH = the row carries a
-    // 16-B scale chunk (fp8 row scale | q8 hd/32 f16 group scales, hd == 256).
+    // 16-B scale chunk (fp8 row scale | q8/q4k group scales, hd == 256).
     constexpr bool Q8 = FMT >= XQ_KV_Q8;
-    constexpr int RS = Q8 ? SD : SD * 4;
+    constexpr int RS = P4 ? SD / 2 : (Q8 ? SD : SD * 4);
     constexpr bool SCH = FMT == XQ_KV_FP8 || Q8;
     static_assert(!Q8 || DPT >= 2, "q8: a thread's 16-dgl slice must hold whole 32-groups");
     const int tid = threadIdx.x;
@@ -14134,9 +15605,10 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
     const float* srow = sc + hrow * XQ_DV3_TS;
     const float scale = xq_dv3_scale(hd);
     const int ntile = (npos + T - 1) / T;
-    const int d0b = blockIdx.x * SD * EB;
+    const int d0b = blockIdx.x * (P4 ? SD / 2 : SD * EB);
+    const int scoff = P4 ? hd / 2 : hd;
     // tile 0's V copies and raw scores go out first so their latency overlaps the mx loads
-    xq_dv3_stage_v<SD, N16, SCH, RS>(vb, vsc, kc, 0, npos, d0b, tid);
+    xq_dv3_stage_v<SD, N16, SCH, RS>(vb, vsc, kc, 0, npos, d0b, scoff, tid);
     float4 rw = *reinterpret_cast<const float4*>(srow + dgl * 4);
     // mx: fmaxf over the row's chunk maxima (exactly the set {fl(raw*scale) : t < npos})
     const int nch = (npos + XQ_DV3_CH - 1) / XQ_DV3_CH;
@@ -14166,7 +15638,7 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
         if (ti + 1 < ntile) {
             xq_dv3_stage_v<SD, N16, SCH, RS>(vb + ((ti + 1) & 1) * (T * RS),
                                                       vsc + ((ti + 1) & 1) * (T * 4),
-                                                      kc, t0 + T, npos, d0b, tid);
+                                                      kc, t0 + T, npos, d0b, scoff, tid);
             rw = *reinterpret_cast<const float4*>(srow + t0 + T + dgl * 4);
         } else {
             asm volatile("cp.async.commit_group;\n" ::: "memory");   // keep the group count aligned
@@ -14182,8 +15654,9 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
             #pragma unroll
             for (int u = 0; u < 4; u++) {
                 float v[DPT];
-                if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t + u, dgl, d0 >> 5);
-                else              xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t + u, dgl);
+                if constexpr (P4)      xq_dv3_ldv_q4k<DPT, RS>(v, vcur, scur, t + u, dgl, d0);
+                else if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t + u, dgl, d0 >> 5);
+                else                   xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t + u, dgl);
                 denom = __fadd_rn(denom, ws[u]);
                 #pragma unroll
                 for (int e = 0; e < DPT; e++) acc[e] = __fmaf_rn(ws[u], v[e], acc[e]);
@@ -14192,8 +15665,9 @@ __device__ __forceinline__ void xq_dv3_acc_body(__half* __restrict__ attn, const
         for (; t < tn; t++) {
             const float w = wh[t];
             float v[DPT];
-            if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t, dgl, d0 >> 5);
-            else              xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t, dgl);
+            if constexpr (P4)      xq_dv3_ldv_q4k<DPT, RS>(v, vcur, scur, t, dgl, d0);
+            else if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t, dgl, d0 >> 5);
+            else                   xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t, dgl);
             denom = __fadd_rn(denom, w);
             #pragma unroll
             for (int e = 0; e < DPT; e++) acc[e] = __fmaf_rn(w, v[e], acc[e]);
@@ -14275,6 +15749,14 @@ __device__ __forceinline__ void xq_dv3_acc_entry(__half* __restrict__ attn, cons
         case XQ_KV_F32: xq_dv3_acc_body<G, XQ_KV_F32, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
         case XQ_KV_F16: xq_dv3_acc_body<G, XQ_KV_F16, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
         case XQ_KV_FP8: xq_dv3_acc_body<G, XQ_KV_FP8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
+        case XQ_KV_Q4K:
+            if constexpr (DPT >= 2) {
+                xq_dv3_acc_body<G, XQ_KV_Q4K, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+            } else {
+                if ((int)blockIdx.x < hd / 32)   // block-uniform
+                    xq_dv3_acc_body<G, XQ_KV_Q4K, 2>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+            }
+            break;
         default:
             // q8 / probe-only q4x (same layout + reader). The output un-rotation needs a whole
             // 32-group per thread-16 slice, so the single-row acc1 (DPT=1, 16-dim slices) runs
@@ -14414,7 +15896,7 @@ extern "C" __global__ void xq_gdn_commit(__half* __restrict__ core,
 // each state row in registers. Per element the op sequence is identical to
 // xq_gdn_token's (FMUL by g, then FFMA kk·delta + S), so the committed state is
 // bitwise the replay's. grid (nh * vd/XQ_GDN_C), block kd; thread = one state row.
-#define XQ_GDN_RING_CMAX 8   // WP23: mirrors GDN_RING_CMAX in exl3_forward.rs
+#define XQ_GDN_RING_CMAX 11   // WP23: mirrors GDN_RING_CMAX in exl3_forward.rs
 extern "C" __global__ void __launch_bounds__(128)
 xq_gdn_commit_ring(float* __restrict__ state, const float* __restrict__ ring,
                    int nh, int kd, int vd, const int* __restrict__ slotacc) {
@@ -16750,6 +18232,19 @@ __device__ __forceinline__ void xq_q8_deq8(float* o, const XqQ8Raw& r) {
     #pragma unroll
     for (int i = 0; i < 4; i++) o[4 + i] = xq_q8v(r.u.y, i, sm, hs);
 }
+// q4k dims d0..d0+7 as raw bytes in the SAME register pair (u.x = the 4 code bytes, h = the
+// 32-group's f16 scale bits at row + hd/2; d0 % 8 == 0). == xq_kv_ld8's q4k branch: sm =
+// fl(f16(scale) * 2^-3), hs = 0.5 * sm, o = fma(code - 8, sm, hs).
+__device__ __forceinline__ void xq_q4k_raw(XqQ8Raw& r, const char* row, int hd, int d0) {
+    r.u.x = *reinterpret_cast<const unsigned*>(row + (d0 >> 1));
+    r.h = reinterpret_cast<const unsigned short*>(row + hd / 2)[d0 >> 5];
+}
+__device__ __forceinline__ void xq_q4k_deq8(float* o, const XqQ8Raw& r) {
+    const float sm = __fmul_rn(__half2float(__ushort_as_half(r.h)), 0.125f);
+    const float hs = 0.5f * sm;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) o[i] = __fmaf_rn((float)((int)((r.u.x >> (4 * i)) & 0xF) - 8), sm, hs);
+}
 extern "C" __global__ void __launch_bounds__(XQ_PQ8_NW * 32, 4)
 xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc,
                 const float* __restrict__ qstage, const float* __restrict__ kcvc, const int* __restrict__ sel,
@@ -16776,6 +18271,7 @@ xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restric
     const int begin = sp * split_len;
     const int end = min((sp + 1) * split_len, nsel);
     const float rsq = rsqrtf((float)hd);
+    const bool is4 = kc.fmt == XQ_KV_Q4K;      // block-uniform: the packed 4-bit row (raw twin loaders)
     float qv[XQ_PQ8_HPW][8], acc[XQ_PQ8_HPW][8], mx[XQ_PQ8_HPW], lx[XQ_PQ8_HPW];
     #pragma unroll
     for (int g = 0; g < XQ_PQ8_HPW; g++) {
@@ -16788,7 +18284,8 @@ xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restric
         *reinterpret_cast<float4*>(qv[g] + 4) = reinterpret_cast<const float4*>(qrow + lane * 8)[1];
     }
     // thread item k of a tile: row-slot rs = warp + NW*k -> entry rs >> 1, K|V = rs & 1, dims lane*8..+7
-    // (a warp reads one row's 256 contiguous code bytes + its 16 scale bytes per item: coalesced).
+    // (a warp reads one row's 256 contiguous code bytes + its 16 scale bytes per item: coalesced;
+    //  q4k: the 128 code bytes of the packed row + the same 16 scale bytes).
     XqQ8Raw raw[XQ_PQ8_IPT];
     for (int cb = begin; cb < end; cb += XQ_PQ8_CH) {
         const int n = min(XQ_PQ8_CH, end - cb);
@@ -16799,7 +18296,11 @@ xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restric
         for (int k = 0; k < XQ_PQ8_IPT; k++) {             // prefetch tile 0 (warp-uniform branches)
             const int rs = warp + XQ_PQ8_NW * k, e = rs >> 1;
             const int t = e < n ? s_t[e] : -1;
-            if (t >= 0) xq_q8_raw(raw[k], ((rs & 1) ? kc.v : kc.k) + (long long)t * kc.rb, hd, lane * 8);
+            if (t >= 0) {
+                const char* row = ((rs & 1) ? kc.v : kc.k) + (long long)t * kc.rb;
+                if (is4) xq_q4k_raw(raw[k], row, hd, lane * 8);
+                else     xq_q8_raw(raw[k], row, hd, lane * 8);
+            }
         }
         for (int e0 = 0; e0 < n; e0 += XQ_PQ8_TE) {
             const int ne = min(XQ_PQ8_TE, n - e0);
@@ -16809,7 +18310,8 @@ xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restric
                 const int rs = warp + XQ_PQ8_NW * k, e = rs >> 1;
                 if (e < ne && s_t[e0 + e] >= 0) {
                     float o[8];
-                    xq_q8_deq8(o, raw[k]);
+                    if (is4) xq_q4k_deq8(o, raw[k]);
+                    else     xq_q8_deq8(o, raw[k]);
                     tile[e][rs & 1][lane] = make_float4(o[0], o[1], o[2], o[3]);
                     tile[e][rs & 1][32 + lane] = make_float4(o[4], o[5], o[6], o[7]);
                 }
@@ -16820,7 +18322,11 @@ xq_attn_sel_pq8(float* __restrict__ pm, float* __restrict__ pl, float* __restric
                 for (int k = 0; k < XQ_PQ8_IPT; k++) {
                     const int rs = warp + XQ_PQ8_NW * k, e = e0 + XQ_PQ8_TE + (rs >> 1);
                     const int t = e < n ? s_t[e] : -1;
-                    if (t >= 0) xq_q8_raw(raw[k], ((rs & 1) ? kc.v : kc.k) + (long long)t * kc.rb, hd, lane * 8);
+                    if (t >= 0) {
+                        const char* row = ((rs & 1) ? kc.v : kc.k) + (long long)t * kc.rb;
+                        if (is4) xq_q4k_raw(raw[k], row, hd, lane * 8);
+                        else     xq_q8_raw(raw[k], row, hd, lane * 8);
+                    }
                 }
             }
             for (int e = 0; e < ne; e++) {
@@ -16943,6 +18449,100 @@ extern "C" __global__ void xq_attn_dense_splitk4(float* __restrict__ pm, float* 
         }
         #pragma unroll
         for (int i = 0; i < 8; i++) pacc[(hg * nsplits + sp) * hd + lane * 8 + i] = acc[i];
+    }
+}
+
+// ---- DSPLITK round 2 (owner 2026-11-07): the SHARED-READ twin of xq_attn_dense_splitk4 for the rows of ONE verify
+// (one slot, the host guarantees it). xq_attn_dense_splitk4 gives every row its own blocks, so a verify of m rows
+// fetches the context m times (35B at 48K: ~+10 ms per draft depth). Here a block takes XQ_VR_ROWS rows of one
+// (KV head, slice): each K/V row of the union of the rows' slice ranges is loaded ONCE and folded into every row
+// whose OWN range [sp*split_len_r, ...) contains it — per row the same keys, the same ascending order and the same
+// expressions as xq_attn_dense_splitk4, so its partials (and the combine) are bitwise those of a decode at that
+// position (the --probe-exl3-tpspec LOSSLESS gate is the check). Grid ceil(m / XQ_VR_ROWS) x nkv x nsplits, block 256.
+#define XQ_VR_ROWS 4
+extern "C" __global__ void xq_attn_dense_splitk4_vr(float* __restrict__ pm, float* __restrict__ pl,
+                                                   float* __restrict__ pacc, const float* __restrict__ qstage,
+                                                   const float* __restrict__ kcvc, const int* __restrict__ slotpos,
+                                                   int nh_packed, long long geom, int m) {
+    XQ_PDL_ENTRY();
+    const int nh = nh_packed & 0xFFFF;
+    const int nkv = (nh_packed >> 16) & 0xFFFF;
+    const int nsplits = (int)(geom & 0xFFFFF);
+    const int max_pos = (int)(geom >> 32);
+    const int sp = blockIdx.x % nsplits;
+    const int kvh = (blockIdx.x / nsplits) % nkv;
+    const int r0 = (blockIdx.x / (nsplits * nkv)) * XQ_VR_ROWS;
+    const int nrows = min(XQ_VR_ROWS, m - r0);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int gqa = nh / nkv;
+    const int hd = blockDim.x;                   // 256: 32 lanes x 8 dims per head row
+    const int slot = slotpos[r0 * 2 + 0];
+    const XqKv kc = xq_kv_make(kcvc, max_pos, hd, nkv, slot, kvh);
+    int rb[XQ_VR_ROWS], re[XQ_VR_ROWS];
+    int ub = 0x7fffffff, ue = 0;
+    #pragma unroll
+    for (int r = 0; r < XQ_VR_ROWS; r++) {
+        rb[r] = 0; re[r] = 0;
+        if (r < nrows) {
+            const int npos = slotpos[(r0 + r) * 2 + 1] + 1;    // keys 0..=p (p's own K/V written by xq_attn_prep)
+            const int split_len = (npos + nsplits - 1) / nsplits;
+            rb[r] = sp * split_len;
+            re[r] = min(rb[r] + split_len, npos);
+            if (rb[r] < re[r]) { ub = min(ub, rb[r]); ue = max(ue, re[r]); }
+        }
+    }
+    for (int hh = 0; hh < 2; hh++) {
+        const int w = warp + hh * 8;
+        if (w >= gqa) break;
+        const int h = kvh * gqa + w;
+        float qv[XQ_VR_ROWS][8];
+        #pragma unroll
+        for (int r = 0; r < XQ_VR_ROWS; r++) {
+            const float* qrow = qstage + ((long long)(r0 + min(r, nrows - 1)) * nh + h) * hd;
+            *reinterpret_cast<float4*>(qv[r]) = reinterpret_cast<const float4*>(qrow + lane * 8)[0];
+            *reinterpret_cast<float4*>(qv[r] + 4) = reinterpret_cast<const float4*>(qrow + lane * 8)[1];
+        }
+        const float qs = rsqrtf((float)hd);
+        float mr[XQ_VR_ROWS], lr[XQ_VR_ROWS], acc[XQ_VR_ROWS][8];
+        #pragma unroll
+        for (int r = 0; r < XQ_VR_ROWS; r++) {
+            mr[r] = -INFINITY; lr[r] = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) acc[r][i] = 0.0f;
+        }
+        for (int t = ub; t < ue; t++) {
+            float kv[8], vv[8];
+            xq_kv_ld8(kv, kc.k + (long long)t * kc.rb, kc.fmt, hd, lane * 8);
+            xq_kv_ld8(vv, kc.v + (long long)t * kc.rb, kc.fmt, hd, lane * 8);
+            #pragma unroll
+            for (int r = 0; r < XQ_VR_ROWS; r++) {
+                if (t < rb[r] || t >= re[r]) continue;       // warp-uniform: the row's own slice only
+                float dot = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) dot += qv[r][i] * kv[i];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+                const float sc = dot * qs;
+                const float m_new = fmaxf(mr[r], sc);
+                const float scale_f = __expf(mr[r] - m_new);
+                const float wt = __expf(sc - m_new);
+                lr[r] = lr[r] * scale_f + wt;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) acc[r][i] = acc[r][i] * scale_f + wt * vv[i];
+                mr[r] = m_new;
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < XQ_VR_ROWS; r++) {
+            if (r >= nrows) break;
+            const long long hg = (long long)(r0 + r) * nh + h;
+            if (lane == 0) {
+                pm[hg * nsplits + sp] = mr[r];
+                pl[hg * nsplits + sp] = lr[r];
+            }
+            #pragma unroll
+            for (int i = 0; i < 8; i++) pacc[(hg * nsplits + sp) * hd + lane * 8 + i] = acc[r][i];
+        }
     }
 }
 
@@ -17400,14 +19000,14 @@ xq_gdn_commit_all_w4(const unsigned long long* __restrict__ lptr, int L,
 // BIT CONTRACT (== xq_attn_dense_acc4 / _acc1 == v2): mx = the same fmaxf over the row's chunk
 // maxima; w = __expf(__fmaf_rn(raw, scale, -mx)) per (head, position) (a tile only regroups
 // WHICH thread evaluates it); denom = __fadd_rn(denom, w) and acc = __fmaf_rn(w, v, acc) over t
-// ascending from 0, through the same V readers (xq_dv3_ldv / xq_dv3_ldv_q8) on the same staged
-// raw bytes; the closing expressions (f32/f16/fp8: f16((acc/denom)*sig(g)); q8: the in-warp H32
-// un-rotation) are xq_dv3_acc_body's verbatim.
+// ascending from 0, through the same V readers (xq_dv3_ldv / xq_dv3_ldv_q8 / xq_dv3_ldv_q4k) on the
+// same staged raw bytes; the closing expressions (f32/f16/fp8: f16((acc/denom)*sig(g)); q8 and q4k:
+// the in-warp H32 un-rotation) are xq_dv3_acc_body's verbatim.
 #define XQ_W4A_T   32
 #define XQ_W4A_NST 5
 template <int SD, int N16, bool SCH, int RS>
 __device__ __forceinline__ void xq_w4a_stage_v(char* vbt, float* vsct, const XqKv& kc, int t0,
-                                               int npos, int d0b, int tid) {
+                                               int npos, int d0b, int scoff, int tid) {
     constexpr int NPER = N16 + (SCH ? 1 : 0);
     for (int i = tid; i < XQ_W4A_T * NPER; i += blockDim.x) {
         const int tr = i / NPER;
@@ -17416,7 +19016,7 @@ __device__ __forceinline__ void xq_w4a_stage_v(char* vbt, float* vsct, const XqK
         if (t < npos) {
             const char* src = kc.v + (long long)t * kc.rb;
             if (c < N16) moe_coop_cp16(vbt + tr * RS + c * 16, src + d0b + c * 16, 16);
-            else         moe_coop_cp16(vsct + tr * 4, src + kc.hd, 16);
+            else         moe_coop_cp16(vsct + tr * 4, src + scoff, 16);
         }
     }
 }
@@ -17426,12 +19026,15 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
                                             const __half* __restrict__ qg, int nh, int hd,
                                             int kvh, int row, int npos, char* vb, float* vsc, float* wb) {
     constexpr int T = XQ_W4A_T, NST = XQ_W4A_NST, SD = 16 * DPT, WST = XQ_W4A_T + 4;
-    constexpr int EB = FMT == XQ_KV_F32 ? 4 : (FMT == XQ_KV_F16 ? 2 : 1);
-    constexpr int N16 = SD * EB / 16;
+    constexpr bool P4 = FMT == XQ_KV_Q4K;
+    constexpr int EB = P4 ? 1 : (FMT == XQ_KV_F32 ? 4 : (FMT == XQ_KV_F16 ? 2 : 1));
+    // q4k: SD/2 code bytes per smem row (2 dims per byte); q8: SD; f32/f16/fp8: SD*4.
+    constexpr int N16 = P4 ? SD / 32 : SD * EB / 16;
+    // The closing un-rotation runs the q8 branch for q4k too (same H32, same rotated basis).
     constexpr bool Q8 = FMT >= XQ_KV_Q8;
-    constexpr int RS = Q8 ? SD : SD * 4;
+    constexpr int RS = P4 ? SD / 2 : (Q8 ? SD : SD * 4);
     constexpr bool SCH = FMT == XQ_KV_FP8 || Q8;
-    static_assert(!Q8 || DPT >= 2, "q8: a thread's 16-dgl slice must hold whole 32-groups");
+    static_assert(!Q8 || DPT >= 2, "q8/q4k: a thread's 16-dgl slice must hold whole 32-groups");
     static_assert(T == 32, "the weight tile below maps 16 threads x 2 positions");
     const int tid = threadIdx.x;
     const int h = tid >> 4;
@@ -17441,11 +19044,12 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
     const float* srow = sc + hrow * XQ_DV3_TS;
     const float scale = xq_dv3_scale(hd);
     const int ntile = (npos + T - 1) / T;
-    const int d0b = blockIdx.x * SD * EB;
+    const int d0b = blockIdx.x * (P4 ? SD / 2 : SD * EB);
+    const int scoff = P4 ? hd / 2 : hd;
     // prologue: tiles 0..NST-2, one cp.async group each (empty groups keep the count aligned)
     #pragma unroll
     for (int p = 0; p < NST - 1; p++) {
-        if (p < ntile) xq_w4a_stage_v<SD, N16, SCH, RS>(vb + p * (T * RS), vsc + p * (T * 4), kc, p * T, npos, d0b, tid);
+        if (p < ntile) xq_w4a_stage_v<SD, N16, SCH, RS>(vb + p * (T * RS), vsc + p * (T * 4), kc, p * T, npos, d0b, scoff, tid);
         asm volatile("cp.async.commit_group;\n" ::: "memory");
     }
     float2 rw = *reinterpret_cast<const float2*>(srow + dgl * 2);
@@ -17474,7 +19078,7 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
         const int pf = ti + NST - 1;
         if (pf < ntile)
             xq_w4a_stage_v<SD, N16, SCH, RS>(vb + (pf % NST) * (T * RS), vsc + (pf % NST) * (T * 4),
-                                             kc, pf * T, npos, d0b, tid);
+                                             kc, pf * T, npos, d0b, scoff, tid);
         asm volatile("cp.async.commit_group;\n" ::: "memory");
         if (ti + 1 < ntile) rw = *reinterpret_cast<const float2*>(srow + t0 + T + dgl * 2);
         asm volatile("cp.async.wait_group %0;\n" :: "n"(XQ_W4A_NST - 1) : "memory");   // tile ti (this thread)
@@ -17490,8 +19094,9 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
             #pragma unroll
             for (int u = 0; u < 4; u++) {
                 float v[DPT];
-                if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t + u, dgl, d0 >> 5);
-                else              xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t + u, dgl);
+                if constexpr (P4)      xq_dv3_ldv_q4k<DPT, RS>(v, vcur, scur, t + u, dgl, d0);
+                else if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t + u, dgl, d0 >> 5);
+                else                   xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t + u, dgl);
                 denom = __fadd_rn(denom, ws[u]);
                 #pragma unroll
                 for (int e = 0; e < DPT; e++) acc[e] = __fmaf_rn(ws[u], v[e], acc[e]);
@@ -17500,8 +19105,9 @@ __device__ __forceinline__ void xq_w4a_body(__half* __restrict__ attn, const flo
         for (; t < tn; t++) {
             const float w = wh[t];
             float v[DPT];
-            if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t, dgl, d0 >> 5);
-            else              xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t, dgl);
+            if constexpr (P4)      xq_dv3_ldv_q4k<DPT, RS>(v, vcur, scur, t, dgl, d0);
+            else if constexpr (Q8) xq_dv3_ldv_q8<DPT, RS>(v, vcur, scur, t, dgl, d0 >> 5);
+            else                   xq_dv3_ldv<FMT, DPT, SD>(v, vcur, scur, t, dgl);
             denom = __fadd_rn(denom, w);
             #pragma unroll
             for (int e = 0; e < DPT; e++) acc[e] = __fmaf_rn(w, v[e], acc[e]);
@@ -17578,6 +19184,16 @@ __device__ __forceinline__ void xq_w4a_entry(__half* __restrict__ attn, const fl
         case XQ_KV_F32: xq_w4a_body<G, XQ_KV_F32, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
         case XQ_KV_F16: xq_w4a_body<G, XQ_KV_F16, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
         case XQ_KV_FP8: xq_w4a_body<G, XQ_KV_FP8, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb); break;
+        case XQ_KV_Q4K:
+            // q4k: xq_dv3_acc_entry's rule (the single-row acc1_w4 runs the DPT=2 body on its
+            // first hd/32 CTAs; RS = SD/2 keeps it inside acc1_w4's vb)
+            if constexpr (DPT >= 2) {
+                xq_w4a_body<G, XQ_KV_Q4K, DPT>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+            } else {
+                if ((int)blockIdx.x < hd / 32)   // block-uniform
+                    xq_w4a_body<G, XQ_KV_Q4K, 2>(attn, sc, pmx, kc, qg, nh, hd, kvh, row, npos, vb, vsc, wb);
+            }
+            break;
         default:
             // q8 / probe-only q4x: xq_dv3_acc_entry's rule (the single-row acc1 runs the DPT=2 body on
             // its first hd/32 CTAs; RS = SD bytes keeps it inside acc1's vb)
@@ -17752,6 +19368,312 @@ xq_attn_dense_splitk4_w4(float* __restrict__ pm, float* __restrict__ pl,
         if (lane == 0) { pm[hg * nsplits + sp] = mB; pl[hg * nsplits + sp] = lB; }
         #pragma unroll
         for (int i = 0; i < 8; i++) pacc[(hg * nsplits + sp) * hd + lane * 8 + i] = accB[i];
+    }
+}
+
+// ---- DSPLITK round 3 (owner 2026-11-08): the q8 cache (the served default) was decoded by EVERY warp of a block —
+// gqa (6 on the 27B, 8 on the 35B) x the same unpack-and-scale per K/V value — which made the trunk's split-K
+// issue-bound at ~2x its memory floor (27B q8 at 48K: d1 +26 ms/round over short vs a ~14 ms two-row floor).
+// Here a block decodes each staged K/V row ONCE with xq_kv_ld8 (the served reader, so the values are the same bits)
+// into an f32 tile, [row j][K|V][half][lane]: dims lane*8+0..3 in half 0 and lane*8+4..7 in half 1, so both the
+// writes (one warp per (row, K|V)) and every warp's two lds.128 per row are conflict-free. The step after it is
+// xq_w4d_step unchanged -> per (row, head, split) the same keys ascending, the same values and the same ops as
+// xq_attn_dense_splitk4_w4 -> bitwise. Needs blockDim == hd == 256 (32 lanes x 8 dims; the host geometry check).
+__device__ __forceinline__ void xq_dskt_decode(float4 (*xt)[2][2][32], char (*ring)[2][1024], int s0, int tn,
+                                               int fmt, int hd, int tid) {
+    const int j = tid >> 6, kvsel = (tid >> 5) & 1, c = tid & 31;
+    if (j < tn) {
+        float o[8];
+        xq_kv_ld8(o, ring[s0 + j][kvsel], fmt, hd, c * 8);
+        xt[j][kvsel][0][c] = make_float4(o[0], o[1], o[2], o[3]);
+        xt[j][kvsel][1][c] = make_float4(o[4], o[5], o[6], o[7]);
+    }
+}
+__device__ __forceinline__ void xq_dskt_read(float (&kv)[8], float (&vv)[8], float4 (*xt)[2][2][32], int j, int lane) {
+    const float4 k0 = xt[j][0][0][lane], k1 = xt[j][0][1][lane];
+    const float4 v0 = xt[j][1][0][lane], v1 = xt[j][1][1][lane];
+    kv[0] = k0.x; kv[1] = k0.y; kv[2] = k0.z; kv[3] = k0.w; kv[4] = k1.x; kv[5] = k1.y; kv[6] = k1.z; kv[7] = k1.w;
+    vv[0] = v0.x; vv[1] = v0.y; vv[2] = v0.z; vv[3] = v0.w; vv[4] = v1.x; vv[5] = v1.y; vv[6] = v1.z; vv[7] = v1.w;
+}
+// The trunk-only twin of xq_attn_dense_splitk4_w4 (that kernel also serves the draft head on every EXL3 pack,
+// Flash-Next included, and stays byte-for-byte as it is), for q8 / fp8 caches (row = 272 B at hd 256):
+//  * the group (4 keys) is decoded ONCE per block into the f32 tile (xq_dskt_decode / xq_dskt_read);
+//  * a DEEP ring: XQ_T4_NG groups of raw 272-B rows (13 KB), so XQ_T4_NG - 1..XQ_T4_NG groups are in flight while one
+//    computes (the 2-group ring of _w4 kept ONE group in flight: a 35B q8 48K split-K call ran at ~1.5x its DRAM floor
+//    and the 2-row shared-read verify at ~3.7x, the nsys receipt in PLAN/DSPLITK round 3);
+//  * the grid is ROW-FASTEST (blockIdx = ((split * nkv) + kvh) * rows + row): the rows of one verify walk the same
+//    split's keys at the same time, so the second..m-th reader of each K/V line is an L2 hit, without the register-
+//    heavy shared-read body. A decode (rows = 1) is the same order as before.
+// Per (row, head, split): the same keys ascending, the same values, the same xq_w4d_step ops -> bitwise == _w4.
+#define XQ_T4_NG 6
+#define XQ_T4_RB 272
+__device__ __forceinline__ void xq_t4_stage(char (*ring)[4][2][XQ_T4_RB], int slot, const XqKv& kc, int t0, int end, int tid) {
+    constexpr int NC = XQ_T4_RB / 16;                // 17 chunks per row
+    for (int i = tid; i < 4 * 2 * NC; i += blockDim.x) {
+        const int j = i / (2 * NC), r = i - j * (2 * NC);
+        const int t = t0 + j;
+        if (t < end) {
+            const int kvsel = r >= NC ? 1 : 0;
+            const int c = r - kvsel * NC;
+            const char* src = (kvsel ? kc.v : kc.k) + (long long)t * XQ_T4_RB + c * 16;
+            moe_coop_cp16(&ring[slot][j][kvsel][c * 16], src, 16);
+        }
+    }
+}
+__device__ __forceinline__ void xq_t4_decode(float4 (*xt)[2][2][32], char (*grp)[2][XQ_T4_RB], int tn, int fmt, int hd, int tid) {
+    const int j = tid >> 6, kvsel = (tid >> 5) & 1, c = tid & 31;
+    if (j < tn) {
+        float o[8];
+        xq_kv_ld8(o, grp[j][kvsel], fmt, hd, c * 8);
+        xt[j][kvsel][0][c] = make_float4(o[0], o[1], o[2], o[3]);
+        xt[j][kvsel][1][c] = make_float4(o[4], o[5], o[6], o[7]);
+    }
+}
+// A full group of 4 keys for one head: the 4 dots (each xq_w4d_step's FFMA chain from +0, dims lane*8+i ascending)
+// and their shfl_xor 16..1 FADD trees INTERLEAVED (one position's reduction no longer waits on the previous one's),
+// then the 4 online-softmax updates IN KEY ORDER with xq_w4d_step's exact ops -> bitwise == 4 xq_w4d_step calls.
+__device__ __forceinline__ void xq_t4_step4(const float (&q)[8], float4 (*xt)[2][2][32], int lane, float qs,
+                                            float& m, float& l, float (&acc)[8]) {
+    float d[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const float4 k0 = xt[j][0][0][lane], k1 = xt[j][0][1][lane];
+        const float kv[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+        float x = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) x = __fmaf_rn(q[i], kv[i], x);
+        d[j] = x;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) d[j] = __fadd_rn(d[j], __shfl_xor_sync(0xffffffffu, d[j], off));
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const float4 v0 = xt[j][1][0][lane], v1 = xt[j][1][1][lane];
+        const float vv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+        const float sc = __fmul_rn(d[j], qs);
+        const float m_new = fmaxf(m, sc);
+        const float scale_f = __expf(m - m_new);
+        const float wt = __expf(sc - m_new);
+        l = __fmaf_rn(l, scale_f, wt);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) acc[i] = __fmaf_rn(acc[i], scale_f, __fmul_rn(wt, vv[i]));
+        m = m_new;
+    }
+}
+extern "C" __global__ void __launch_bounds__(256, 3)
+xq_attn_dense_splitk4_t4(float* __restrict__ pm, float* __restrict__ pl,
+                         float* __restrict__ pacc, const float* __restrict__ qstage,
+                         const float* __restrict__ kcvc, const int* __restrict__ slotpos,
+                         int nh_packed, long long geom, int rows) {
+    XQ_PDL_ENTRY();
+    __shared__ __align__(16) char ring[XQ_T4_NG][4][2][XQ_T4_RB];
+    __shared__ float4 xt[4][2][2][32];
+    const int nh = nh_packed & 0xFFFF;
+    const int nkv = (nh_packed >> 16) & 0xFFFF;
+    const int nsplits = (int)(geom & 0xFFFFF);
+    const int max_pos = (int)(geom >> 32);
+    const int row = blockIdx.x % rows;                               // row-fastest
+    const int kvh = (blockIdx.x / rows) % nkv;
+    const int sp = blockIdx.x / (rows * nkv);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int gqa = nh / nkv;
+    const int hd = blockDim.x;
+    const int slot = slotpos[row * 2 + 0];
+    const int npos = slotpos[row * 2 + 1] + 1;
+    const XqKv kc = xq_kv_make(kcvc, max_pos, hd, nkv, slot, kvh);
+    const int split_len = (npos + nsplits - 1) / nsplits;
+    const int begin = sp * split_len;
+    const int end = min(begin + split_len, npos);
+    const bool hasA = warp < gqa, hasB = warp + 8 < gqa;
+    const int hA = kvh * gqa + warp, hB = kvh * gqa + warp + 8;
+    float qA[8], qB[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) { qA[i] = 0.0f; qB[i] = 0.0f; }
+    if (hasA) {
+        const float* qrow = qstage + ((long long)row * nh + hA) * hd;
+        *reinterpret_cast<float4*>(qA) = reinterpret_cast<const float4*>(qrow + lane * 8)[0];
+        *reinterpret_cast<float4*>(qA + 4) = reinterpret_cast<const float4*>(qrow + lane * 8)[1];
+    }
+    if (hasB) {
+        const float* qrow = qstage + ((long long)row * nh + hB) * hd;
+        *reinterpret_cast<float4*>(qB) = reinterpret_cast<const float4*>(qrow + lane * 8)[0];
+        *reinterpret_cast<float4*>(qB + 4) = reinterpret_cast<const float4*>(qrow + lane * 8)[1];
+    }
+    const float qs = rsqrtf((float)hd);
+    float mA = -INFINITY, lA = 0.0f, mB = -INFINITY, lB = 0.0f;
+    float accA[8], accB[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) { accA[i] = 0.0f; accB[i] = 0.0f; }
+    const int n = end > begin ? end - begin : 0;
+    const int ng = (n + 3) >> 2;
+    #pragma unroll
+    for (int q = 0; q < XQ_T4_NG; q++) {                             // prologue: XQ_T4_NG groups in flight
+        if (q < ng) xq_t4_stage(ring, q, kc, begin + 4 * q, end, threadIdx.x);
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    }
+    for (int g = 0; g < ng; g++) {
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(XQ_T4_NG - 1) : "memory");   // group g (this thread)
+        __syncthreads();                                              // ... and everyone's; the tile's readers are done
+        const int t0 = begin + 4 * g;
+        const int tn = min(4, end - t0);
+        const int sl = g % XQ_T4_NG;
+        xq_t4_decode(xt, ring[sl], tn, kc.fmt, hd, threadIdx.x);
+        __syncthreads();                                              // tile ready; ring slot sl free
+        if (g + XQ_T4_NG < ng) xq_t4_stage(ring, sl, kc, begin + 4 * (g + XQ_T4_NG), end, threadIdx.x);
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        if (tn == 4) {                                                // a full group: 4 positions in flight
+            if (hasA) xq_t4_step4(qA, xt, lane, qs, mA, lA, accA);
+            if (hasB) xq_t4_step4(qB, xt, lane, qs, mB, lB, accB);
+        } else {
+            for (int j = 0; j < tn; j++) {
+                float kv[8], vv[8];
+                xq_dskt_read(kv, vv, xt, j, lane);
+                if (hasA) xq_w4d_step(qA, kv, vv, qs, mA, lA, accA);
+                if (hasB) xq_w4d_step(qB, kv, vv, qs, mB, lB, accB);
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    if (hasA) {
+        const long long hg = (long long)row * nh + hA;
+        if (lane == 0) { pm[hg * nsplits + sp] = mA; pl[hg * nsplits + sp] = lA; }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) pacc[(hg * nsplits + sp) * hd + lane * 8 + i] = accA[i];
+    }
+    if (hasB) {
+        const long long hg = (long long)row * nh + hB;
+        if (lane == 0) { pm[hg * nsplits + sp] = mB; pl[hg * nsplits + sp] = lB; }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) pacc[(hg * nsplits + sp) * hd + lane * 8 + i] = accB[i];
+    }
+}
+// ---- DSPLITK round 2b (owner 2026-11-07): xq_attn_dense_splitk4_vr on xq_attn_dense_splitk4_w4's machinery —
+// the rows of ONE verify (XQ_VR_ROWS per block) walk the UNION of their slice ranges once through the cp.async
+// smem ring (xq_w4d_stage, groups of 4 keys), and each staged K/V row is folded into every row whose own range
+// holds it with xq_w4d_step (the pinned op sequence of xq_attn_dense_splitk4). Per (row, head, split): the same
+// keys ascending and the same ops as _w4 / the base kernel -> bitwise. Heads w and w+8 (gqa > 8) take a second
+// walk. Grid ceil(m / XQ_VR_ROWS) x nkv x nsplits, block 256 (host: rb % 16 == 0, rb <= 1024).
+extern "C" __global__ void __launch_bounds__(256)
+xq_attn_dense_splitk4_vr_w4(float* __restrict__ pm, float* __restrict__ pl,
+                            float* __restrict__ pacc, const float* __restrict__ qstage,
+                            const float* __restrict__ kcvc, const int* __restrict__ slotpos,
+                            int nh_packed, long long geom, int m) {
+    XQ_PDL_ENTRY();
+    __shared__ __align__(16) char ring[XQ_W4D_NR][2][1024];
+    __shared__ float4 xt[4][2][2][32];                        // round 3: the decoded group (q8 / fp8 only)
+    const int nh = nh_packed & 0xFFFF;
+    const int nkv = (nh_packed >> 16) & 0xFFFF;
+    const int nsplits = (int)(geom & 0xFFFFF);
+    const int max_pos = (int)(geom >> 32);
+    const int sp = blockIdx.x % nsplits;
+    const int kvh = (blockIdx.x / nsplits) % nkv;
+    const int r0 = (blockIdx.x / (nsplits * nkv)) * XQ_VR_ROWS;
+    const int nrows = min(XQ_VR_ROWS, m - r0);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int gqa = nh / nkv;
+    const int hd = blockDim.x;
+    const int slot = slotpos[r0 * 2 + 0];
+    const XqKv kc = xq_kv_make(kcvc, max_pos, hd, nkv, slot, kvh);
+    const bool tile = kc.fmt != XQ_KV_F16 && kc.fmt != XQ_KV_F32;   // block-uniform
+    int rb[XQ_VR_ROWS], re[XQ_VR_ROWS];
+    int ub = 0x7fffffff, ue = 0;
+    #pragma unroll
+    for (int r = 0; r < XQ_VR_ROWS; r++) {
+        rb[r] = 0; re[r] = 0;
+        if (r < nrows) {
+            const int npos = slotpos[(r0 + r) * 2 + 1] + 1;
+            const int split_len = (npos + nsplits - 1) / nsplits;
+            rb[r] = sp * split_len;
+            re[r] = min(rb[r] + split_len, npos);
+            if (rb[r] < re[r]) { ub = min(ub, rb[r]); ue = max(ue, re[r]); }
+        }
+    }
+    if (ue <= ub) { ub = 0; ue = 0; }   // no row has a key in this slice: an EMPTY walk (the sentinel must never be staged:
+                                        // xq_w4d_stage's t = ub + j would overflow INT_MAX into a negative key index)
+    const float qs = rsqrtf((float)hd);
+    const int npass = gqa > 8 ? 2 : 1;
+    for (int pass = 0; pass < npass; pass++) {
+        const int w = warp + pass * 8;
+        const bool has = w < gqa;
+        const int h = kvh * gqa + w;
+        float qv[XQ_VR_ROWS][8];
+        float mr[XQ_VR_ROWS], lr[XQ_VR_ROWS], acc[XQ_VR_ROWS][8];
+        #pragma unroll
+        for (int r = 0; r < XQ_VR_ROWS; r++) {
+            mr[r] = -INFINITY; lr[r] = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) { acc[r][i] = 0.0f; qv[r][i] = 0.0f; }
+            if (has) {
+                const float* qrow = qstage + ((long long)(r0 + min(r, nrows - 1)) * nh + h) * hd;
+                *reinterpret_cast<float4*>(qv[r]) = reinterpret_cast<const float4*>(qrow + lane * 8)[0];
+                *reinterpret_cast<float4*>(qv[r] + 4) = reinterpret_cast<const float4*>(qrow + lane * 8)[1];
+            }
+        }
+        const int n = ue > ub ? ue - ub : 0;
+        const int ng = (n + 3) >> 2;
+        __syncthreads();                                              // the ring is free (previous pass)
+        xq_w4d_stage(ring, kc, ub, ue, 0, threadIdx.x);
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        if (ng > 1) xq_w4d_stage(ring, kc, ub + 4, ue, 4, threadIdx.x);
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        for (int g = 0; g < ng; g++) {
+            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+            __syncthreads();                                          // group g landed; the tile's readers are done
+            const int t0 = ub + 4 * g;
+            const int tn = min(4, ue - t0);
+            const int s0 = (g & 1) * 4;
+            if (tile) {                                               // round 3: decode the group ONCE per block
+                xq_dskt_decode(xt, ring, s0, tn, kc.fmt, hd, threadIdx.x);
+                __syncthreads();                                      // tile ready; ring slots s0.. free
+                if (g + 2 < ng) xq_w4d_stage(ring, kc, ub + 4 * (g + 2), ue, s0, threadIdx.x);
+                asm volatile("cp.async.commit_group;\n" ::: "memory");
+            }
+            bool all4 = tile && tn == 4;                              // a full group inside every live row's range:
+            #pragma unroll                                            // xq_t4_step4 per row (bitwise == 4 steps)
+            for (int r = 0; r < XQ_VR_ROWS; r++)
+                if (r < nrows && !(t0 >= rb[r] && t0 + 3 < re[r])) all4 = false;
+            if (all4) {
+                if (has) {
+                    #pragma unroll
+                    for (int r = 0; r < XQ_VR_ROWS; r++)
+                        if (r < nrows) xq_t4_step4(qv[r], xt, lane, qs, mr[r], lr[r], acc[r]);
+                }
+            } else
+            for (int j = 0; j < tn; j++) {
+                const int t = t0 + j;
+                float kv[8], vv[8];
+                if (tile) {
+                    xq_dskt_read(kv, vv, xt, j, lane);
+                } else {
+                    xq_kv_ld8(kv, ring[s0 + j][0], kc.fmt, hd, lane * 8);
+                    xq_kv_ld8(vv, ring[s0 + j][1], kc.fmt, hd, lane * 8);
+                }
+                if (has) {
+                    #pragma unroll
+                    for (int r = 0; r < XQ_VR_ROWS; r++)
+                        if (t >= rb[r] && t < re[r]) xq_w4d_step(qv[r], kv, vv, qs, mr[r], lr[r], acc[r]);
+                }
+            }
+            if (!tile) {
+                __syncthreads();
+                if (g + 2 < ng) xq_w4d_stage(ring, kc, ub + 4 * (g + 2), ue, s0, threadIdx.x);
+                asm volatile("cp.async.commit_group;\n" ::: "memory");
+            }
+        }
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        if (has) {
+            #pragma unroll
+            for (int r = 0; r < XQ_VR_ROWS; r++) {
+                if (r >= nrows) break;
+                const long long hg = (long long)(r0 + r) * nh + h;
+                if (lane == 0) { pm[hg * nsplits + sp] = mr[r]; pl[hg * nsplits + sp] = lr[r]; }
+                #pragma unroll
+                for (int i = 0; i < 8; i++) pacc[(hg * nsplits + sp) * hd + lane * 8 + i] = acc[r][i];
+            }
+        }
     }
 }
 #define XQ_W4C_MAXS 256

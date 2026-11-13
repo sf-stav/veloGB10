@@ -298,6 +298,29 @@ impl FwdModel {
         Ok(RecurCkpt { buf: self.dev.alloc_zeros::<f32>(w)?, hist: [248046i32; 2] })
     }
 
+    /// PFXPOOL: copy checkpoint `src`'s device words to `dst` (a pool slab offset, `ckpt_layout().bytes()` long);
+    /// returns its host PLE pair.
+    pub fn ckpt_save_to(&self, src: &RecurCkpt, dst: u64) -> Result<[i32; 2]> {
+        unsafe { cudarc::driver::result::memcpy_dtod_async(dst, *src.buf.device_ptr() as u64, src.buf.len() * 4, self.stream.stream) }?;
+        Ok(src.hist)
+    }
+
+    /// PFXPOOL: fill checkpoint `dst` from a pool slab offset `src` written by `ckpt_save_to` (+ its host pair).
+    pub fn ckpt_load_from(&self, dst: &mut RecurCkpt, src: u64, hist: [i32; 2]) -> Result<()> {
+        unsafe { cudarc::driver::result::memcpy_dtod_async(*dst.buf.device_ptr() as u64, src, dst.buf.len() * 4, self.stream.stream) }?;
+        dst.hist = hist;
+        Ok(())
+    }
+
+    /// PFXPOOL: `dst` := `src` (device copy on the compute stream + the host PLE pair).
+    pub fn ckpt_copy_buf(&self, dst: &mut RecurCkpt, src: &RecurCkpt) -> Result<()> {
+        anyhow::ensure!(dst.buf.len() == src.buf.len(), "WP16: checkpoint sizes differ");
+        unsafe { cudarc::driver::result::memcpy_dtod_async(*dst.buf.device_ptr() as u64, *src.buf.device_ptr() as u64,
+                                                            src.buf.len() * 4, self.stream.stream) }?;
+        dst.hist = src.hist;
+        Ok(())
+    }
+
     /// Copy `slot`'s recurrent state (+ the head-fill carry in `psc`) into `ck`. Device copies on
     /// the compute stream, ordered after the prefill chunk that produced the state: bit-exact.
     pub fn ckpt_save(&self, slot: usize, psc: &PrefillScratch, ck: &mut RecurCkpt) -> Result<()> {
@@ -574,6 +597,40 @@ impl<B> CkptStore<B> {
         let s = &mut self.slots[slot];
         s.toks.clear();
         for e in s.list.drain(..) { self.free.push(e.b); }
+    }
+
+    /// PFXPOOL: `slot`'s checkpoints that a pool entry holding `toks` (rows 0..toks.len()) can carry: positions
+    /// <= `upto` within the part of the slot's aligned prefix that equals `toks`. Returns the chunk width they were
+    /// taken at and (position, checkpoint) pairs, ascending.
+    pub fn ckpts_under(&self, slot: usize, toks: &[u32], upto: usize) -> (usize, Vec<(usize, &B)>) {
+        let Some(s) = self.slots.get(slot) else { return (0, Vec::new()) };
+        let lim = s.toks.iter().zip(toks).take_while(|(a, b)| a == b).count().min(upto);
+        (s.c, s.list.iter().filter(|e| e.pos > 0 && e.pos <= lim).map(|e| (e.pos, &e.b)).collect())
+    }
+
+    /// PFXPOOL: how much of `toks` is `slot`'s ALIGNED prefix (rows written by an aligned chunked prefill of exactly
+    /// these tokens), and the chunk width it was written at.
+    pub fn aligned_len(&self, slot: usize, toks: &[u32]) -> (usize, usize) {
+        let Some(s) = self.slots.get(slot) else { return (0, 0) };
+        (s.c, s.toks.iter().zip(toks).take_while(|(a, b)| a == b).count())
+    }
+
+    /// PFXPOOL: `slot`'s rows 0..prefix.len() were just restored from a pool entry whose lane wrote them in an aligned
+    /// run at chunk width `c`: adopt that prefix (no checkpoints), so the C1 rule treats the resumed run exactly as an
+    /// own-lane prefix hit (tracked: realigned grid, tail checkpoint, WP16 checkpoints from the resume point on).
+    pub fn adopt(&mut self, slot: usize, c: usize, prefix: &[u32]) {
+        self.clear_slot(slot);
+        self.slots[slot].c = c;
+        self.slots[slot].toks.extend_from_slice(prefix);
+    }
+
+    /// PFXPOOL: make `slot` hold exactly one checkpoint, `b` at `pos`, over the aligned prefix `prefix` (its rows were
+    /// just restored from a pool entry) at chunk width `c` — so the ordinary WP16 resume picks it up.
+    pub fn install(&mut self, slot: usize, c: usize, prefix: &[u32], pos: usize, b: B) {
+        self.clear_slot(slot);
+        self.slots[slot].c = c;
+        self.slots[slot].toks.extend_from_slice(prefix);
+        self.insert(slot, pos, b);
     }
 
     pub fn live(&self) -> usize { self.slots.iter().map(|s| s.list.len()).sum() }

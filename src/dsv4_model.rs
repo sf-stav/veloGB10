@@ -154,6 +154,9 @@ impl Dsv4GpuModel {
         );
         let mut layers = Vec::with_capacity(n_layers);
         let mut states = Vec::with_capacity(n_layers);
+        // BASICS (owner 2026-11-02): a percentage at the normal level next to the per-layer lines
+        let load_prog = crate::boot_report::Progress::new("loading weights", n_layers as u64,
+                                                          crate::boot_report::Unit::Items("layers"));
         for layer_id in 0..n_layers {
             let kind = cfg.layer_kind(layer_id);
             let layer = rt
@@ -168,7 +171,9 @@ impl Dsv4GpuModel {
             layers.push(layer);
             states.push(st);
             eprintln!("[dsv4]   layer {layer_id:2} ({kind:?}) loaded");
+            load_prog.add(1);
         }
+        load_prog.finish();
         Ok(Self {
             dev: dev.clone(),
             cfg: cfg.clone(),
@@ -444,6 +449,9 @@ impl Dsv4GpuModel {
         eprintln!("[dsv4] converted-load: {n_layers} layer(s), max_seq_len={max_seq_len}, s_max={s_max} (rank {rank}/{world}) ...");
         let mut layers = Vec::with_capacity(n_layers);
         let mut states = Vec::with_capacity(n_layers);
+        // BASICS (owner 2026-11-02): a percentage at the normal level next to the per-layer lines
+        let load_prog = crate::boot_report::Progress::new("loading weights", n_layers as u64,
+                                                          crate::boot_report::Unit::Items("layers"));
         for layer_id in 0..n_layers {
             let kind = cfg.layer_kind(layer_id);
             let art = ArtFile::open(&load_dir.join(format!("layer{layer_id}.safetensors")))
@@ -456,7 +464,9 @@ impl Dsv4GpuModel {
             layers.push(layer);
             states.push(st);
             eprintln!("[dsv4]   layer {layer_id:2} ({kind:?}) loaded (converted)");
+            load_prog.add(1);
         }
+        load_prog.finish();
         Ok(Self {
             dev: dev.clone(), cfg: cfg.clone(), rt, layers, states,
             scratch: gpu::new_moe_grouped_scratch_raw(dev, cfg.n_routed_experts, cfg.dim, cfg.moe_inter_dim, cfg.n_activated_experts, s_max, s_max.min(gpu::MOE_D_CAP) * cfg.n_activated_experts),

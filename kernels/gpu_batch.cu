@@ -3693,6 +3693,99 @@ extern "C" __global__ void rep_penalty_f32_b(float* logits, const int* pen_token
     }
 }
 
+// ---- whole-output penalties (vLLM semantics), dense per-slot state (LOOPFIX 2026-11-06) ----
+// The list kernels above penalize only what the host packs into a short window (the trunk sampler
+// used the last 64 generated tokens), so a repeated paragraph longer than the window was never
+// penalized and small models looped. These kernels read a per-slot DENSE state instead:
+//   cnt[slot][v]   u32 — occurrences of token v in the lane's OUTPUT so far (committed tokens)
+//   pbits[slot][w] u32 — bitset of tokens present in the lane's PROMPT
+// Per row r (a decode lane or a verify column): row_slot[r] names the state (-1 = no penalty);
+// row_extra[r][0..extra_stride) are tokens the row adds on top of that state (a verify column's
+// preceding drafts), -1 padded (extra_stride 0 = none). Semantics = vLLM apply_penalties:
+// repetition (HF/CTRL, multiplicative) on every token in the prompt OR the output; presence (flat)
+// and frequency (per occurrence) on output tokens only. The formula per token is the list
+// kernel's, so a token both kernels penalize gets the identical value.
+#define PEN_EXTRA_MAX 16
+__device__ __forceinline__ float pen_ld(__nv_bfloat16 x) { return b2f(x); }
+__device__ __forceinline__ float pen_ld(float x) { return x; }
+__device__ __forceinline__ void pen_st(__nv_bfloat16* p, float x) { *p = f2b(x); }
+__device__ __forceinline__ void pen_st(float* p, float x) { *p = x; }
+template <typename T>
+__device__ __forceinline__ void pen_apply_row(T* col, int b, const int* row_slot, const int* row_extra,
+    int extra_stride, const unsigned int* cnt, const unsigned int* pbits,
+    const float* rep_factors, const float* presences, const float* frequencies, int vocab, int words) {
+    const float rep = rep_factors[b], pres = presences[b], freq = frequencies[b];
+    const bool use_rep = rep > 1.0f;
+    if (!use_rep && pres == 0.0f && freq == 0.0f) return;          // neutral row: no work
+    const int slot = row_slot[b];
+    if (slot < 0) return;
+    __shared__ int ex[PEN_EXTRA_MAX];
+    __shared__ int nex;
+    if (threadIdx.x == 0) {
+        int n = 0;
+        for (int j = 0; j < extra_stride && n < PEN_EXTRA_MAX; j++) {
+            const int t = row_extra[(long long)b * extra_stride + j];
+            if (t >= 0 && t < vocab) ex[n++] = t;
+        }
+        nex = n;
+    }
+    __syncthreads();
+    const unsigned int* c = cnt + (long long)slot * vocab;
+    const unsigned int* pb = pbits + (long long)slot * words;
+    const int ne = nex;
+    for (int v = threadIdx.x; v < vocab; v += blockDim.x) {
+        unsigned int k = c[v];
+        for (int j = 0; j < ne; j++) k += (ex[j] == v) ? 1u : 0u;
+        const bool in_prompt = use_rep && ((pb[v >> 5] >> (v & 31)) & 1u);
+        if (k == 0u && !in_prompt) continue;
+        float x = pen_ld(col[v]);
+        if (use_rep) x = x > 0.0f ? x / rep : x * rep;
+        if (k > 0u) { x -= pres; x -= freq * (float)k; }
+        pen_st(&col[v], x);
+    }
+}
+// grid (B,1,1), block (256,1,1) — the list kernels' launch shape (graph captures unchanged in form).
+extern "C" __global__ void pen_apply_b(__nv_bfloat16* logits, const int* row_slot, const int* row_extra,
+    int extra_stride, const unsigned int* cnt, const unsigned int* pbits,
+    const float* rep_factors, const float* presences, const float* frequencies, int vocab, int words, int B) {
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    pen_apply_row<__nv_bfloat16>(logits + (long long)b * vocab, b, row_slot, row_extra, extra_stride, cnt,
+                                 pbits, rep_factors, presences, frequencies, vocab, words);
+}
+extern "C" __global__ void pen_apply_f32_b(float* logits, const int* row_slot, const int* row_extra,
+    int extra_stride, const unsigned int* cnt, const unsigned int* pbits,
+    const float* rep_factors, const float* presences, const float* frequencies, int vocab, int words, int B) {
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    pen_apply_row<float>(logits + (long long)b * vocab, b, row_slot, row_extra, extra_stride, cnt,
+                         pbits, rep_factors, presences, frequencies, vocab, words);
+}
+// Count newly committed output tokens: cnt[slots[i]][toks[i]] += 1. grid (ceil(n/256)), block 256.
+extern "C" __global__ void pen_count_add_b(unsigned int* cnt, const int* slots, const int* toks, int n, int vocab) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int s = slots[i], t = toks[i];
+    if (s < 0 || t < 0 || t >= vocab) return;
+    atomicAdd(&cnt[(long long)s * vocab + t], 1u);
+}
+// A lane takes over a slot: zero its output counts and its prompt bitset. grid-stride, block 256.
+extern "C" __global__ void pen_slot_reset_b(unsigned int* cnt, unsigned int* pbits, int slot, int vocab, int words) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < vocab; i += stride)
+        cnt[(long long)slot * vocab + i] = 0u;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < words; i += stride)
+        pbits[(long long)slot * words + i] = 0u;
+}
+// Mark the prompt's tokens in the slot's bitset (repetition penalty). grid (ceil(n/256)), block 256.
+extern "C" __global__ void pen_prompt_set_b(unsigned int* pbits, int slot, const int* toks, int n, int vocab, int words) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int t = toks[i];
+    if (t < 0 || t >= vocab) return;
+    atomicOr(&pbits[(long long)slot * words + (t >> 5)], 1u << (t & 31));
+}
+
 // ---- JSON-schema logit mask (constrained decoding) ----------------------------------
 // Bitset mask over the vocabulary: every entry whose bit is CLEAR is written to -inf.
 // Entries whose bit is SET are never touched — the mask leaves allowed logits

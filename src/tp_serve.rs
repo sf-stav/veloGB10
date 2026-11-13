@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 /// A `BatchRequest` minus its token channel — everything the mirror needs to replay an admission
-/// with bit-identical scheduler state. `seed: None` stays None: the default (DefaultHasher of the
-/// prompt) is derived identically on both ranks.
+/// with bit-identical scheduler state. A seedless request got a random seed at the head's intake
+/// (LOOPFIX, `--seedless-seed random`), so `seed` ships set; under `--seedless-seed prompt-hash` it
+/// ships None and the default (DefaultHasher of the prompt) is derived identically on both ranks.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireRequest {
     pub prompt: Vec<u32>,
@@ -61,6 +62,16 @@ pub struct WireRequest {
     /// slot tables diverge. `None` = unscoped (policy off / baseline admission).
     #[serde(default)]
     pub reserve: Option<Scoping>,
+    /// THINKBUDGET1: the request's thinking budget (vLLM's thinking_token_budget). It rides the wire
+    /// so every rank forces the end-of-thinking marker at the same token: the budget state is a pure
+    /// function of the prompt, the emitted tokens and this value. Absent = None (no budget).
+    #[serde(default)]
+    pub thinking_budget: Option<usize>,
+    /// Logprobs at TP (owner 2026-11-02): the request's `logprobs` (top-n). Every rank needs it: a step with such a
+    /// lane runs the LM-head tail that leaves FULL logits rows (`Scratch::lp_live`, a collective at TP), and its lane
+    /// is kept out of packed rounds; only the head reads the rows back. Absent = None.
+    #[serde(default)]
+    pub logprobs: Option<u8>,
 }
 
 /// LANERES3: the head-decided admission scoping that rides `WireRequest::reserve`.
@@ -177,6 +188,8 @@ impl From<&BatchRequest> for WireRequest {
             image_bytes: 0,   // set by the head when it ships the rows (exl3_serve)
             image_digest: 0,
             reserve: None, // LANERES3: set by the head when the plan scoped the admit
+            thinking_budget: r.thinking_budget,
+            logprobs: r.logprobs,
         }
     }
 }
@@ -208,6 +221,9 @@ impl WireRequest {
             // W2: the schema FSM lives on the HEAD (that is where the sampler runs); the node's
             // mirror lane is unconstrained by construction.
             schema: None,
+            thinking_budget: self.thinking_budget,
+            // every rank runs the full-rows tail for it (Scratch::lp_live); only the head reads the rows
+            logprobs: self.logprobs,
         }
     }
 }

@@ -97,6 +97,91 @@ impl Stage {
     }
 }
 
+// ---- progress lines (owner 2026-11-02) ---------------------------------------
+//
+// Work whose size is known up front — reading the model into memory, shipping shards to a TP node,
+// hashing the pack, the n-gram table into RAM, the quantizer's tensors — reports a percentage at the
+// NORMAL level: `[boot] <what>: NN% (<done> of <total> <unit>, <s> s[, <rate>])`. One line per 5 %
+// step at most, and at least 1 s apart (the 100 % line always prints once anything printed or the
+// work took a second or more), so a fast load stays quiet and a slow one is never silent.
+
+/// What a [`Progress`] counts: bytes (shown in GB with a rate) or whole items of a named kind.
+#[derive(Clone, Copy, Debug)]
+pub enum Unit { Bytes, Items(&'static str) }
+
+/// One progress line (pure: the format is pinned by a test like the stage lines).
+pub fn progress_str(what: &str, done: u64, total: u64, unit: Unit, secs: f64) -> String {
+    let pct = if total == 0 { 100 } else { (done.min(total) as u128 * 100 / total as u128) as u64 };
+    match unit {
+        Unit::Bytes => {
+            let gb = |b: u64| b as f64 / 1e9;
+            let rate = if secs > 0.0 { format!(", {:.2} GB/s", gb(done.min(total)) / secs) } else { String::new() };
+            format!("[boot] {what}: {pct:>3}% ({:.1} of {:.1} GB, {secs:.0} s{rate})", gb(done.min(total)), gb(total))
+        }
+        Unit::Items(kind) => format!("[boot] {what}: {pct:>3}% ({} of {total} {kind}, {secs:.0} s)", done.min(total)),
+    }
+}
+
+/// A known-size piece of boot work, reported as a percentage (see the block comment above).
+/// Thread-safe: parallel workers call `add` on one shared `Progress`.
+pub struct Progress {
+    what: String,
+    total: u64,
+    unit: Unit,
+    t0: Instant,
+    done: std::sync::atomic::AtomicU64,
+    /// The next 5 % step that may print (u64::MAX = the 100 % line is claimed: nothing more prints).
+    next_pct: std::sync::atomic::AtomicU64,
+    /// Milliseconds since `t0` of the last printed line (u64::MAX = none yet).
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Progress {
+    pub fn new(what: impl Into<String>, total: u64, unit: Unit) -> Progress {
+        use std::sync::atomic::AtomicU64;
+        Progress { what: what.into(), total, unit, t0: Instant::now(), done: AtomicU64::new(0),
+                   next_pct: AtomicU64::new(5), last_ms: AtomicU64::new(u64::MAX) }
+    }
+    /// `n` more units of the work are done.
+    pub fn add(&self, n: u64) {
+        let d = self.done.fetch_add(n, Ordering::Relaxed) + n;
+        self.maybe_print(d, false);
+    }
+    /// The work done so far is `d` units (for loops that know the running total).
+    pub fn set(&self, d: u64) {
+        self.done.fetch_max(d, Ordering::Relaxed);
+        self.maybe_print(self.done.load(Ordering::Relaxed), false);
+    }
+    /// The work is complete: the 100 % line (once), unless the whole job was quick and silent.
+    pub fn finish(&self) {
+        let d = self.done.load(Ordering::Relaxed).max(self.total);
+        self.maybe_print(d, true);
+    }
+    fn maybe_print(&self, d: u64, finishing: bool) {
+        if self.total == 0 { return; }
+        let pct = (d.min(self.total) as u128 * 100 / self.total as u128) as u64;
+        let ms = self.t0.elapsed().as_millis() as u64;
+        let last = self.last_ms.load(Ordering::Relaxed);
+        let quiet_so_far = last == u64::MAX && ms < 1000;
+        if pct >= 100 {
+            // the final line: once, when something printed already or the job took >= 1 s
+            if quiet_so_far && !finishing { return; }
+            if self.next_pct.swap(u64::MAX, Ordering::Relaxed) == u64::MAX { return; }
+            if quiet_so_far { return; } // quick and silent: claimed, not printed
+        } else {
+            let step = self.next_pct.load(Ordering::Relaxed);
+            if step == u64::MAX || pct < step || quiet_so_far { return; }
+            if last != u64::MAX && ms < last.saturating_add(1000) { return; }
+            // one thread claims the step; the next printable step is the 5 % above this one
+            if self.next_pct.compare_exchange(step, (pct / 5 + 1) * 5, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                return;
+            }
+        }
+        self.last_ms.store(ms, Ordering::Relaxed);
+        crate::logq::send(false, progress_str(&self.what, d, self.total, self.unit, ms as f64 / 1000.0));
+    }
+}
+
 // ---- severity vocabulary ---------------------------------------------------
 
 pub fn warn_str(msg: &str) -> String { format!("[boot] warn: {msg}") }
@@ -230,6 +315,30 @@ mod tests {
             "[boot] warn: vision tower load failed (no CUDA); serving text-only");
         assert_eq!(error_str("--model-dir /x does not exist on this box"),
             "[boot] error: --model-dir /x does not exist on this box");
+    }
+
+    #[test]
+    fn progress_lines_are_frozen() {
+        assert_eq!(progress_str("loading weights", 12, 48, Unit::Items("layers"), 9.4),
+            "[boot] loading weights:  25% (12 of 48 layers, 9 s)");
+        assert_eq!(progress_str("shipping to node 192.168.0.2:29500", 24_100_000_000, 53_500_000_000, Unit::Bytes, 18.3),
+            "[boot] shipping to node 192.168.0.2:29500:  45% (24.1 of 53.5 GB, 18 s, 1.32 GB/s)");
+        assert_eq!(progress_str("hashing the model files", 7, 7, Unit::Bytes, 0.0),
+            "[boot] hashing the model files: 100% (0.0 of 0.0 GB, 0 s)");
+        // done beyond the total is clamped (a loader that reads a little more than it planned)
+        assert_eq!(progress_str("x", 60, 48, Unit::Items("layers"), 1.0), "[boot] x: 100% (48 of 48 layers, 1 s)");
+    }
+
+    #[test]
+    fn progress_steps_are_claimed_once() {
+        // quick work never prints (< 1 s, nothing printed yet), and finish() of quick work stays quiet
+        let p = Progress::new("t", 100, Unit::Items("items"));
+        p.add(50);
+        p.finish();
+        assert_eq!(p.next_pct.load(Ordering::Relaxed), u64::MAX);
+        // a second finish() never prints a second 100 % line (the step is already claimed)
+        p.finish();
+        assert_eq!(p.next_pct.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]

@@ -975,6 +975,7 @@ fn seed_of(req: &BatchRequest) -> u64 {
 
 /// Run one request on the head: ship Admit, prefill, then sample / ship / stream token by token.
 fn serve_one(eng: &mut Engine, req: BatchRequest, stop_ids: &[u32], nodes: &mut [std::net::TcpStream]) -> Result<()> {
+    crate::think_budget::note_unsupported(req.thinking_budget, "Naive"); // THINKBUDGET1
     let t0 = std::time::Instant::now();
     let prompt = req.prompt.clone();
     let room = eng.max_pos.saturating_sub(prompt.len());
@@ -1180,6 +1181,7 @@ fn serve_lanes(eng: &mut Engine, srx: &mut tokio::sync::mpsc::UnboundedReceiver<
             let slot = free.remove(fi);
             let max_new = r.max_new.min(room - 1);
             let seed = seed_of(&r);
+            crate::think_budget::note_unsupported(r.thinking_budget, "Naive"); // THINKBUDGET1
             admits.push(LAdmit { lane, slot, prompt: prompt.clone(), max_new, seed, sp: sample_params(&r), owner, reuse, snap });
             new_lanes.push((r, slot, max_new, owner, prompt.len()));
         }
@@ -1412,6 +1414,11 @@ pub fn run_head(args: &[String], model_dir: &str, ctx: crate::tp::TpContext, mut
         decode_headroom: 0,
         // the message boundary (`ckpt_at`) places the Naive prefix snapshot
         prefix_cache: pfx_on,
+        // no deferred schema start on this path
+        schema_defer: false,
+        // PR #30 / #31 ports: the Naive scheduler computes no log probabilities and applies no schema mask
+        logprobs_ok: false,
+        schema_ok: false,
         vision_tower: None,
         vision_gpu: None,
         vision_cpu: false,

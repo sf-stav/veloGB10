@@ -243,7 +243,13 @@ mod tests {
         let experts1 = t1.iter().filter(|n| super::expert_of(n).is_some()).count();
         assert_eq!(experts0, experts1);
         assert!(t0.intersection(&t1).all(|n| super::expert_of(n).is_none()));
-        assert_eq!(p0.presliced.len(), 48 + 1);
+        // 2026-10-31: the TRANSPLANT_A6 re-export physically duplicates the row-sliced
+        // trellis tensors across shard files, so the planner sees each module twice;
+        // the invariant is one DISTINCT module per preslice kind (48 o_proj + 1 dense down).
+        let mut distinct: Vec<&String> = p0.presliced.iter().collect();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 48 + 1);
         let b0 = p0.total_bytes().unwrap() as f64 / 1e9;
         assert!(b0 > 60.0 && b0 < 80.0, "rank bytes {b0} GB");
     }

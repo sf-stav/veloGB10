@@ -18,10 +18,64 @@ use crate::tokenizer::{QwenTokenizer, ThinkingMode};
 use anyhow::{Context as _, Result};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
+use cudarc::driver::{DevicePtr as _, DeviceSlice as _};
+
+/// PFXPOOL: one prefix-pool entry's device buffer (the spill regions of its prompt, back to back) and the host PLE
+/// n-gram pair captured with it.
+pub(crate) struct PoolBuf {
+    /// one slab: the entry's OWN positional rows `r0..r1` of every plane (PFXPOOL2: rows 0..r0 are its parent chain's,
+    /// r0 = 0 for an entry that holds them all), then the recurrent snapshot planes at `snap_off`, then the carried
+    /// checkpoints at `ck_off`, each `ck_bytes` long. Recycled through the scheduler's spare list when shifted out.
+    /// None: freed by this rank alone under memory pressure (`pool_emergency`); the replicated policy drops the entry
+    /// at the next admission (`pool_upkeep`), before anything can read it.
+    buf: Option<cudarc::driver::CudaSlice<u8>>,
+    hist: [i32; 2],
+    r0: usize,
+    r1: usize,
+    snap_off: u64,
+    ck_off: u64,
+    ck_bytes: u64,
+    /// the carried WP16 checkpoints over this prompt: (position, host PLE pair), in slab order; taken at chunk width
+    /// `ckpt_c`. A prompt that shares only part of the entry (the next turn, a shorter prompt) resumes at one.
+    ckpts: Vec<(usize, [i32; 2])>,
+    ckpt_c: usize,
+    /// how many of the entry's tokens were its lane's ALIGNED prefix (WP16 bookkeeping) at chunk width `ckpt_c`: a full
+    /// restore adopts it, so the resumed run is tracked like an own-lane hit (C1 tail checkpoint, WP16 checkpoints)
+    aligned: usize,
+}
+
+/// PFXPOOL: what a pool restore gave the prefill: the entry's whole prompt-end state (`Full(n)`: rows + recurrent
+/// snapshot, resume at n like an own-lane hit) or a carried checkpoint installed as the lane's WP16 checkpoint
+/// (`Ckpt(q)`: rows 0..q restored, the ordinary WP16 resume at q follows).
+enum PoolHit { Full(usize, bool), Ckpt(usize) }
+
+/// PFXPOOL: prompts shorter than this are not kept in the pool (reading them again costs about what a copy does).
+const POOL_MIN_TOKENS: usize = 256;
+/// PFXPOOL2: an entry reads its leading rows from an older entry when they share at least this many (fewer are
+/// cheaper to keep than to chain), through at most this many ancestors (each one is a copy per plane at restore).
+const POOL_SHARE_MIN: usize = 1024;
+const POOL_MAX_DEPTH: usize = 24;
 
 /// S1 (REL_V0_7_3): delegates to the ONE shared `=`-aware parser (`crate::arg_value`) so
 /// `--lane-order=fcfs` and `--lane-order fcfs` behave identically on EXL3 (the old body
 /// matched only the space form and silently ignored the `=` form).
+/// TPSHIP (2026-11-07, AGENTS 1b-bis.8: fall back, do not refuse): the EXL3 engine's KV store formats are f32 / f16 /
+/// fp8 / q8. bf16 (the NVFP4 trunk's KV format, which launch profiles carry over) has no EXL3 store; f16 is the nearest
+/// (the same 2 bytes per value): serve f16, say so once, count it on /metrics. Anything else is still refused.
+pub(crate) fn exl3_kv_cache_value(v: &str) -> anyhow::Result<&str> {
+    if v == "bf16" {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            crate::metrics::exl3_kv_cache_fallback();
+            crate::reprintln!("[exl3-serve] --kv-cache bf16: the EXL3 engine has no bf16 KV store; serving f16 instead \
+(the same 2 bytes per value, the nearest format it has). Pass --kv-cache f16 (or q8) to silence this line.");
+        });
+        return Ok("f16");
+    }
+    anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8" | "q4k"), "--kv-cache must be f32, f16, fp8, q8 or q4k (bf16 is served as f16)");
+    Ok(v)
+}
+
 fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     crate::arg_value(args, name)
 }
@@ -299,6 +353,11 @@ struct Lane {
     pen: Option<crate::exl3_forward::PenParams>,
     // WP08: the reference implementation's streaming loop detector (None = --loop-detect off) + log context.
     loop_det: Option<crate::loop_detect::LoopDetector>,
+    // THINKBUDGET1: vLLM's thinking_token_budget for this request (None = not sent, or the model has
+    // no reasoning markers). Its room() clamps every speculative round's depth (round_depth) and its
+    // filter() replaces the boundary token by the end marker at every emission point (the seam,
+    // round_emit, step_plain). Pure function of replicated state: every TP rank decides the same.
+    think: Option<crate::think_budget::ThinkBudget>,
     prompt_hash: u64,
     history: Vec<u32>,
     // API-parity G2: sampler stream (uniform = hash(seed, ctr); ctr advances per sampled row).
@@ -364,7 +423,103 @@ struct Lane {
     fcfs_credit: usize,
     // S-B9-CF-PACK4: an image request (its slot carries a 3-axis RoPE map) — never packed in v1.
     img: bool,
+    // Log probabilities for every emitted token (`BatchRequest::logprobs`): Some(n) = a
+    // `TokEvent::Logprob` with the n most likely alternatives before each `Tok`. The lane keeps
+    // speculating (owner 2026-11-02): a round's emitted token j is the choice of verify row j (row r0 + j of a
+    // packed round), read back once per round in `round_emit`; plain steps read their row as before.
+    logprobs: Option<u8>,
+    // W2-EXL3: the request's compiled JSON-schema FSM (None = unconstrained), its current
+    // state, and whether the constraint is live yet (false while the lane is still inside the
+    // think block its prompt opened: the mask arms on the think-close token). A schema lane
+    // never speculates (mtp = None for its whole life), so every token it emits comes from a
+    // masked plain step.
+    schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
+    schema_state: u32,
+    schema_armed: bool,
     tx: crate::server::TokTx,
+}
+
+/// Log-softmax of one f16 logits row: the natural-log probability of `tok` and the `n`
+/// most likely tokens (logprob descending, ties by id ascending; only finite logits — a token a
+/// mask removed has probability 0 and is never listed). None when `tok` is outside the row or
+/// its logit, or the row's maximum, is not finite.
+///
+/// One counting pass over the row's f16 bit patterns, then the normalizer as a sum over the
+/// distinct values present (exp once per value, accumulated in f64) and a second pass that
+/// collects only the ids at or above the n-th largest value — no per-call f32 copy or index
+/// vector of the whole vocabulary.
+fn token_logprobs(row: &[u16], tok: u32, n: usize) -> Option<(f32, Vec<(u32, f32)>)> {
+    let lg = |b: u16| half::f16::from_bits(b).to_f32();
+    let xt = lg(*row.get(tok as usize)?);
+    if !xt.is_finite() { return None; }
+    let mut cnt = vec![0u32; 1 << 16];
+    for &b in row { cnt[b as usize] += 1; }
+    // finite values, largest first: +65504 .. +0 are 0x7BFF down to 0x0000, -0 .. -65504 are
+    // 0x8000 up to 0xFBFF (infinities and NaN patterns lie outside both ranges)
+    let desc = || (0x0000u32..=0x7BFF).rev().chain(0x8000..=0xFBFF).filter(|&p| cnt[p as usize] > 0);
+    let lmax = lg(desc().next()? as u16) as f64;
+    let sum: f64 = desc().map(|p| cnt[p as usize] as f64 * (lg(p as u16) as f64 - lmax).exp()).sum();
+    let lse = lmax + sum.ln();
+    let lp = |x: f32| (x as f64 - lse) as f32;
+    let mut top: Vec<(u32, f32)> = Vec::new();
+    if n > 0 {
+        // the n-th largest value present (ties included)
+        let mut acc = 0usize;
+        let mut vth = f32::NEG_INFINITY;
+        for p in desc() {
+            acc += cnt[p as usize] as usize;
+            vth = lg(p as u16);
+            if acc >= n { break; }
+        }
+        let mut cand: Vec<(u32, f32)> = row.iter().enumerate()
+            .filter_map(|(i, &b)| { let x = lg(b); (x.is_finite() && x >= vth).then_some((i as u32, x)) })
+            .collect();
+        // value descending, then id ascending (finite values: partial_cmp is total here)
+        cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+        cand.truncate(n);
+        top = cand.into_iter().map(|(i, x)| (i, lp(x))).collect();
+    }
+    Some((lp(xt), top))
+}
+
+/// W2-EXL3: what one emitted token does to a schema lane.
+#[derive(Debug, PartialEq, Eq)]
+enum SchemaStep {
+    /// keep decoding (constraint not armed yet, or the document is still open)
+    Continue,
+    /// the JSON document is complete: the turn ends here ("stop")
+    Complete,
+    /// the token is not valid in the machine's state, or leaves no valid continuation: the
+    /// turn ends with an error finish (`SCHEMA_DEAD_END`) and the event is logged
+    Invalid,
+}
+
+/// The finish reason of a schema turn that reached a state no token can continue (or emitted a
+/// token the state refuses): an error, so the client never reads the partial document as a
+/// completed one.
+const SCHEMA_DEAD_END: &str = "error: json-schema constrained decoding reached a state with no valid continuation";
+
+/// W2-EXL3: advance a schema lane's FSM by one emitted token (pure; unit-tested).
+fn schema_feed(sm: &crate::json_schema::SchemaMask, state: &mut u32, armed: &mut bool, tok: u32) -> SchemaStep {
+    if !*armed {
+        if sm.defer_until() == Some(tok) { *armed = true; }
+        return SchemaStep::Continue;
+    }
+    match sm.step(*state, tok) {
+        None => SchemaStep::Invalid,
+        Some(ns) => {
+            *state = ns;
+            if sm.is_complete(ns) {
+                SchemaStep::Complete
+            } else if sm.allowed(ns).iter().all(|&w| w == 0) {
+                // a state no token can continue (the machine should never reach one): end the
+                // turn instead of letting a fully masked row pick id 0
+                SchemaStep::Invalid
+            } else {
+                SchemaStep::Continue
+            }
+        }
+    }
 }
 
 /// S-B9-CF-PACK4: host-side anatomy of the packed rounds since boot: wall ms of the three stages
@@ -472,6 +627,23 @@ struct Exl3Scheduler {
     spill_pol: crate::kv_spill::Policy,
     /// This scheduler's rank (0 on a single box): spill files are per-rank.
     spill_rank: usize,
+    /// PFXPOOL `--prefix-pool-gb`: prompt states kept in device (unified) memory ACROSS lanes. A zero-cap pool
+    /// when off (--prefix-pool-gb 0 or --prefix-cache off). Replicated policy under TP (see prefix_pool.rs).
+    pool: crate::prefix_pool::Pool<PoolBuf>,
+    /// PFXPOOL: slabs of entries shifted out, kept for the next capture (a fresh allocation provisions new pages at
+    /// ~25-30 GB/s: 50-400 ms for a long prompt; a recycled slab costs nothing). Freed first under the memory floor.
+    pool_spare: Vec<cudarc::driver::CudaSlice<u8>>,
+    /// PFXPOOL: MemAvailable the pool keeps free on every rank (a capture that would go below it first evicts, then
+    /// is dropped; PFXPOOL2: an admission that finds a rank below it shifts entries out until every rank is above);
+    /// --prefix-pool-floor-gb.
+    pool_floor: u64,
+    /// PFXPOOL2: per lane, the lineage of its positional rows (which prefill computation wrote which rows; see
+    /// prefix_pool::Segs) — pool entries whose rows agree share one copy. Replicated (SPMD admission).
+    slot_segs: Vec<crate::prefix_pool::Segs>,
+    /// PFXPOOL2: the generation counter `slot_segs` labels prefill computations with.
+    row_gen: u64,
+    /// PFXPOOL2: when `pool_emergency` last read MemAvailable.
+    pool_emerg_at: Option<std::time::Instant>,
     /// Per-slot release stamps (released_at, normal finish) for the policy. Stamped only while
     /// the policy is on; read to build SlotViews and the forced-take log line.
     rel: Vec<Option<(std::time::Instant, bool)>>,
@@ -1186,6 +1358,22 @@ pub(crate) fn resolved_max_batch(args: &[String]) -> (usize, usize) {
 /// node before the link (`exl3_tp_node_prelink`, reported to the head), both ranks before the attach
 /// (`run_tp_head_serve` / `run_tp_node_serve`, next to the otel refusal), and `build_serve` as the
 /// backstop for a caller that reaches it another way.
+/// TP2BIT5 #26: head-side pack-width preflight. Opens the pack header-only and refuses —
+/// in SECONDS, before discovery and the 57.5-GiB first sync — any module whose k2 has no
+/// kernel in this build (the same `width_supported` predicate the loader itself enforces,
+/// so head and node can never disagree). MTP-head-only unsupported widths are NOT a refusal:
+/// Fix 4 skips the draft head and serves plain, so this preflight stays silent about them
+/// (open() prints the skip line once, at real load).
+pub fn tp_pack_width_preflight(dir: &str) -> Result<()> {
+    // The loader's own open() IS the check: header-only (cheap, no weight IO), refuses any
+    // non-MTP module at an unsupported k2 with the plain-word bail, and prints the Fix-4 skip
+    // line for MTP-head-only widths instead of refusing. Prefix the refusal so the operator
+    // sees it was caught before the ship.
+    crate::exl3::Exl3Pack::open(dir)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("pack width preflight (before the node sync; nothing was shipped): {e:#}"))
+}
+
 pub fn tp_lane_width_refusal(args: &[String], world: u32) -> Result<()> {
     // F2: the 16-lane cap is applied FIRST, so this can no longer refuse anything — 16 always fits
     // the pairwise agree width (`AGREE_WIDTH_MAX` 31). The function stays as the backstop that keeps
@@ -1745,7 +1933,39 @@ fn round_trace_on() -> bool {
     *ON.get_or_init(|| crate::opts::var(crate::opt!("round-trace")).is_ok())
 }
 
+/// THINKBUDGET1: the token to emit for the model's token `t` — emission `j` of the `n` tokens of its
+/// round — under the request's thinking budget (no budget = `t`). Counts and logs a forced end.
+fn think_emit(tb: Option<&mut crate::think_budget::ThinkBudget>, slot: usize, t: u32, j: usize, n: usize) -> u32 {
+    let Some(tb) = tb else { return t };
+    let ended_before = tb.forced;
+    let (out, forced) = tb.filter(t);
+    if forced && (j > 0 || n > 1) {
+        // Unreachable by construction: round_depth clamps every round at the budget's room, so a
+        // forced token is always the only token of a plain step. If it ever fires, the tokens after
+        // it in this round were predicted from the replaced token, not from the marker.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::reprintln!("[exl3-serve] thinking budget: the end marker was forced at token {j} of a \
+{n}-token round (slot {slot}) — a scheduling bug (the round should have been clamped); please report it"));
+    }
+    if tb.forced > ended_before {
+        crate::metrics::think_budget_forced();
+        crate::dreprintln!("[exl3-serve] thinking budget slot={slot}: the reasoning reached {} tokens (budget {}); \
+the server emitted the end-of-thinking marker", tb.forced_at.unwrap_or(0), tb.budget());
+    }
+    out
+}
+
 impl Lane {
+    /// THINKBUDGET1: tokens this lane may emit before its thinking budget forces one (None = no limit).
+    fn think_room(&self) -> Option<usize> {
+        self.think.as_ref().and_then(|t| t.room())
+    }
+
+    /// THINKBUDGET1: see think_emit.
+    fn think_filter(&mut self, slot: usize, t: u32, j: usize, n: usize) -> u32 {
+        think_emit(self.think.as_mut(), slot, t, j, n)
+    }
+
     fn log_stats(&self, slot: usize, reason: &str) {
         if self.st_rounds == 0 && self.st_plain == 0 { return; }
         let r = self.st_rounds.max(1) as f64;
@@ -1946,7 +2166,10 @@ impl Exl3Scheduler {
             crate::drprintln!("[exl3-serve] prefill grid slot={slot} n={} (pos {from}..{n}) C={c}: {nchunks} chunk(s), rows {shown}{}",
                      n - from, if absorb.is_some() { " (absorb-tail)" } else { "" });
         }
-        for end in grid {
+        for (gi, end) in grid.iter().copied().enumerate() {
+            self.pool_emergency(); // PFXPOOL2: a long prefill must not run the box into the memory watchdog
+            // FP4L-SPEED1: the next chunk's n-gram rows start loading from the drive while this chunk runs
+            if let Some(&next_end) = grid.get(gi + 1) { self.model.ple_warm_ahead(prompt, end, next_end); }
             // (re-borrowed per chunk: the interleave hook at the end of the body needs all of self)
             let psc = self.psc.as_mut().unwrap();
             if pos > from {
@@ -2132,11 +2355,19 @@ impl Exl3Scheduler {
         // does not prefix the incoming prompt — capture the victim's snapshot to the SSD spill
         // tier BEFORE anything below resets/overwrites it. The D2H is the only in-round cost
         // (~0.1 s per 0.5-GiB snapshot); the disk write is the async part.
-        if self.spill.is_some() {
+        // PFXPOOL: the prefix pool takes it first (a device copy into memory); the SSD tier only gets what the pool
+        // did not keep.
+        // PFXPOOL2: agree the pool back into one state (entries a rank freed under memory pressure) and give memory
+        // back while any rank is under the floor — before the capture and the lookup below
+        self.pool_upkeep()?;
+        if self.pool.on() || self.spill.is_some() {
             if let Some(old) = self.cache[slot].clone() {
                 let own = old.len() <= end && key[..old.len()] == old[..];
                 if !own {
-                    self.spill_capture_slot(slot, &old)?;
+                    let held = self.pool_capture_slot(slot, &old)?;
+                    if !held && self.spill.is_some() {
+                        self.spill_capture_slot(slot, &old)?;
+                    }
                 }
             }
         }
@@ -2144,12 +2375,29 @@ impl Exl3Scheduler {
             Some(t) if t.len() <= end && key[..t.len()] == t[..] => t.len(),
             _ => 0,
         };
+        // PFXPOOL / LANERES2: set when `reuse` came from OUTSIDE this lane (a pool entry or an SSD snapshot): the
+        // lane's WP16 bookkeeping then describes the conversation that was here before and is cleared below.
+        let mut external = false;
+        // PFXPOOL: a full pool restore whose lane's aligned prefix was adopted keeps the C1 / WP16 tracking of an own hit
+        let mut adopted = false;
+        // PFXPOOL: own-snapshot miss — restore the deepest pool entry, unless the lane's own WP16 checkpoint is as deep.
+        if reuse == 0 && self.pool.on() {
+            let own_q = self.wp16.as_ref().map_or(0, |st| st.resume_point(slot, key, end, self.chunk.max(1)).0);
+            match self.pool_restore_slot(slot, key, end, own_q)? {
+                Some(PoolHit::Full(n, a)) => { reuse = n; external = true; adopted = a; }
+                Some(PoolHit::Ckpt(_)) => {} // installed as the lane's WP16 checkpoint: the WP16 resume below takes it
+                None => {}
+            }
+        }
         // LANERES2: own-snapshot miss — try the SSD spill tier; a hit restores rows 0..n + the
         // snapshot state and the normal `reuse > 0` branch below runs unchanged. Cost-model
         // gated; every miss/drop/error falls back to the plain prefill and is counted.
         if reuse == 0 && self.spill.is_some() {
             if let Some(n) = self.spill_restore_slot(slot, key, end)? {
                 reuse = n;
+                external = true;
+                adopted = false;
+                self.segs_set(slot, None, n); // PFXPOOL2: rows from disk: a lineage of their own
             }
         }
         if self.psc.is_none() {
@@ -2169,7 +2417,12 @@ impl Exl3Scheduler {
             // C1: with tail checkpoints the run is tracked instead (realigned grid, tail split) when
             // the slot's checkpointed prefix is exactly prompt[..reuse].
             if let Some(st) = self.wp16.as_mut() {
-                if tail_on && st.prefix_ok(slot, key, reuse, c) {
+                if external && !adopted {
+                    // PFXPOOL: rows 0..reuse now hold the restored conversation, but the lane's WP16 list and token
+                    // prefix still describe the one that was here before: a later prompt sharing THAT prefix would
+                    // resume an old checkpoint over the new rows. Forget it (the spill restore had the same hole).
+                    st.clear_slot(slot);
+                } else if tail_on && st.prefix_ok(slot, key, reuse, c) {
                     st.begin_aligned(slot, reuse, c);
                     tracked = true;
                 } else {
@@ -2194,6 +2447,7 @@ impl Exl3Scheduler {
         self.cache[slot] = None;
         self.last_resume = (reuse, q);
         let from = reuse.max(q);
+        self.segs_prefill(slot, from, end); // PFXPOOL2: rows from..end are this run's
         // v0.7.3 (#8.2): report the cache-served prefix (prefill skipped) to the request
         // handler ONCE, before the first token: usage.prompt_tokens_details.cached_tokens
         // and the /metrics counter. from == 0 (fresh prefill) stays silent — the
@@ -2249,6 +2503,7 @@ impl Exl3Scheduler {
                  if x != slot { "scratch" } else { "the same (no free lane)" });
         model.reset_slot_for_prefill(x)?;
         self.prefill_range(x, prompt, prompt, 0, end, None, false, None, false)?;
+        self.segs_set(x, None, end); // PFXPOOL2: rewritten by a fresh prefill
         let mut f = model.ckpt_alloc()?;
         model.ckpt_save(x, self.psc.as_ref().unwrap(), &mut f)?;
         let d = model.ckpt_diff(&r, &f)?;
@@ -2377,6 +2632,10 @@ impl Exl3Scheduler {
     /// Lanes whose request turned MTP off (G1) batch through the plain decode path.
     fn step(&mut self) -> Result<()> {
         let before = self.steps;
+        // Logprobs at TP (owner 2026-11-02): while a lane reports log probabilities, every step's LM-head tail leaves
+        // FULL logits rows (Scratch::lp_live; the row gather is a collective: every rank sets it from the same
+        // mirrored lanes). TP=1 has no vocabulary-parallel tail: nothing changes there.
+        self.sc.lp_live = self.tp.is_some() && self.lanes.iter().flatten().any(|l| l.logprobs.is_some());
         let r = self.step_rounds();
         // H3: round COMPLETE — the age gauge measures from here. Every arm of `step_rounds` ends
         // here (it used to be written on the rr arm only: a shared plain step and an fcfs step
@@ -2385,6 +2644,10 @@ impl Exl3Scheduler {
         self.publish_kv(); // issue #24: lane positions after this step (finished lanes read 0)
         r
     }
+
+    /// Logprobs: this rank reads logits rows back for the requests that asked (TP=1, or the TP head: the nodes
+    /// run the same full-rows tail but serve no client).
+    fn lp_reader(&self) -> bool { self.tp.as_ref().map_or(true, |t| t.rank == 0) }
 
     /// Public issue #24: publish every lane's KV occupancy to /metrics — the positions a running
     /// request holds (`Lane.pos`: prompt + generated; the prefill in flight: the rows written so
@@ -2618,10 +2881,16 @@ impl Exl3Scheduler {
     /// budget: (after the end-of-window and remaining-budget clamps, after the sparse-switch
     /// clamp as well). The second is the round's depth; first > second = the round is clamped
     /// at the switch. One definition for `step_mtp` and the packed arm's plan.
-    fn round_depth(&self, p: usize, remaining: usize) -> (usize, usize) {
+    fn round_depth(&self, p: usize, remaining: usize, think_room: Option<usize>) -> (usize, usize) {
         let mut k_eff = self.mtp_k.min(self.model.max_pos().saturating_sub(p + 2));
         if crate::exl3_forward::a_flags().rem_clamp {
             k_eff = k_eff.min(remaining.saturating_sub(1));
+        }
+        // THINKBUDGET1: a round never emits past the thinking budget (room tokens -> at most room-1
+        // drafts + the correction); room 0 -> k_eff 0, a plain step, whose token the filter forces.
+        // Unconditional (independent of --a-remclamp): forcing mid-round would desync the state.
+        if let Some(r) = think_room {
+            k_eff = k_eff.min(r.saturating_sub(1));
         }
         (k_eff, self.model.regime_depth(p, k_eff))
     }
@@ -2634,7 +2903,7 @@ impl Exl3Scheduler {
         if !self.lane_pack.on() || slots.len() < 2 { return None; }
         let views: Vec<LaneView> = slots.iter().map(|&s| {
             let l = self.lanes[s].as_ref().unwrap();
-            let (k_pre, kd_reg) = self.round_depth(l.pos, l.max_new.saturating_sub(l.generated));
+            let (k_pre, kd_reg) = self.round_depth(l.pos, l.max_new.saturating_sub(l.generated), l.think_room());
             let facts = LaneFacts {
                 mtp_armed: l.mtp.is_some(),
                 force_control: l.force_control,
@@ -2646,6 +2915,7 @@ impl Exl3Scheduler {
                 sampled_lone: crate::wp24::dump_on() || !self.pack_sampled,
                 penalized: l.pen.is_some(),
                 image: l.img,
+                logprobs_tp: l.logprobs.is_some() && self.tp.is_some(),
                 depth: 0, // set by lane_view from kd_reg (capped at PACK_DEPTH_MAX: PACK4-REVIEW A4)
             };
             // The verify's regime is its LAST row's (p + w for the w <= kd drafts the DDS keeps).
@@ -2728,7 +2998,7 @@ velogb10_lane_pack_skip_total{{reason=\"{}\"}})", why.text(), self.pack_logs, wh
         // (slot, bonus token, position, tap row, depth, cost) of each lane, before the round
         let pre: Vec<(usize, i32, usize, usize, usize, f64)> = [sa, sb].iter().map(|&s| {
             let l = self.lanes[s].as_ref().unwrap();
-            let (_, kd) = self.round_depth(l.pos, l.max_new.saturating_sub(l.generated));
+            let (_, kd) = self.round_depth(l.pos, l.max_new.saturating_sub(l.generated), l.think_room());
             let kd = kd.min(crate::lane_pack::PACK_DEPTH_MAX); // PACK4-REVIEW A4: the plan's own depth
             (s, l.last_tok as i32, l.pos, l.mtp.unwrap(), kd,
              if l.ema_tok > 0.0 { l.ema_ms / l.ema_tok } else { 0.0 })
@@ -3074,10 +3344,10 @@ lane rounds outside a pack: {}", self.tp.as_ref().map_or(String::new(), |t| form
         let k = self.mtp_k;
         let af = crate::exl3_forward::a_flags();
         let head = self.model.mtp.as_ref().unwrap();
-        let (b, p, tap_row, rows, pen, remaining, lane_cost) = {
+        let (b, p, tap_row, rows, pen, remaining, think_room, lane_cost) = {
             let lane = self.lanes[s].as_ref().unwrap();
             (lane.last_tok as i32, lane.pos, lane.mtp.unwrap(), lane.samp_rows(k + 1), lane.pen,
-             lane.max_new.saturating_sub(lane.generated),
+             lane.max_new.saturating_sub(lane.generated), lane.think_room(),
              if lane.ema_tok > 0.0 { lane.ema_ms / lane.ema_tok } else { 0.0 })
         };
         if crate::exl3_forward::DF2_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3102,7 +3372,7 @@ lane rounds outside a pack: {}", self.tp.as_ref().map_or(String::new(), |t| form
         // step (with the budget clamp that is the request's last token).
         // (S-B9-CF-PACK4: the two clamps and the regime clamp below are `round_depth` — one
         // definition for this round and the packed arm's plan.)
-        let (mut k_eff, kd) = self.round_depth(p, remaining);
+        let (mut k_eff, kd) = self.round_depth(p, remaining, think_room);
         // S-B9-REL-QSAREGIME: a verify (and its draft chain) runs ONE attention regime, chosen from
         // its last row, so a round that straddles the sparse switch would put its rows at/below the
         // switch on the sparse kernels — not the bits a plain decode of those positions has (AGENTS
@@ -3573,9 +3843,28 @@ ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, 
     /// client mid-list; a finishing lane frees its slot). `packed_row0` = Some(the lane's first
     /// row in the packed verify) when the round's logits rows live in the packed scratch.
     fn round_emit(&mut self, s: usize, out: &crate::exl3_forward::MtpRoundOut, packed_row0: Option<usize>) -> Result<()> {
+        // PR #30 + speculation (owner 2026-11-02): the log probabilities of a speculative round's tokens. Emitted token j
+        // is the choice of logits row r0 + j (item 5(a) below: still in sc.logits — the re-prime after a verify is
+        // KV-only), so the round's rows are read back ONCE and reduced in parallel before the tokens go out. TP=1 only
+        // (under TP no rank holds a full greedy row; the HTTP layer serves such requests with logprobs null).
+        let r0 = packed_row0.unwrap_or(0);
+        let lp_n = self.lanes[s].as_ref().and_then(|l| l.logprobs).filter(|_| self.lp_reader());
+        let lps = lp_n.map(|n| self.round_logprobs(packed_row0.is_some(), r0, &out.emitted, n));
         // ---- emit the round's tokens (stop at EOS / max_new mid-list)
         for (j, &t32) in out.emitted.iter().enumerate() {
-            let t = t32 as u32;
+            // THINKBUDGET1: the clamp makes a forced token the first (and only) token of its round
+            let t = self.lanes[s].as_mut().unwrap().think_filter(s, t32 as u32, j, out.emitted.len());
+            if let (Some(n), Some(lp)) = (lp_n, lps.as_ref()) {
+                let tx = self.lanes[s].as_ref().unwrap().tx.clone();
+                if t == t32 as u32 {
+                    if let Some(Some((logprob, top))) = lp.get(j) {
+                        let _ = tx.send(crate::batch::TokEvent::Logprob { logprob: *logprob, top: top.clone() });
+                    }
+                } else if self.lp_reader() {
+                    // logprobs of a token the thinking budget forced (not the row's own choice): its probability under that row
+                    self.send_logprob(&tx, packed_row0.is_some(), r0 + j, t, n);
+                }
+            }
             let (finish, reason, generated) = {
                 let lane = self.lanes[s].as_mut().unwrap();
                 lane.last_tok = t;
@@ -3634,6 +3923,45 @@ ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, 
         // produced the residual bug-5 wrong-but-consistent chains.
         Ok(())
     }
+
+    /// A speculative round's log probabilities: rows `r0 .. r0 + toks.len()` read back in one copy, each emitted token's
+    /// row reduced on its own thread (token_logprobs is ~0.9 ms per 248K-entry row). None per token when the readback
+    /// fails or a row is not finite (the handler then has no entry for that token) — it never stops the request.
+    fn round_logprobs(&self, packed: bool, r0: usize, toks: &[i32], n: u8) -> Vec<Option<(f32, Vec<(u32, f32)>)>> {
+        let v = self.model.cfg.vocab_size;
+        // a packed round's rows are in the packed scratch (row0 + j), like send_stop_info's
+        let sc = match (packed, self.scp.as_ref()) { (true, Some(scp)) => scp, _ => &self.sc };
+        let rows = match self.model.logits_rows(sc, r0, toks.len()) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::reprintln!("[exl3-serve] logprob readback failed (rows {r0}..{}): {e:#}", r0 + toks.len());
+                return vec![None; toks.len()];
+            }
+        };
+        crate::metrics::logprobs_spec_rows(toks.len() as u64);
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = toks.iter().enumerate()
+                .map(|(j, &t)| { let r = &rows[j * v..(j + 1) * v]; sc.spawn(move || token_logprobs(r, t as u32, n as usize)) })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap_or(None)).collect()
+        })
+    }
+
+    /// The log probability of `tok` (the choice of the plain step's logits row `row` in
+    /// `self.sc`) and the `n` most likely alternatives, sent as a `TokEvent::Logprob` just before
+    /// the token itself. A failed readback sends nothing (the handler then has no entry for that
+    /// token and reports the gap) — it never stops the request.
+    fn send_logprob(&self, tx: &crate::server::TokTx, packed: bool, row: usize, tok: u32, n: u8) {
+        let sc = match (packed, self.scp.as_ref()) { (true, Some(scp)) => scp, _ => &self.sc };
+        match self.model.logits_row(sc, row) {
+            Ok(r) => match token_logprobs(&r, tok, n as usize) {
+                Some((logprob, top)) => { let _ = tx.send(TokEvent::Logprob { logprob, top }); }
+                None => crate::dreprintln!("[exl3-serve] logprob unavailable (row {row}, token {tok}): non-finite logits"),
+            },
+            Err(e) => crate::reprintln!("[exl3-serve] logprob readback failed (row {row}): {e:#}"),
+        }
+    }
+
 
     /// S-B9-REL-SMALLFIXES item 5(a): the lane in slot `s` is finishing on the stop token `tok`,
     /// the choice of logits row `row` of the step that just ran. Reads that ONE row back and sends
@@ -3782,6 +4110,19 @@ the [gen] line says stop_p=na", stats));
             .map(|&s| self.lanes[s].as_ref().unwrap().pen)
             .collect();
         self.model.set_penalties(&mut self.sc, &pens)?;
+        // W2-EXL3: per-row schema masks for the armed schema lanes (nothing staged — and no
+        // mask node in the step's graph — when no lane in this step carries a live constraint).
+        {
+            let masks: Vec<Option<std::sync::Arc<Vec<u32>>>> = slots.iter().map(|&s| {
+                let l = self.lanes[s].as_ref().unwrap();
+                match (&l.schema, l.schema_armed) {
+                    (Some(sm), true) => Some(sm.allowed(l.schema_state)),
+                    _ => None,
+                }
+            }).collect();
+            let rows: Vec<Option<&[u32]>> = masks.iter().map(|m| m.as_deref().map(|v| &v[..])).collect();
+            self.model.set_vmask(&mut self.sc, &rows)?;
+        }
         let ids = self.model.forward_step(&mut self.sc, &toks, &poss, slots, None)?;
         // S-B9: one agreed ms for the step (the HEAD's under TP — a rank-local clock must
         // never drive a decision), reused by the shared estimate and the off-lane sampler.
@@ -3854,7 +4195,7 @@ the [gen] line says stop_p=na", stats));
         for (j, &s) in slots.iter().enumerate() {
             let t = {
                 let lane = self.lanes[s].as_mut().unwrap();
-                let next = ids[j] as u32;
+                let next = lane.think_filter(s, ids[j] as u32, 0, 1); // THINKBUDGET1
                 lane.ctr = lane.ctr.wrapping_add(1);
                 lane.st_plain += 1;
                 lane.arms.push('p', 1);
@@ -3872,8 +4213,25 @@ the [gen] line says stop_p=na", stats));
                     (true, "length")
                 } else if self.eos.contains(&t) && !lane.ignore_eos && lane.generated >= lane.min_new {
                     (true, "stop")
+                } else if let Some(sm) = lane.schema.clone().filter(|_| lane.schema_armed) {
+                    // W2-EXL3: a schema turn ends at the end of its JSON document. The loop
+                    // detector does not run on an armed lane: the mask bounds the output, and a
+                    // valid document may legitimately repeat (a long array of equal values).
+                    match schema_feed(&sm, &mut lane.schema_state, &mut lane.schema_armed, t) {
+                        SchemaStep::Continue => (false, ""),
+                        SchemaStep::Complete => (true, "stop"),
+                        SchemaStep::Invalid => {
+                            crate::reprintln!("[schema] slot {s}: token {t} leaves no valid continuation \
+                                               — ending the turn with an error");
+                            (true, SCHEMA_DEAD_END)
+                        }
+                    }
                 } else if lane.loop_feed(t) {
                     (true, "loop_detected") // WP08
+                } else if let Some(sm) = lane.schema.clone() {
+                    // not armed yet (reasoning): this token may be the one that arms it
+                    schema_feed(&sm, &mut lane.schema_state, &mut lane.schema_armed, t);
+                    (false, "")
                 } else {
                     (false, "")
                 }
@@ -3882,6 +4240,11 @@ the [gen] line says stop_p=na", stats));
             // item 5(a): ids[j] is the choice of the step's logits row j
             if finish && reason == "stop" { self.send_stop_info(s, j, t, false); }
             if finish { self.publish_kv(); } // issue #24: the lane's final position (the peaks include the round that ends the request)
+            // ids[j] is also the choice of logits row j for the log probabilities
+            if let Some(n) = self.lanes[s].as_ref().and_then(|l| l.logprobs).filter(|_| self.lp_reader()) {
+                let tx = self.lanes[s].as_ref().unwrap().tx.clone();
+                self.send_logprob(&tx, false, j, t, n);
+            }
             let lane = self.lanes[s].as_mut().unwrap();
             // TP-D: under TP a failed send is not a cancel here (the head's next sweep ships it)
             if lane.tx.send(TokEvent::Tok(t)).is_err() && !tp_on {
@@ -3919,6 +4282,7 @@ the [gen] line says stop_p=na", stats));
             if self.fatal.is_some() {
                 return self.die(waiting, rx);
             }
+            self.pool_emergency(); // PFXPOOL2 (rank-local, rate-limited)
             if waiting.is_empty() && self.lanes.iter().all(|l| l.is_none()) {
                 // Clean idle point: report the TOTAL number of fcfs rotations this scheduler made
                 // (the per-rotation log caps at 16 lines; G1 needs the true count).
@@ -3934,7 +4298,7 @@ the [gen] line says stop_p=na", stats));
                 self.publish_kv(); // issue #24: the idle value (lanes freed outside a step included)
                 if let Some(line) = self.pack_idle_line() { crate::drprintln!("{line}"); } // S-B9-CF-PACK4
                 crate::metrics::sched_idle(); // H3: about to block for work (busy must not stick at 1)
-                match rx.blocking_recv() {
+                match self.idle_recv(&mut rx) {
                     Some(req) => waiting.push_back(req),
                     None => break,
                 }
@@ -4103,6 +4467,425 @@ the [gen] line says stop_p=na", stats));
         // VIS-3: the QSA indexer ropes its pooled keys through the same per-slot map, so an image
         // request runs past the dense window like text (no generated-token cap)
         Ok((key, usize::MAX))
+    }
+
+    // ---------------------------------------------------------- PFXPOOL: the prefix pool
+    fn pool_publish(&self) {
+        crate::metrics::pfx_pool_state(self.pool.cap_bytes(), self.pool.bytes(), self.pool.len() as u64);
+    }
+
+    /// The pool's lockstep bit under TP (the AND of every rank's local outcome; the spill tier's SpillFlag
+    /// rendezvous, run at the same admission point on every rank); local truth on a single box.
+    fn pool_agree(&mut self, ok: bool) -> Result<bool> {
+        match self.tp.as_mut() {
+            Some(t) => t.spill_agree(ok),
+            None => Ok(ok),
+        }
+    }
+
+    /// Would `bytes` more device memory keep this box at or above the pool's MemAvailable floor?
+    fn pool_mem_ok(&self, bytes: u64) -> bool {
+        crate::memwatch::mem_available_bytes().map_or(true, |a| a >= bytes.saturating_add(self.pool_floor))
+    }
+
+    /// PFXPOOL2: lane `slot`'s row lineage (empty until the lane has prefilled under the pool).
+    fn segs_of(&mut self, slot: usize) -> &mut crate::prefix_pool::Segs {
+        if self.slot_segs.len() <= slot { self.slot_segs.resize(slot + 1, Vec::new()); }
+        &mut self.slot_segs[slot]
+    }
+
+    /// PFXPOOL2: rows 0..from of `slot` are kept, rows from..end are written by a new prefill computation.
+    fn segs_prefill(&mut self, slot: usize, from: usize, end: usize) {
+        self.row_gen += 1;
+        let g = self.row_gen;
+        let s = self.segs_of(slot);
+        let mut kept = crate::prefix_pool::clip(s, from).unwrap_or_default();
+        if kept.last().map_or(0, |x| x.0) < from {
+            // rows below `from` of unknown provenance (should not happen): label them with this computation alone
+            kept.clear();
+        }
+        if end > kept.last().map_or(0, |x| x.0) { kept.push((end, g)); }
+        *s = kept;
+    }
+
+    /// PFXPOOL2: rows 0..n of `slot` now hold a copy of rows with lineage `src` (a pool restore), or (None) rows of
+    /// unknown lineage (an SSD restore): a fresh label.
+    fn segs_set(&mut self, slot: usize, src: Option<crate::prefix_pool::Segs>, n: usize) {
+        let v = match src.and_then(|s| crate::prefix_pool::clip(&s, n)) {
+            Some(v) => v,
+            None => { self.row_gen += 1; if n > 0 { vec![(n, self.row_gen)] } else { Vec::new() } }
+        };
+        *self.segs_of(slot) = v;
+    }
+
+    /// PFXPOOL: `slot` is being taken over by a different conversation — copy its prompt state (`old`: the
+    /// tokens its prompt-end snapshot holds) into the pool before anything overwrites it. Returns true when
+    /// the pool now holds that state (captured now, or already held). Never fails the round on its own:
+    /// over the cap, under the memory floor or a failed copy on ANY rank = not captured (counted). Err only
+    /// when a TP agree itself fails (the link is gone; the admission must stop with that message).
+    /// PFXPOOL2: when the lane's leading rows are an older entry's (same lineage), only the rows after them are copied
+    /// (the entry reads the rest through that one). Under memory pressure it never empties the pool for nothing: it
+    /// first agrees that shifting entries out CAN make room.
+    fn pool_capture_slot(&mut self, slot: usize, old: &[u32]) -> Result<bool> {
+        if !self.pool.on() { return Ok(false); }
+        // text only (image rows carry ids >= 2^31 and per-lane vision rope rows a snapshot does not hold);
+        // short prompts are cheaper to read again than to keep
+        if old.len() < POOL_MIN_TOKENS || old.iter().any(|&t| t >= 0x8000_0000) {
+            crate::metrics::pfx_pool_skip();
+            return Ok(false);
+        }
+        if self.pool.contains(old) {
+            crate::metrics::pfx_pool_skip();
+            return Ok(true);
+        }
+        let n = old.len();
+        let segs = match crate::prefix_pool::clip(self.segs_of(slot), n) {
+            Some(v) => v,
+            None => { self.segs_set(slot, None, n); self.segs_of(slot).clone() }
+        };
+        // the lane's WP16 checkpoints over this prompt travel with it (copies: the incoming prompt may still resume
+        // from them in this lane)
+        let (ck_c, ck_pos, aligned): (usize, Vec<usize>, usize) = match self.wp16.as_ref() {
+            Some(st) => {
+                let (c, v) = st.ckpts_under(slot, old, n);
+                (c, v.into_iter().map(|(p, _)| p).collect(), st.aligned_len(slot, old).1)
+            }
+            None => (0, Vec::new(), 0),
+        };
+        let snapb = self.model.pool_snap_bytes()?;
+        let ckb = self.model.ckpt_bytes();
+        let ckt = ck_pos.len() as u64 * ckb;
+        let r1 = self.model.pool_rows_for(n);
+        let grid = self.model.pool_row_grid();
+        // the entry whose rows this lane's leading rows are (same lineage): only the rows after them are copied. Its
+        // chain is touched now, so the cap below shifts it out last.
+        let mut parent: Option<(u64, usize)> = self.pool.best_parent(&segs, POOL_MAX_DEPTH).and_then(|(i, k)| {
+            let sh = (k / grid * grid).min(r1);
+            (sh >= POOL_SHARE_MIN).then(|| (self.pool.get(i).unwrap().id, sh))
+        });
+        if let Some((id, _)) = parent { if let Some(i) = self.pool.index_of(id) { self.pool.touch(i); } }
+        let need = |m: &FwdModel, p: &Option<(u64, usize)>| -> Result<u64> {
+            Ok(m.pool_rows_bytes(p.map_or(0, |x| x.1), r1)? + snapb + ckt)
+        };
+        let mut bytes = need(&self.model, &parent)?;
+        if !self.pool.fits(bytes) {
+            crate::metrics::pfx_pool_refused();
+            crate::drprintln!("[exl3-serve] prefix pool: {n} tokens ({} MiB) exceed the cap ({} MiB); not kept",
+                              bytes >> 20, self.pool.cap_bytes() >> 20);
+            return Ok(false);
+        }
+        let t0 = std::time::Instant::now();
+        // the cap: shift out least recently used entries; their slabs become spares
+        let mut nev = 0u64;
+        loop {
+            let ev = self.pool.make_room(bytes);
+            nev += ev.len() as u64;
+            for e in ev { if let Some(b) = e.buf.buf { self.pool_spare.push(b); } }
+            if parent.map_or(false, |(id, _)| self.pool.index_of(id).is_none()) {
+                parent = None; // the parent itself had to go: this capture keeps all its rows
+                bytes = need(&self.model, &parent)?;
+                if !self.pool.fits(bytes) { break; }
+                continue;
+            }
+            break;
+        }
+        crate::metrics::pfx_pool_evict(nev);
+        let chain: Vec<u64> = parent.and_then(|(id, _)| self.pool.index_of(id)).map_or(Vec::new(), |i| self.pool.chain(i));
+        // a slab: a recycled one when one is big enough (no new memory), else a fresh allocation under the memory floor,
+        // agreed across ranks. Feasibility first (every rank: could freeing the spares and every entry except the chain
+        // this capture needs make room?), so a capture that cannot fit does not shift the pool out for nothing.
+        // The spare list is rank-local (`pool_emergency` frees it on one rank alone), so every rank runs the same agree
+        // sequence whether or not it found a spare.
+        let mut slab = self.pool_take_spare(bytes);
+        {
+            let keep: u64 = chain.iter().filter_map(|id| self.pool.index_of(*id)).map(|i| self.pool.get(i).unwrap().bytes).sum();
+            let spare_b: u64 = self.pool_spare.iter().map(|b| b.len() as u64).sum();
+            let reclaim = spare_b + self.pool.bytes().saturating_sub(keep);
+            let feasible = slab.is_some() || crate::memwatch::mem_available_bytes()
+                .map_or(true, |a| a.saturating_add(reclaim) >= bytes.saturating_add(self.pool_floor));
+            if !self.pool_agree(feasible)? {
+                if let Some(b) = slab.take() { self.pool_spare.push(b); }
+                crate::metrics::pfx_pool_refused();
+                self.pool_publish();
+                crate::drprintln!("[exl3-serve] prefix pool: memory floor ({} GiB free kept) — {n} tokens not kept (the pool \
+                                   could not make room; nothing shifted out)", self.pool_floor >> 30);
+                return Ok(false);
+            }
+            let mut k = 0u64;
+            let mut cleared = false;
+            loop {
+                let ok = slab.is_some() || self.pool_mem_ok(bytes);
+                if self.pool_agree(ok)? { break; }
+                if !cleared {
+                    cleared = true;
+                    self.pool_spare.clear();
+                } else {
+                    // the LRU entry is replicated state: every rank takes the same branch here
+                    if self.pool.lru().map_or(true, |id| chain.contains(&id)) {
+                        crate::metrics::pfx_pool_evict(k);
+                        crate::metrics::pfx_pool_refused();
+                        if let Some(b) = slab.take() { self.pool_spare.push(b); }
+                        self.pool_publish();
+                        crate::drprintln!("[exl3-serve] prefix pool: memory floor ({} GiB free kept) — {n} tokens not kept",
+                                          self.pool_floor >> 30);
+                        return Ok(false);
+                    }
+                    for e in self.pool.pop_lru() {
+                        k += 1;
+                        if let Some(b) = e.buf.buf {
+                            if slab.is_none() && b.len() as u64 >= bytes { slab = Some(b); }
+                        }
+                    }
+                }
+                self.model.dev().synchronize()?; // the stream-ordered frees return the memory at a sync
+            }
+            crate::metrics::pfx_pool_evict(k);
+        }
+        let fresh = slab.is_none();
+        let t_slab = t0.elapsed().as_secs_f64() * 1e3;
+        let r0 = parent.map_or(0, |x| x.1);
+        let cap = (|| -> Result<PoolBuf> {
+            let buf = match slab { Some(b) => b, None => self.model.pool_alloc(bytes as usize)? };
+            let base = *buf.device_ptr() as u64;
+            let snap_off = self.model.pool_capture_rows(slot, r0, r1, base)?;
+            let hist = self.model.pool_capture_snap_to(slot, base + snap_off)?;
+            let ck_off = snap_off + snapb;
+            let mut ckpts = Vec::with_capacity(ck_pos.len());
+            if let Some(st) = self.wp16.as_ref() {
+                for (k, &p) in ck_pos.iter().enumerate() {
+                    let src = st.get(slot, p).context("WP16 checkpoint vanished")?;
+                    let h = self.model.ckpt_save_to(src, base + ck_off + k as u64 * ckb)?;
+                    ckpts.push((p, h));
+                }
+            }
+            Ok(PoolBuf { buf: Some(buf), hist, r0, r1, snap_off, ck_off, ck_bytes: ckb, ckpts, ckpt_c: ck_c, aligned })
+        })();
+        let t_copy = t0.elapsed().as_secs_f64() * 1e3;
+        if !self.pool_agree(cap.is_ok())? {
+            if let Err(e) = &cap { crate::dreprintln!("[exl3-serve] prefix pool: capture failed slot={slot} ({e:#}); not kept"); }
+            if let Ok(pb) = cap { if let Some(b) = pb.buf { self.pool_spare.push(b); } }
+            crate::metrics::pfx_pool_refused();
+            self.pool_publish();
+            return Ok(false);
+        }
+        let pb = cap?;
+        self.pool.insert_marked(old.to_vec(), bytes, pb, ck_pos.clone(), parent, segs);
+        // keep at most two spare slabs (the largest: the likeliest to fit the next long prompt)
+        self.pool_spare.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        self.pool_spare.truncate(2);
+        crate::metrics::pfx_pool_capture(t0.elapsed().as_micros() as u64);
+        self.pool_publish();
+        if crate::boot_report::debug() {
+            self.model.dev().synchronize()?; // debug only: when the copies have actually landed
+            crate::rprintln!("[exl3-serve] prefix pool: kept {n} tokens from slot={slot} ({}) with {} checkpoint(s) ({} MiB, {} slab; \
+                              pool {} entries, {} of {} MiB; {:.1} GiB free) — slab {:.1} ms, copies queued {:.1} ms, landed {:.1} ms",
+                             if r0 > 0 { format!("rows 0..{r0} shared with an older entry") } else { "all rows".to_string() },
+                             ck_pos.len(), bytes >> 20, if fresh { "new" } else { "recycled" }, self.pool.len(),
+                             self.pool.bytes() >> 20, self.pool.cap_bytes() >> 20,
+                             crate::memwatch::mem_available_bytes().map_or(0.0, |b| b as f64 / (1u64 << 30) as f64),
+                             t_slab, t_copy, t0.elapsed().as_secs_f64() * 1e3);
+        }
+        Ok(true)
+    }
+
+    /// PFXPOOL2: write rows 0..`rows` of pool entry `i` into `slot` through its parent chain.
+    fn pool_restore_chain(&self, slot: usize, i: usize, rows: usize) -> Result<()> {
+        let parts = self.pool.row_parts(i, rows).context("prefix pool: an ancestor vanished")?;
+        for (j, lo, hi) in parts {
+            let e = self.pool.get(j).context("prefix pool: entry vanished")?;
+            let b = e.buf.buf.as_ref().context("prefix pool: entry freed")?;
+            self.model.pool_restore_rows_part(slot, lo, hi, e.buf.r0, e.buf.r1, *b.device_ptr() as u64)?;
+        }
+        Ok(())
+    }
+
+    /// PFXPOOL2: memory pressure while serving. The pool's floor was only checked when an entry was kept, so other
+    /// growth (the head box's other processes, a build) could push a box to the memory watchdog with the pool still
+    /// full (owner hand test 2026-11-10: exit at 4.0 GB free while VeloBench grew 36 -> 45 GB). Two halves:
+    /// `pool_emergency` (any time, rank-local) frees slabs in LRU order the moment its box is under the floor;
+    /// `pool_upkeep` (every admission, an SPMD point) agrees the policy back into one state: entries freed on any rank
+    /// are dropped everywhere, then while any rank is under the floor the LRU entry is shifted out everywhere.
+    fn pool_upkeep(&mut self) -> Result<()> {
+        if !self.pool.on() { return Ok(()); }
+        let (mut k, mut freed, mut cleared) = (0u64, 0u64, false);
+        // entries a rank freed on its own: one agree when none is (the common case); else one per entry, in id order
+        // (replicated), dropping exactly the ones freed somewhere (with their descendants)
+        let alive = |s: &Self, i: usize| s.pool.get(i).map_or(true, |e| e.buf.buf.is_some());
+        let all = (0..self.pool.len()).all(|i| alive(self, i));
+        if !self.pool_agree(all)? {
+            for id in self.pool.ids() {
+                let Some(i) = self.pool.index_of(id) else { continue }; // went with an ancestor
+                if !self.pool_agree(alive(self, i))? {
+                    for e in self.pool.remove_id(id) { k += 1; freed += e.bytes; }
+                }
+            }
+        }
+        loop {
+            if self.pool_agree(self.pool_mem_ok(0))? { break; }
+            if !cleared {
+                cleared = true;
+                freed += self.pool_spare.iter().map(|b| b.len() as u64).sum::<u64>();
+                self.pool_spare.clear();
+            } else if self.pool.is_empty() {
+                break;
+            } else {
+                for e in self.pool.pop_lru() { k += 1; freed += e.bytes; }
+            }
+            self.model.dev().synchronize()?;
+        }
+        if k > 0 || freed > 0 {
+            crate::metrics::pfx_pool_evict(k);
+            self.pool_publish();
+            crate::drprintln!("[exl3-serve] prefix pool: memory floor — shifted out {k} entr(ies), {} MiB ({} entries kept)",
+                              freed >> 20, self.pool.len());
+        }
+        Ok(())
+    }
+
+    /// PFXPOOL2: rank-local emergency release, called between prefill chunks and scheduler iterations (at most every
+    /// 200 ms). Under the floor it frees the spare slabs, then entry slabs in the order `pool_upkeep` will shift the
+    /// entries out (LRU, with descendants), until the box is back above the floor. No rendezvous: the policy keeps the
+    /// entries (marked freed) until the next admission agrees them away; nothing reads a freed entry before that.
+    fn pool_emergency(&mut self) {
+        if !self.pool.on() || (self.pool.is_empty() && self.pool_spare.is_empty()) { return; }
+        let now = std::time::Instant::now();
+        if self.pool_emerg_at.map_or(false, |t| now.duration_since(t) < std::time::Duration::from_millis(200)) { return; }
+        self.pool_emerg_at = Some(now);
+        if self.pool_mem_ok(0) { return; }
+        let mut freed = 0u64;
+        if !self.pool_spare.is_empty() {
+            freed += self.pool_spare.iter().map(|b| b.len() as u64).sum::<u64>();
+            self.pool_spare.clear();
+            let _ = self.model.dev().synchronize();
+        }
+        let mut n = 0usize;
+        for i in self.pool.lru_order() {
+            if self.pool_mem_ok(0) { break; }
+            for j in self.pool.family_of(i) {
+                if let Some(e) = self.pool.get_mut(j) {
+                    if let Some(b) = e.buf.buf.take() { freed += b.len() as u64; n += 1; drop(b); }
+                }
+            }
+            let _ = self.model.dev().synchronize();
+        }
+        crate::metrics::pfx_pool_emergency(n as u64);
+        crate::rprintln!("[exl3-serve] prefix pool: under the memory floor ({} GiB) — freed {n} entr(ies) and spares on this box \
+                          ({} MiB; {:.1} GiB free now); the pool drops them at the next request",
+                         self.pool_floor >> 30, freed >> 20,
+                         crate::memwatch::mem_available_bytes().map_or(0.0, |b| b as f64 / (1u64 << 30) as f64));
+    }
+
+    /// PFXPOOL2: the scheduler's idle wait for the next request. With the pool on it wakes every second to run
+    /// `pool_emergency`, so an idle server also gives memory back when its box comes under the floor (the box's other
+    /// processes keep running while it waits).
+    fn idle_recv(&mut self, rx: &mut UnboundedReceiver<BatchRequest>) -> Option<BatchRequest> {
+        if !self.pool.on() { return rx.blocking_recv(); }
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_time().build() {
+            Ok(r) => r,
+            Err(_) => return rx.blocking_recv(),
+        };
+        loop {
+            match rt.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await }) {
+                Ok(v) => return v,
+                Err(_) => self.pool_emergency(),
+            }
+        }
+    }
+
+    /// PFXPOOL: the smallest spare slab that holds `bytes` (removed from the list), or None.
+    fn pool_take_spare(&mut self, bytes: u64) -> Option<cudarc::driver::CudaSlice<u8>> {
+        let i = self.pool_spare.iter().enumerate().filter(|(_, b)| b.len() as u64 >= bytes)
+            .min_by_key(|(_, b)| b.len()).map(|(i, _)| i)?;
+        Some(self.pool_spare.swap_remove(i))
+    }
+
+    /// PFXPOOL: the lane's own snapshot missed — restore the deepest pool entry that prefixes `key` (holding at most
+    /// `end` tokens) into `slot`, unless the lane's own WP16 checkpoint (`own_q`) is at least as deep (that resume
+    /// needs no copy). Returns the restored token count (the new `reuse`). Lookup and choice are replicated state, the
+    /// copies are local device copies; a failed copy is fatal under TP (the ranks' KV would differ) and a re-prefill
+    /// on a single box. PFXPOOL2: rows come through the entry's parent chain, the recurrent state from the entry; the
+    /// lane's row lineage becomes the entry's.
+    fn pool_restore_slot(&mut self, slot: usize, key: &[u32], end: usize, own_q: usize) -> Result<Option<PoolHit>> {
+        if !self.pool.on() || self.pool.is_empty() || key.iter().any(|&t| t >= 0x8000_0000) {
+            return Ok(None);
+        }
+        let c = self.chunk.max(1);
+        // a carried checkpoint needs the WP16 store (and the chunk width it was taken at); a full entry does not
+        let cand = self.pool.best(key, end).filter(|r| r.full || (self.wp16.is_some()
+            && self.pool.get(r.i).map_or(false, |e| e.buf.ckpt_c == c)));
+        let Some(r) = cand.filter(|r| r.at > own_q) else {
+            crate::metrics::pfx_pool_miss();
+            return Ok(None);
+        };
+        let t0 = std::time::Instant::now();
+        let segs = self.pool.get(r.i).context("prefix pool: entry vanished")?.segs.clone();
+        if r.full {
+            let res = (|| -> Result<()> {
+                self.pool_restore_chain(slot, r.i, self.model.pool_rows_for(r.at))?;
+                let e = self.pool.get(r.i).context("prefix pool: entry vanished")?;
+                let b = e.buf.buf.as_ref().context("prefix pool: entry freed")?;
+                self.model.pool_restore_snap_from(slot, *b.device_ptr() as u64 + e.buf.snap_off, e.buf.hist)
+            })();
+            if let Err(e) = res {
+                if self.tp.is_some() {
+                    anyhow::bail!("prefix pool: restore failed slot={slot} ({e:#}) — the ranks' KV would differ");
+                }
+                crate::dreprintln!("[exl3-serve] prefix pool: restore failed slot={slot} ({e:#}); re-prefill");
+                crate::metrics::pfx_pool_miss();
+                self.segs_set(slot, None, 0);
+                return Ok(None);
+            }
+            self.segs_set(slot, Some(segs), r.at);
+            // C1 parity with an own-lane hit: the lane adopts the entry's aligned prefix (when it covers the restore
+            // point at this chunk width), so the run below is tracked exactly as it would be in the entry's own lane.
+            let adopted = match (self.wp16.as_mut(), self.pool.get(r.i)) {
+                (Some(st), Some(e)) if e.buf.ckpt_c == c && e.buf.aligned >= r.at => {
+                    st.adopt(slot, c, &e.toks[..e.buf.aligned]);
+                    true
+                }
+                _ => false,
+            };
+            self.pool.touch(r.i);
+            crate::metrics::pfx_pool_hit(r.at as u64, t0.elapsed().as_micros() as u64);
+            crate::drprintln!("[exl3-serve] prefix pool hit slot={slot}: restored {} of {} prompt tokens{}", r.at, end + 1,
+                              if adopted { " (aligned prefix adopted)" } else { "" });
+            return Ok(Some(PoolHit::Full(r.at, adopted)));
+        }
+        // a carried checkpoint at q: a WP16 buffer for the lane (agreed: an allocation that fails on any rank skips the
+        // resume everywhere), rows 0..q, then the checkpoint installed as the lane's own
+        let q = r.at;
+        let model = self.model.clone();
+        let got = self.wp16.as_mut().unwrap().acquire(|| model.ckpt_alloc());
+        if !self.pool_agree(got.is_some())? {
+            if let Some(b) = got { self.wp16.as_mut().unwrap().release(b); }
+            crate::metrics::pfx_pool_miss();
+            return Ok(None);
+        }
+        let mut dst = got.unwrap();
+        let res = (|| -> Result<()> {
+            self.pool_restore_chain(slot, r.i, self.model.pool_rows_for(q))?;
+            let e = self.pool.get(r.i).context("prefix pool: entry vanished")?;
+            let k = e.buf.ckpts.iter().position(|(p, _)| *p == q).context("prefix pool: checkpoint vanished")?;
+            let b = e.buf.buf.as_ref().context("prefix pool: entry freed")?;
+            let at = *b.device_ptr() as u64 + e.buf.ck_off + k as u64 * e.buf.ck_bytes;
+            self.model.ckpt_load_from(&mut dst, at, e.buf.ckpts[k].1)
+        })();
+        if let Err(e) = res {
+            if self.tp.is_some() {
+                anyhow::bail!("prefix pool: checkpoint restore failed slot={slot} ({e:#}) — the ranks' KV would differ");
+            }
+            self.wp16.as_mut().unwrap().release(dst);
+            crate::dreprintln!("[exl3-serve] prefix pool: checkpoint restore failed slot={slot} ({e:#}); re-prefill");
+            crate::metrics::pfx_pool_miss();
+            self.segs_set(slot, None, 0);
+            return Ok(None);
+        }
+        self.segs_set(slot, Some(segs), q);
+        self.wp16.as_mut().unwrap().install(slot, c, &key[..q], q, dst);
+        self.pool.touch(r.i);
+        crate::metrics::pfx_pool_hit(q as u64, t0.elapsed().as_micros() as u64);
+        crate::drprintln!("[exl3-serve] prefix pool hit slot={slot}: carried checkpoint at {q} of {} prompt tokens", end + 1);
+        Ok(Some(PoolHit::Ckpt(q)))
     }
 
     // ---------------------------------------------------------- LANERES2: --kv-spill
@@ -4345,7 +5128,7 @@ the [gen] line says stop_p=na", stats));
         self.publish_kv();
     }
 
-    fn admit_req(&mut self, req: BatchRequest, scoped: Option<(&[usize], crate::lane_reserve::Kind)>) {
+    fn admit_req(&mut self, mut req: BatchRequest, scoped: Option<(&[usize], crate::lane_reserve::Kind)>) {
         let t_admit = std::time::Instant::now();
         // prefix cache: prefer the free lane whose snapshot is the longest prefix of this prompt,
         // then a lane with no snapshot, then any free lane.
@@ -4412,12 +5195,10 @@ the [gen] line says stop_p=na", stats));
                 }
             }
         }
-        if req.schema.is_some() {
-            let _ = req.tx.send(TokEvent::Finish {
-                reason: "error: json-schema constraint not supported on the exl3 serve path yet".into(),
-            });
-            return;
-        }
+        // W2-EXL3 / PR #30: the masked plain step and the logits readback are wired at TP=1 only. The server
+        // already serves such requests without them under TP (AppState schema_ok / logprobs_ok); the head strips
+        // them before an Admit ships; this is the structural backstop (never a refusal).
+        if let Some(w) = self.tp.as_ref().map(|t| t.world) { exl3_tp_strip(&mut req, w); }
         if req.prompt.is_empty() {
             let _ = req.tx.send(TokEvent::Finish { reason: "error: empty prompt".into() });
             return;
@@ -4502,6 +5283,46 @@ the [gen] line says stop_p=na", stats));
             if self.tp.is_some() { self.fatal = Some(format!("{e:#}")); } // TP-D: never a one-rank skip
             return;
         }
+        // THINKBUDGET1: the request's thinking budget, from the prompt's reasoning state (vLLM's rule).
+        // A model without single-token <think> / </think> markers cannot apply it: served without it,
+        // said once, counted.
+        let mut think = req.thinking_budget.and_then(|b| {
+            match crate::think_budget::Markers::from_encoder(|txt| self.tok.encode(txt, false).ok(), crate::think_budget::reasoning_cfg()) {
+                Some(m) => {
+                    crate::metrics::think_budget_applied();
+                    let tb = crate::think_budget::ThinkBudget::new(b, m, &req.prompt);
+                    crate::dreprintln!("[exl3-serve] thinking budget slot={free}: {b} tokens (the prompt {} a reasoning block{})",
+                        if tb.in_think() { "opens" } else { "does not open" },
+                        if tb.in_think() { format!("; {} of the budget used by the prompt", b.saturating_sub(tb.room().unwrap_or(0))) } else { String::new() });
+                    Some(tb)
+                }
+                None => {
+                    crate::metrics::think_budget_unsupported();
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| crate::reprintln!("[exl3-serve] thinking_token_budget: this model's tokenizer has no single-token \
+<think> / </think> markers, so requests run without a thinking budget (counted in velogb10_thinking_budget_requests_total; \
+this line prints once per boot)"));
+                    None
+                }
+            }
+        });
+        // Logprobs at TP: the seam step's row is this request's first logprob (every rank: the request is mirrored)
+        if self.tp.is_some() && req.logprobs.is_some() { self.sc.lp_live = true; }
+        // W2-EXL3: the seam step emits the request's FIRST token — mask it when the constraint
+        // is live from the start (no think block to wait for).
+        let mut schema_state = req.schema.as_ref().map_or(0, |sm| sm.start_state());
+        let mut schema_armed = req.schema.as_ref().map_or(false, |sm| sm.defer_until().is_none());
+        let vstaged = match req.schema.as_ref().filter(|_| schema_armed) {
+            Some(sm) => {
+                let bits = sm.allowed(schema_state);
+                self.model.set_vmask(&mut self.sc, &[Some(&bits[..])])
+            }
+            None => self.model.set_vmask(&mut self.sc, &[None]),
+        };
+        if let Err(e) = vstaged {
+            let _ = req.tx.send(TokEvent::Finish { reason: format!("error: schema mask staging failed: {e}") });
+            return;
+        }
         let last = match self.model.forward_step(
             &mut self.sc,
             &[*req.prompt.last().unwrap() as i32],
@@ -4509,7 +5330,7 @@ the [gen] line says stop_p=na", stats));
             &[free],
             None,
         ) {
-            Ok(ids) => ids[0] as u32,
+            Ok(ids) => think_emit(think.as_mut(), free, ids[0] as u32, 0, 1),
             Err(e) => {
                 eprintln!("[exl3-serve] seam decode step failed (slot {free}): {e:#}");
                 let _ = req.tx.send(TokEvent::Finish {
@@ -4544,6 +5365,9 @@ the [gen] line says stop_p=na", stats));
                 return;
             }
         }
+        if let Some(n) = req.logprobs.filter(|_| self.lp_reader()) {
+            self.send_logprob(&req.tx, false, 0, last, n);
+        }
         if req.tx.send(TokEvent::Tok(last)).is_err() && self.tp.is_none() {
             // WP02: the client is gone — no lane (the prefix snapshot stays valid). TP-D: under TP
             // the lane is created on every rank and the head's next sweep cancels it.
@@ -4563,12 +5387,35 @@ the [gen] line says stop_p=na", stats));
             let _ = req.tx.send(TokEvent::Finish { reason: "stop".into() });
             return;
         }
+        if let Some(sm) = req.schema.as_ref() {
+            match schema_feed(sm, &mut schema_state, &mut schema_armed, last) {
+                SchemaStep::Continue => {}
+                SchemaStep::Complete => {
+                    let _ = req.tx.send(TokEvent::Finish { reason: "stop".into() });
+                    return;
+                }
+                SchemaStep::Invalid => {
+                    crate::reprintln!("[schema] slot {free}: first token {last} leaves no valid continuation \
+                                       — ending the turn with an error");
+                    let _ = req.tx.send(TokEvent::Finish { reason: SCHEMA_DEAD_END.into() });
+                    return;
+                }
+            }
+        }
         // S-A3-f-d: greedy lanes on an M1 pack speculate by default (AGENTS 1b).
         // Prime the head once: snapshot the tap that predicted `last` (now the
         // seam decode step's sc.resid — exact, same composition as the bench-mtp
         // prime and every round's re-prime), then feed the head the last prompt
         // token with that tap (round 1's draft-extend reuses tap_row 0).
-        let mtp = if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt() {
+        // A JSON-schema lane decodes plain steps (its mask does not cover the verify rows yet); a lane that reports log
+        // probabilities speculates like any other (round_emit reads the round's verify rows).
+        if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt() && req.schema.is_some() {
+            // the speed such a request pays, visible to scripts/owner_check.py (velogb10_spec_off_lanes_total)
+            crate::metrics::spec_off_lane(true);
+        }
+        // log probabilities keep speculation (round_emit reads the round's verify rows); a schema lane decodes
+        // plain steps until its mask covers the verify rows
+        let mtp = if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt() && req.schema.is_none() {
             match self.mtp_prime(free, *req.prompt.last().unwrap(), plen) {
                 Ok(()) => {
                     if crate::exl3_forward::a_xcheck_on() {
@@ -4607,6 +5454,7 @@ the [gen] line says stop_p=na", stats));
             min_p: req.min_p,
             pen,
             loop_det,
+            think: think.take(),
             prompt_hash: prompt_hash(&req.prompt),
             history: req.prompt.clone(),
             seed,
@@ -4635,6 +5483,10 @@ the [gen] line says stop_p=na", stats));
             admit_seq,
             fcfs_credit: 0,
             img: is_img,
+            logprobs: req.logprobs,
+            schema: req.schema.clone(),
+            schema_state,
+            schema_armed,
             tx: req.tx,
         });
     }
@@ -4645,13 +5497,25 @@ the [gen] line says stop_p=na", stats));
 /// A request the EXL3 path refuses before admission (checked on the head BEFORE an Admit ships,
 /// so a refused request never reaches the node).
 fn exl3_reject(req: &BatchRequest) -> Option<String> {
-    if req.schema.is_some() {
-        return Some("error: json-schema constraint not supported on the exl3 serve path yet".into());
-    }
     if req.prompt.is_empty() {
         return Some("error: empty prompt".into());
     }
     None
+}
+
+/// PR #30 / #31 ports, owner rule (fall back, never refuse): under TP a request's schema mask is dropped (wired at
+/// TP=1), and its log probabilities at a world without row-gather kernels (they are served at TP=2 / 4). The HTTP layer already decides this (AppState schema_ok / logprobs_ok: the reply carries
+/// `x-json-schema-enforced: none` / `logprobs: null`); this keeps the head, the node and any direct caller
+/// consistent. Said once per boot.
+fn exl3_tp_strip(req: &mut BatchRequest, world: i32) {
+    let had_schema = req.schema.take().is_some();
+    // logprobs at TP (owner 2026-11-02): served at world 2 and 4 (the row-gather kernels exist there)
+    let had_lp = !matches!(world, 2 | 4) && req.logprobs.take().is_some();
+    if had_schema || had_lp {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::reprintln!("[exl3-serve] TP: a request's schema mask / log probabilities are not applied \
+under TP yet; such requests are served without them (this line prints once per boot)"));
+    }
 }
 
 /// The seed a request without one gets (admit's TP=1 derivation, minus the slot term).
@@ -4751,6 +5615,7 @@ impl Exl3Scheduler {
         crate::dprintln!("[exl3-serve] TP control: {}", if fast_ctl { "step-go over RDMA while live, TCP Step only with events (TP-E)" }
                  else { "TCP Step every step (--exl3-tp-fastctl=0)" });
         loop {
+            self.pool_emergency(); // PFXPOOL2 (rank-local, rate-limited)
             if waiting.is_empty() && self.lanes.iter().all(|l| l.is_none()) {
                 // Clean idle point (TP twin of the single-process loop): total fcfs rotations.
                 if self.lane_order == LaneOrder::Fcfs && self.fcfs_rots > rots_printed {
@@ -4765,7 +5630,7 @@ impl Exl3Scheduler {
                 self.publish_kv(); // issue #24: the idle value (lanes freed outside a step included)
                 if let Some(line) = self.pack_idle_line() { crate::drprintln!("{line}"); } // S-B9-CF-PACK4
                 crate::metrics::sched_idle(); // H3: about to block for work (busy must not stick at 1)
-                match rx.blocking_recv() {
+                match self.idle_recv(&mut rx) {
                     Some(req) => waiting.push_back(req),
                     None => {
                         let _ = self.tp_ship(&ServingMsg::Shutdown);
@@ -4824,6 +5689,7 @@ impl Exl3Scheduler {
                             crate::lane_reserve::Plan::Admit { waiting_index, allowed, kind } => {
                                 if let Some(mut req) = waiting.remove(waiting_index) {
                                     if !req.tx.is_closed() {
+                                        exl3_tp_strip(&mut req, self.tp.as_ref().map_or(1, |t| t.world)); // before the Admit ships: head and node agree
                                         if let Some(why) = exl3_reject(&req) {
                                             let _ = req.tx.send(TokEvent::Finish { reason: why });
                                         } else {
@@ -4881,6 +5747,7 @@ impl Exl3Scheduler {
                 if req.tx.is_closed() {
                     continue;
                 }
+                exl3_tp_strip(&mut req, self.tp.as_ref().map_or(1, |t| t.world)); // before the Admit ships: head and node agree
                 if let Some(why) = exl3_reject(&req) {
                     let _ = req.tx.send(TokEvent::Finish { reason: why });
                     continue;
@@ -4980,6 +5847,7 @@ impl Exl3Scheduler {
         let fast_ctl = crate::opts::var(crate::opt!("exl3-tp-fastctl")).map_or(true, |v| v != "0");
         crate::drprintln!("[exl3-serve] TP control (node): {}", if fast_ctl { "step-go over RDMA while live (TP-E)" } else { "TCP Step every step" });
         loop {
+            self.pool_emergency(); // PFXPOOL2 (rank-local, rate-limited; an idle node waits on the head's stream)
             let live = self.lanes.iter().any(|l| l.is_some());
             if fast_ctl && live {
                 let (hs, n) = self.tp.as_mut().context("mirror without TP state")?.step_go(step_no + 1, 0)?;
@@ -5191,6 +6059,13 @@ fn tp_boot_agree(s: &mut Exl3Scheduler) -> Result<()> {
     w.extend([dc as u32, (dc >> 32) as u32, s.draft_temp.map_or(0, |t| t.to_bits())]);
     w.extend(s.loop_cfg.map_or([0, 0], |(a, b)| [a as u32, b as u32]));
     w.extend(s.wp16.as_ref().map_or([0, 0], |st| [1, st.cap as u32]));
+    // PFXPOOL: the pool policy is replicated — its cap, floor and per-entry cost (the geometry-derived bytes of a
+    // 1K-token entry on this rank) must match, or the ranks would evict differently. An ON-only word, so a pool-off
+    // boot's hash is the pre-PFXPOOL one.
+    if s.pool.on() {
+        let per_k = s.model.pool_entry_bytes(1024).unwrap_or(0);
+        w.extend([0x5046_0000, (s.pool.cap_bytes() >> 20) as u32, (s.pool_floor >> 20) as u32, per_k as u32, (per_k >> 32) as u32]);
+    }
     w.push(crate::exl3_forward::tail_ckpt_on() as u32);
     w.push(crate::exl3_forward::kv_fmt_from_opts() as u32);
     // TP-I #7: the WP23 cost-guard prior both ranks resolved (it only matters if the targets differ)
@@ -5268,7 +6143,11 @@ fn tp_boot_agree(s: &mut Exl3Scheduler) -> Result<()> {
         }
         return Ok(());
     }
-    if let Err(why) = tp_agree_eq(0xB0_0700, 0, 0, h) {
+    // TP-D: the world-2 boot agree is the FIRST cross-rank rendezvous after two INDEPENDENT
+    // model loads (50-400 s of legitimate skew) — it must use the boot deadline
+    // (`net::agree_boot`), not the 10 s per-step watchdog: the 2026-10-30 #26 repro aborted
+    // exactly here while the head was still loading weights.
+    if let Err(why) = tp_agree_decide(0, 0, h, crate::net::agree_boot(0xB0_0700, h)) {
         crate::net::abort_link();
         anyhow::bail!("TP boot agree FAILED: the ranks resolved different serve configs (hash {h:08x} on rank {rank}): {why}");
     }
@@ -5484,6 +6363,25 @@ pub fn fit_plan(p: FitParts, lanes: usize, avail: u64, mode: &str, max_pos: usiz
     Ok(with_table <= avail)
 }
 
+/// CTXCLAMP (owner 2026-11-07): the longest `--max-seq-len` below `asked` — a multiple of 1,024, at least 4,096 — at
+/// which ONE lane's memory plan fits (`fit_plan` Ok, as `fit_max_lanes` reads it). `parts_at(max_pos)` gives the parts
+/// at a context (the per-lane KV grows with it; nothing else does). None: not even 4,096 tokens fit (the refusal).
+pub fn fit_max_ctx(asked: usize, headroom: usize, avail: u64, mode: &str,
+                   parts_at: &dyn Fn(usize) -> Option<FitParts>) -> Option<usize> {
+    let ok = |seq: usize| parts_at(seq + headroom).map_or(false, |p| fit_plan(p, 1, avail, mode, seq + headroom).is_ok());
+    const MIN_K: usize = 4; // 4,096 tokens
+    let mut hi = asked / 1024;                 // candidates are k * 1024 for k in MIN_K..=hi, below `asked`
+    if hi * 1024 >= asked { hi = hi.saturating_sub(1); }
+    if hi < MIN_K || !ok(MIN_K * 1024) { return None; }
+    if ok(hi * 1024) { return Some(hi * 1024); }
+    let mut lo = MIN_K;                        // invariant: ok(lo * 1024), !ok(hi * 1024)
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if ok(mid * 1024) { lo = mid } else { hi = mid }
+    }
+    Some(lo * 1024)
+}
+
 /// MAXBATCH1: the largest lane count `<= width` whose memory plan fits — `fit_plan` Ok (the auto
 /// arm accepts the n-gram table landing on SSD, exactly like an un-fitted boot). None when not
 /// even one lane fits (the refusal case: nothing can be served on this box at this context).
@@ -5685,7 +6583,8 @@ mod ctx_clamp_tests {
     fn the_serve_and_the_tp_head_go_through_the_clamp() {
         let code = |src: &str| src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
         let serve = code(include_str!("exl3_serve.rs"));
-        let needle = ["let max_seq_len: usize = clamp_max_seq_len(model_dir, ", "arg(args, \"--max-seq-len\")"].concat();
+        // CTXCLAMP: `let mut` (the TP = 1 memory fit may clamp it afterwards, one boot line + /metrics)
+        let needle = ["let mut max_seq_len: usize = clamp_max_seq_len(model_dir, ", "arg(args, \"--max-seq-len\")"].concat();
         assert_eq!(serve.matches(&needle).count(), 1, "build_serve");
         let main = code(include_str!("main.rs"));
         let needle = ["tpc.max_seq_len = gb10_inference::exl3_serve::", "resolve_max_seq_len("].concat();
@@ -5722,9 +6621,11 @@ pub fn fit_parts(model_dir: &str, max_pos: usize, world: usize, head: bool, kv_b
     let shards: u64 = files.iter().map(|f| size(f)).sum();
     // A shipped per-rank shard dir (B32, `gb10_shard.json`) already holds this rank's share; a full pack is split by world.
     let share = if dir.join("gb10_shard.json").is_file() { 1 } else { world.max(1) as u64 };
-    let mut weights = shards / share;
-    if head { weights += size("vision_tower_bf16.safetensors"); }
-    let mut table: u64 = ngram.iter().map(|f| size(f)).sum();
+    // FP4L: the n-gram table and the tower live INSIDE the shards; size them from the tensor headers
+    let fp4l = crate::fp4l::fit_bytes(dir);
+    let mut weights = match fp4l { Some((d, _, _)) => d / share, None => shards / share };
+    if head { weights += match fp4l { Some((_, _, tw)) => tw, None => size("vision_tower_bf16.safetensors") }; }
+    let mut table: u64 = match fp4l { Some((_, t, _)) => t, None => ngram.iter().map(|f| size(f)).sum() };
     if table == 0 {
         table = std::fs::read_dir(dir).ok()?.flatten()
             .filter(|e| e.file_name().to_string_lossy().contains("ngram"))
@@ -5812,6 +6713,9 @@ pub fn ensure_singlefile_index(dir: &str) -> std::io::Result<bool> {
 /// index carries `.trellis` entries (the A3 spec's quadruple manifest).
 pub fn is_exl3_pack(dir: &str) -> bool {
     let dir = dir.trim_end_matches('/');
+    // FP4L: NVIDIA's ModelOpt mixed-precision Qwen3.8-Flash-Next is served by this trunk too
+    // (exl3_forward/fp4l_fwd.rs); every EXL3 entry point (serve, TP head/node, bench, ppl) accepts it.
+    if crate::fp4l::pack::is_fp4l_dir(std::path::Path::new(dir)) { return true; }
     let qc = std::path::Path::new(dir).join("quantization_config.json");
     if !qc.exists() {
         return false;
@@ -5839,6 +6743,7 @@ struct ServeParts {
 
 /// Boot the EXL3 HTTP server (TP=1). Mirrors run_server's serving surface.
 pub fn run(args: &[String], model_dir: &str) -> Result<()> {
+    crate::fp4l::apply_pack_defaults(model_dir);
     let parts = build_serve(args, model_dir, None)?;
     serve_http(parts, None)
 }
@@ -5885,7 +6790,9 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         crate::opts::set(crate::opt!("rope-yarn-factor"), f.to_string());
     }
     let st_config = crate::boot_report::Stage::begin("config");
-    let max_seq_len: usize = clamp_max_seq_len(model_dir, arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096));
+    // CTXCLAMP (owner 2026-11-07): `mut` — at TP = 1 the memory fit below may boot a context that does not fit even
+    // one lane at the longest context that does (one boot line + /metrics), instead of refusing.
+    let mut max_seq_len: usize = clamp_max_seq_len(model_dir, arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096));
     // F2 (owner 2026-10-10): at most 16 requests are served at once; a larger --max-batch boots
     // with 16 and further requests wait in the queue (--max-waiting semantics unchanged).
     // MAXBATCH1: `width` is `mut` — the memory fit below may boot it down to the largest lane
@@ -5906,7 +6813,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
             crate::boot_report::notice(&l);
         }
     }
-    let max_pos = max_seq_len + crate::batch::decode_headroom(false);
+    let mut max_pos = max_seq_len + crate::batch::decode_headroom(false);
     // --prefix-cache on|off (default on, as the NVFP4 server): per-slot recurrent-state snapshots
     // at the message boundary so a multi-turn re-send prefills only its new suffix.
     let prefix_on = !matches!(arg(args, "--prefix-cache"), Some("off"));
@@ -5930,7 +6837,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // f16 per-32 scale, WP25) quarter the long-context KV bytes. Transported to the loader via
     // [kv-cache] (an explicit env value wins when the flag is absent).
     if let Some(v) = arg(args, "--kv-cache") {
-        anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8"), "--kv-cache must be f32, f16, fp8 or q8");
+        let v = exl3_kv_cache_value(v)?;   // TPSHIP: bf16 -> f16 with one line (no refusal)
         crate::opts::set(crate::opt!("kv-cache"), v);
     }
     // --spec-source <s> (ISSUES[94]): the mirror of the trunk resolve_spec_source (main.rs) —
@@ -5978,7 +6885,13 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
             row_regime: crate::exl3_forward::row_regime_on(),
             a_ctrl_old: crate::exl3_forward::a_flags().ctrl == 2,
             fcfs: LaneOrder::parse(crate::opt_or_arg(args, "--lane-order").as_deref().map(str::trim).filter(|v| !v.is_empty()))? == LaneOrder::Fcfs,
+            dense_v3: crate::exl3_forward::dense_v3_on(),
+            kv_any: crate::lane_pack::kv_any(),
         }));
+        if crate::lane_pack::kv_any() && !matches!(kv_name, "q8" | "q4k") {
+            crate::rprintln!("[exl3-serve] lane packing runs on --kv-cache {kv_name} (--lane-pack-kv any): UNGATED — no gate chain has run \
+                              packed verifies on a {kv_name} cache yet; --lane-pack-kv q8 serves that cache without packed rounds");
+        }
     }
     // --reasoning-effort / --thinking: the server-wide thinking defaults, as on the NVFP4 server.
     // Unset = the model's own chat template decides (Qwen3.8: thinking on at xhigh, the model
@@ -6001,12 +6914,20 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // no refusals"): resolve the memory fit BEFORE the tune table is selected (the table is keyed
     // by the lane count that will actually serve). An asked lane count that does not fit memory
     // BOOTS ANYWAY on the nearest thing that works — the largest lane count that fits at the
-    // asked context — with ONE clear line: what was asked, what it does instead, why. The context
-    // length is never silently cut (full-context serving is the READY bar; a lane waits instead).
-    // CF-P1d keeps its teeth: the refusal remains when not even ONE lane fits, with the
-    // arithmetic and what to change (that boot could not serve anything at all).
+    // asked context — with ONE clear line: what was asked, what it does instead, why. Lanes are
+    // cut before the context (full-context serving is the READY bar; a lane waits instead).
+    // CTXCLAMP (owner 2026-11-07): when not even ONE lane fits, a TP = 1 boot serves one lane at the
+    // longest context that fits (one line + /metrics) instead of refusing; TP > 1 and a pack whose
+    // weights alone overflow keep CF-P1d's refusal, with the arithmetic and what to change.
     {
-        let kvb = match kv_name { "f32" => 4.0, "f16" => 2.0, "fp8" => 1.0, _ => 1.0625 };
+        // Bytes per element per K/V channel: q4k's row is 144 B at hd 256, q8's 272.
+        let kvb = match kv_name {
+            "f32" => 4.0,
+            "f16" => 2.0,
+            "fp8" => 1.0,
+            "q4k" => 0.5625,
+            _ => 1.0625,
+        };
         let mode = match crate::opts::var(crate::opt!("ple-ram")).as_deref() { Ok("on") | Ok("ram") => "ram", Ok("off") | Ok("ssd") => "ssd", _ => "auto" };
         let world = tp_world.max(1) as usize;
         if let Some(parts) = fit_parts(model_dir, max_pos, world, tp_rank.map_or(true, |r| r == 0), kvb, wp16_gb) {
@@ -6027,8 +6948,30 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
                             fx_g = gb(parts.fixed), fl_g = gb(parts.floor)));
                         width = n;
                     } else {
-                        eprintln!("error: {msg}");
-                        std::process::exit(2);
+                        // CTXCLAMP (owner 2026-11-07, "probably yes"): not even ONE lane fits at the asked context. At
+                        // TP = 1 boot anyway with one lane at the longest context that fits (a multiple of 1,024, at
+                        // least 4,096), one line saying what was asked and what serves, and /metrics
+                        // velogb10_exl3_ctx_clamped{asked,served}. TP > 1 keeps the refusal: every rank runs this fit
+                        // on its own memory and ranks must not disagree on the context.
+                        let headroom = crate::batch::decode_headroom(false);
+                        let parts_at = |mp: usize| fit_parts(model_dir, mp, world, true, kvb, wp16_gb);
+                        let clamp = if tp_world <= 1 { fit_max_ctx(max_seq_len, headroom, avail, mode, &parts_at) } else { None };
+                        let Some(ctx) = clamp else {
+                            eprintln!("error: {msg}");
+                            std::process::exit(2);
+                        };
+                        let gb = |b: u64| b as f64 / 1e9;
+                        crate::boot_report::notice(&format!(
+                            "[exl3-serve] --max-seq-len {asked}: not even one lane fits memory at this context length on this \
+                             box ({avail_g:.1} GB available; one lane needs weights {w_g:.1} GB + {pl_g:.2} GB KV + {fx_g:.1} GB \
+                             working memory + {fl_g:.1} GB serving headroom); booting with 1 lane at --max-seq-len {ctx} — the \
+                             longest context that fits (--tp 2 serves the full context)",
+                            asked = max_seq_len, avail_g = gb(avail), w_g = gb(parts.weights), pl_g = gb(parts.per_lane),
+                            fx_g = gb(parts.fixed), fl_g = gb(parts.floor)));
+                        crate::metrics::set_exl3_ctx_clamped(max_seq_len, ctx);
+                        max_seq_len = ctx;
+                        max_pos = ctx + headroom;
+                        width = 1;
                     }
                 }
             }
@@ -6532,6 +7475,25 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
     } else {
         "[exl3-serve] kv spill: off (the default; --kv-spill auto or a directory turns it on)".to_string()
     });
+    // PFXPOOL: --prefix-pool-gb N (Spmd: identical on every rank) — prompt states kept in device memory across lanes;
+    // --prefix-pool-floor-gb F: the MemAvailable every rank keeps (a capture that would go below it evicts, then is
+    // dropped). Off with --prefix-cache off (no snapshots to keep) or N = 0.
+    let pool_gb = crate::opts::ranged(crate::opt!("prefix-pool-gb")).map_err(|e| anyhow::anyhow!("{e}"))? as u64;
+    let pool_floor_gb = crate::opts::ranged(crate::opt!("prefix-pool-floor-gb")).map_err(|e| anyhow::anyhow!("{e}"))? as u64;
+    let pool_on = prefix_on && model.prefix_snapshots() && pool_gb > 0;
+    let pool = crate::prefix_pool::Pool::<PoolBuf>::new(if pool_on { pool_gb << 30 } else { 0 });
+    let pool_floor = pool_floor_gb << 30;
+    crate::metrics::pfx_pool_state(pool.cap_bytes(), 0, 0);
+    crate::rprintln!("{}", if pool_on {
+        let free = crate::memwatch::mem_available_bytes().map_or("?".to_string(), |b| format!("{:.1}", b as f64 / (1u64 << 30) as f64));
+        let per_k = model.pool_entry_bytes(1024).map(|b| b as f64 / (1u64 << 20) as f64).unwrap_or(0.0);
+        format!("[exl3-serve] prefix pool: on, up to {pool_gb} GiB of prompt states shared by all lanes (keeps {pool_floor_gb} GiB \
+                 free; {free} GiB free now; ~{per_k:.0} MiB per 1K-token prompt on this rank; text-only; --prefix-pool-gb 0 = off)")
+    } else if !prefix_on {
+        "[exl3-serve] prefix pool: off (--prefix-cache off)".to_string()
+    } else {
+        "[exl3-serve] prefix pool: off (--prefix-pool-gb 0)".to_string()
+    });
     let sched = Exl3Scheduler {
         model: model.clone(), sc, width,
         lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, interleave, psc: Some(psc0),
@@ -6541,6 +7503,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         reprobe_on, reprobe_cfg,
         reserve: reserve_cfg, reserve_st: crate::lane_reserve::State::new(), rel: (0..width).map(|_| None).collect(),
         spill: spill_store, spill_pol, spill_rank: tp_rank.map(|r| r as usize).unwrap_or(0),
+        pool, pool_floor, pool_spare: Vec::new(), slot_segs: Vec::new(), row_gen: 0, pool_emerg_at: None,
         shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, spec_win_tok: [0.0; 2], spec_win_ms: [0.0; 2], spec_win_n: [0; 2], spec_win_acc: [0; 2], spec_arm_rate: [0.0; 2], spec_arm_n: [0; 2], spec_arm_fold: [0; 2], spec_probe: None, spec_probe_ctr: 0, spec_est_pick: None, spec_margin: 0.0, spec_margin_n: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
         prefix_on, cache: (0..width).map(|_| None).collect(),
         wp16, wp16_xcheck,
@@ -6631,6 +7594,12 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         // exl3 snapshots at the prompt end: no ckpt_at render needed — except C1 tail checkpoints,
         // which take one at the message boundary (ckpt_at) of every prompt
         prefix_cache: prefix_on && tail_ckpt_boot,
+        // the EXL3 scheduler arms a schema after the think-close token (schema_feed)
+        schema_defer: true,
+        // PR #30 / #31 ports: logprobs at TP=1 and (owner 2026-11-02) TP=2 / 4 (the full-rows tail is the row
+        // gather); the vocabulary mask at TP=1 only (the TP head serves it unconstrained, said once, counted)
+        logprobs_ok: tp_rank.is_none() || matches!(tp_world, 2 | 4),
+        schema_ok: tp_rank.is_none(),
         vision_tower,
         vision_gpu,
         vision_cpu: false,
@@ -6728,6 +7697,9 @@ fn serve_http(parts: ServeParts, tp_ctl: Option<Vec<std::net::TcpStream>>) -> Re
     let model_name = state.model_name.clone();
     // v0.7.3 ("tel"): the ONE sender task rides THIS runtime (serve_http is head/TP=1 only).
     let otel_sink = state.otel.clone();
+    // THINKBUDGET1: parse --reasoning-config now, so a value that does not parse is reported at boot
+    // (with its fallback) rather than at the first budgeted request.
+    let _ = crate::think_budget::reasoning_cfg();
     // HOST / RO-7: pin THIS thread (it runs the HTTP runtime below) to the big cores BEFORE the
     // scheduler thread is spawned — a new thread inherits its creator's mask (Linux), and so do
     // the threads either of them spawns later (prefill PLE workers, tokio's blocking pool).
@@ -6857,6 +7829,8 @@ fn wp24_gate_arm(sched: &mut Exl3Scheduler, arm: GateArm, prompt: &[u32], t: f32
                 image_embeds: None,
                 image_spans: Vec::new(),
                 schema: None,
+                thinking_budget: None,
+                logprobs: None,
             });
             if let Some(f) = sched.fatal.as_ref() { anyhow::bail!("WP24 gate: engine fatal at admit: {f}"); }
             rxs.push((rx, bl));
@@ -6880,6 +7854,7 @@ fn wp24_gate_arm(sched: &mut Exl3Scheduler, arm: GateArm, prompt: &[u32], t: f32
                     // #8.2: admission telemetry — no action for a gate drain.
                     TokEvent::Admitted { .. } => {}
                     TokEvent::StopInfo { .. } => {}
+                    TokEvent::Logprob { .. } => {} // not requested by this drain
                 }
             }
             anyhow::ensure!(reason.as_deref() == Some("length") && toks.len() == positions,
@@ -6932,7 +7907,7 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
     // from --kv-cache / [kv-cache] / the default, graphs precaptured like the server boot
     crate::opts::set(crate::opt!("exl3-prefix"), "1");
     if let Some(v) = arg(args, "--kv-cache") {
-        anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8"), "--kv-cache must be f32, f16, fp8 or q8");
+        let v = exl3_kv_cache_value(v)?;   // TPSHIP: bf16 -> f16 with one line (no refusal)
         crate::opts::set(crate::opt!("kv-cache"), v);
     }
     if let Some(off) = crate::exl3_forward::mtp_off_by_opt() {
@@ -6968,6 +7943,7 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
     };
     let mut sched = Exl3Scheduler {
         spill: None, spill_pol: crate::kv_spill::Policy::new(0), spill_rank: 0,
+        pool: crate::prefix_pool::Pool::new(0), pool_floor: 0, pool_spare: Vec::new(), slot_segs: Vec::new(), row_gen: 0, pool_emerg_at: None,
         model: model.clone(), sc, width,
         lanes: (0..width).map(|_| None).collect(), eos, chunk, interleave: 0, psc: Some(psc0),
         df2: None, df2_k: crate::dflash2::block() - 1, // run_spec probe path: no DF2 artifact
@@ -7185,7 +8161,7 @@ mod wp23_tests {
     #[test]
     fn depth_buckets_cover_the_window() {
         let b: Vec<usize> = (0..crate::exl3_forward::MTP_MAX_K).map(wp23_depth_bucket).collect();
-        assert_eq!(b, vec![0, 1, 1, 2, 2, 3, 3]);
+        assert_eq!(b, vec![0, 1, 1, 2, 2, 3, 3, 3, 3, 3]); // MTP26/DEPTH: k window 7 -> 10 (buckets unchanged, coarse bins)
         assert!(b.iter().all(|&x| x < WP23_DEPTH_BUCKETS));
     }
 }
@@ -7302,7 +8278,7 @@ fn spec_arm(sched: &mut Exl3Scheduler, arm: SpecArm, prompt: &[u32], gen: usize)
         rep_penalty: 1.0, presence_penalty: 0.0, frequency_penalty: 0.0, min_p: 0.0, min_new: 0,
         ignore_eos: false, tx, seed: Some(0x7C0D_E5EE_D000_0001), ckpt_at: None,
         domain: crate::batch::Domain::General, received_at: std::time::Instant::now(),
-        image_embeds: None, image_spans: Vec::new(), schema: None,
+        image_embeds: None, image_spans: Vec::new(), schema: None, thinking_budget: None, logprobs: None,
     });
     if let Some(f) = sched.fatal.as_ref() { anyhow::bail!("spec: engine fatal at admit: {f}"); }
     if arm == SpecArm::Plain {
@@ -7324,6 +8300,7 @@ fn spec_arm(sched: &mut Exl3Scheduler, arm: SpecArm, prompt: &[u32], gen: usize)
             // #8.2: admission telemetry — no action for a spec gate drain.
             TokEvent::Admitted { .. } => {}
             TokEvent::StopInfo { .. } => {}
+            TokEvent::Logprob { .. } => {} // not requested by this drain
         }
     }
     anyhow::ensure!(!reason.starts_with("error"), "spec: {} request failed: {reason}", arm.name());
@@ -7430,6 +8407,7 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
     };
     let mut sched = Exl3Scheduler {
         spill: None, spill_pol: crate::kv_spill::Policy::new(0), spill_rank: 0,
+        pool: crate::prefix_pool::Pool::new(0), pool_floor: 0, pool_spare: Vec::new(), slot_segs: Vec::new(), row_gen: 0, pool_emerg_at: None,
         model: model.clone(), sc, width,
         lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, interleave: 0, psc: Some(psc0),
         df2: None, df2_k: crate::dflash2::block() - 1, // this path loads no DF2 artifact
@@ -7965,6 +8943,27 @@ mod fit_tests {
     /// exactly like a plain boot that only fits on SSD. None is reserved for "not even one lane
     /// can serve" — the one refusal CF-P1d keeps — and a forced `--ple-ram ram` is honoured
     /// (the explicit user demand), not silently downgraded to SSD.
+    #[test]
+    fn fit_max_ctx_picks_the_longest_context_one_lane_fits() {
+        use super::{fit_max_ctx, fit_plan, FitParts};
+        const G: u64 = 1_000_000_000;
+        // per-lane KV linear in max_pos: 5.61 GB at 262,145 (the issue-#26 4bpw pack at TP = 1, .11, 2026-11-07)
+        let parts_at = |mp: usize| Some(FitParts { weights: 69_900_000_000, table: 39 * G,
+            per_lane: (5_610_000_000f64 * mp as f64 / 262_145.0) as u64, fixed: 19_300_000_000, floor: 20 * G });
+        let avail = 111_200_000_000;
+        let ctx = fit_max_ctx(262_144, 1, avail, "auto", &parts_at).expect("a shorter context fits");
+        assert_eq!(ctx % 1024, 0);
+        assert!(fit_plan(parts_at(ctx + 1).unwrap(), 1, avail, "auto", ctx + 1).is_ok(), "the clamp fits");
+        assert!(fit_plan(parts_at(ctx + 1024 + 1).unwrap(), 1, avail, "auto", ctx + 1024 + 1).is_err(), "1,024 more does not");
+        assert!((80_000..110_000).contains(&ctx), "{ctx}");
+        // everything fits: the largest candidate below the ask
+        assert_eq!(fit_max_ctx(262_144, 1, 400 * G, "auto", &parts_at), Some(261_120));
+        // weights alone overflow: no context fits (the refusal stays)
+        assert_eq!(fit_max_ctx(262_144, 1, 100 * G, "auto", &parts_at), None);
+        // a tiny ask: nothing below 4,096 is offered
+        assert_eq!(fit_max_ctx(4096, 1, 400 * G, "auto", &parts_at), None);
+    }
+
     #[test]
     fn fit_max_lanes_picks_the_largest_lane_count_that_boots() {
         use super::fit_max_lanes;
@@ -8670,7 +9669,24 @@ mod stop_info_tests {
             assert!(line.contains("reason == \"stop\""), "a call not guarded by the stop reason: `{}`", line.trim());
         }
         let rb = format!(".logits_{}(", "row");
-        assert_eq!(src.matches(rb.as_str()).count(), 1, "one readback site in the scheduler (send_stop_info)");
+        assert_eq!(src.matches(rb.as_str()).count(), 2, "two readback sites in the scheduler (send_stop_info, send_logprob)");
+        // send_logprob runs only for a request that asked for log probabilities, and never under TP
+        let lp = format!("self.send_{}(", "logprob");
+        assert_eq!(src.matches(lp.as_str()).count(), 3, "the plain step, the prefill's first token, a forced token of a speculative round");
+        for (i, _) in src.match_indices(lp.as_str()) {
+            let before = &src[src[..i].rfind("\n        ").unwrap_or(0)..i];
+            let ctx = &src[i.saturating_sub(400)..i];
+            assert!(ctx.contains("logprobs") && ctx.contains("self.lp_reader()"),
+                    "a send_logprob call not gated on the request's logprobs and the reading rank: `{}`", before.trim());
+        }
+        // logprobs with speculation: ONE batched readback per round, only for a lane that asked for them, only at TP=1
+        let rbs = format!(".logits_{}(", "rows");
+        assert_eq!(src.matches(rbs.as_str()).count(), 1, "one batched readback site (round_logprobs)");
+        let rl = format!("self.round_{}(", "logprobs");
+        assert_eq!(src.matches(rl.as_str()).count(), 1, "round_emit calls round_logprobs once per round");
+        let i = src.find(rl.as_str()).unwrap();
+        let ctx = &src[i.saturating_sub(300)..i];
+        assert!(ctx.contains("l.logprobs") && ctx.contains("self.lp_reader()"), "round_logprobs gated on the lane's logprobs and the reading rank");
         let f = &src[src.find(format!("fn send_{}(&self", "stop_info").as_str()).expect("send_stop_info")..];
         assert!(f.find("if self.tp.is_some() { return; }").unwrap() < f.find(rb.as_str()).unwrap(), "no readback under TP");
     }
@@ -8870,7 +9886,7 @@ mod lane_pack_wiring_tests {
         let sp = &sp[..sp.find("\n    }\n").unwrap()];
         assert!(sp.contains("kd.min(crate::lane_pack::PACK_DEPTH_MAX)"));
         // PACK4-REVIEW B4: step_pair drafts at the round's CLAMPED depth (round_depth's regime-clamped value), never at mtp_k
-        assert!(sp.contains("let (_, kd) = self.round_depth(l.pos, l.max_new.saturating_sub(l.generated));"));
+        assert!(sp.contains("let (_, kd) = self.round_depth(l.pos, l.max_new.saturating_sub(l.generated), l.think_room());"));
         assert!(!sp.contains("self.mtp_k.min("), "the pair round must not recompute a depth of its own");
     }
 
@@ -9864,9 +10880,9 @@ mod df2_gate_tests {
     fn df2_boot_lines_are_verbatim() {
         let sha = "0123456789abcdef".repeat(4);
         assert_eq!(df2_boot_line_engaged("/d", &sha, 8, false, 1),
-                   format!("[exl3-serve] df2: ENGAGED draft=/d sha256={sha} block=8 round-shard=off (DFlash2 chain on EXL3, TP=1; chain verify k<=7 = the pack MTP wide-verify width)"));
+                   format!("[exl3-serve] df2: ENGAGED draft=/d sha256={sha} block=8 round-shard=off (DFlash2 chain on EXL3, TP=1; chain verify k<=10 = the pack MTP wide-verify width)"));
         assert_eq!(df2_boot_line_engaged("/d2", &sha, 16, true, 2),
-                   format!("[exl3-serve] df2: ENGAGED draft=/d2 sha256={sha} block=16 round-shard=on (DFlash2 chain on EXL3, TP=2; chain verify k<=7 = the pack MTP wide-verify width)"));
+                   format!("[exl3-serve] df2: ENGAGED draft=/d2 sha256={sha} block=16 round-shard=on (DFlash2 chain on EXL3, TP=2; chain verify k<=10 = the pack MTP wide-verify width)"));
         assert_eq!(df2_boot_line_fallback("source"),
                    "[exl3-serve] df2: FALLBACK to pack MTP (source)");
         assert_eq!(df2_boot_line_fallback("no --draft-dir"),
@@ -9943,5 +10959,69 @@ mod review_p0_pins {
                 "the fixed chain no longer stages the slot only for a sparse last pass");
         assert!(!s.contains(&["if self.qsa_live(p + kmax - 1) {\n            if stage {\n                let st = sc.wp05", ""].concat()),
                 "the adaptive chain no longer stages the slot only for a sparse last pass");
+    }
+}
+
+#[cfg(test)]
+mod token_logprobs_tests {
+    use super::token_logprobs;
+
+    fn row(xs: &[f32]) -> Vec<u16> { xs.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect() }
+
+    #[test]
+    fn log_softmax_and_top_n() {
+        let r = row(&[1.0, 3.0, 2.0, 3.0, f32::NEG_INFINITY]);
+        let lse = (1f64.exp() + 3f64.exp() + 2f64.exp() + 3f64.exp()).ln();
+        let (lp, top) = token_logprobs(&r, 2, 3).unwrap();
+        assert!((lp as f64 - (2.0 - lse)).abs() < 1e-5);
+        // logit descending, ties by id ascending
+        assert_eq!(top.iter().map(|t| t.0).collect::<Vec<_>>(), vec![1, 3, 2]);
+        assert!((top[0].1 as f64 - (3.0 - lse)).abs() < 1e-5);
+        let p: f64 = (0..4).map(|i| (token_logprobs(&r, i, 0).unwrap().0 as f64).exp()).sum();
+        assert!((p - 1.0).abs() < 1e-5, "probabilities sum to 1 over the finite logits");
+    }
+
+    /// host cost per token at the model's vocabulary size (run with --ignored --nocapture)
+    #[test]
+    #[ignore]
+    fn host_cost_full_vocab() {
+        let v = 248_320usize;
+        let r: Vec<u16> = (0..v).map(|i| half::f16::from_f32(((i * 7919) % 2003) as f32 / 97.0 - 10.0).to_bits()).collect();
+        let t = std::time::Instant::now();
+        for i in 0..100 { std::hint::black_box(token_logprobs(&r, i as u32, 20)); }
+        eprintln!("token_logprobs (248K vocab, top 20): {:.3} ms per call", t.elapsed().as_secs_f64() * 10.0);
+    }
+
+    #[test]
+    fn masked_tokens_are_never_listed() {
+        let r = row(&[f32::NEG_INFINITY, 0.5, f32::NEG_INFINITY]);
+        let (lp, top) = token_logprobs(&r, 1, 20).unwrap();
+        assert_eq!(lp, 0.0);
+        assert_eq!(top, vec![(1, 0.0)]);
+        assert!(token_logprobs(&r, 0, 1).is_none(), "a masked token was not emitted by a sampler");
+        assert!(token_logprobs(&r, 9, 1).is_none(), "out of the row");
+        assert!(token_logprobs(&row(&[f32::NAN, f32::NAN]), 0, 1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tpship_kv_tests {
+    /// TPSHIP: bf16 (no EXL3 store) is served as f16; the four real formats pass through; anything else is refused.
+    #[test]
+    fn bf16_kv_falls_back_to_f16_and_the_rest_is_unchanged() {
+        assert_eq!(super::exl3_kv_cache_value("bf16").unwrap(), "f16");
+        for v in ["f32", "f16", "fp8", "q8"] { assert_eq!(super::exl3_kv_cache_value(v).unwrap(), v); }
+        assert!(super::exl3_kv_cache_value("int4").is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod tp_preflight_tests {
+    #[test]
+    fn tp_pack_width_preflight_refusal_names_the_ship() {
+        let e = super::tp_pack_width_preflight("/nonexistent-pack-dir").unwrap_err().to_string();
+        assert!(e.contains("pack width preflight (before the node sync; nothing was shipped)"),
+            "{e}");
     }
 }

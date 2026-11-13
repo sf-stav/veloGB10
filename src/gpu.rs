@@ -2340,8 +2340,10 @@ mod geom_pack_tests {
 
 impl GpuModel {
     /// Synchronize the inference stream (blocks until all GPU work on our stream completes).
+    /// CPUIDLE: the wait follows --gpu-wait (crate::host_wait); each call site keeps its own prediction.
+    #[track_caller]
     pub fn sync_stream(&self) {
-        unsafe { cudarc::driver::result::stream::synchronize(self.stream.stream) }.unwrap();
+        crate::host_wait::stream_wait(self.stream.stream).unwrap();
     }
 
     /// S4F: install the DFlash2 tap-capture sink on a model loaded WITHOUT `--df2-capture`
@@ -3164,9 +3166,17 @@ impl GpuModel {
                 crate::ple::PleTableMeta::load(std::path::Path::new(model_dir))
                     .map(|m| m.total_rows * m.record_bytes).unwrap_or(0)
             } else { 0 };
+            // Single node, MEASURED accounting (owner 2026-11-07, "how can an NVFP4 pack of the 122B not fit in
+            // ~115 GB?"): the streaming raw transient is ~1 read-ahead shard plus its parts (posix_fadvise DONTNEED
+            // drops each shard after its parts drain — the same J9 measurement the TP branch below uses), NOT q4/3 of
+            // the whole model, and MemAvailable already excludes the OS and every other process, so one 8 GB margin
+            // is the buffer. The old `q4/3 + 16 GB + 8 GB` refused the 122B NVFP4 at 117.8 + 8 > 124.3 GB available
+            // while the forced load ran at ~106 GB used / 19.3 GB free on .12 (TP=1, the runner's 2026-11-07 case).
+            let nshards1 = safetensors_files.len().max(1);
+            let raw_transient1 = 2 * (q4_bytes / nshards1).max(2 << 30);
             let mut est = fp4_resident + q8_bytes + bf16_bytes + kv_bytes + (4 << 30)
-                + q4_bytes / 3 + (16 << 30) + ple_resident;
-            let mut extra = 8 << 30;   // safety buffer beyond the margin
+                + raw_transient1 + (8 << 30) + ple_resident;
+            let mut extra = 0;   // the 8 GB margin above is the buffer
             if cfg.is_q4() && sal.is_none() {
                 // qwen4_exp, MEASURED accounting (2026-08-28): the load-time transient is the
                 // largest raw shard (read whole) + a copy of its parts + the pipeline cap + the
@@ -4247,6 +4257,11 @@ impl GpuModel {
                     jq.1.notify_all();
                 });
                 let shard_result: anyhow::Result<()> = (|| -> anyhow::Result<()> {
+        // BASICS (owner 2026-11-02): the shard read as a percentage of the pack's bytes, at the normal level
+        let shard_bytes: Vec<u64> = safetensors_files.iter()
+            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).collect();
+        let load_prog = crate::boot_report::Progress::new("loading weights", shard_bytes.iter().sum(),
+                                                          crate::boot_report::Unit::Bytes);
         for (i, sf_path) in safetensors_files.iter().enumerate() {
             let t_iter0 = std::time::Instant::now();
             if safetensors_files.len() > 1 {
@@ -4528,7 +4543,9 @@ impl GpuModel {
             // STREAMING LOAD: drain this shard's ready groups while the next shard is read.
             push_ready_jobs(&recorded, &mut pushed, &host_q4, &host_q8, &gpu_q4_sharded,
                             &job_q, sal, &cfg, world.max(1) as usize, PIPE_CAP_BYTES, &presliced);
+            load_prog.add(shard_bytes[i]);
         }
+        load_prog.finish();
                     Ok(())
                 })();
                 if let Err(e) = shard_result {
@@ -4919,7 +4936,7 @@ impl GpuModel {
             "write_kv_b","compact_kv_b","sigmoid_gate_b","split_qgate_b",
             "gather_rope_b","embed_gather_b","argmax_b","gemm_binv_argmax_b","argmax_part_b",
             "conv1d_prefill","conv1d_prefill_state","delta_step_prefill","gdn_chunk_prefill_b","gdn_prep_b","attn_softmax_tile","attn_finalize","attn_tile_init","attn_prefill_fa_b","attn_prefill_fa_sc_b","write_kv_prefill","gqa_attn_prefill",
-            "rep_penalty_b","rep_penalty_f32_b","logit_mask_b","logit_mask_f32_b","gqa_attn_splitk","gqa_attn_reduce","sample_b","sample_f32_b","concat_b",
+            "rep_penalty_b","rep_penalty_f32_b","pen_apply_b","pen_apply_f32_b","pen_count_add_b","pen_slot_reset_b","pen_prompt_set_b","logit_mask_b","logit_mask_f32_b","gqa_attn_splitk","gqa_attn_reduce","sample_b","sample_f32_b","concat_b",
             "gemm_binv_b","gemm_binv_f32_b","sample_prob_b","spec_verify_b","spec_verify_f32_b","spec_verify_realq_b","df2_topk20_dump_b","nll_b","argmax_f32_b","verify_chain_params_b",
             "gemm_mma_fp4_b","gemm_mma_fp8_b","gemm_mma_fp8_blk_b","fp8_repack_e_b","fp8_blk_scales_b","fp8_pack_b","fp8_quant_pack_b","gemm_fp8_prefill_e_b","gemm_mma_fp4_splitk_b","gemm_mma_splitk_reduce_b","gemm_dsv4_fp8_bsb","dequant_fp4_tiled_b","dequant_fp8_tiled_b","dequant_fp8_blk_tiled_b",
             "embed_gather_fp4_tiled_b","embed_gather_fp8_tiled_b","bw_read_b",
@@ -11042,6 +11059,72 @@ impl GpuModel {
 
     // ===================== OPTIMIZED DECODE (pre-computed everything) =====================
 
+    // ===================== LOOPFIX: whole-output penalty state =====================
+
+    /// Decode-row penalties (vLLM semantics) over `batch` lanes: row k uses slot `slot_ids_dev[k]`'s
+    /// committed output + prompt; no extra tokens. The per-row VALUES (rep_pen/presence/frequency_dev)
+    /// are neutral for a lane without a penalty, and the kernel returns at once for a neutral row.
+    pub fn pen_apply_decode(&self, bufs: &DecodeBuffers, logits: u64, f32_logits: bool, batch: usize) {
+        let v = self.cfg.vocab_size;
+        let name = if f32_logits { "pen_apply_f32_b" } else { "pen_apply_b" };
+        blaunch!(self, name, (batch as u32,1,1), (256,1,1), 0,
+            (logits, *bufs.slot_ids_dev.device_ptr() as u64, 0u64, 0i32,
+             *bufs.pen_cnt_dev.device_ptr() as u64, *bufs.pen_pbits_dev.device_ptr() as u64,
+             *bufs.rep_pen_dev.device_ptr() as u64, *bufs.presence_dev.device_ptr() as u64,
+             *bufs.frequency_dev.device_ptr() as u64, v as i32, pen_words_for(v) as i32, batch as i32));
+    }
+
+    /// Verify-column penalties (vLLM semantics): column c uses `p.slots[c]`'s committed output +
+    /// prompt plus its `PEN_EXTRA` extra tokens (the drafts before it). Same per-token formula as
+    /// the decode rows, so a verify column and a plain decode step at the same point penalize
+    /// identically (spec on/off byte identity for greedy penalized requests).
+    pub fn pen_apply_verify(&self, p: &VerifyPenalty, logits: u64, f32_logits: bool, n: usize) {
+        let v = self.cfg.vocab_size;
+        let name = if f32_logits { "pen_apply_f32_b" } else { "pen_apply_b" };
+        blaunch!(self, name, (n as u32,1,1), (256,1,1), 0,
+            (logits, p.slots_ptr, p.extra_ptr, PEN_EXTRA as i32, p.cnt_ptr, p.pbits_ptr,
+             p.rep_pen_ptr, p.presence_ptr, p.freq_ptr, v as i32, pen_words_for(v) as i32, n as i32));
+    }
+
+    /// A lane takes over `slot`: zero its output counts; mark its prompt tokens when the lane's
+    /// repetition penalty is active (`prompt` empty = leave the bitset clear).
+    pub fn pen_slot_init(&self, bufs: &mut DecodeBuffers, slot: usize, prompt: &[u32]) {
+        assert!(slot < bufs.pen_slots, "pen_slot_init: slot {slot} >= {}", bufs.pen_slots);
+        let v = self.cfg.vocab_size;
+        let w = pen_words_for(v);
+        let blocks = ((v.max(w) + 255) / 256).min(1024) as u32;
+        blaunch!(self, "pen_slot_reset_b", (blocks,1,1), (256,1,1), 0,
+            (*bufs.pen_cnt_dev.device_ptr() as u64, *bufs.pen_pbits_dev.device_ptr() as u64,
+             slot as i32, v as i32, w as i32));
+        if !prompt.is_empty() {
+            let toks: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+            let dev_toks = self.dev.htod_sync_copy(&toks).unwrap();
+            blaunch!(self, "pen_prompt_set_b", (((toks.len() + 255) / 256) as u32,1,1), (256,1,1), 0,
+                (*bufs.pen_pbits_dev.device_ptr() as u64, slot as i32, *dev_toks.device_ptr() as u64,
+                 toks.len() as i32, v as i32, w as i32));
+            // dev_toks is read by the kernel above: keep it alive until the stream passes it.
+            self.sync_stream();
+            drop(dev_toks);
+        }
+    }
+
+    /// Count newly committed output tokens: `(slot, token)` pairs into pen_cnt_dev.
+    pub fn pen_count_add(&self, bufs: &mut DecodeBuffers, pairs: &[(i32, i32)]) {
+        let v = self.cfg.vocab_size;
+        for chunk in pairs.chunks(PEN_ADD_CAP) {
+            let slots: Vec<i32> = chunk.iter().map(|p| p.0).collect();
+            let toks: Vec<i32> = chunk.iter().map(|p| p.1).collect();
+            // Host-blocking NULL-stream copies order before the kernel on the blocking compute
+            // stream (invariant I1); the staging buffers are reused only after this launch.
+            self.dev.htod_sync_copy_into(&slots, &mut bufs.pen_add_slots_dev.slice_mut(0..chunk.len())).unwrap();
+            self.dev.htod_sync_copy_into(&toks, &mut bufs.pen_add_toks_dev.slice_mut(0..chunk.len())).unwrap();
+            blaunch!(self, "pen_count_add_b", (((chunk.len() + 255) / 256) as u32,1,1), (256,1,1), 0,
+                (*bufs.pen_cnt_dev.device_ptr() as u64, *bufs.pen_add_slots_dev.device_ptr() as u64,
+                 *bufs.pen_add_toks_dev.device_ptr() as u64, chunk.len() as i32, v as i32));
+            if chunk.len() == PEN_ADD_CAP { self.sync_stream(); } // the next chunk reuses the staging
+        }
+    }
+
     pub fn new_decode_buffers(&self, max_batch: usize) -> DecodeBuffers {
         let rdim = self.cfg.rotary_dim;
         DecodeBuffers {
@@ -11051,18 +11134,19 @@ impl GpuModel {
             cos_dev: self.dev.alloc_zeros::<f32>(max_batch * rdim).unwrap(),
             sin_dev: self.dev.alloc_zeros::<f32>(max_batch * rdim).unwrap(),
             token_ids_dev: self.dev.alloc_zeros::<i32>(max_batch).unwrap(),
-            penalty_tokens_dev: self.dev.htod_sync_copy(&vec![-1i32; MAX_PEN_TOKENS * max_batch]).unwrap(),
-            penalty_counts_dev: self.dev.htod_sync_copy(&vec![0i16; MAX_PEN_TOKENS * max_batch]).unwrap(),
+            // LOOPFIX: whole-output penalty state, htod zero-initialized (invariant 2).
+            pen_cnt_dev: self.dev.htod_sync_copy(&vec![0u32; max_batch * self.cfg.vocab_size]).unwrap(),
+            pen_pbits_dev: self.dev.htod_sync_copy(&vec![0u32; max_batch * pen_words_for(self.cfg.vocab_size)]).unwrap(),
+            pen_add_slots_dev: self.dev.htod_sync_copy(&vec![-1i32; PEN_ADD_CAP]).unwrap(),
+            pen_add_toks_dev: self.dev.htod_sync_copy(&vec![-1i32; PEN_ADD_CAP]).unwrap(),
+            pen_slots: max_batch,
             temps_dev: self.dev.htod_sync_copy(&vec![1.0f32; max_batch]).unwrap(),
             topk_dev: self.dev.htod_sync_copy(&vec![1i32; max_batch]).unwrap(),
             topp_dev: self.dev.htod_sync_copy(&vec![1.0f32; max_batch]).unwrap(),
             seeds_dev: self.dev.htod_sync_copy(&vec![0u32; max_batch]).unwrap(),
             rep_pen_dev: self.dev.htod_sync_copy(&vec![1.0f32; max_batch]).unwrap(),
-            // Resident-loop buffers: htod-initialized (-1 ring, 0 state, 0 keys). alloc_zeros
-            // does NOT zero (AGENTS.md invariant 2) and the graph head's ids_advance/ring kernels
-            // read these before any dirty upload on the first step.
-            pen_ring_dev: self.dev.htod_sync_copy(&vec![-1i32; MAX_PEN_TOKENS * max_batch]).unwrap(),
-            pen_ring_state_dev: self.dev.htod_sync_copy(&vec![0i32; max_batch]).unwrap(),
+            // Resident-loop keys: htod-initialized (0). alloc_zeros does NOT zero (AGENTS.md
+            // invariant 2) and the graph head reads these before any dirty upload on the first step.
             seeds_key_dev: self.dev.htod_sync_copy(&vec![0u64; max_batch]).unwrap(),
             presence_dev: self.dev.htod_sync_copy(&vec![0.0f32; max_batch]).unwrap(),
             frequency_dev: self.dev.htod_sync_copy(&vec![0.0f32; max_batch]).unwrap(),
@@ -11204,17 +11288,11 @@ impl GpuModel {
              *bufs.pos_dev.device_ptr() as u64, batch as i32));
         // 2. embed .. logits (TP all-reduces inside; unchanged).
         let logits = self.forward_decode_logits(pool, bufs, state, kv_stride, max_pc, batch);
-        // 3. penalty window rebuild from the device ring (byte-identical to the host rebuild).
-        blaunch!(self, "penalty_window_b", (batch as u32,1,1), (MAX_PEN_TOKENS as u32,1,1), 0,
-            (*bufs.pen_ring_dev.device_ptr() as u64, *bufs.pen_ring_state_dev.device_ptr() as u64,
-             *bufs.penalty_tokens_dev.device_ptr() as u64, *bufs.penalty_counts_dev.device_ptr() as u64,
-             MAX_PEN_TOKENS as i32, batch as i32));
-        // 4. penalty application + selection (unchanged kernels).
+        // 3. penalty application + selection. LOOPFIX: the whole-output penalty state
+        //    (pen_cnt_dev) is brought up to date by the host before the step (`pen_count_add`), so
+        //    the resident core no longer rebuilds a window ring nor pushes into one.
         self.forward_decode_select(pool, bufs, logits, batch, sampling);
-        // 5. epilogue: push the selected id into the ring; advance the sample seed keys once.
-        blaunch!(self, "penalty_ring_push_b", (batch as u32,1,1), (1,1,1), 0,
-            (*bufs.pen_ring_dev.device_ptr() as u64, *bufs.pen_ring_state_dev.device_ptr() as u64,
-             *bufs.token_ids_dev.device_ptr() as u64, MAX_PEN_TOKENS as i32, batch as i32));
+        // 4. epilogue: advance the sample seed keys once.
         if sampling {
             blaunch!(self, "seed_advance_b", (1,1,1), (batch as u32,1,1), 0,
                 (*bufs.seeds_dev.device_ptr() as u64, *bufs.seeds_key_dev.device_ptr() as u64,
@@ -11285,13 +11363,7 @@ impl GpuModel {
         let smem = ((2 * 64usize + 2 * nthr as usize) * 4) as u32;
         match logits {
             DecodeLogits::F32(logits) => {
-                blaunch!(self, "rep_penalty_f32_b", (batch as u32,1,1), (256,1,1), 0,
-                    (d(&logits), *bufs.penalty_tokens_dev.device_ptr() as u64,
-                     *bufs.penalty_counts_dev.device_ptr() as u64, MAX_PEN_TOKENS as i32,
-                     *bufs.rep_pen_dev.device_ptr() as u64,
-                     *bufs.presence_dev.device_ptr() as u64,
-                     *bufs.frequency_dev.device_ptr() as u64,
-                     v as i32, batch as i32));
+                self.pen_apply_decode(bufs, d(&logits), true, batch);
                 // W2: JSON-schema mask — applied to the logits column AFTER the penalties and
                 // BEFORE selection, so every downstream reduction sees the same fixed order it
                 // always did (allowed entries stay byte-identical).
@@ -11315,13 +11387,7 @@ impl GpuModel {
                 pool.release(logits, v * batch);
             }
             DecodeLogits::Bf16(logits) => {
-                blaunch!(self, "rep_penalty_b", (batch as u32,1,1), (256,1,1), 0,
-                    (d(&logits), *bufs.penalty_tokens_dev.device_ptr() as u64,
-                     *bufs.penalty_counts_dev.device_ptr() as u64, MAX_PEN_TOKENS as i32,
-                     *bufs.rep_pen_dev.device_ptr() as u64,
-                     *bufs.presence_dev.device_ptr() as u64,
-                     *bufs.frequency_dev.device_ptr() as u64,
-                     v as i32, batch as i32));
+                self.pen_apply_decode(bufs, d(&logits), false, batch);
                 // W2: JSON-schema mask — applied to the logits column AFTER the penalties and
                 // BEFORE selection, so every downstream reduction sees the same fixed order it
                 // always did (allowed entries stay byte-identical).
@@ -11385,13 +11451,7 @@ impl GpuModel {
             // hy_v3: fp32 logits, penalized on-GPU, read to host UNROUNDED (the f32 twin kernels).
             let logits = self.logits_batch_f32(pool, &out, batch);
             pool.release_bf16(out, h * batch);
-            blaunch!(self, "rep_penalty_f32_b", (batch as u32,1,1), (256,1,1), 0,
-                (d(&logits), *bufs.penalty_tokens_dev.device_ptr() as u64,
-                 *bufs.penalty_counts_dev.device_ptr() as u64, MAX_PEN_TOKENS as i32,
-                 *bufs.rep_pen_dev.device_ptr() as u64,
-                 *bufs.presence_dev.device_ptr() as u64,
-                 *bufs.frequency_dev.device_ptr() as u64,
-                 v as i32, batch as i32));
+            self.pen_apply_decode(bufs, d(&logits), true, batch);
             self.sync_stream();
             let lh: Vec<f32> = self.dev.dtoh_sync_copy(&logits).unwrap();
             pool.release(logits, v * batch);
@@ -11401,13 +11461,7 @@ impl GpuModel {
         }
         let logits = self.logits_batch(pool, &out, batch);
         pool.release_bf16(out, h * batch);
-        blaunch!(self, "rep_penalty_b", (batch as u32,1,1), (256,1,1), 0,
-            (d(&logits), *bufs.penalty_tokens_dev.device_ptr() as u64,
-             *bufs.penalty_counts_dev.device_ptr() as u64, MAX_PEN_TOKENS as i32,
-             *bufs.rep_pen_dev.device_ptr() as u64,
-             *bufs.presence_dev.device_ptr() as u64,
-             *bufs.frequency_dev.device_ptr() as u64,
-             v as i32, batch as i32));
+        self.pen_apply_decode(bufs, d(&logits), false, batch);
 
         // Read logits to host and sample per-lane
         self.sync_stream();
@@ -11493,7 +11547,7 @@ impl GpuModel {
                 return None;
             }
         }
-        Some(CudaGraph { exec, stream })
+        Some(CudaGraph { exec, stream, frac_rounds: [0; crate::metrics::EXL3_WIDTH_SLOTS] })
     }
 
     /// Replay a captured decode+sample graph and read back token ids. Caller must htod fresh
@@ -11595,7 +11649,7 @@ impl GpuModel {
             }
         }
 
-        Some(CudaGraph { exec, stream })
+        Some(CudaGraph { exec, stream, frac_rounds: [0; crate::metrics::EXL3_WIDTH_SLOTS] })
     }
 
     /// Replay a captured graph and read back token IDs.
@@ -13258,9 +13312,7 @@ impl GpuModel {
         match logits {
             VerifyLogits::B16(lg) => {
                 if let Some(p) = penalty {
-                    blaunch!(self, "rep_penalty_b", (n as u32,1,1), (256,1,1), 0,
-                        (d(&lg), p.tokens_ptr, p.counts_ptr, MAX_PEN_TOKENS as i32,
-                         p.rep_pen_ptr, p.presence_ptr, p.freq_ptr, vocab as i32, n as i32));
+                    self.pen_apply_verify(&p, d(&lg), false, n);
                 }
                 if let Some((mw, mf)) = self.verify_mask_ptrs() {
                     let gy = ((mask_words_for(vocab) as u32) + 255) / 256;
@@ -13274,9 +13326,7 @@ impl GpuModel {
             }
             VerifyLogits::F32(lg) => {
                 if let Some(p) = penalty {
-                    blaunch!(self, "rep_penalty_f32_b", (n as u32,1,1), (256,1,1), 0,
-                        (d(&lg), p.tokens_ptr, p.counts_ptr, MAX_PEN_TOKENS as i32,
-                         p.rep_pen_ptr, p.presence_ptr, p.freq_ptr, vocab as i32, n as i32));
+                    self.pen_apply_verify(&p, d(&lg), true, n);
                 }
                 if let Some((mw, mf)) = self.verify_mask_ptrs() {
                     let gy = ((mask_words_for(vocab) as u32) + 255) / 256;
@@ -13357,9 +13407,7 @@ impl GpuModel {
         match logits {
             VerifyLogits::B16(lg) => {
                 if let Some(p) = penalty {
-                    blaunch!(self, "rep_penalty_b", (n as u32,1,1), (256,1,1), 0,
-                        (d(&lg), p.tokens_ptr, p.counts_ptr, MAX_PEN_TOKENS as i32,
-                         p.rep_pen_ptr, p.presence_ptr, p.freq_ptr, vocab as i32, n as i32));
+                    self.pen_apply_verify(&p, d(&lg), false, n);
                 }
                 let block = 1024u32;
                 blaunch!(self, "argmax_b", (n as u32,1,1), (block,1,1), (block*8),
@@ -13368,9 +13416,7 @@ impl GpuModel {
             }
             VerifyLogits::F32(lg) => {
                 if let Some(p) = penalty {
-                    blaunch!(self, "rep_penalty_f32_b", (n as u32,1,1), (256,1,1), 0,
-                        (d(&lg), p.tokens_ptr, p.counts_ptr, MAX_PEN_TOKENS as i32,
-                         p.rep_pen_ptr, p.presence_ptr, p.freq_ptr, vocab as i32, n as i32));
+                    self.pen_apply_verify(&p, d(&lg), true, n);
                 }
                 let block = 1024u32;
                 blaunch!(self, "argmax_f32_b", (n as u32,1,1), (block,1,1), (block*8),
@@ -13393,7 +13439,7 @@ impl GpuModel {
             crate::metrics::graph_capture_lost("nvfp4-verify", &format!("verify graph, slot {slot}"), &format!("instantiate {r:?}")); // S-B9-REL-INTEG C1
             return None;
         }
-        Some(CudaGraph { exec, stream })
+        Some(CudaGraph { exec, stream, frac_rounds: [0; crate::metrics::EXL3_WIDTH_SLOTS] })
     }
 
     /// Shared backbone + logits for both greedy and stochastic verify paths. Returns
@@ -14097,12 +14143,8 @@ impl GpuModel {
         // Apply penalty (same as verify_forward).
         if let Some(p) = &penalty {
             match &logits {
-                VerifyLogits::F32(l) => blaunch!(self, "rep_penalty_f32_b", (n as u32,1,1), (256,1,1), 0,
-                    (d(l), p.tokens_ptr, p.counts_ptr, MAX_PEN_TOKENS as i32,
-                     p.rep_pen_ptr, p.presence_ptr, p.freq_ptr, vocab as i32, n as i32)),
-                VerifyLogits::B16(l) => blaunch!(self, "rep_penalty_b", (n as u32,1,1), (256,1,1), 0,
-                    (d(l), p.tokens_ptr, p.counts_ptr, MAX_PEN_TOKENS as i32,
-                     p.rep_pen_ptr, p.presence_ptr, p.freq_ptr, vocab as i32, n as i32)),
+                VerifyLogits::F32(l) => self.pen_apply_verify(p, d(l), true, n),
+                VerifyLogits::B16(l) => self.pen_apply_verify(p, d(l), false, n),
             }
         }
 
@@ -14236,9 +14278,7 @@ impl GpuModel {
         if let Some(p) = &penalty {
             match &logits {
                 VerifyLogits::F32(_) => panic!("verify_forward_sample_rq: the f32 (hy_v3) arm is not wired (Qwen-only path)"),
-                VerifyLogits::B16(l) => blaunch!(self, "rep_penalty_b", (n as u32,1,1), (256,1,1), 0,
-                    (d(l), p.tokens_ptr, p.counts_ptr, MAX_PEN_TOKENS as i32,
-                     p.rep_pen_ptr, p.presence_ptr, p.freq_ptr, vocab as i32, n as i32)),
+                VerifyLogits::B16(l) => self.pen_apply_verify(p, d(l), false, n),
             }
         }
 
@@ -16238,6 +16278,7 @@ impl GpuModel {
     /// makes deep drafts look cheaper than they are at ≥16K — the policy over-reached exactly there.
     pub fn calibrate_mtp_r(&self, pool: &mut Pool, state: &mut BatchGpuState, prompt: &[u32],
                            kv_stride: usize) -> Vec<(usize, Vec<(usize, f32)>)> {
+        let _spin = crate::host_wait::SpinScope::new(); // CPUIDLE: policy timings see the exact (spin) path
         let _ = prompt;   // content is timing-neutral (see time_mtp_phases_at_ctx); arg kept so the
                           // SPMD head/node call shape is unchanged.
         // Determinism hygiene: zero the KV the phases will read. Timing itself is value-independent
@@ -16247,8 +16288,13 @@ impl GpuModel {
             if let Some(k) = state.k_cache[li].as_mut() { self.dev.memset_zeros(k).unwrap(); }
             if let Some(v) = state.v_cache[li].as_mut() { self.dev.memset_zeros(v).unwrap(); }
         }
-        mtp_calib_ctx_points(kv_stride).iter().map(|&ctx| {
+        // BASICS (owner 2026-11-02): one step per context size, as a percentage at the normal level
+        let points = mtp_calib_ctx_points(kv_stride);
+        let prog = crate::boot_report::Progress::new("measuring the speculation cost", points.len() as u64,
+                                                     crate::boot_report::Unit::Items("context sizes"));
+        let out: Vec<(usize, Vec<(usize, f32)>)> = points.iter().map(|&ctx| {
             let rows = self.time_mtp_phases_at_ctx(pool, state, ctx, kv_stride, 3);
+            prog.add(1);
             let get = |k: &str| rows.iter().find(|r| r.0.trim().starts_with(k)).map(|r| r.1).unwrap_or(0.0);
             let decode = get("decode step");
             if decode <= 0.0 { return (ctx, vec![]); }
@@ -16263,7 +16309,9 @@ impl GpuModel {
                 (d, (step / decode) as f32)
             }).collect();
             (ctx, table)
-        }).collect()
+        }).collect();
+        prog.finish();
+        out
     }
 
     /// E11 measurement harness (`--bench-decode-ctx`): per-phase p50 of one decode/MTP step at
@@ -16272,6 +16320,7 @@ impl GpuModel {
     /// row, "decode step (batch=1, baseline)", IS the per-token decode p50 at ctx. Best-of-3
     /// (three full runs, min per phase) — the discipline's interleaved-best-of-N.
     pub fn bench_decode_at_ctx(&self, ctx: usize, kv_stride: usize, runs: usize) -> Vec<(String, f64)> {
+        let _spin = crate::host_wait::SpinScope::new(); // CPUIDLE: policy timings see the exact (spin) path
         let mut pool = Pool::new(self.dev.clone());
         // 0 = the decode/verify lane, 1 = spare, 2 = the MTP snapshot the rollback phase copies
         // from (copy_gdn_slot(s, 2, 0)), then ONE checkpoint slot per verify column: the verify
@@ -16305,6 +16354,7 @@ impl GpuModel {
     /// cheap — measuring at 131072 ctx costs the phases, not a 131072-token prefill.
     fn time_mtp_phases_at_ctx(&self, pool: &mut Pool, state: &mut BatchGpuState, ctx: usize,
                               kv_stride: usize, iters: usize) -> Vec<(String, f64)> {
+        let _spin = crate::host_wait::SpinScope::new(); // CPUIDLE: policy timings see the exact (spin) path
         let h = self.cfg.hidden_size;
         let _nkv = self.cfg.num_kv_heads; let hd = self.cfg.head_dim;
         let mut bufs = self.new_decode_buffers(3);
@@ -21024,8 +21074,6 @@ pub struct DecodeBuffers {
     pub cos_dev: S,
     pub sin_dev: S,
     pub token_ids_dev: cudarc::driver::CudaSlice<i32>,
-    pub penalty_tokens_dev: cudarc::driver::CudaSlice<i32>,
-    pub penalty_counts_dev: cudarc::driver::CudaSlice<i16>,
     pub temps_dev: cudarc::driver::CudaSlice<f32>,
     pub topk_dev: cudarc::driver::CudaSlice<i32>,
     pub topp_dev: cudarc::driver::CudaSlice<f32>,
@@ -21033,12 +21081,19 @@ pub struct DecodeBuffers {
     pub rep_pen_dev: cudarc::driver::CudaSlice<f32>,
     pub presence_dev: cudarc::driver::CudaSlice<f32>,
     pub frequency_dev: cudarc::driver::CudaSlice<f32>,
-    /// Device-resident token-loop state (EXPERT_DEVICE_ARGMAX_LOOP_RESPONSE): the penalty ring
-    /// (last <=64 emitted tokens per lane, MRU at head-1), its packed (head<<8|len) state, and the
-    /// per-lane splitmix64 keys the sample graph's seed_advance_b advances. Uploaded on DIRTY
-    /// steps only (admission/finish/MTP/param change); clean steps keep them device-resident.
-    pub pen_ring_dev: cudarc::driver::CudaSlice<i32>,
-    pub pen_ring_state_dev: cudarc::driver::CudaSlice<i32>,
+    /// LOOPFIX (2026-11-06): whole-output penalty state (vLLM semantics), one row per physical lane
+    /// slot: output-token counts [slots][vocab] u32 and the prompt bitset [slots][pen_words] u32
+    /// (`pen_apply_b`). Replaces the 64-token window list + device ring, which never penalized a
+    /// repeated block longer than the window. `pen_add_*` stage newly committed tokens for
+    /// `pen_count_add_b` (host-driven: `pen_count_add`). Zero-initialized (htod), never alloc_zeros.
+    pub pen_cnt_dev: cudarc::driver::CudaSlice<u32>,
+    pub pen_pbits_dev: cudarc::driver::CudaSlice<u32>,
+    pub pen_add_slots_dev: cudarc::driver::CudaSlice<i32>,
+    pub pen_add_toks_dev: cudarc::driver::CudaSlice<i32>,
+    pub pen_slots: usize,
+    /// Device-resident token-loop state (EXPERT_DEVICE_ARGMAX_LOOP_RESPONSE): the per-lane
+    /// splitmix64 keys the sample graph's seed_advance_b advances. Uploaded on DIRTY steps only
+    /// (admission/finish/MTP/param change); clean steps keep them device-resident.
     pub seeds_key_dev: cudarc::driver::CudaSlice<u64>,
     /// W2 (Phase 13) JSON-schema masks for the DECODE path: per-lane vocabulary bitsets
     /// (`mask_words_dev` = [max_batch][mask_words_for(vocab)] u32 little-endian, bit t = token t
@@ -21050,15 +21105,30 @@ pub struct DecodeBuffers {
     pub mask_any: bool,
 }
 
+/// Draft-side penalty window (DraftPenalty, the MTP head's own sampling heuristic only — the
+/// TARGET's penalties are whole-output since LOOPFIX, see VerifyPenalty / pen_apply_b).
 pub const MAX_PEN_TOKENS: usize = 64;
 
+/// Extra tokens a verify column can add on top of its lane's committed output (its preceding
+/// drafts). Matches PEN_EXTRA_MAX in gpu_batch.cu; a verify is at most MAX_VERIFY columns wide.
+pub const PEN_EXTRA: usize = MAX_VERIFY;
+/// Staging capacity of `pen_count_add` (tokens per launch; larger syncs are chunked).
+pub const PEN_ADD_CAP: usize = 4096;
+
+/// Words of the per-slot prompt bitset for a vocabulary of `v` tokens.
+pub fn pen_words_for(v: usize) -> usize { (v + 31) / 32 }
+
 /// Penalty device-buffer pointers for the MTP verify path (so greedy MTP lanes keep their
-/// repetition/presence/frequency penalty → no repetition). All `n` verify positions share the
-/// lane's committed-history penalty. Passed as `Option` to `verify_forward`.
+/// repetition/presence/frequency penalty → no repetition). LOOPFIX: whole-output state — column c
+/// penalizes with slot `slots[c]`'s committed output + prompt (DecodeBuffers::pen_cnt_dev /
+/// pen_pbits_dev) plus `extra[c][0..PEN_EXTRA)` (its preceding drafts, -1 padded); slot -1 = none.
+/// Passed as `Option` to `verify_forward`.
 #[derive(Clone, Copy)]
 pub struct VerifyPenalty {
-    pub tokens_ptr: u64,    // [n * MAX_PEN_TOKENS] i32, -1 sentinel for unused slots
-    pub counts_ptr: u64,    // [n * MAX_PEN_TOKENS] i16
+    pub slots_ptr: u64,     // [n] i32 (-1 = this column is not penalized)
+    pub extra_ptr: u64,     // [n * PEN_EXTRA] i32, -1 padded
+    pub cnt_ptr: u64,       // DecodeBuffers::pen_cnt_dev
+    pub pbits_ptr: u64,     // DecodeBuffers::pen_pbits_dev
     pub rep_pen_ptr: u64,   // [n] f32
     pub presence_ptr: u64,  // [n] f32
     pub freq_ptr: u64,      // [n] f32
@@ -21251,6 +21321,9 @@ pub struct DraftPenalty {
 pub struct CudaGraph {
     exec: cudarc::driver::sys::CUgraphExec,
     stream: cudarc::driver::sys::CUstream,
+    /// K35: MoE rounds on a fractional expert width (by k2) this graph holds — counted on every
+    /// replay (velogb10_exl3_frac_expert_rounds_total), so the receipt covers graphed serving too.
+    frac_rounds: [u32; crate::metrics::EXL3_WIDTH_SLOTS],
 }
 
 // Safe: the graph handle and stream are only ever used from the single scheduler task.
@@ -21260,8 +21333,11 @@ unsafe impl Sync for CudaGraph {}
 impl CudaGraph {
     /// S5F: wrap a raw instantiated graph + stream (the DFlash2 round's graph capture).
     pub fn from_exec(exec: cudarc::driver::sys::CUgraphExec, stream: cudarc::driver::sys::CUstream) -> Self {
-        CudaGraph { exec, stream }
+        CudaGraph { exec, stream, frac_rounds: [0; crate::metrics::EXL3_WIDTH_SLOTS] }
     }
+
+    /// K35: attach the fractional-expert round tally the capture recorded (metrics::exl3_frac_capture_take).
+    pub fn with_frac_rounds(mut self, n: [u32; crate::metrics::EXL3_WIDTH_SLOTS]) -> Self { self.frac_rounds = n; self }
 
     /// Replay the captured graph on its stream. Does NOT sync — caller must sync before reading results.
     pub fn launch(&self) {
@@ -21270,6 +21346,7 @@ impl CudaGraph {
             let r = sys::cuGraphLaunch(self.exec, self.stream);
             assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "cuGraphLaunch failed");
         }
+        if self.frac_rounds.iter().any(|v| *v > 0) { crate::metrics::exl3_frac_expert_rounds_replayed(&self.frac_rounds); }
     }
 }
 

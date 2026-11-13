@@ -34,8 +34,7 @@ const HDR_WORDS: usize = 8;
 const MAGIC: u32 = 0x5050_0001;
 
 fn rdma_dev() -> String {
-    crate::opts::var(crate::opt!("rdma-dev")).ok().filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "rocep1s0f1".to_string())
+    crate::tp::rdma_dev()   // explicit --rdma-dev, else the auto-detected rail 1 (tp::rdma_devs)
 }
 
 fn link_up(rank: i32, peer_ip: &str) -> anyhow::Result<TpLink> {

@@ -301,7 +301,7 @@ pub struct TpConfig {
     #[serde(default)]
     pub exl3_ep_deal: String,
     /// v23 (CLI-1): the head's resolved option registry — every set, non-node-local option as
-    /// (flag, value) (`opts::snapshot`, filled at ship time in cluster::head_sync_one). The node
+    /// (flag, value) (`opts::snapshot`, filled at ship time in cluster::head_ship). The node
     /// installs exactly this set (`opts::install_head`, every mode, before anything reads an option)
     /// and clears any non-local option of its own the head did not set — "one knob, set on the head,
     /// rides TpConfig" (AGENTS §7). Replaces v18..v22's env snapshot `exl3_env`.
@@ -312,7 +312,8 @@ pub struct TpConfig {
     pub exl3_mode: String,
     /// v25 (B32): the head shipped this node ONLY its rank's shard dir through the blob cache (shard_plan) —
     /// always, for every model the shard plan covers (no switch, owner 2026-10-02); the node loads the assembled
-    /// cache dir, never the head's path. false = a model the plan does not cover (its own existing path).
+    /// cache dir, never the head's path. TPSHIP (2026-11-07): also true for an EXL3 pack the plan does not cover,
+    /// which now ships whole through the same cache. false = a non-EXL3 model (its own existing manifest path).
     #[serde(default)]
     pub ship_shards: bool,
     /// v25 (B32, `--tp-sync-only`): sync, report, exit (head and nodes) — no model load.
@@ -448,7 +449,7 @@ impl TpConfig {
             exl3_vp_sampled: None,
             exl3_seq_parallel: None,
             exl3_mode: String::new(),
-            ship_shards: false, // set by the head per node when it ships shards (cluster::head_sync_one)
+            ship_shards: false, // set by the head per node when it ships shards (cluster::head_ship)
             sync_only: crate::opts::var(crate::opt!("tp-sync-only")).is_ok(),
         }
     }
@@ -528,11 +529,94 @@ pub fn resolve_topology(world: i32) -> Result<Vec<IpAddr>> {
     Ok(ips)
 }
 
+/// Rail 1's RoCE device (see `rdma_devs`).
 pub fn rdma_dev() -> String {
-    crate::opts::var(crate::opt!("rdma-dev")).ok()
-        .and_then(|s| s.split(',').next().map(|x| x.trim().to_string()))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_RDMA_DEV.to_string())
+    rdma_devs()[0].clone()
+}
+
+/// Rail 2's RoCE device (see `rdma_devs`); when only one rail is cabled, the legacy GX10 name (the
+/// dual-rail preflight then names it in its refusal, as before).
+pub fn rdma_dev_rail2() -> String {
+    rdma_devs().get(1).cloned().unwrap_or_else(|| DEFAULT_RDMA_DEV2.to_string())
+}
+
+const DEFAULT_RDMA_DEV2: &str = "roceP2p1s0f1";
+
+/// The RoCE devices this box's TP links use, in rail order (owner 2026-11-09). An explicit
+/// `--rdma-dev d1[,d2]` always wins. Without it, the devices are auto-detected from sysfs: a device
+/// counts when its port 1 is ACTIVE and carries a RoCE v2 IPv4-mapped GID (cabled AND addressed).
+/// The active devices are grouped by PCI function (the `fN` of `rocep1s0fN` / `roceP2p1s0fN`: one
+/// cable pair = the same port on both rails). Exactly one active group -> it is used (the ASUS GX10s
+/// here cable f1, the DGX Sparks f0). More than one -> the operator must pick with `--rdma-dev`
+/// (the box exits at startup naming the candidates). None (sysfs unreadable / nothing cabled) -> the
+/// legacy default names, so the bring-up fails exactly as it always did, with the shim's message.
+/// Resolved once per process; the decision is printed once.
+pub fn rdma_devs() -> &'static Vec<String> {
+    static DEVS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    DEVS.get_or_init(|| {
+        if let Ok(s) = crate::opts::var(crate::opt!("rdma-dev")) {
+            let v: Vec<String> = s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+            if !v.is_empty() {
+                crate::reprintln!("[tp] RDMA devices {} (explicit --rdma-dev)", v.join(","));
+                return v;
+            }
+        }
+        match detect_rdma_rails(std::path::Path::new("/sys/class/infiniband")) {
+            RailPick::One(v) => {
+                crate::reprintln!("[tp] RDMA devices {} (auto-detected: the only active RoCE port pair on this box)", v.join(","));
+                v
+            }
+            RailPick::None(why) => {
+                crate::reprintln!("[tp] RDMA devices {DEFAULT_RDMA_DEV},{DEFAULT_RDMA_DEV2} (default names: {why}; \
+                           pass --rdma-dev <d1[,d2]> if this box uses other ports)");
+                vec![DEFAULT_RDMA_DEV.to_string(), DEFAULT_RDMA_DEV2.to_string()]
+            }
+            RailPick::Ambiguous(groups) => {
+                eprintln!("[tp] FATAL: this box has more than one active RoCE port pair: {}. Pick the pair this \
+                           cluster is cabled on with --rdma-dev <d1[,d2]> (e.g. --rdma-dev {}) on this box's \
+                           --node / head command line.",
+                          groups.iter().map(|g| g.join(",")).collect::<Vec<_>>().join("  |  "), groups[0].join(","));
+                std::process::exit(2);
+            }
+        }
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum RailPick { One(Vec<String>), Ambiguous(Vec<Vec<String>>), None(String) }
+
+/// The auto-detect half of `rdma_devs`, over a sysfs root so the unit tests drive it with fixtures.
+pub(crate) fn detect_rdma_rails(sysfs: &std::path::Path) -> RailPick {
+    let rd = match std::fs::read_dir(sysfs) {
+        Ok(r) => r,
+        Err(e) => return RailPick::None(format!("{} unreadable: {e}", sysfs.display())),
+    };
+    let mut names: Vec<String> = rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    names.sort();
+    // group key = the PCI function suffix ("f0", "f1"); a name without one is its own group
+    let mut groups: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
+    for n in names {
+        let port = sysfs.join(&n).join("ports/1");
+        let active = std::fs::read_to_string(port.join("state")).map(|s| s.trim().starts_with('4')).unwrap_or(false);
+        if !active || scan_rocev2_gid(sysfs, &n).is_none() { continue; }
+        let key = match n.rfind('f') {
+            Some(i) if i + 1 < n.len() && n[i + 1..].chars().all(|c| c.is_ascii_digit()) => n[i..].to_string(),
+            _ => n.clone(),
+        };
+        // rail order = PCI address order (domain 0000 = rail 1, 0002 = rail 2); the name as the fallback
+        let pci = std::fs::read_link(sysfs.join(&n).join("device")).ok()
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string())).unwrap_or_else(|| n.clone());
+        groups.entry(key).or_default().push((pci, n));
+    }
+    let mut gs: Vec<Vec<String>> = groups.into_values().map(|mut g| {
+        g.sort();
+        g.into_iter().map(|(_, n)| n).collect()
+    }).collect();
+    match gs.len() {
+        0 => RailPick::None("no ACTIVE RoCE v2 port with an IPv4 address found".into()),
+        1 => RailPick::One(gs.remove(0)),
+        _ => RailPick::Ambiguous(gs),
+    }
 }
 
 /// PR #15 (ported): scan `<sysfs>/class/infiniband/<dev>/ports/1` for the first GID whose type is
@@ -939,5 +1023,77 @@ mod gid_tests {
             return;
         }
         assert_eq!(resolve_gid_idx_at(&r, "rocep1s0f1"), GID_IDX);
+    }
+}
+
+#[cfg(test)]
+mod rail_detect_tests {
+    //! Owner 2026-11-09: `--rdma-dev` is needed only when a box has more than one active port pair.
+    use super::{detect_rdma_rails, RailPick};
+    use std::path::PathBuf;
+
+    const V4: &str = "0000:0000:0000:0000:0000:ffff:c0a8:b110";
+    const ZERO: &str = "0000:0000:0000:0000:0000:0000:0000:0000";
+
+    /// devs: (name, pci address, active, has an IPv4 RoCE v2 GID)
+    fn fixture(tag: &str, devs: &[(&str, &str, bool, bool)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("gb10_rail_fixture_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pcis = root.join("_pci");
+        for (n, pci, active, v4) in devs {
+            let port = root.join(n).join("ports/1");
+            std::fs::create_dir_all(port.join("gid_attrs/types")).unwrap();
+            std::fs::create_dir_all(port.join("gids")).unwrap();
+            std::fs::write(port.join("state"), if *active { "4: ACTIVE\n" } else { "1: DOWN\n" }).unwrap();
+            std::fs::write(port.join("gid_attrs/types/3"), "RoCE v2\n").unwrap();
+            std::fs::write(port.join("gids/3"), if *v4 { V4 } else { ZERO }).unwrap();
+            std::fs::create_dir_all(pcis.join(pci)).unwrap();
+            std::os::unix::fs::symlink(pcis.join(pci), root.join(n).join("device")).unwrap();
+        }
+        // the helper dir is not a device: give it no ports/1 so it is skipped
+        root
+    }
+
+    const SPARK: [(&str, &str, bool, bool); 4] = [
+        ("rocep1s0f0", "0000:01:00.0", true, true), ("rocep1s0f1", "0000:01:00.1", false, false),
+        ("roceP2p1s0f0", "0002:01:00.0", true, true), ("roceP2p1s0f1", "0002:01:00.1", false, false)];
+
+    #[test]
+    fn one_active_pair_is_picked_in_rail_order() {
+        // DGX Spark cabling (f0); rail order follows the PCI domain, not the name's sort order
+        let r = fixture("spark", &SPARK);
+        assert_eq!(detect_rdma_rails(&r), RailPick::One(vec!["rocep1s0f0".into(), "roceP2p1s0f0".into()]));
+        // ASUS GX10 cabling (f1)
+        let r = fixture("gx10", &[("rocep1s0f0", "0000:01:00.0", false, false), ("rocep1s0f1", "0000:01:00.1", true, true),
+                                  ("roceP2p1s0f0", "0002:01:00.0", false, false), ("roceP2p1s0f1", "0002:01:00.1", true, true)]);
+        assert_eq!(detect_rdma_rails(&r), RailPick::One(vec!["rocep1s0f1".into(), "roceP2p1s0f1".into()]));
+    }
+
+    #[test]
+    fn a_single_cabled_rail_is_one_pair() {
+        let r = fixture("single", &[("rocep1s0f0", "0000:01:00.0", true, true), ("roceP2p1s0f0", "0002:01:00.0", false, false)]);
+        assert_eq!(detect_rdma_rails(&r), RailPick::One(vec!["rocep1s0f0".into()]));
+    }
+
+    #[test]
+    fn two_active_pairs_need_the_flag() {
+        let r = fixture("both", &[("rocep1s0f0", "0000:01:00.0", true, true), ("rocep1s0f1", "0000:01:00.1", true, true),
+                                  ("roceP2p1s0f0", "0002:01:00.0", true, true), ("roceP2p1s0f1", "0002:01:00.1", true, true)]);
+        assert_eq!(detect_rdma_rails(&r), RailPick::Ambiguous(vec![
+            vec!["rocep1s0f0".into(), "roceP2p1s0f0".into()], vec!["rocep1s0f1".into(), "roceP2p1s0f1".into()]]));
+    }
+
+    #[test]
+    fn active_without_an_address_does_not_count() {
+        // link up but no IPv4 (not assigned) on f1: only f0 counts
+        let r = fixture("noaddr", &[("rocep1s0f0", "0000:01:00.0", true, true), ("rocep1s0f1", "0000:01:00.1", true, false)]);
+        assert_eq!(detect_rdma_rails(&r), RailPick::One(vec!["rocep1s0f0".into()]));
+    }
+
+    #[test]
+    fn nothing_active_or_no_sysfs_falls_back() {
+        let r = fixture("none", &[("rocep1s0f0", "0000:01:00.0", false, false)]);
+        assert!(matches!(detect_rdma_rails(&r), RailPick::None(_)));
+        assert!(matches!(detect_rdma_rails(std::path::Path::new("/nonexistent/gb10/ib")), RailPick::None(_)));
     }
 }

@@ -20,6 +20,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use crate::boot_report::{Progress, Unit};
 
 const PROTOCOL_VERSION: u32 = 6;   // v6 (S-B9-CF-AGREE16/16B): every pairwise lockstep word changed (the
                                      //     verify width is a 5-bit field of its own, the digest folded to 27
@@ -66,8 +67,11 @@ pub struct Artifact {
 #[derive(Serialize, Deserialize, Debug)]
 enum Msg {
     Hello { version: String, role: String, hostname: String },
-    Manifest { model_id: String, artifacts: Vec<Artifact> },
-    Missing { hashes: Vec<String> },
+    /// `draft` (owner 2026-11-02, the drive-space check): the drafter files this session will offer after `Config`,
+    /// so the node's space report covers everything the session would store on it. Empty = no drafter.
+    Manifest { model_id: String, artifacts: Vec<Artifact>, #[serde(default)] draft: Vec<Artifact> },
+    /// `space`: the node's drive-space report, sent with the MODEL round's reply (None on the drafter round).
+    Missing { hashes: Vec<String>, #[serde(default)] space: Option<SpaceReport> },
     BlobHeader { hash: String, size: u64 },
     Ready { model_dir: String },
     Config(crate::tp::TpConfig),
@@ -104,6 +108,58 @@ fn send_msg(w: &mut impl Write, m: &Msg) -> Result<()> { send_json(w, m) }
 fn recv_msg(r: &mut impl Read) -> Result<Msg> { recv_json(r) }
 
 // ---------------------------------------------------------------------------------------------------
+// Drive space (owner 2026-11-02): the head checks every node BEFORE the first byte ships
+// ---------------------------------------------------------------------------------------------------
+
+/// What a node reports with its model-round `Missing`: the bytes this session would store in its blob cache (the
+/// model shards it does not have yet + the drafter files announced in `Manifest::draft` it does not have yet), the
+/// free bytes of the drive that holds that cache, the cache dir and the node's hostname.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub(crate) struct SpaceReport { pub need: u64, pub free: u64, pub dir: String, pub host: String }
+
+/// Room left on a node's drive on top of what a session stores there: a sync never fills a drive to the last byte.
+pub(crate) const SHIP_HEADROOM: u64 = 1_000_000_000;
+
+/// Free bytes for an unprivileged writer on the drive that holds `p` (its nearest existing ancestor), None when the
+/// drive cannot be asked.
+fn free_bytes(p: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut q = p.to_path_buf();
+    while !q.exists() {
+        if !q.pop() { return None; }
+    }
+    let c = std::ffi::CString::new(q.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a valid NUL-terminated path and a zeroed out-struct the call fills.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 { return None; }
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+fn gb(b: u64) -> String { format!("{:.1} GB", b as f64 / 1e9) }
+
+/// One line per node whose drive cannot hold what this session would store there plus `SHIP_HEADROOM` (empty = every
+/// node has room). `rows` = (rank, the head's name for the node, its report); a node that sent no report (its drive
+/// could not be asked) is not judged here: shipping then fails the way it always did if the drive fills.
+fn space_shortfalls(rows: &[(i32, String, Option<SpaceReport>)]) -> Vec<String> {
+    rows.iter().filter_map(|(rank, name, r)| {
+        let r = r.as_ref()?;
+        let need = r.need.saturating_add(SHIP_HEADROOM);
+        if r.need == 0 || r.free >= need { return None; }
+        let who = if r.host.is_empty() || r.host == *name { name.clone() } else { format!("{} ({name})", r.host) };
+        Some(format!("rank {rank}, node {who}: needs ~{} ({} of model files it does not have yet + {} headroom), has {} free \
+on the drive of {} — short by ~{}", gb(need), gb(r.need), gb(SHIP_HEADROOM), gb(r.free), r.dir, gb(need - r.free)))
+    }).collect()
+}
+
+/// The head's refusal: why it stops, per short node how much space is needed, and what to do.
+fn space_refusal(short: &[String], nodes: usize) -> String {
+    format!("not enough drive space on {} of {nodes} TP node(s) for the model files this start would ship to them. Nothing \
+was shipped; the head stops here.\n  {}\nTo start: free that much space on each node listed (its TP model cache: run \
+`gb10_inference --cached-models-list` on the node, then `--cached-models-remove <ID>` for models you no longer use), or \
+start the node with --tp-cache <a directory on a drive with room>.", short.len(), short.join("\n  "))
+}
+
+// ---------------------------------------------------------------------------------------------------
 // Content-addressed cache
 // ---------------------------------------------------------------------------------------------------
 
@@ -124,7 +180,8 @@ fn publish_blob(hash: &str, tmp: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<(String, u64)> {
+/// A file's sha256 and size; `prog` counts every chunk into a boot progress line (BASICS, owner 2026-11-02).
+fn sha256_file_with(path: &Path, prog: Option<&Progress>) -> Result<(String, u64)> {
     let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
@@ -134,8 +191,36 @@ fn sha256_file(path: &Path) -> Result<(String, u64)> {
         if n == 0 { break; }
         h.update(&buf[..n]);
         total += n as u64;
+        if let Some(p) = prog { p.add(n as u64); }
     }
     Ok((hex(&h.finalize()), total))
+}
+
+/// BASICS: the bytes `files` would hash now (the cache answers the rest), for the hashing percentage.
+fn uncached_bytes(files: &[PathBuf], cache: &HashMap<String, String>) -> Result<u64> {
+    let mut n = 0u64;
+    for p in files {
+        if !cache.contains_key(&cached_key(p)?) { n += std::fs::metadata(p)?.len(); }
+    }
+    Ok(n)
+}
+
+/// BASICS: a stream that counts the bytes it carries into a boot progress line (model shipping, both ends).
+struct Counted<'a, S> { inner: &'a mut S, prog: &'a Progress }
+impl<S: Write> Write for Counted<'_, S> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(b)?;
+        self.prog.add(n as u64);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
+}
+impl<S: Read> Read for Counted<'_, S> {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(b)?;
+        self.prog.add(n as u64);
+        Ok(n)
+    }
 }
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
 
@@ -199,13 +284,15 @@ pub fn build_manifest(model_dir: &Path, world: u32) -> Result<(String, Vec<Vec<A
     let sharded: Vec<bool> = (1..world)
         .map(|r| model_dir.join(format!("rank{r}")).exists())
         .collect();
-    for path in model_files(model_dir)? {
+    let files = model_files(model_dir)?;
+    let prog = Progress::new("hashing the model files (first use; cached afterwards)", uncached_bytes(&files, &cache)?, Unit::Bytes);
+    for path in files {
         let rel = path.strip_prefix(model_dir).unwrap_or(&path).to_string_lossy().to_string();
         let key = cached_key(&path)?;
         let (hash, size) = if let Some(h) = cache.get(&key) {
             (h.clone(), std::fs::metadata(&path)?.len())
         } else {
-            let (h, sz) = sha256_file(&path)?;
+            let (h, sz) = sha256_file_with(&path, Some(&prog))?;
             cache.insert(key, h.clone());
             dirty = true;
             (h, sz)
@@ -217,6 +304,7 @@ pub fn build_manifest(model_dir: &Path, world: u32) -> Result<(String, Vec<Vec<A
             }
         }
     }
+    prog.finish();
     if dirty { hash_cache_save(&cache); }
     let model_id = model_dir.file_name().map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "model".into());
@@ -235,22 +323,30 @@ pub struct RankShip {
 }
 
 /// A `Write` that only hashes (and counts) — a synthesized segment's sha256 without a copy on disk.
-struct HashWriter { h: Sha256, n: u64 }
-impl Write for HashWriter {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.h.update(b); self.n += b.len() as u64; Ok(b.len()) }
+struct HashWriter<'a> { h: Sha256, n: u64, prog: Option<&'a Progress> }
+impl Write for HashWriter<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.h.update(b);
+        self.n += b.len() as u64;
+        if let Some(p) = self.prog { p.add(b.len() as u64); }
+        Ok(b.len())
+    }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-fn hash_plan_src(src: &crate::shard_plan::PlanSrc) -> Result<String> {
+fn hash_plan_src(src: &crate::shard_plan::PlanSrc, prog: Option<&Progress>) -> Result<String> {
     use crate::shard_plan::PlanSrc;
     Ok(match src {
-        PlanSrc::Whole(p) => sha256_file(p)?.0,
+        PlanSrc::Whole(p) => sha256_file_with(p, prog)?.0,
         PlanSrc::Segment(ps) => {
-            let mut w = HashWriter { h: Sha256::new(), n: 0 };
+            let mut w = HashWriter { h: Sha256::new(), n: 0, prog };
             crate::shard_plan::write_segment(ps, &mut w)?;
             hex(&w.h.finalize())
         }
-        PlanSrc::Bytes(b) => { let mut h = Sha256::new(); h.update(b); hex(&h.finalize()) }
+        PlanSrc::Bytes(b) => {
+            if let Some(p) = prog { p.add(b.len() as u64); }
+            let mut h = Sha256::new(); h.update(b); hex(&h.finalize())
+        }
     })
 }
 
@@ -277,7 +373,7 @@ pub fn ship_plans(model_dir: &Path, world: u32) -> Result<Vec<RankShip>> {
     let world = world as usize;
     let fmt = detect_format(model_dir).with_context(|| format!(
         "shard shipping: {} is neither an EXL3 pack nor a qwen4_exp NVFP4 model — no shard plan", model_dir.display()))?;
-    let deal = match fmt { ShardFormat::Exl3 => crate::exl3_forward::xtp::ep_deal_kind(), ShardFormat::Nvfp4 => "contig".to_string(),
+    let deal = match fmt { ShardFormat::Exl3 | ShardFormat::Fp4l => crate::exl3_forward::xtp::ep_deal_kind(), ShardFormat::Nvfp4 => "contig".to_string(),
                            ShardFormat::Naive => crate::naive::shipplan::deal(world) };
     let base = model_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "model".into());
     let mut plans = Vec::new();
@@ -305,16 +401,18 @@ pub fn ship_plans(model_dir: &Path, world: u32) -> Result<Vec<RankShip>> {
         let next = AtomicUsize::new(0);
         let out: std::sync::Mutex<Vec<(usize, Result<String>)>> = std::sync::Mutex::new(Vec::new());
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+        let prog = Progress::new("hashing the shard files (first ship; cached afterwards)", hashed, Unit::Bytes);
         std::thread::scope(|sc| {
             for _ in 0..threads.min(todo.len()) {
                 sc.spawn(|| loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i >= todo.len() { break; }
-                    let r = hash_plan_src(&todo[i].1);
+                    let r = hash_plan_src(&todo[i].1, Some(&prog));
                     out.lock().unwrap().push((i, r));
                 });
             }
         });
+        prog.finish();
         for (i, r) in out.into_inner().unwrap() {
             cache.insert(todo[i].0.clone(), r?);
         }
@@ -329,7 +427,7 @@ pub fn ship_plans(model_dir: &Path, world: u32) -> Result<Vec<RankShip>> {
             let size = RankPlan::file_size(&f)?;
             let hash = match plan_src_key(&f.src)? {
                 Some(k) => cache.get(&k).cloned().context("B32: a planned file was not hashed")?,
-                None => hash_plan_src(&f.src)?,
+                None => hash_plan_src(&f.src, None)?,
             };
             arts.push(Artifact { logical: f.logical.clone(), hash, size });
             srcs.insert(f.logical, f.src);
@@ -343,7 +441,7 @@ pub fn ship_plans(model_dir: &Path, world: u32) -> Result<Vec<RankShip>> {
 }
 
 /// Send one artifact's bytes: from its B32 plan source when there is one, else the model dir's file.
-fn send_artifact(s: &mut TcpStream, model_dir: &Path, a: &Artifact,
+fn send_artifact(s: &mut impl Write, model_dir: &Path, a: &Artifact,
                  srcs: Option<&HashMap<String, crate::shard_plan::PlanSrc>>) -> Result<()> {
     use crate::shard_plan::PlanSrc;
     match srcs.and_then(|m| m.get(&a.logical)) {
@@ -457,17 +555,19 @@ fn sha256_files_parallel(jobs: &[(PathBuf, u64)], threads: usize) -> Result<Vec<
     let next = AtomicUsize::new(0);
     let out: std::sync::Mutex<Vec<Option<Result<String>>>> =
         std::sync::Mutex::new((0..jobs.len()).map(|_| None).collect());
+    let prog = Progress::new("hashing the model files (first use; cached afterwards)", jobs.iter().map(|j| j.1).sum(), Unit::Bytes);
     std::thread::scope(|sc| {
         for _ in 0..threads.max(1).min(jobs.len().max(1)) {
             sc.spawn(|| loop {
                 let k = next.fetch_add(1, Ordering::Relaxed);
                 if k >= order.len() { break; }
                 let i = order[k];
-                let r = sha256_file(&jobs[i].0).map(|(h, _)| h);
+                let r = sha256_file_with(&jobs[i].0, Some(&prog)).map(|(h, _)| h);
                 out.lock().unwrap()[i] = Some(r);
             });
         }
     });
+    prog.finish();
     out.into_inner().unwrap().into_iter()
         .map(|r| r.unwrap_or_else(|| Err(anyhow::anyhow!("hash worker did not run"))))
         .collect()
@@ -771,19 +871,22 @@ fn draft_manifest(dir: &Path) -> Result<(String, Vec<Artifact>)> {
     let mut cache = hash_cache_load();
     let mut dirty = false;
     let mut artifacts = Vec::new();
-    for path in model_files(dir)? {
+    let files = model_files(dir)?;
+    let prog = Progress::new("hashing the drafter files (first use; cached afterwards)", uncached_bytes(&files, &cache)?, Unit::Bytes);
+    for path in files {
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().to_string();
         let key = cached_key(&path)?;
         let (hash, size) = if let Some(h) = cache.get(&key) {
             (h.clone(), std::fs::metadata(&path)?.len())
         } else {
-            let (h, sz) = sha256_file(&path)?;
+            let (h, sz) = sha256_file_with(&path, Some(&prog))?;
             cache.insert(key, h.clone());
             dirty = true;
             (h, sz)
         };
         artifacts.push(Artifact { logical: rel, hash, size });
     }
+    prog.finish();
     if dirty { hash_cache_save(&cache); }
     let model_id = dir.file_name().map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "draft".into());
@@ -875,14 +978,10 @@ struct Roce { ib: String, netdev: String, ip: Ipv4Addr, bcast: Ipv4Addr, mask: u
 /// Resolve the GB10 RoCE rails by their fixed IB device names → netdev (via /sys) → IPv4 (via `ip`).
 /// Names/types are constant across GB10 boxes (per the hardware); only the IPs are configuration.
 fn roce_interfaces() -> Vec<Roce> {
-    // Default = the fixed GB10 rail names (identical across DGX Spark + every OEM clone: same SoC,
-    // hard-wired PCIe topology, systemd predictable naming). Manual fallback for any platform that
-    // breaks that: --rdma-dev=dev1[,dev2] (rail order), set via --rdma-dev.
-    let devs: Vec<(String, u8)> = match crate::opts::var(crate::opt!("rdma-dev")) {
-        Ok(s) if !s.trim().is_empty() =>
-            s.split(',').enumerate().map(|(i, d)| (d.trim().to_string(), (i + 1) as u8)).collect(),
-        _ => vec![("rocep1s0f1".into(), 1), ("roceP2p1s0f1".into(), 2)],
-    };
+    // The rails in order: explicit --rdma-dev=dev1[,dev2], else auto-detected (tp::rdma_devs: the only
+    // active RoCE port pair; the ASUS GX10s here cable f1, the DGX Sparks f0).
+    let devs: Vec<(String, u8)> = crate::tp::rdma_devs().iter().enumerate()
+        .map(|(i, d)| (d.clone(), (i + 1) as u8)).collect();
     let mut out = Vec::new();
     for (ib, rail) in &devs {
         let netdir = format!("/sys/class/infiniband/{ib}/device/net");
@@ -1140,8 +1239,8 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
     }
     send_msg(&mut s, &Msg::Hello { version: binary_version(), role: "node".into(), hostname: hostname() })?;
 
-    let (model_id, artifacts) = match recv_msg(&mut s)? {
-        Msg::Manifest { model_id, artifacts } => (model_id, artifacts),
+    let (model_id, artifacts, draft_offer) = match recv_msg(&mut s)? {
+        Msg::Manifest { model_id, artifacts, draft } => (model_id, artifacts, draft),
         _ => bail!("expected Manifest"),
     };
     let missing: Vec<String> = artifacts.iter().map(|a| a.hash.clone())
@@ -1150,23 +1249,33 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
     crate::deprintln!("  [node] manifest '{model_id}': {} artifacts, {have} cached, {} to fetch",
               artifacts.len(), missing.len());
     let fetch_bytes: u64 = artifacts.iter().filter(|a| missing.contains(&a.hash)).map(|a| a.size).sum();
+    // owner 2026-11-02: report what this session would store here and the drive's free space; the head checks EVERY
+    // node before it ships to any (and stops the session, telling us why, when a drive is short)
+    let draft_need: u64 = draft_offer.iter().filter(|a| !have_blob(&a.hash) && !missing.contains(&a.hash)).map(|a| a.size).sum();
+    let root = cache_root();
+    let space = free_bytes(&root).map(|free| SpaceReport { need: fetch_bytes + draft_need, free,
+                                                           dir: root.display().to_string(), host: hostname() });
     let t_fetch = std::time::Instant::now();
-    send_msg(&mut s, &Msg::Missing { hashes: missing.clone() })?;
+    send_msg(&mut s, &Msg::Missing { hashes: missing.clone(), space })?;
 
+    let prog = Progress::new("receiving the model from the head", fetch_bytes, Unit::Bytes);
     for _ in 0..missing.len() {
         match recv_msg(&mut s)? {
             Msg::BlobHeader { hash, size } => {
-                let tmp = recv_blob(&mut s, &hash, size)?;
+                let tmp = recv_blob(&mut Counted { inner: &mut s, prog: &prog }, &hash, size)?;
                 publish_blob(&hash, &tmp)?;
                 crate::deprintln!("  [node] cached {} ({:.1} MB)", &hash[..12], size as f64 / 1e6);
             }
+            Msg::Error { msg } => bail!("the head stopped the sync: {msg}"),
             _ => bail!("expected BlobHeader"),
         }
     }
+    prog.finish();
     let dir = assemble_model_dir(&model_id, &artifacts)?;
     send_msg(&mut s, &Msg::Ready { model_dir: dir.to_string_lossy().to_string() })?;
     let cfg = match recv_msg(&mut s)? {
         Msg::Config(c) => c,
+        Msg::Error { msg } => bail!("the head stopped the sync: {msg}"),
         _ => bail!("expected Config"),
     };
     crate::deprintln!("  [node] config from head: shard_mixers={} graph={} fp32_partials={} mtp={} depth={:?} mode_serve={}",
@@ -1189,17 +1298,20 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
             let have = artifacts.len() - missing.len();
             crate::deprintln!("  [node] draft manifest '{model_id}': {} artifacts, {have} cached, {} to fetch",
                       artifacts.len(), missing.len());
-            send_msg(&mut s, &Msg::Missing { hashes: missing.clone() })?;
+            send_msg(&mut s, &Msg::Missing { hashes: missing.clone(), space: None })?;
+            let dbytes: u64 = artifacts.iter().filter(|a| missing.contains(&a.hash)).map(|a| a.size).sum();
+            let dprog = Progress::new("receiving the drafter from the head", dbytes, Unit::Bytes);
             for _ in 0..missing.len() {
                 match recv_msg(&mut s)? {
                     Msg::BlobHeader { hash, size } => {
-                        let tmp = recv_blob(&mut s, &hash, size)?;
+                        let tmp = recv_blob(&mut Counted { inner: &mut s, prog: &dprog }, &hash, size)?;
                         publish_blob(&hash, &tmp)?;
                         crate::deprintln!("  [node] cached draft blob {} ({:.1} MB)", &hash[..12], size as f64 / 1e6);
                     }
                     _ => bail!("expected draft BlobHeader"),
                 }
             }
+            dprog.finish();
             let ddir = assemble_model_dir(&model_id, &artifacts)?;
             send_msg(&mut s, &Msg::DraftReady { model_dir: ddir.to_string_lossy().to_string() })?;
             crate::deprintln!("  [node] DRAFT READY — drafter assembled at {} (loads from the cache, no local copy)",
@@ -1227,6 +1339,7 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
 /// + the retained control stream (dropped by bench sessions, kept by serving ones).
 pub fn run_node(tcp_port: u16, udp_port: u16)
     -> Result<(PathBuf, Option<PathBuf>, IpAddr, crate::tp::TpConfig, TcpStream)> {
+    let _ = crate::tp::rdma_devs();   // resolve + print the RDMA rails now (an ambiguous box exits here, not mid-boot)
     spawn_discovery_responder(tcp_port, udp_port)?;
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, tcp_port))
         .with_context(|| format!("bind TCP {tcp_port}"))?;
@@ -1278,31 +1391,62 @@ fn head_hello(s: &mut TcpStream, node: &NodeInfo, mine: &str) -> Result<()> {
 /// config is a per-node clone: `node_rank` identifies this node and `topology` is the full
 /// rank→RoCE-IP map (the node reads both back from its own `Msg::Config`). Returns the RETAINED
 /// control stream — the TP serving session keeps it as its control plane; the bench path drops it.
-fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &str,
-                 artifacts: &[Artifact], topology: &[String],
-                 cfg: &crate::tp::TpConfig,
-                 draft: Option<&(String, Vec<Artifact>)>,
-                 srcs: Option<&HashMap<String, crate::shard_plan::PlanSrc>>) -> Result<TcpStream> {
+/// One node's answer to the manifest, before anything ships: the open stream, the hashes it lacks and its
+/// drive-space report.
+struct Offer { s: TcpStream, missing: Vec<String>, space: Option<SpaceReport> }
+
+/// Phase 1 of a node's sync: connect, check the version, offer the manifest (and the drafter files that will follow)
+/// and read the node's answer. Nothing ships here.
+fn head_sync_one(node: &NodeInfo, model_id: &str, artifacts: &[Artifact],
+                 draft: Option<&(String, Vec<Artifact>)>) -> Result<Offer> {
     let mut s = TcpStream::connect_timeout(&node.addr, Duration::from_secs(10))
         .with_context(|| format!("connect {}", node.addr))?;
     s.set_nodelay(true).ok();
     harden_or_warn(&s, "head"); // TP-4D (C3/C9): both ends of the retained stream
     head_hello(&mut s, node, &binary_version())?;
-    send_msg(&mut s, &Msg::Manifest { model_id: model_id.into(), artifacts: artifacts.to_vec() })?;
-    let missing = match recv_msg(&mut s)? {
-        Msg::Missing { hashes } => hashes,
+    send_msg(&mut s, &Msg::Manifest { model_id: model_id.into(), artifacts: artifacts.to_vec(),
+                                      draft: draft.map(|d| d.1.clone()).unwrap_or_default() })?;
+    match recv_msg(&mut s)? {
+        Msg::Missing { hashes, space } => Ok(Offer { s, missing: hashes, space }),
+        Msg::Error { msg } => bail!("node error: {msg}"),
         _ => bail!("expected Missing"),
-    };
+    }
+}
+
+/// Owner 2026-11-02: every node's drive must hold what this session would store on it; checked after every node
+/// answered the manifest and BEFORE the first byte ships. A short drive stops the session: every node is told why
+/// and the head returns the refusal (the callers print it and exit).
+fn space_check(nodes: &[NodeInfo], offers: &mut [Offer]) -> Result<()> {
+    let rows: Vec<(i32, String, Option<SpaceReport>)> = nodes.iter().zip(offers.iter()).enumerate()
+        .map(|(i, (n, o))| ((i + 1) as i32, n.addr.ip().to_string(), o.space.clone())).collect();
+    let short = space_shortfalls(&rows);
+    if short.is_empty() { return Ok(()); }
+    let msg = space_refusal(&short, nodes.len());
+    for o in offers.iter_mut() {
+        let _ = send_msg(&mut o.s, &Msg::Error { msg: msg.clone() });
+    }
+    bail!(msg)
+}
+
+/// Phase 2 of a node's sync: ship what it lacks, then Ready / Config / the drafter round (unchanged).
+fn head_ship(node: &NodeInfo, node_rank: i32, offer: Offer, model_dir: &Path,
+             artifacts: &[Artifact], topology: &[String],
+             cfg: &crate::tp::TpConfig,
+             draft: Option<&(String, Vec<Artifact>)>,
+             srcs: Option<&HashMap<String, crate::shard_plan::PlanSrc>>) -> Result<TcpStream> {
+    let Offer { mut s, missing, .. } = offer;
     let by_hash: HashMap<&str, &Artifact> = artifacts.iter().map(|a| (a.hash.as_str(), a)).collect();
     let total: u64 = missing.iter().filter_map(|h| by_hash.get(h.as_str())).map(|a| a.size).sum();
     crate::deprintln!("[head] {} (rank {node_rank}) needs {} / {} artifacts ({:.2} GB)", node.hostname,
               missing.len(), artifacts.len(), total as f64 / 1e9);
     let t0 = std::time::Instant::now();
+    let prog = Progress::new(format!("shipping the model to {} (rank {node_rank})", node.hostname), total, Unit::Bytes);
     for h in &missing {
         let a = by_hash.get(h.as_str()).context("node asked for unknown hash")?;
         send_msg(&mut s, &Msg::BlobHeader { hash: a.hash.clone(), size: a.size })?;
-        send_artifact(&mut s, model_dir, a, srcs)?;
+        send_artifact(&mut Counted { inner: &mut s, prog: &prog }, model_dir, a, srcs)?;
     }
+    prog.finish();
     match recv_msg(&mut s)? {
         Msg::Ready { model_dir } => {
             let secs = t0.elapsed().as_secs_f64();
@@ -1311,7 +1455,10 @@ fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &s
                       if secs > 0.0 { total as f64/1e9/secs } else { 0.0 });
             let mut node_cfg = cfg.clone();
             node_cfg.node_rank = node_rank;
-            node_cfg.ship_shards = srcs.is_some(); // B32: this node got its rank's shard dir (load it, not the head's path)
+            // B32: this node got its rank's shard dir (load it, not the head's path). TPSHIP (2026-11-07): an EXL3 pack the
+            // shard plan does not cover (the 27B dense / 35B / 122B MoE EXL3 packs, ...) now ships WHOLE through the same
+            // blob cache — the node loads that copy too, never its own disk at the head's path.
+            node_cfg.ship_shards = srcs.is_some() || (cfg.exl3 && !artifacts.is_empty());
             node_cfg.topology = topology.to_vec();
             // CLI-1: the head's resolved option registry rides the config (v23), taken at ship time
             // so every option the head resolved before its sync reaches the node.
@@ -1328,7 +1475,7 @@ fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &s
                                                           artifacts: draft_arts.clone() })?;
                     let src_dir = Path::new(&cfg.df2_draft_dir);
                     let dmissing = match recv_msg(&mut s)? {
-                        Msg::Missing { hashes } => hashes,
+                        Msg::Missing { hashes, .. } => hashes,
                         _ => bail!("expected draft Missing from {}", node.hostname),
                     };
                     let dby_hash: HashMap<&str, &Artifact> =
@@ -1337,11 +1484,13 @@ fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &s
                     crate::deprintln!("[head] {} drafter: {} / {} artifacts ({:.2} GB)",
                               node.hostname, dmissing.len(), draft_arts.len(), dtotal as f64 / 1e9);
                     let dt0 = std::time::Instant::now();
+                    let dprog = Progress::new(format!("shipping the drafter to {}", node.hostname), dtotal, Unit::Bytes);
                     for h in &dmissing {
                         let a = dby_hash.get(h.as_str()).context("node asked for unknown draft hash")?;
                         send_msg(&mut s, &Msg::BlobHeader { hash: a.hash.clone(), size: a.size })?;
-                        send_blob(&mut s, &src_dir.join(&a.logical))?;
+                        send_blob(&mut Counted { inner: &mut s, prog: &dprog }, &src_dir.join(&a.logical))?;
                     }
+                    dprog.finish();
                     match recv_msg(&mut s)? {
                         Msg::DraftReady { model_dir } => {
                             let secs = dt0.elapsed().as_secs_f64();
@@ -1380,33 +1529,35 @@ pub fn run_head(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, discover_wa
 
 /// TP-D: `run_head` that RETAINS the per-node control streams (rank-indexed: `streams[i]` goes to
 /// rank i + 1) — the EXL3 TP serve runs its Step / HeadFlag / Ready / Shutdown control plane over
-/// them (EXL3 ships no artifacts, so `run_head_session`'s manifest/drafter path does not apply).
+/// them. TPSHIP (2026-11-07): an EXL3 pack ships through the blob cache like every other model — per-rank shards
+/// when the shard plan covers it (Qwen3.8-Flash-Next, B32), otherwise the whole pack replicated to every node.
 pub fn run_head_retain(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, discover_wait: Duration,
                        cfg: &crate::tp::TpConfig)
     -> Result<(Vec<NodeInfo>, Vec<TcpStream>)>
 {
     let world = cfg.world.max(1);
+    // 2026-11-07: refuse a pack the engine cannot serve BEFORE shipping it (a ModelOpt pack whose formats the FP4-Local
+    // reader does not serve used to ship ~98 GB to every node before a node refused it at open).
+    if crate::fp4l::pack::is_fp4l_dir(model_dir) { crate::fp4l::pack::preflight(model_dir)?; }
     crate::deprintln!("[head] {} — building manifest for {} (world {world}) ...", hostname(), model_dir.display());
-    // TP-A (EXL3, D-T0-6) legacy path: nothing ships — every node loads its OWN local pack copy at the
-    // head's path (`TpConfig.exl3_pack_dir`). Nothing checks that copy against the head's: the manifest
-    // check was removed (owner, 074c669, 2026-09-30). The node still runs the unchanged
-    // Hello/Manifest/Ready/Config handshake, with an empty artifact list.
+    // TPSHIP (2026-11-07): the TP-A (EXL3, D-T0-6) legacy path shipped NOTHING — every node loaded its OWN local
+    // pack copy at the head's path, unchecked; with the models on .11 only (owner 2026-10-26) a node without that
+    // copy failed its boot ("EXL3 pack <head path>: config.json missing"). An EXL3 pack the shard plan does not
+    // cover now ships whole (build_manifest: replicated to every node, content-addressed, a re-run sends nothing).
     // B32: each node gets ONLY its rank's shard dir through the blob cache — always, when the shard plan covers
     // the model (no switch, owner 2026-10-02).
     let ships = if crate::shard_plan::applies(model_dir, world as usize).is_some() { Some(ship_plans(model_dir, world)?) } else { None };
     let (model_id, per_rank) = if let Some(sh) = &ships {
         (sh[0].model_id.clone(), sh.iter().map(|r| r.artifacts.clone()).collect::<Vec<_>>())
-    } else if cfg.exl3 {
-        (model_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "exl3".into()),
-         vec![Vec::new(); world as usize])
     } else {
         build_manifest(model_dir, world)?
     };
     let total: u64 = per_rank.iter().flatten().map(|a| a.size).sum();
     crate::deprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB{}", total_artifacts(&per_rank), total as f64/1e9,
               if ships.is_some() { " (B32: per-rank shards through the blob cache)" }
-              else if cfg.exl3 { " (EXL3 legacy: nodes load their local pack at the head's path, unchecked)" } else { "" });
+              else if cfg.exl3 { " (EXL3: the whole pack, replicated to every node through the blob cache)" } else { "" });
 
+    let _ = crate::tp::rdma_devs();   // resolve + print the RDMA rails before shipping anything
     let ifaces = roce_interfaces();
     let mut nodes: Vec<NodeInfo> = match explicit {
         Some(addrs) => addrs.into_iter()
@@ -1447,16 +1598,22 @@ pub fn run_head_retain(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, disc
     // the port resolution: a naive-serve session ships the Naive drafter decision above; every other session
     // keeps master's DF2-class decision (FLASHNEXT-DF2-C) instead of the None the block above yields for it.
     let draft = if cfg.exl3_mode.starts_with("naive-serve:") { draft } else { df2_draft };
-    let mut streams = Vec::with_capacity(nodes.len());
+    // owner 2026-11-02: every node answers the manifest first (with its drive-space report); the head ships to none
+    // of them until all have room
+    let mut offers = Vec::with_capacity(nodes.len());
     for (i, node) in nodes.iter().enumerate() {
+        let rank = i + 1;
+        let mid = ships.as_ref().map_or(model_id.as_str(), |sh| sh[rank].model_id.as_str());
+        offers.push(head_sync_one(node, mid, &per_rank[rank], draft.as_ref())?);
+    }
+    space_check(&nodes, &mut offers)?;
+    let mut streams = Vec::with_capacity(nodes.len());
+    for (i, (node, offer)) in nodes.iter().zip(offers).enumerate() {
         let rank = (i + 1) as i32;
         // Bench sessions ship no drafter (bench nodes never load a round; the bench wire adds
         // only the empty-DraftManifest round to the pre-v5 behavior).
-        let (mid, srcs) = match &ships {
-            Some(sh) => (sh[rank as usize].model_id.as_str(), Some(&sh[rank as usize].srcs)),
-            None => (model_id.as_str(), None),
-        };
-        streams.push(head_sync_one(node, rank, model_dir, mid, &per_rank[rank as usize], &topology, cfg, draft.as_ref(), srcs)?);
+        let srcs = ships.as_ref().map(|sh| &sh[rank as usize].srcs);
+        streams.push(head_ship(node, rank, offer, model_dir, &per_rank[rank as usize], &topology, cfg, draft.as_ref(), srcs)?);
     }
     crate::deprintln!("[head] all {} node(s) synced.", nodes.len());
     sync_only_exit(cfg, nodes.len());
@@ -1565,15 +1722,21 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
     // The serving control plane (CalibTable, per-step Step, Shutdown) must fan out to ALL world-1
     // nodes; dropping rank 2..N-1's streams here is exactly what deadlocked world>2 bring-up (those
     // nodes reached node_serve_tp and blocked forever on a CalibTable the head never sent them).
-    let mut streams: Vec<TcpStream> = Vec::with_capacity(need);
+    // owner 2026-11-02: every node answers the manifest first (with its drive-space report); nothing ships to any
+    // node until all have room
+    let mut offers = Vec::with_capacity(need);
     for (i, node) in nodes.iter().enumerate() {
+        let rank = i + 1;
+        let mid = ships.as_ref().map_or(model_id.as_str(), |sh| sh[rank].model_id.as_str());
+        offers.push(head_sync_one(node, mid, &per_rank[rank], draft.as_ref())?);
+    }
+    space_check(&nodes, &mut offers)?;
+    let mut streams: Vec<TcpStream> = Vec::with_capacity(need);
+    for (i, (node, offer)) in nodes.iter().zip(offers).enumerate() {
         let rank = (i + 1) as i32;
-        let (mid, srcs) = match &ships {
-            Some(sh) => (sh[rank as usize].model_id.as_str(), Some(&sh[rank as usize].srcs)),
-            None => (model_id.as_str(), None),
-        };
-        let stream = head_sync_one(node, rank, model_dir, mid, &per_rank[rank as usize],
-                                   &topology, cfg, draft.as_ref(), srcs)?;
+        let srcs = ships.as_ref().map(|sh| &sh[rank as usize].srcs);
+        let stream = head_ship(node, rank, offer, model_dir, &per_rank[rank as usize],
+                               &topology, cfg, draft.as_ref(), srcs)?;
         streams.push(stream);
     }
     anyhow::ensure!(streams.len() == need,
@@ -2054,7 +2217,7 @@ mod pack_manifest_tests {
         let jobs: Vec<(PathBuf, u64)> = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors", "LICENSE"]
             .iter().map(|n| (a.join(n), std::fs::metadata(a.join(n)).unwrap().len())).collect();
         let par = sha256_files_parallel(&jobs, 3).unwrap();
-        let seq: Vec<String> = jobs.iter().map(|(p, _)| sha256_file(p).unwrap().0).collect();
+        let seq: Vec<String> = jobs.iter().map(|(p, _)| sha256_file_with(p, None).unwrap().0).collect();
         assert_eq!(par, seq);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2143,6 +2306,111 @@ mod pack_manifest_tests {
         std::thread::sleep(Duration::from_millis(250));
         w.disarm(&streams);
         assert_eq!(streams[0].read_timeout().unwrap(), None);
+    }
+
+    fn space_report(need: u64, free: u64) -> Option<SpaceReport> {
+        Some(SpaceReport { need, free, dir: "/c".into(), host: "box".into() })
+    }
+
+    /// Owner 2026-11-02, the rule itself: a node is short when its drive cannot hold what it would store plus
+    /// `SHIP_HEADROOM`; a node with nothing to store or no report is not judged; the line says how much is needed.
+    #[test]
+    fn a_node_is_short_when_its_drive_cannot_hold_the_shipment_plus_headroom() {
+        let rows = vec![
+            (1, "10.0.0.1".to_string(), space_report(40_000_000_000, 40_000_000_000 + SHIP_HEADROOM)), // exactly fits
+            (2, "10.0.0.2".to_string(), space_report(40_000_000_000, 8_000_000_000)),                  // short
+            (3, "10.0.0.3".to_string(), space_report(0, 0)),                                            // stores nothing
+            (4, "10.0.0.4".to_string(), None),                                                          // no report
+            (5, "10.0.0.5".to_string(), space_report(40_000_000_000, 40_000_000_000)),                 // the headroom is missing
+        ];
+        let short = space_shortfalls(&rows);
+        assert_eq!(short.len(), 2, "{short:?}");
+        assert_eq!(short[0], "rank 2, node box (10.0.0.2): needs ~41.0 GB (40.0 GB of model files it does not have yet + \
+1.0 GB headroom), has 8.0 GB free on the drive of /c — short by ~33.0 GB");
+        assert!(short[1].starts_with("rank 5, node box (10.0.0.5): needs ~41.0 GB") && short[1].ends_with("short by ~1.0 GB"), "{}", short[1]);
+        let msg = space_refusal(&short, 5);
+        assert!(msg.starts_with("not enough drive space on 2 of 5 TP node(s)") && msg.contains("Nothing was shipped")
+                && msg.contains("--cached-models-remove") && msg.contains("--tp-cache"), "{msg}");
+    }
+
+    fn blob_artifact(dir: &Path, logical: &str, bytes: &[u8]) -> Artifact {
+        std::fs::write(dir.join(logical), bytes).unwrap();
+        let mut h = Sha256::new(); h.update(bytes);
+        Artifact { logical: logical.into(), hash: hex(&h.finalize()), size: bytes.len() as u64 }
+    }
+    /// One real `node_handle` on loopback, returning its model dir and its rank on success.
+    fn loopback_node() -> (NodeInfo, std::thread::JoinHandle<Result<(PathBuf, i32)>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            node_handle(s).map(|(dir, _, cfg, _)| (dir, cfg.node_rank))
+        });
+        (NodeInfo { hostname: addr.ip().to_string(), addr }, t)
+    }
+
+    /// Owner 2026-11-02, over loopback with the real node and head code: one node's drive cannot hold its share, so
+    /// the head stops after the manifest round, before any byte ships. Each node reported what it would store
+    /// (the drafter files announced with the manifest included, a file it gets in both counted once), each node is
+    /// told why and stops, and nothing was written to the cache.
+    #[test]
+    fn a_short_node_drive_stops_the_head_before_anything_ships() {
+        let tmp = std::env::temp_dir().join(format!("shipspace_short_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _g = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()); // tp-cache is process-global
+        let cache = tmp.join("cache"); // not created: the free space comes from its nearest existing ancestor
+        crate::opts::set(crate::opt!("tp-cache"), &cache.to_string_lossy());
+        let md = tmp.join("model");
+        std::fs::create_dir_all(&md).unwrap();
+        let small = blob_artifact(&md, "a.bin", &[1u8; 1000]);
+        let dfile = blob_artifact(&md, "d.bin", &[2u8; 5000]);
+        let huge = Artifact { logical: "b.bin".into(), hash: "f".repeat(64), size: 1 << 60 }; // no drive holds 1.15 EB
+        let draft = ("drafter".to_string(), vec![dfile, small.clone()]);
+        let (n1, t1) = loopback_node();
+        let (n2, t2) = loopback_node();
+        let nodes = vec![n1, n2];
+        let mut offers = vec![head_sync_one(&nodes[0], "m", &[small.clone()], Some(&draft)).unwrap(),
+                              head_sync_one(&nodes[1], "m", &[small.clone(), huge], None).unwrap()];
+        let r1 = offers[0].space.clone().expect("a node reports its drive");
+        assert_eq!((r1.need, r1.dir.clone()), (1000 + 5000, cache.display().to_string()), "{r1:?}");
+        assert!(r1.free > 0 && r1.host == hostname(), "{r1:?}");
+        assert_eq!(offers[1].space.as_ref().unwrap().need, 1000 + (1 << 60));
+        let e = format!("{:#}", space_check(&nodes, &mut offers).expect_err("the head must stop"));
+        eprintln!("head error: {e}"); // the exact text the head prints (receipt with --nocapture)
+        assert!(e.starts_with("not enough drive space on 1 of 2 TP node(s)") && e.contains("Nothing was shipped")
+                && e.contains(&format!("rank 2, node {} (127.0.0.1): needs ~", hostname())) && !e.contains("rank 1,")
+                && e.contains("short by ~"), "{e}");
+        drop(offers);
+        for t in [t1, t2] {
+            let ne = format!("{:#}", t.join().unwrap().expect_err("each node is told and stops"));
+            assert!(ne.starts_with("the head stopped the sync: not enough drive space"), "{ne}");
+        }
+        assert!(!cache.join("blobs").exists(), "nothing was stored on any node");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The two-phase sync still syncs: a node with room passes the check and gets its files, config and rank.
+    #[test]
+    fn a_node_with_room_is_synced_after_the_check() {
+        let tmp = std::env::temp_dir().join(format!("shipspace_room_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _g = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::opts::set(crate::opt!("tp-cache"), &tmp.join("cache").to_string_lossy());
+        let md = tmp.join("model");
+        std::fs::create_dir_all(&md).unwrap();
+        let small = blob_artifact(&md, "a.bin", &[3u8; 1000]);
+        let (n1, t1) = loopback_node();
+        let nodes = vec![n1];
+        let mut offers = vec![head_sync_one(&nodes[0], "m", &[small.clone()], None).unwrap()];
+        assert_eq!(offers[0].space.as_ref().unwrap().need, 1000);
+        space_check(&nodes, &mut offers).expect("room for 1 KB");
+        let topo = vec!["127.0.0.1".to_string(); 2];
+        let cfg = crate::tp::TpConfig::from_opts();
+        let _s = head_ship(&nodes[0], 1, offers.pop().unwrap(), &md, &[small.clone()], &topo, &cfg, None, None).unwrap();
+        let (dir, rank) = t1.join().unwrap().expect("the node synced");
+        assert_eq!(rank, 1);
+        assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), vec![3u8; 1000]);
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
 
@@ -2318,7 +2586,8 @@ mod build_id_tests {
         // both head entries hand the SAME decision to head_sync_one (the retain entry passed None)
         let src = include_str!("cluster.rs");
         let retain = &src[src.find("pub fn run_head_retain(").unwrap()..src.find("fn sync_only_exit(").unwrap()];
-        assert!(retain.contains("let draft = draft_for_cfg(cfg);") && retain.contains("cfg, draft.as_ref(), srcs)"),
+        assert!(retain.contains("let draft = draft_for_cfg(cfg);") && retain.contains("cfg, draft.as_ref(), srcs)")
+                && retain.contains("head_sync_one(node, mid, &per_rank[rank], draft.as_ref())"),
                 "run_head_retain must ship draft_for_cfg's decision");
         assert!(!retain.contains("cfg, None, srcs)"), "the EXL3 head may no longer pass None as the drafter");
         std::fs::remove_dir_all(&d).ok();
@@ -2359,7 +2628,7 @@ mod build_id_tests {
             let mut s = TcpStream::connect(addr).unwrap();
             let ni = NodeInfo { hostname: "fake".into(), addr };
             let r = head_hello(&mut s, &ni, &binary_version());
-            if r.is_ok() { send_msg(&mut s, &Msg::Manifest { model_id: "m".into(), artifacts: Vec::new() }).unwrap(); }
+            if r.is_ok() { send_msg(&mut s, &Msg::Manifest { model_id: "m".into(), artifacts: Vec::new(), draft: Vec::new() }).unwrap(); }
             drop(s);
             let (first, next) = fake.join().unwrap();
             assert!(matches!(first, Msg::Hello { ref role, .. } if role == "head"));
@@ -2385,5 +2654,176 @@ mod build_id_tests {
                                  body.find("Msg::Manifest").expect("head_sync_one ships the manifest"));
         assert!(hello < manifest, "the version check comes before the manifest");
         assert!(src.contains("if r.version != binary_version() {"), "discovery filters on the version token");
+    }
+
+    /// EXL3-SHARDSHIP — the ISSUES row's contract, exercised end to end on the REAL code path:
+    /// a minimal qwen4_exp EXL3 pack is planned by the real `ship_plans` (B32), rank 1's blobs
+    /// are materialized exactly as the head's shipper produces the wire bytes (Whole = the
+    /// file's bytes, Segment = `write_segment`, Bytes = inline), published and assembled by the
+    /// real blob-cache path (`publish_blob` + `assemble_model_dir`), and the REAL node loader
+    /// (`Exl3Pack::open`) must open the assembled rank dir: the rank's own expert modules +
+    /// every common module and every sidecar the serve boot reads, no foreign expert, the
+    /// regenerated index and gb10_shard.json in place — and strictly less than the whole pack.
+    /// The wiring pins close the row's two ends: the head ships whenever the plan covers the
+    /// model and stamps `ship_shards`; the node's EXL3 boot swaps the head's local pack dir for
+    /// the shipped one (never the head's path).
+    #[test]
+    fn exl3_rank_ship_round_trip_through_the_blob_cache_and_the_node_loader() {
+        use std::collections::BTreeMap;
+        let deal = crate::exl3_forward::xtp::ep_deal_kind();
+        assert_eq!(deal, "interleave", "the fixture pins the default expert deal");
+
+        // ---- the fixture pack: 2 trunk layers x 4 experts (gate/up/down), a common attn
+        // module per layer, lm_head, and the sidecars the node's serve boot reads by name.
+        let root = std::env::temp_dir().join(format!("shardship_exl3_{}", std::process::id()));
+        let pack = root.join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        let (nl, ne) = (2usize, 4usize);
+        let mut names: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut module = |v: &mut Vec<(String, Vec<usize>)>, name: String| {
+            v.push((format!("{name}.trellis"), vec![1, 1, 32])); // words 32 -> k2 4 (kernel-supported)
+            for s in ["suh", "svh", "mul1"] { v.push((format!("{name}.{s}"), vec![1])); }
+        };
+        for l in 0..nl {
+            module(&mut names, format!("model.language_model.layers.{l}.self_attn.q_proj"));
+        }
+        module(&mut names, "lm_head".to_string());
+        for l in 0..nl { for e in 0..ne { for proj in ["gate_proj", "up_proj", "down_proj"] {
+            module(&mut names, format!("model.language_model.layers.{l}.mlp.experts.{e}.{proj}"));
+        } } }
+        let mut header: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        let mut data: Vec<u8> = Vec::new();
+        for (name, shape) in &names {
+            let bytes = shape.iter().product::<usize>() * 4; // F32
+            let start = data.len();
+            data.extend(std::iter::repeat(0u8).take(bytes));
+            header.insert(name.clone(), serde_json::json!({
+                "dtype": "F32", "shape": shape, "data_offsets": [start, start + bytes]
+            }));
+        }
+        let hj = serde_json::to_string(&header).unwrap();
+        let mut st = (hj.len() as u64).to_le_bytes().to_vec();
+        st.extend_from_slice(hj.as_bytes());
+        st.extend_from_slice(&data);
+        let st_name = "model-00001-of-00001.safetensors";
+        std::fs::write(pack.join(st_name), &st).unwrap();
+        let mut wmap = serde_json::Map::new();
+        for (name, _) in &names { wmap.insert(name.clone(), serde_json::json!(st_name)); }
+        std::fs::write(pack.join("model.safetensors.index.json"),
+                       serde_json::json!({ "weight_map": wmap }).to_string()).unwrap();
+        std::fs::write(pack.join("config.json"), serde_json::json!({
+            "model_type": "qwen4_exp",
+            "text_config": { "hidden_size": 256, "num_hidden_layers": nl, "num_experts": ne,
+                             "num_experts_per_tok": 2, "moe_intermediate_size": 128 }
+        }).to_string()).unwrap();
+        std::fs::write(pack.join("quantization_config.json"),
+                       serde_json::json!({ "quant_method": "exl3", "codebook": "mul1", "bits": 2.0 }).to_string()).unwrap();
+        std::fs::write(pack.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(pack.join("generation_config.json"), "{}").unwrap();
+
+        // ---- the row's front door: the plan covers this pack at world 2, never at world 1
+        assert_eq!(crate::shard_plan::detect_format(&pack), Some(crate::shard_plan::ShardFormat::Exl3));
+        assert_eq!(crate::shard_plan::applies(&pack, 2), Some(crate::shard_plan::ShardFormat::Exl3));
+        assert_eq!(crate::shard_plan::applies(&pack, 1), None, "world < 2 never ships shards");
+
+        // ---- the head: the real B32 planning + hashing
+        let ships = ship_plans(&pack, 2).expect("the covered pack must plan");
+        assert_eq!(ships.len(), 2, "ships[0] is the head (nothing shipped), ships[1] is rank 1");
+        assert!(ships[0].artifacts.is_empty() && ships[0].srcs.is_empty());
+        let ship = &ships[1];
+        let src_total = std::fs::metadata(pack.join(st_name)).unwrap().len()
+            + ["config.json", "quantization_config.json", "tokenizer.json", "generation_config.json"]
+                .iter().map(|f| std::fs::metadata(pack.join(f)).unwrap().len()).sum::<u64>();
+        let ship_total: u64 = ship.artifacts.iter().map(|a| a.size).sum();
+        assert!(ship_total < src_total,
+                "rank 1 must receive only its shards, not the whole pack ({ship_total} vs {src_total} B)");
+
+        // ---- the wire: every artifact's bytes exactly as the shipper produces them, published
+        // into the real blob cache and assembled by the real node-side assembly
+        let mut blobs = Vec::new();
+        std::fs::create_dir_all(cache_root().join("blobs")).unwrap(); // first publish on a fresh box creates it
+        for a in &ship.artifacts {
+            let src = ship.srcs.get(&a.logical).expect("every artifact has its plan source");
+            let bytes: Vec<u8> = match src {
+                crate::shard_plan::PlanSrc::Whole(p) => std::fs::read(p).unwrap(),
+                crate::shard_plan::PlanSrc::Bytes(b) => b.clone(),
+                crate::shard_plan::PlanSrc::Segment(ps) => {
+                    let mut v = Vec::new();
+                    crate::shard_plan::write_segment(ps, &mut v).unwrap();
+                    v
+                }
+            };
+            assert_eq!(bytes.len() as u64, a.size, "{}: wire bytes must match the manifest size", a.logical);
+            let tmp = cache_root().join("blobs").join(format!("tmp.shardship.{}", a.hash));
+            std::fs::write(&tmp, &bytes).unwrap();
+            publish_blob(&a.hash, &tmp).unwrap();
+            blobs.push(blob_path(&a.hash));
+        }
+        let dir = assemble_model_dir(&ship.model_id, &ship.artifacts).unwrap();
+
+        // ---- the node: the REAL loader opens the assembled rank dir
+        let p = crate::exl3::Exl3Pack::open(&dir.to_string_lossy())
+            .expect("the assembled rank shard dir must open as an EXL3 pack");
+        assert_eq!(p.cfg.num_experts, ne, "the shipped config.json parses");
+        let mut expert_modules = 0usize;
+        for m in &p.modules {
+            if let Some(rest) = m.name.strip_prefix("model.language_model.layers.") {
+                if let Some((l, tail)) = rest.split_once('.') {
+                    if let Some(experts) = tail.strip_prefix("mlp.experts.") {
+                        let (e, _) = experts.split_once('.').expect("expert tensor name");
+                        let own = crate::exl3_forward::xtp::ep_layer_owners_kind(&deal, ne, 2, l.parse().unwrap()).unwrap();
+                        assert_eq!(own[e.parse::<usize>().unwrap()], 1,
+                                   "rank 1's dir must hold no foreign expert: {}", m.name);
+                        expert_modules += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(expert_modules, nl * (ne / 2) * 3, "own gate/up/down modules only, every layer");
+        for f in ["config.json", "quantization_config.json", "tokenizer.json",
+                  "generation_config.json", "model.safetensors.index.json", "gb10_shard.json"] {
+            assert!(dir.join(f).is_file(), "{f} must ship to the rank dir");
+        }
+        let info: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("gb10_shard.json")).unwrap()).unwrap();
+        assert_eq!(info["rank"].as_u64(), Some(1), "the shard info names this rank");
+        assert!(dir.join("config.json").symlink_metadata().unwrap().file_type().is_symlink(),
+                "the assembled files are blob-cache links: the node never needed the head's path");
+
+        // ---- the row's two wiring ends, pinned against regression
+        let src = include_str!("cluster.rs");
+        let retain = &src[src.find("pub fn run_head_retain(").unwrap()..src.find("fn sync_only_exit(").unwrap()];
+        assert!(retain.contains("applies(model_dir, world"),
+                "the head must ship whenever the shard plan covers the model");
+        let one = &src[src.find("fn head_sync_one(").unwrap()..];
+        assert!(one.contains("node_cfg.ship_shards = srcs.is_some()"),
+                "the head must stamp ship_shards when the rank's shards shipped");
+        let msrc = include_str!("main.rs");
+        assert!(msrc.contains("if tpc.ship_shards {") &&
+                msrc.contains("tpc.exl3_pack_dir = dir.to_string_lossy().to_string();"),
+                "the node's EXL3 boot must load the shipped shard dir, not the head's local path");
+
+        std::fs::remove_dir_all(&dir).ok();
+        for b in blobs { std::fs::remove_file(b).ok(); }
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod tpship_tests {
+    /// TPSHIP (2026-11-07): an EXL3 pack the shard plan does not cover ships whole (no empty-manifest branch is left
+    /// in the EXL3 head sync) and the node is told to load that copy (ship_shards), never the head's path.
+    #[test]
+    fn exl3_packs_outside_the_shard_plan_ship_whole_and_load_the_shipped_copy() {
+        let src = include_str!("cluster.rs");
+        let retain = &src[src.find("pub fn run_head_retain(").unwrap()..];
+        let retain = &retain[..retain.find("\n}\n").unwrap()];
+        assert!(!retain.contains("vec![Vec::new(); world as usize]"), "the EXL3 empty-manifest (load at the head's path) branch is gone");
+        assert!(retain.contains("build_manifest(model_dir, world)?"), "a pack outside the plan ships whole");
+        // ship-space (2026-11-02) split the per-node sync: the shipment and its ship_shards stamp live in head_ship
+        let sync = &src[src.find("fn head_ship(").unwrap()..];
+        let sync = &sync[..sync.find("\nfn ").unwrap()];
+        assert!(sync.contains("node_cfg.ship_shards = srcs.is_some() || (cfg.exl3 && !artifacts.is_empty());"),
+                "a node that received an EXL3 pack loads the shipped copy");
     }
 }

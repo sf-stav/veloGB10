@@ -8,7 +8,8 @@ fn print_help() {
     let prog = std::path::Path::new(&arg0)
         .file_name().unwrap_or_default().to_string_lossy();
 
-    println!("gb10_inference — from-scratch Rust+CUDA inference on NVIDIA GB10 (DGX Spark): Qwen3.5/3.6/3.8 incl. Qwen3.8-Flash-Next EXL3");
+    println!("{}", gb10_inference::startup::version_line());
+    println!("from-scratch Rust+CUDA inference on NVIDIA GB10 (DGX Spark): Qwen3.5/3.6/3.8 incl. Qwen3.8-Flash-Next EXL3");
     println!();
     println!("USAGE:");
     println!("  {prog} <MODE> [OPTIONS]");
@@ -16,6 +17,12 @@ fn print_help() {
     println!("MODES:");
     println!("  --server            OpenAI-compatible HTTP server (this is the one you want)");
     println!("  --quantize          Offline NVFP4/FP8 quantizer (--model-dir <in> --out <dir> --recipe <r>)");
+    println!("                      --recipe examples (the grammar: --quantize under PROBES & BENCHES below):");
+    println!("                        all,gdn:fp8                 NVFP4, GatedDeltaNet projections FP8 (the default)");
+    println!("                        all                         everything NVFP4 (smallest; most loss)");
+    println!("                        all:fp8                     everything FP8 (closest to bf16; largest)");
+    println!("                        all,-router,-embed,-lmhead  NVFP4, router / embeddings / LM head kept bf16");
+    println!("                        all,gdn:fp8,attn:fp8        NVFP4 MLP and experts, attention and GDN FP8");
     println!("  (also the --perplexity mode, a measuring tool: its options are listed once, under PERPLEXITY TOOL below)");
     println!("  --bench-mtp         End-to-end MTP probe: proves greedy is bitwise lossless, reports tok/s");
     println!("  --bench-verify      MTP verify == sequential decode, bitwise (add --draws N to fuzz)");
@@ -26,6 +33,11 @@ fn print_help() {
     println!("  --cached-models-remove <ID>  Remove ONE cached model (name/unique prefix)");
     println!("  --cached-models-remove-all  Clear the whole TP model cache");
     println!("  (default)           Interactive CLI: load model, generate from a prompt");
+    println!("  --version           Print the app name and version, then exit");
+    println!("  --update            Update this installed binary to the latest GitHub release");
+    println!("                     (dev builds refuse; the previous image is kept as .prev; the");
+    println!("                     same version must be installed on every TP node)");
+    println!("  --no-update-check   Skip the boot-time newer-release notification");
     println!("  --help, -h          Show this help (day-to-day options only)");
     println!("  --help-advanced     Every option incl. diagnostics, drills and probes");
     println!();
@@ -91,7 +103,7 @@ fn print_help() {
     println!();
     println!("  SAMPLING DEFAULTS  (server-level; every request may override in its JSON body)");
     println!("    --default-repetition-penalty <F>  Repetition penalty, 1.0 = off                    [1.0]");
-    println!("    --default-presence-penalty <F>    Presence penalty  [EXL3: 0.0; NVFP4: 2.0 on 2B, else 1.5]");
+    println!("    --default-presence-penalty <F>    Presence penalty  [EXL3: 0.0; NVFP4: 2.0 on Qwen3.5 0.8B/2B, else 1.5]");
     println!("    --default-frequency-penalty <F>   Frequency penalty                                [0.0]");
     println!("    --penalty-range <N>        EXL3: repetition/presence/frequency window, the reference");
     println!("                               engine's semantics: N tokens at full strength + N fading   [1024]");
@@ -204,14 +216,14 @@ fn print_help() {
     println!("  TP FLAGS (head)");
     println!("    --tp [N]                 Enable TP on --server (sync + RDMA bring-up first).");
     println!("                             N is the rank count, a power of two (default 2).");
-    println!("                             EXL3 packs: N=2 serves; N=4 runs only the probe tier for now");
-    println!("                             (--head --tp 4 --probe-exl3-xtp, 3 --nodes; --tp-prefill-xport");
-    println!("                             dual (default, rail 2 is a full N-way link) | single | off).");
+    println!("                             EXL3 packs: N=2 and N=4 serve; --tp-prefill-xport dual");
+    println!("                             (default, rail 2 is a full N-way link) | single | off;");
+    println!("                             probe tier for bring-up checks: --probe-exl3-xtp.");
     println!("                             Other model families are unchanged.");
     println!("    --nodes <ip[:port],...>  Explicit node address(es); skips UDP discovery");
     println!("    --discover-wait <S>      Discovery broadcast window instead of --nodes      [3]");
-    println!("    --rdma-dev <d1[,d2]>     RoCE devices if the defaults (rocep1s0f1, roceP2p1s0f1)");
-    println!("                             don't match the platform (also --rdma-dev)");
+    println!("    --rdma-dev <d1[,d2]>     RoCE devices; default: auto-detected (the box's only active port");
+    println!("                             pair). Required only on a box with two active pairs");
     println!("    --no-shard-mixers        Escape hatch: DON'T shard attention/GDN mixers + KV");
     println!("                             (default is ON under --tp/--head — it's where the speed is)");
     println!("    --tp-graph               CUDA-graph the TP decode (bench path)");
@@ -405,7 +417,10 @@ fn print_help() {
     println!("                           the old xq_had_suh_rows / xq_moe_combine_rows_ep at the served shapes, + per-call timing (TP-4M1)");
     println!("  --probe-exl3-hcw4        EXL3 xq_hc_w4 alone (synthetic): bitwise vs the p4c hc path, m 1..8,");
     println!("                           grids x flags, then the standalone DRAM-cold timing table (TP-I3 (b))");
-    println!("  --probe-exl3-ltrows      Sequence-parallel precondition (synthetic): prefill cuBLASLt GEMMs per-row");
+    println!("  --probe-exl3-bitwidths    EXL3 synthetic width-matrix gate (no model): dense a1 all k2,");
+println!("                           wide 3..=8, split-K ks, moe_pf 2..=7, WP20 EPI 3..=7, refusal");
+println!("                           predicates; poison canaries; fresh host oracle per cell (PR#27-D3)");
+println!("  --probe-exl3-ltrows      Sequence-parallel precondition (synthetic): prefill cuBLASLt GEMMs per-row");
     println!("                           bit-identical at m = c/2 vs m = c, own-heuristic vs pinned plan");
     println!("                           [--ltrows-c 2048,1024,... | A-B (sweep)] [--ltrows-shapes all|hc] (TP-I3 (a) rung 1)");
     println!("  --probe-exl3-sppin       TP-SP1 gate (synthetic): the sequence-parallel prefill's pinned-plan GEMM call on every");
@@ -521,9 +536,17 @@ fn print_help() {
     println!();
     println!("  --kv-cache bf16|q4|tq|tq3|k8v4|k8v8  KV cache format (q4 = 4-bit; tq = 3.5-bit");
     println!("                           TurboQuant; k8v4 = int8-K + q4-V; k8v8 = int8 K+V; bf16 = default)");
-    println!("  --kv-cache f32|f16|fp8|q8  EXL3 packs: attention KV format (default q8 = H32-rotated int8");
-    println!("                           + f16 per-32 scale, the reference implementation's -cq 8; f32 = exact)");
+    println!("  --kv-cache f32|f16|fp8|q8|q4k  EXL3 packs: attention KV format (default q8 = H32-rotated int8");
+    println!("                           + f16 per-32 scale, the reference implementation's -cq 8; q4k = the");
+    println!("                           same basis at 4 bits, 2 dims per byte; f32 = exact)");
     println!("  --reasoning-effort <e>   reasoning level in the chat template (no_think|low|high|medium|xhigh)");
+    println!("  --model-dir <DIR|repo>   a local model directory OR a Hugging Face repo id (issue #33; the");
+    println!("                           id resolves to the newest local snapshot in the HF cache; no network");
+    println!("                           downloads - an uncached id fails the boot naming the fix)");
+    println!("  --hf-cache <DIR>         an extra Hugging Face cache root to search (default + this; issue #33)");
+    println!("  --chat-template <PATH>   use this chat template file instead of the pack's own (issue #34;");
+    println!("                           wins over chat_template.jinja and tokenizer_config.json; an unreadable or");
+    println!("                           non-compiling file fails the boot rather than silently falling back)");
     println!("  --thinking <mode>        server: engine's thinking override — auto (default: pass nothing, the");
     println!("                           model's own chat_template.jinja decides) | on | off. Per-request");
     println!("                           override: chat_template_kwargs.enable_thinking");
@@ -613,6 +636,54 @@ fn load_model_gpu(dir: &str, tp_rank: Option<i32>, world: i32)
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    // BASICS (owner 2026-11-02): `--version` prints the version line and exits; every other run
+    // prints it as its FIRST line (stderr under --print-config, whose stdout stays byte-identical;
+    // --help prints it as the first line of the help text).
+    if args.iter().skip(1).any(|a| a == "--version") {
+        println!("{}", gb10_inference::startup::version_line());
+        return;
+    }
+    // --update: self-update to the latest GitHub release (installed apps only; never a TP
+    // node process). Explicit only — the boot path below merely NOTIFIES.
+    if args.iter().skip(1).any(|a| a == "--update") {
+        let tp_world = parse_tp_world(&args).unwrap_or(1);
+        if tp_world >= 2 && args.iter().any(|a| a == "--node") {
+            eprintln!("refused: a TP node must never replace itself out from under a head — run --update on the head, and install the same version on every node");
+            std::process::exit(2);
+        }
+        std::process::exit(gb10_inference::self_update::update(false));
+    }
+    gb10_inference::startup::print_banner(&args);
+    // Boot-time version notification (never a replacement): one colored line when a newer
+    // GitHub release exists. SILENT on no-network / rate-limit / curl-missing; skip entirely
+    // under --no-update-check or on a TP node (the head is the only rank that should talk).
+    if !args.iter().skip(1).any(|a| a == "--no-update-check") {
+        let tp_world = parse_tp_world(&args).unwrap_or(1);
+        let is_node = args.iter().skip(1).any(|a| a == "--node");
+        if tp_world < 2 || !is_node {
+            gb10_inference::self_update::boot_check();
+        }
+    }
+    // Issue #33: a --model-dir that looks like a Hugging Face repo id (org/name, no path
+    // separators of its own) resolves to the newest LOCAL snapshot under the HF cache before
+    // any mode reads it. No network: an uncached id fails loudly here, naming the roots
+    // searched and the download command.
+    let mut args: Vec<String> = args;
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == "--model-dir" || (args[i].starts_with("--model-dir=") && false) {
+            let v = &args[i + 1];
+            if gb10_inference::hf_cache::looks_like_repo_id(v) {
+                match gb10_inference::hf_cache::resolve(v, None) {
+                    Ok(p) => {
+                        let ps = p.display().to_string();
+                        eprintln!("[hf] --model-dir {v} -> local snapshot {ps}");
+                        args[i + 1] = ps;
+                    }
+                    Err(e) => { eprintln!("FATAL: {e}"); std::process::exit(2); }
+                }
+            }
+        }
+    }
     // CLI-1 (AGENTS §7): every engine option is a command-line flag. An environment variable the
     // engine used to read is refused here, loudly, naming its flag; then the registry is filled
     // from argv once, before any worker / GPU thread starts.
@@ -633,6 +704,8 @@ fn main() {
         eprintln!("FATAL: {msg}");
         std::process::exit(2);
     }
+    // BASICS: the run's configuration right after the version line (not for --help / --print-config).
+    gb10_inference::startup::print_config(&args);
     // F9b: one info line when --tp is bare (stderr only; --print-config stdout stays byte-identical)
     if let Some(hint) = gb10_inference::opts::tp_bare_hint(&args) {
         eprintln!("{hint}");
@@ -745,7 +818,11 @@ fn main() {
     }
 
     // Check for server mode
-    if args.iter().any(|a| a == "--server") {
+    if args.iter().any(|a| a == "--server" || a == "server") {
+        // 2026-10-30 (P7 B6): the bare `server` positional is accepted as `--server`.
+        // Before: it was silently ignored, fell through to the default-generation path,
+        // and the trunk qwen loader panicked ("missing tensor: lm_head.weight") on every
+        // EXL3 pack — a confusing crash instead of serve (the §1b-bis.8 posture).
         run_server(&args);
         return;
     }
@@ -1731,6 +1808,15 @@ fn main() {
         });
         return;
     }
+    // PR#27-D3: synthetic, model-independent EXL3 width-matrix gate (no --model-dir).
+    //   ./gb10_inference --probe-exl3-bitwidths
+    if args.iter().any(|a| a == "--probe-exl3-bitwidths") {
+        gb10_inference::exl3_bench::probe_bitwidths().unwrap_or_else(|e| {
+            eprintln!("EXL3-BITWIDTHS FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
     // S-A3-c: G-A3-5 — batch invariance (y_raw/y row 0 bitwise across verify widths) +
     // GEMM correctness vs the host reference (kernel-mirrored Hadamards, fp32 GEMM).
     //   ./gb10_inference --probe-exl3-binv --model-dir <EXL3-pack> [--exl3-widths 1,2,4,8]
@@ -1781,6 +1867,8 @@ fn main() {
         });
         return;
     }
+    // FP4L: the FP4-Local probes (--probe-fp4l CPU receipts, --probe-fp4l-gpu kernel truth; src/fp4l/probe.rs)
+    if gb10_inference::fp4l::probe::dispatch(&args) { return; }
     // TP-4T1: the prefill tail-chunk small-M GEMM (synthetic; bitwise vs xq_gemm_f16 + per-call timing).
     if args.iter().any(|a| a == "--probe-exl3-tailgemm") {
         gb10_inference::exl3_bench::probe_tailgemm().unwrap_or_else(|e| {
@@ -2537,14 +2625,14 @@ fn cli_opts_bridge(args: &[String]) {
             // [kv-cache], so these values are refused there rather than silently serving bf16.
             // q4x = the WP25 kvnll probe's deliberately broken positive control (never served:
             // exl3_serve refuses it)
-            "f32" | "f16" | "fp8" | "q8" | "q4x" => {
+            "f32" | "f16" | "fp8" | "q8" | "q4x" | "q4k" => {
                 if !parse_arg(args, "--model-dir").map_or(false, gb10_inference::exl3_serve::is_exl3_pack) {
                     eprintln!("--kv-cache {v} is an EXL3-pack format (needs an EXL3 --model-dir); NVFP4 formats are bf16|q4|tq|tq3|k8v4|k8v8");
                     std::process::exit(1);
                 }
                 opts::set(opt!("kv-cache"), v);
             }
-            other => { eprintln!("--kv-cache must be bf16|q4|tq|tq3|k8v4|k8v8 (NVFP4) or f32|f16|fp8|q8 (EXL3) (got '{other}')"); std::process::exit(1); }
+            other => { eprintln!("--kv-cache must be bf16|q4|tq|tq3|k8v4|k8v8 (NVFP4) or f32|f16|fp8|q8|q4k (EXL3) (got '{other}')"); std::process::exit(1); }
         }
     }
     // MTP: the bench-path [tp-mtp] / [tp-mtp-depth] internals from the server CLI (`--mtp=on|off`, `--mtp-depth`).
@@ -8702,6 +8790,9 @@ fn run_cluster_node(args: &[String]) {
     // process) may already hold it on a shared box -- this flag lets a second node coexist without
     // touching the first. The head is unaffected (explicit --nodes dials TCP; no UDP involved).
     let udp: u16 = parse_arg(args, "--discovery-port").and_then(|s| s.parse().ok()).unwrap_or(29499);
+    // resolve + print the RDMA rails at supervisor start: a box with two active port pairs exits HERE
+    // (naming them), not when a head connects
+    let _ = gb10_inference::tp::rdma_devs();
 
     // RESIDENT by default (TP item B): supervise one-shot sessions, re-arming after each so the node
     // survives a head restart with zero manual intervention. One process per session is the whole
@@ -8774,16 +8865,28 @@ fn run_cluster_node_once(port: u16, udp: u16) {
         return;
     }
     if tpc.exl3 {
-        // TP-A: the EXL3 engine, zero-config knobs. Legacy: the local pack at the head's path (UNCHECKED —
-        // the manifest check was removed, owner 074c669). B32 (always, for Qwen3.8-Flash-Next): the rank's shard dir the
-        // head just shipped through the blob cache. TP-D: the serve mode keeps the control stream (the Step /
+        // TP-A: the EXL3 engine, zero-config knobs. B32 (always, for Qwen3.8-Flash-Next): the rank's shard dir the head
+        // just shipped through the blob cache; TPSHIP (2026-11-07): every other EXL3 pack ships whole the same way
+        // (ship_shards is set for both), so a node never opens the head's filesystem path. TP-D: the serve mode keeps the control stream (the Step /
         // HeadFlag plane); the programs drop it.
         let mut tpc = tpc;
         if tpc.ship_shards {
-            gb10_inference::dprintln!("NODE — B32 shard dir from the blob cache: {} (the head's path is not read)", dir.display());
+            gb10_inference::dprintln!("NODE — EXL3 pack shipped through the blob cache: {} (the head's path is not read)", dir.display());
             tpc.exl3_pack_dir = dir.to_string_lossy().to_string();
             gb10_inference::tp::set_tp_config(tpc.clone());
         }
+        // DF2 block-16 (2026-11-08, the runner's 27B EXL3 DF2 TP=2/TP=4 boots): install the HEAD's draft block before
+        // the EXL3 load, as the NVFP4 node does below. This branch returned before that site, so an EXL3 node kept the
+        // built-in block 8 while a --df2-block 16 head ran 16 — the TP boot agree refused every such boot (its DF2 word
+        // carries the global block). SPMD-critical: MASK rows and verify columns are collective.
+        // TP2BIT5 #26: clean exit, never a panic! — a panic in the node boot path unwinds
+        // through partial CUDA state and can double-abort in CudaSlice::drop (the issue's
+        // teardown double-panic class).
+        if let Err(e) = gb10_inference::dflash2::set_block(tpc.df2_block) {
+            eprintln!("node exl3 tp error: shipped df2_block {}: {e}", tpc.df2_block);
+            std::process::exit(1);
+        }
+        gb10_inference::dprintln!("NODE — DF2 block = {} (from the head's config)", gb10_inference::dflash2::block());
         if let Err(e) = run_exl3_tp_node(&tpc, head_ip, stream) {
             eprintln!("node exl3 tp error: {e:#}"); std::process::exit(1);
         }
@@ -9016,8 +9119,11 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
     // SPMD-critical: the round's MASK row count and the verify column count are collective, so a
     // one-sided block desyncs the verify all-reduce (and the round would size different buffers).
     // An absent field on the wire means an older head => the serde default 8.
-    gb10_inference::dflash2::set_block(tpc.df2_block)
-        .unwrap_or_else(|e| panic!("node: shipped df2_block {}: {e}", tpc.df2_block));
+    // TP2BIT5 #26: clean exit, never a panic! (same class as the EXL3 site above)
+    if let Err(e) = gb10_inference::dflash2::set_block(tpc.df2_block) {
+        eprintln!("node tp serve error: shipped df2_block {}: {e}", tpc.df2_block);
+        std::process::exit(1);
+    }
     // DF2_CARRY: the node applies the head's value (never resolved locally — SPMD). The
     // scheduler install below is the only consumer, so there is nothing to install here; the
     // value is read from `tpc` at the node's own `set_df2_carry` call site.
@@ -9141,6 +9247,8 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
     // exactly when the head skips it (same model head-presence, same --mtp force in the config).
     if gpu.mtp_present() && tpc.mtp_force != Some(false) {
         println!("NODE — SPMD MTP calibration (tables discarded; head's are shipped)...");
+        // TP boot barrier: every rank arrives before the calibration's first all-reduce (boot deadline, not the 10 s watchdog)
+        gb10_inference::net::boot_barrier(0xCA1B).expect("TP boot barrier before the MTP calibration");
         let mut cpool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
         // Same sizing as the head's calibration state (main.rs run_server): ONE live KV slot at the
         // top context bucket's stride; GDN checkpoint slots (2..=N) are separately sized.
@@ -9526,6 +9634,7 @@ fn run_exl3_tp_head(args: &[String], model_dir: &str) {
     let mut tpc = gb10_inference::tp::TpConfig::from_opts();
     tpc.world = world;
     tpc.exl3 = true;
+    tpc.df2_block = gb10_inference::dflash2::block();   // DF2 block-16: the node installs the head's block (SPMD)
     tpc.exl3_pack_dir = dir_abs.clone();
     // --ep-deal interleave|contig|freq: a registry option (validated at startup; CLI-1 merged the
     // old GB10_TP_EP_DEAL=freq env override into it)
@@ -9594,6 +9703,7 @@ fn run_naive_tp_head(args: &[String], model_dir: &str, mode: &str) {
     tpc.world = world;
     tpc.mode_serve = true;
     tpc.exl3 = true;              // the cluster sync ships NO artifacts: every rank reads its own pack copy
+    tpc.df2_block = gb10_inference::dflash2::block();   // DF2 block-16: the node installs the head's block (SPMD)
     tpc.exl3_pack_dir = dir_abs.clone();
     tpc.max_seq_len = max_pos;
     let mut node_args: Vec<String> = args.to_vec();
@@ -9673,6 +9783,7 @@ fn run_naive_tp_node(tpc: &gb10_inference::tp::TpConfig, shard_dir: &std::path::
 }
 
 fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
+    gb10_inference::fp4l::apply_pack_defaults(model_dir); // FP4L: the pack's quality defaults (ride TpConfig as set options)
     // (--rdma-dev is a registry option: parsed at startup, node-local, never shipped)
     gb10_inference::dprintln!("{}", gb10_inference::exl3_forward::xtp::identity_line("head rank=0 (serve)"));
     let world = parse_tp_world(args).unwrap_or(2);
@@ -9702,6 +9813,7 @@ fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
     tpc.world = world;
     tpc.mode_serve = true;
     tpc.exl3 = true;
+    tpc.df2_block = gb10_inference::dflash2::block();   // DF2 block-16: the node installs the head's block (SPMD)
     tpc.exl3_pack_dir = dir_abs.clone();
     // --ep-deal interleave|contig|freq: a registry option (validated at startup; CLI-1 merged the
     // old GB10_TP_EP_DEAL=freq env override into it)
@@ -9728,6 +9840,13 @@ fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
     }
     gb10_inference::dprintln!("[head] EXL3 TP serve config: deal {} options shipped {:?}; node argv {:?}", tpc.exl3_ep_deal,
              gb10_inference::opts::snapshot(), node_args);
+    // TP2BIT5 #26: head-side width preflight -- the pack's module widths decide bootability, so
+    // check them BEFORE discovery and the first sync (the node refusal used to arrive only after
+    // 57.5 GiB had shipped). Same predicate as the loader's (width_supported); MTP-head-only
+    // unsupported widths stay a Fix-4 skip (serve without speculation), not a refusal.
+    if let Err(e) = gb10_inference::exl3_serve::tp_pack_width_preflight(&dir_abs) {
+        eprintln!("EXL3 TP head: {e:#}"); std::process::exit(2);
+    }
     gb10_inference::tp::set_tp_config(tpc.clone());
     let streams = match gb10_inference::cluster::run_head_retain(std::path::Path::new(&dir_abs), explicit, wait, &tpc) {
         Ok((nodes, s)) => {
@@ -9838,7 +9957,8 @@ fn exl3_tp_node_prelink(tpc: &gb10_inference::tp::TpConfig) -> anyhow::Result<Ex
 fn run_cluster_head(args: &[String]) {
     // (--rdma-dev is a registry option: parsed at startup, node-local, never shipped)
     let model_dir = parse_arg(args, "--model-dir").expect("--head requires --model-dir <DIR>").to_string();
-    if gb10_inference::exl3::is_exl3_dir(&model_dir) {
+    if gb10_inference::exl3::is_exl3_dir(&model_dir) || gb10_inference::fp4l::pack::is_fp4l_dir(std::path::Path::new(&model_dir)) {
+        gb10_inference::fp4l::apply_pack_defaults(&model_dir);
         run_exl3_tp_head(args, &model_dir);
         return;
     }
@@ -13948,6 +14068,10 @@ fn run_quantize(args: &[String]) {
         outs.clear();
     };
 
+    // BASICS (owner 2026-11-02): the input tensors' bytes as a percentage at the normal level
+    let qprog = gb10_inference::boot_report::Progress::new("quantizing",
+        shards.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum(),
+        gb10_inference::boot_report::Unit::Bytes);
     for (i, sf) in shards.iter().enumerate() {
         println!("  shard {}/{}: {}", i + 1, shards.len(),
                  sf.file_name().unwrap_or_default().to_string_lossy());
@@ -13956,6 +14080,7 @@ fn run_quantize(args: &[String]) {
         for (name, view) in st.tensors() {
             let data = view.data();
             bytes_in += data.len() as u64;
+            qprog.add(data.len() as u64);
             // Un-fused expert weight? stash for fusion, don't emit yet. Fuse ON-COMPLETE (a full
             // contiguous 0..E set for all three projections) so the stash stays ~1 layer deep in RAM.
             if let Some((base, proj, idx)) = parse_expert(&name) {
@@ -13976,6 +14101,7 @@ fn run_quantize(args: &[String]) {
         }
         // shard bytes dropped here — peak memory is one shard + the (much smaller) output
     }
+    qprog.finish();
 
     // Drain any bases still pending at the end (e.g. the 122B's single MTP block, whose fusion triggers
     // here when `n_experts` was absent or the set only completed on the last shard). They MUST be
@@ -15896,8 +16022,10 @@ fn run_server(args: &[String]) {
     // Model-card presence-penalty default varies by model size (2B: 2.0, 4B+: 1.5). Temperature,
     // top_p and top_k defaults are resolved per request in server.rs (AppState::sampling_defaults
     // on the chat path, default_temperature()/.. on the legacy completions path).
-    let is_2b = model_path.contains("2b");
-    let default_presence_penalty = if is_2b { 2.0 } else { 1.5 };
+    // LOOPFIX (2026-11-06): by the model's IDENTITY (config.json), not its folder name — a "2b"
+    // substring also matched "122b" and missed the 0.8B, and the velogb10 runner's folder is
+    // "current_model". Qwen3.5 0.8B / 2B cards: 2.0; every other model 1.5, as before.
+    let default_presence_penalty = gb10_inference::server::qwen35_card(&model_path).map(|(_, p)| p).unwrap_or(1.5);
 
     let default_rep_penalty = parse_arg(args, "--default-repetition-penalty").and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
     let default_presence_penalty = parse_arg(args, "--default-presence-penalty").and_then(|s| s.parse::<f32>().ok()).unwrap_or(default_presence_penalty);
@@ -15959,7 +16087,13 @@ fn run_server(args: &[String]) {
             if gb10_inference::boot_report::debug() {
                 println!("Loading tokenizer from {}...", tokenizer_path);
             }
-            let tok_pre = QwenTokenizer::from_file(&tokenizer_path).expect("Failed to load tokenizer");
+            // TP2BIT5 #26: a missing/corrupt tokenizer is a REFUSAL with a fix, not a panic (the
+            // bogus-pack boot test hit exactly this .expect on its way out).
+            let tok_pre = QwenTokenizer::from_file(&tokenizer_path).unwrap_or_else(|e| {
+                eprintln!("FATAL: cannot load the tokenizer at {tokenizer_path} ({e:#}); the pack is incomplete — \
+                           re-download it or point --model-dir at a complete snapshot");
+                std::process::exit(2);
+            });
             st_tok_pre.ok();
             // Same parses as their post-load counterparts below (idempotent; needed here for tpc).
             let mtp_depth_pre = parse_arg(args, "--mtp-depth").and_then(|s| s.parse::<usize>().ok());
@@ -16367,6 +16501,9 @@ fn run_server(args: &[String]) {
             let calib_seq = *calib_points.last().unwrap();
             let mut cstate = gpu.new_batch_state(1, 2 + gb10_inference::gpu::PROFILE_MAX_N, calib_seq);
             let probe = tokenizer.encode("The capital of France is", true).expect("probe encode");
+            // TP boot barrier (the node's twin is before its SPMD calibration): ranks finish their own setup at
+            // different times; the calibration's all-reduces must not start under the 10 s per-step watchdog.
+            if tp { gb10_inference::net::boot_barrier(0xCA1B).expect("TP boot barrier before the MTP calibration"); }
             let bs = gpu.calibrate_mtp_r(&mut cpool, &mut cstate, &probe, calib_seq);
             for (ctx, t) in &bs {
                 for &(d, r) in t {
@@ -16681,8 +16818,16 @@ fn run_server(args: &[String]) {
         gb10_inference::metrics::set_max_batch(max_batch);
         // FLASHNEXT-DF2-B (ISSUES work[113]): the pack's generation_config.json decides the
         // unsent-field sampler defaults (LEGACY 0.7/0.8/20 only when the pack has none).
-        let (sampling_defaults, sd_src) = gb10_inference::server::SamplingDefaults::from_pack(
-            &model_path, gb10_inference::server::SamplingDefaults::LEGACY);
+        // LOOPFIX (2026-11-06): a pack WITHOUT generation_config.json falls back to its Qwen3.5 / 3.6 /
+        // 3.8 model card (qwen35_card: per-mode, per-size), not LEGACY 0.7 / 0.8 / 20 for both modes; a
+        // pack WITH the file is unchanged (LEGACY fallback => its triple for both modes, as before).
+        let has_gen = std::path::Path::new(&format!("{}/generation_config.json", model_path.trim_end_matches('/'))).exists();
+        let card = if has_gen { None } else { gb10_inference::server::qwen35_card(&model_path).map(|(d, _)| d) };
+        let (sampling_defaults, sd_src) = match card {
+            Some(d) => (d, "the Qwen3.5 model card (the pack has no generation_config.json)"),
+            None => gb10_inference::server::SamplingDefaults::from_pack(
+                &model_path, gb10_inference::server::SamplingDefaults::LEGACY),
+        };
         println!("[serve] {}", sampling_defaults.describe(sd_src));
         let state = AppState {
             sampling_defaults,
@@ -16721,6 +16866,12 @@ fn run_server(args: &[String]) {
             max_seq_len,
             decode_headroom,
             prefix_cache,
+            // this scheduler applies a schema from the first token
+            schema_defer: false,
+            // PR #30 port: this scheduler computes no log probabilities (served with logprobs null, counted);
+            // W2: it applies response_format masks itself (greedy MTP verify included), the TP head too
+            logprobs_ok: false,
+            schema_ok: true,
             // Vision tower(s) (v3): load the 333 model.visual.* tensors, and build the GPU fast path
             // on the shared device. Fails softly — a text-only / GPU-less server keeps its exact
             // behavior. --vision-cpu forces the CPU reference tower (diagnostic escape hatch).
@@ -16730,6 +16881,16 @@ fn run_server(args: &[String]) {
             otel: otel_sink,
             stop_ids: stop_ids_for_state,
         };
+
+        // Issue #34: a --chat-template override is a configuration the owner must SEE, not one
+        // he has to dig out of debug logs. One line, always, naming the file that won and its
+        // hash (template_meta.origin is the flag's path when the override engaged).
+        if let Some((origin, sha, nbytes)) = state.tokenizer.template_meta.clone() {
+            let argv: Vec<String> = std::env::args().collect();
+            if gb10_inference::opt_or_arg(&argv, "--chat-template").is_some() {
+                println!("[tokenizer] chat template OVERRIDE in effect: {} (sha256 {} {}, {} bytes)", origin, &sha[..12], nbytes, nbytes);
+            }
+        }
 
         // Phase-2 A3: ONE boot line that pins the rendering/penalty configuration this process
         // actually runs under. Every Phase-1 report had to infer these from campaign notes, and

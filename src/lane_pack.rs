@@ -147,7 +147,7 @@ pub(crate) fn fam_of(samp_live: bool, rq_live: bool) -> PackFam {
 /// model load, so a refused boot costs nothing (the `--lane-order fcfs` refusal used to fire after
 /// the 414 MB packed scratch and the 26 captures).
 pub(crate) struct Posture<'a> {
-    /// the resolved `--kv-cache` name (q8 is the default and the only gated format)
+    /// the resolved `--kv-cache` name (q8 is the default; q8 and q4k are the admitted formats)
     pub kv: &'a str,
     /// the resolved speculation depth ceiling (`--exl3-mtp-k`; MTP_MAX_K is the default and the gated one)
     pub mtp_k: usize,
@@ -157,6 +157,11 @@ pub(crate) struct Posture<'a> {
     pub a_ctrl_old: bool,
     /// `--lane-order fcfs`: one lane per scheduler step; a pack steps two
     pub fcfs: bool,
+    /// `--exl3-dense-v3=0`: `xq_attn_decode_group` resolves ONE slot for the whole group, so a
+    /// packed verify's segment B would read and write segment A's K/V (q8 and q4k alike)
+    pub dense_v3: bool,
+    /// `--lane-pack-kv any`: packing may run on a KV format other than q8 (opt-in, ungated)
+    pub kv_any: bool,
 }
 
 /// F1 (owner 2026-10-10, AGENTS §1b-bis item 8 — "support things properly or gracefully fall back"):
@@ -165,13 +170,25 @@ pub(crate) struct Posture<'a> {
 /// line (`lane packing (--lane-pack, on by default) is NOT ACTIVE on this boot: <reason>; requests are
 /// served without packed rounds`), and the decision rides `/metrics` and the TP boot agree. Returns the plain-word
 /// reasons (empty = this posture can pack).
+/// `--lane-pack-kv q8|any` (default q8): `any` lets the packed arm run on an f16 / fp8 KV cache (ungated opt-in).
+/// q4k is ADMITTED (owner 2026-11-13, PLAN/Q4K_PACK_WORK_2026-11-13.md): the default posture packs on it.
+pub(crate) fn kv_any() -> bool {
+    crate::opts::var(crate::opt!("lane-pack-kv")).as_deref() == Ok("any")
+}
+
 pub(crate) fn posture_fallbacks(p: &Posture) -> Vec<String> {
     let mut v = Vec::new();
     if p.fcfs {
         v.push("--lane-order fcfs: fcfs steps ONE lane per scheduler step, a pack steps two (the rr order steps both)".to_string());
     }
-    if p.kv != "q8" {
-        v.push(format!("--kv-cache {}: the packed verify's per-segment attention and commit were never run on another KV format (gated: q8)", p.kv));
+    // q4k is admitted (owner 2026-11-13, Option A on PLAN/Q4K_PACK_WORK_2026-11-13.md): its rows are
+    // symmetric (144 B) and the packed arm reaches KV only through xq_kv_make, with attention on
+    // xq_attn_decode_group (per-row slot, issue #35). Evidence: the pack2/packstate/binv receipts in
+    // docs/KV_CACHE_Q4K.md §6 were genuine packed verifies on q4k — the gate only ever applied to the
+    // serving boot, never the probe paths.
+    if !matches!(p.kv, "q8" | "q4k") && !p.kv_any {
+        v.push(format!("--kv-cache {}: the packed verify's per-segment attention and commit were never run on this KV format (gated: q8, q4k; \
+                        --lane-pack-kv any runs them anyway, ungated)", p.kv));
     }
     if p.mtp_k != MTP_MAX_K {
         v.push(format!("--exl3-mtp-k {}: the packed widths and the control-cadence arithmetic were never run at another depth (gated: {MTP_MAX_K})", p.mtp_k));
@@ -181,6 +198,9 @@ pub(crate) fn posture_fallbacks(p: &Posture) -> Vec<String> {
     }
     if p.a_ctrl_old {
         v.push("--a-ctrl old: a lane whose last step was a control round drafts from a clobbered residual — acceptance moves, and the pair's control cadence arithmetic assumes the default".to_string());
+    }
+    if !p.dense_v3 {
+        v.push("--exl3-dense-v3 0: xq_attn_decode_group resolves one KV slot for the whole group, so a packed verify's second segment would read and write the first lane's K/V (dense-v3 resolves a slot per row)".to_string());
     }
     v
 }
@@ -245,11 +265,15 @@ pub(crate) enum Skip {
     RegimeClamp,
     /// The boot holds no packed graph for this width and regime: never captured while serving.
     NoGraph,
+    /// A request that reports log probabilities on a TP boot: its rows must be full logits rows and no
+    /// packed graph family records them (the greedy family ends in the vocab-parallel key exchange).
+    LogprobsTp,
 }
 
 impl Skip {
-    pub(crate) const ALL: [Skip; 13] = [Skip::FewPackable, Skip::OddLane, Skip::Prefill, Skip::MtpOff, Skip::Control,
-        Skip::Probe, Skip::Sampled, Skip::Penalty, Skip::Image, Skip::Depth0, Skip::MixedRegime, Skip::RegimeClamp, Skip::NoGraph];
+    pub(crate) const ALL: [Skip; 14] = [Skip::FewPackable, Skip::OddLane, Skip::Prefill, Skip::MtpOff, Skip::Control,
+        Skip::Probe, Skip::Sampled, Skip::Penalty, Skip::Image, Skip::Depth0, Skip::MixedRegime, Skip::RegimeClamp, Skip::NoGraph,
+        Skip::LogprobsTp];
 
     /// The metric label value.
     pub(crate) fn label(self) -> &'static str {
@@ -258,6 +282,7 @@ impl Skip {
             Skip::MtpOff => "mtp_off", Skip::Control => "control", Skip::Probe => "probe", Skip::Sampled => "sampled",
             Skip::Penalty => "penalty", Skip::Image => "image", Skip::Depth0 => "depth0",
             Skip::MixedRegime => "mixed_regime", Skip::RegimeClamp => "regime_clamp", Skip::NoGraph => "no_graph",
+            Skip::LogprobsTp => "logprobs_tp",
         }
     }
 
@@ -277,6 +302,7 @@ impl Skip {
             Skip::MixedRegime => "mixed regime",
             Skip::RegimeClamp => "round clamped at the sparse switch for one lane only",
             Skip::NoGraph => "no packed graph for this width",
+            Skip::LogprobsTp => "log-probability request under TP (no packed family keeps full logits rows)",
         }
     }
 
@@ -296,6 +322,8 @@ pub(crate) struct LaneFacts {
     pub sampled_lone: bool,
     pub penalized: bool,
     pub image: bool,
+    /// The lane reports log probabilities on a TP boot (`Skip::LogprobsTp`).
+    pub logprobs_tp: bool,
     /// The round's draft depth ceiling after the window, budget and regime clamps (0 = plain step).
     pub depth: usize,
 }
@@ -308,6 +336,7 @@ pub(crate) fn lane_block(f: &LaneFacts) -> Option<Skip> {
     if f.sampled && f.sampled_lone { return Some(Skip::Sampled); }
     if f.penalized { return Some(Skip::Penalty); }
     if f.image { return Some(Skip::Image); }
+    if f.logprobs_tp { return Some(Skip::LogprobsTp); }
     if f.depth == 0 { return Some(Skip::Depth0); }
     None
 }
@@ -933,8 +962,10 @@ mod tests {
     /// FALLBACK with its plain-word reason; the default posture packs.
     #[test]
     fn ungated_postures_fall_back_at_boot() {
-        let ok = Posture { kv: "q8", mtp_k: MTP_MAX_K, row_regime: true, a_ctrl_old: false, fcfs: false };
+        let ok = Posture { kv: "q8", mtp_k: MTP_MAX_K, row_regime: true, a_ctrl_old: false, fcfs: false, kv_any: false, dense_v3: true };
         assert!(posture_fallbacks(&ok).is_empty(), "the default posture packs");
+        // Q4K admission (owner 2026-11-13): q4k packs by default too, no --lane-pack-kv any needed.
+        assert!(posture_fallbacks(&Posture { kv: "q4k", ..ok }).is_empty(), "q4k packs by default (admitted, KV_CACHE_Q4K.md §6 receipts)");
         for (name, p, want) in [
             ("fcfs", Posture { fcfs: true, ..ok }, "--lane-order fcfs"),
             ("kv f16", Posture { kv: "f16", ..ok }, "--kv-cache f16"),
@@ -942,6 +973,7 @@ mod tests {
             ("depth 5", Posture { mtp_k: 5, ..ok }, "--exl3-mtp-k 5"),
             ("row regime off", Posture { row_regime: false, ..ok }, "--qsa-row-regime 0"),
             ("a-ctrl old", Posture { a_ctrl_old: true, ..ok }, "--a-ctrl old"),
+            ("dense v3 off", Posture { dense_v3: false, ..ok }, "--exl3-dense-v3 0"),
         ] {
             let v = posture_fallbacks(&p);
             assert_eq!(v.len(), 1, "{name}: one reason per fallback, got {v:?}");
@@ -950,6 +982,11 @@ mod tests {
         // F1: several ungated options at once = several reasons in one line, joined by the boot.
         let multi = Posture { kv: "f16", mtp_k: 5, ..ok };
         assert_eq!(posture_fallbacks(&multi).len(), 2, "each reason is listed");
+        // --lane-pack-kv any (opt-in, ungated): an f16 / fp8 cache packs; the other reasons still apply
+        for kv in ["f16", "fp8"] {
+            assert!(posture_fallbacks(&Posture { kv, kv_any: true, ..ok }).is_empty(), "kv {kv} under --lane-pack-kv any packs");
+        }
+        assert_eq!(posture_fallbacks(&Posture { kv: "f16", kv_any: true, mtp_k: 5, ..ok }).len(), 1, "only the depth reason is left");
     }
 
     /// F10 (owner 2026-10-12): the default is ON, resolved from the registry row; `parse(None)` stays the
@@ -1034,6 +1071,7 @@ mod tests {
         assert_eq!(lane_block(&LaneFacts { sampled: true, penalized: true, ..base }), Some(Skip::Penalty),
                    "a penalized sampled lane still stays out (penalties are step 2)");
         assert_eq!(lane_block(&LaneFacts { image: true, ..base }), Some(Skip::Image));
+        assert_eq!(lane_block(&LaneFacts { logprobs_tp: true, ..base }), Some(Skip::LogprobsTp));
         assert_eq!(lane_block(&LaneFacts { depth: 0, ..base }), Some(Skip::Depth0));
         // precedence: an MTP-off lane is "mtp_off" whatever else is true of it
         assert_eq!(lane_block(&LaneFacts { mtp_armed: false, sampled: true, depth: 0, ..base }), Some(Skip::MtpOff));
@@ -1408,8 +1446,11 @@ mod tests {
     /// of legal depths stays inside the packed list.
     #[test]
     fn list_rows_and_handoff() {
-        assert_eq!(MTP_MAX_K + 1, 8, "the served list: one row per draft pass + the spare");
-        for w in 0..=8 { assert_eq!(rq_list_rows(w), 8, "scratch of {w} rows: the size before PACK4S"); }
+        // MTP26/DEPTH: the served list follows MTP_MAX_K (one row per draft pass + the spare;
+        // was a hard 8 at k=7). <= MTP_MAX_K+1 keeps the pre-PACK4S size; wider scratches
+        // return their own width, unchanged.
+        assert_eq!(MTP_MAX_K + 1, 11, "the served list: one row per draft pass + the spare");
+        for w in 0..=11 { assert_eq!(rq_list_rows(w), 11, "scratch of {w} rows: the size before PACK4S"); }
         assert_eq!(rq_list_rows(PACK_ROWS_MAX), 16, "the packed scratch: a 16-row verify reads list rows up to 14");
         assert_eq!(rq_list_rows(12), 12);
         let dst = rq_list_rows(PACK_ROWS_MAX) * RQ_ROW;
@@ -1431,7 +1472,7 @@ mod tests {
         }
         // the OLD 8-row list cannot hold a pair's second segment: the resize is load-bearing
         assert!(list_handoff(8, 7, true, 8 * RQ_ROW).is_err());
-        assert!(list_handoff(0, 8, true, dst).is_err(), "at most MTP_MAX_K draft rows");
+        assert!(list_handoff(0, MTP_MAX_K + 1, true, dst).is_err(), "at most MTP_MAX_K draft rows");
         assert!(list_handoff(0, 0, true, dst).is_err());
     }
 

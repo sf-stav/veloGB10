@@ -70,13 +70,15 @@ fn main() {
         // sm_121: fp16 mma.m16n8k16 + dp4a are baseline CC 12.1.
         ("exl3_bench.cu", "exl3_bench.ptx", "sm_121"),
         // CF-P1g (4.05 bpw): the same source with a `case 6` in every bit-width switch (see the file).
-        ("exl3_bench_k6.cu", "exl3_bench_k6.ptx", "sm_121"),
         // NAIVE (PLAN/NAIVE_N05_PORT.md S3): the Naive-N0.5-Flash family module — copies of the EXL3
         // kernels with half-integer trellis rates; loaded by src/naive/gpu.rs only.
         ("gpu_naive.cu", "gpu_naive.ptx", "sm_121"),
         // NAIVE S8: the DSpark drafter round (plain f16 weights, small-M mma GEMM, Markov + confidence);
         // loaded by src/naive/drafter_gpu.rs only.
         ("gpu_naive_draft.cu", "gpu_naive_draft.ptx", "sm_121"),
+        // FP4L (PLAN/FP4L_DESIGN.md): nvidia/Qwen3.8-Flash-Next-FP4-Local weight kernels (MXFP8 W8A16,
+        // f16-weight, NVFP4 experts) for the EXL3 trunk; sm_121a for the e2m1x2 -> f16x2 cvt (SM12x family form).
+        ("gpu_fp4l.cu", "gpu_fp4l.ptx", "sm_121a"),
     ];
 
     for (src_name, _, _) in &kernels {

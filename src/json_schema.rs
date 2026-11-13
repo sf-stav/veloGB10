@@ -391,6 +391,25 @@ fn compile_schema(v: &Value, depth: usize, via: &str, table: &mut Vec<Schema>) -
                 "keyword 'enum' values do not match {ty_label} (V1 supports string and integer enum values only)"
             )));
         }
+        // Only values the schema's other keywords also accept are candidates: an enum value
+        // outside minLength/maxLength or the numeric bounds would let decoding start a prefix
+        // with no valid completion.
+        let (min_len, max_len) = (s.min_len, s.max_len);
+        s.enum_str.retain(|e| {
+            let n = e.chars().count() as u64;
+            min_len.map_or(true, |m| n >= m) && max_len.map_or(true, |m| n <= m)
+        });
+        let in_bounds = |v: f64| {
+            s.minimum.map_or(true, |m| v >= m) && s.excl_min.map_or(true, |m| v > m)
+                && s.maximum.map_or(true, |m| v <= m) && s.excl_max.map_or(true, |m| v < m)
+        };
+        let ints: Vec<i64> = s.enum_int.iter().copied().filter(|&e| in_bounds(e as f64)).collect();
+        s.enum_int = ints;
+        if s.enum_str.is_empty() && s.enum_int.is_empty() {
+            return Err(err_msg(
+                "keyword 'enum': no value satisfies the schema's other constraints".to_string(),
+            ));
+        }
         s.has_enum = true;
     }
 
@@ -426,14 +445,20 @@ enum Esc {
 struct StrState {
     esc: Esc,
     dec: Vec<u8>,
+    /// The raw bytes consumed inside the string (kept with `dec`): enum values and declared keys
+    /// are matched in their canonical spelling (see [`canon_match`]).
+    raw: Vec<u8>,
     cp: u32,
     /// Trailing bytes of a not-yet-complete UTF-8 sequence (a token can split a code point).
     pend: Vec<u8>,
+    /// Skip this string's minLength / maxLength checks. Only set on the machine used to build a
+    /// length-free base mask (see [`SchemaMask::allowed_len_bounded`]); never on a live state.
+    free_len: bool,
 }
 
 impl StrState {
     fn new() -> StrState {
-        StrState { esc: Esc::None, dec: Vec::new(), cp: 0, pend: Vec::new() }
+        StrState { esc: Esc::None, dec: Vec::new(), raw: Vec::new(), cp: 0, pend: Vec::new(), free_len: false }
     }
     fn is_closed_interior(&self) -> bool {
         self.esc == Esc::None && self.pend.is_empty()
@@ -493,7 +518,13 @@ fn push_raw(st: &mut StrState, b: u8, keep: bool) -> bool {
 
 /// Advance one byte inside a string. `keep` mirrors the caller's prefix-constraint need.
 fn str_advance(st: &mut StrState, b: u8, keep: bool) -> Step {
+    if keep && !(st.esc == Esc::None && b == b'"') {
+        st.raw.push(b);
+    }
     match st.esc {
+        // An ASCII byte (including `"` and `\`) while a multi-byte UTF-8 sequence is still
+        // incomplete would make the string invalid UTF-8.
+        Esc::None if !st.pend.is_empty() && b < 0x80 => Step::Bad,
         Esc::None => match b {
             b'"' => Step::Closed,
             b'\\' => {
@@ -537,6 +568,11 @@ fn str_advance(st: &mut StrState, b: u8, keep: bool) -> Step {
             let Some(d) = hex_val(b) else { return Step::Bad };
             let acc = acc * 16 + d as u32;
             if n + 1 < 4 {
+                // `\uDC`..`\uDF` can only become a lone low surrogate: refuse it now, while
+                // another byte can still follow, instead of at the fourth digit
+                if n + 1 == 2 && (0xDC..=0xDF).contains(&acc) {
+                    return Step::Bad;
+                }
                 st.esc = Esc::Hex { n: n + 1, acc };
                 return Step::Open;
             }
@@ -573,6 +609,11 @@ fn str_advance(st: &mut StrState, b: u8, keep: bool) -> Step {
             let Some(d) = hex_val(b) else { return Step::Bad };
             let acc = acc * 16 + d as u32;
             if n + 1 < 4 {
+                // the second half of a pair must be `\uDC00`..`\uDFFF`: refuse a prefix that
+                // cannot become one
+                if (n + 1 == 1 && acc != 0xD) || (n + 1 == 2 && !(0xDC..=0xDF).contains(&acc)) {
+                    return Step::Bad;
+                }
                 st.esc = Esc::LowHex { n: n + 1, acc, hi };
                 return Step::Open;
             }
@@ -693,7 +734,16 @@ enum Frame {
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 struct Machine {
     stack: Vec<Frame>,
+    /// Consecutive STRUCTURAL whitespace bytes just consumed (whitespace between tokens of the
+    /// document, never string content). Capped at [`MAX_WS_RUN`]: without a cap, whitespace is
+    /// legal in every structural position, so a model that does not want to start the document
+    /// can emit blank space until max_tokens and the reply never parses.
+    ws: u8,
 }
+
+/// Longest run of structural whitespace the machine accepts (enough for pretty-printing a deeply
+/// nested document: a newline plus indentation).
+const MAX_WS_RUN: u8 = 24;
 
 impl Machine {
     fn is_dead(&self) -> bool {
@@ -703,6 +753,52 @@ impl Machine {
     fn at_doc_end(&self) -> bool {
         self.stack.len() == 1 && matches!(self.stack[0], Frame::DocEnd)
     }
+    /// True while the next byte is string CONTENT (a value string or an object key).
+    fn in_string(&self) -> bool {
+        matches!(self.stack.last(), Some(Frame::Str { .. }) | Some(Frame::Obj { phase: ObjPhase::Key(_), .. }))
+    }
+}
+
+/// The canonical JSON encoding (serde_json's: `"` `\\` and the short control escapes, other
+/// control characters as lowercase `\u00XX`, everything else as raw UTF-8) of string `v`,
+/// without the quotes, compared against `raw` (the bytes emitted so far inside the string).
+/// Returns (`raw` is a prefix of the encoding, `raw` is the whole encoding).
+///
+/// Enum values and declared property names are matched in this ONE canonical spelling. Matching
+/// the decoded value instead admits every escaped spelling (`"\u0074"` for `t`), and a model
+/// under the mask then wanders into long escape sequences (or into escapes and partial UTF-8
+/// sequences that no candidate completes) instead of writing the value.
+fn canon_match(v: &str, raw: &[u8]) -> (bool, bool) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut i = 0usize;
+    let mut buf = [0u8; 6];
+    for c in v.chars() {
+        let enc: &[u8] = match c {
+            '"' => b"\\\"",
+            '\\' => b"\\\\",
+            '\u{08}' => b"\\b",
+            '\u{0C}' => b"\\f",
+            '\n' => b"\\n",
+            '\r' => b"\\r",
+            '\t' => b"\\t",
+            c if (c as u32) < 0x20 => {
+                buf = [b'\\', b'u', b'0', b'0', HEX[(c as usize) >> 4], HEX[(c as usize) & 15]];
+                &buf[..]
+            }
+            c => c.encode_utf8(&mut buf).as_bytes(),
+        };
+        for &e in enc {
+            if i == raw.len() {
+                return (true, false);
+            }
+            if raw[i] != e {
+                return (false, false);
+            }
+            i += 1;
+        }
+    }
+    // the encoding is exhausted: `raw` matches only if it is exhausted too
+    (i == raw.len(), i == raw.len())
 }
 
 /// Undo log for a single byte, used by the trie walk to roll a shared machine back instead of
@@ -756,6 +852,34 @@ struct TrieNode {
 struct Vocab {
     nodes: Vec<TrieNode>,
     by_id: HashMap<u32, Vec<u8>>,
+    /// Longest piece in bytes: an upper bound on the characters one token adds to a string.
+    max_piece: usize,
+    /// Per token id, fed from the interior of a value string (no pending escape or UTF-8
+    /// sequence): the characters it adds before the string closes or the piece ends, with
+    /// [`STR_RUN_CLOSES`] set when it closes the string. [`STR_RUN_BAD`] when the bytes are not
+    /// valid string content (such a token is never in a base mask, so it is never consulted).
+    str_run: Vec<u16>,
+}
+
+const STR_RUN_CLOSES: u16 = 0x8000;
+const STR_RUN_BAD: u16 = 0xFFFF;
+
+/// 1 while a started escape or UTF-8 sequence has not produced its character yet.
+fn pending_char(st: &StrState) -> u64 {
+    u64::from(!st.is_closed_interior())
+}
+
+/// [`Vocab::str_run`] entry for one piece.
+fn str_run_of(bytes: &[u8]) -> u16 {
+    let mut st = StrState::new();
+    for &b in bytes {
+        match str_advance(&mut st, b, false) {
+            Step::Open => {}
+            Step::Closed => return (st.cp.min(0x7FFE) as u16) | STR_RUN_CLOSES,
+            Step::Bad => return STR_RUN_BAD,
+        }
+    }
+    ((st.cp as u64 + pending_char(&st)).min(0x7FFE)) as u16
 }
 
 impl Vocab {
@@ -770,6 +894,7 @@ impl Vocab {
             if bytes.is_empty() {
                 continue;
             }
+            v.max_piece = v.max_piece.max(bytes.len());
             v.by_id.insert(id, bytes.clone());
             let mut cur = 0usize;
             for &b in &bytes {
@@ -785,6 +910,10 @@ impl Vocab {
                 cur = nxt;
             }
             v.nodes[cur].token = Some(id); // duplicate piece: last id wins
+        }
+        v.str_run = vec![STR_RUN_BAD; vocab_size];
+        for (&id, bytes) in &v.by_id {
+            v.str_run[id as usize] = str_run_of(bytes);
         }
         (v, vocab_size)
     }
@@ -818,9 +947,47 @@ pub struct SchemaMask {
     /// `state -> allowed bitset`. Computed on demand; states are interned so identical machine
     /// snapshots share one entry.
     cache: Mutex<HashMap<u32, Arc<Vec<u32>>>>,
-    vocab: Vocab,
+    /// `mask key -> allowed bitset` (see [`SchemaMask::mask_key`]): states that differ only in a
+    /// string's character count, where the count cannot change the allowed set, share one entry.
+    /// Without it every token inside a free-text string is a new state and a full trie walk.
+    mask_cache: Mutex<HashMap<Machine, Arc<Vec<u32>>>>,
+    /// Shared, immutable byte trie of the model vocabulary (see [`VocabTable`]): built once per
+    /// process and handed to every request's mask, instead of rebuilding a 248K-entry trie per
+    /// request.
+    vocab: Arc<Vocab>,
     vocab_size: usize,
     words: usize,
+    /// When `Some(tok)`, the mask is NOT applied until the lane has emitted `tok` (the model's
+    /// think-close token): a request whose prompt opens a reasoning block reasons freely, and
+    /// only the answer after the block is constrained. `None` = constrained from the first token.
+    defer_until: Option<u32>,
+}
+
+/// A model vocabulary prepared for constrained decoding: token id -> raw output bytes plus the
+/// byte trie `allowed()` walks. Immutable after `build`; share it with `Arc` across requests and
+/// attach it with [`SchemaMask::set_vocab_table`].
+#[derive(Debug, Clone)]
+pub struct VocabTable {
+    vocab: Arc<Vocab>,
+    size: usize,
+}
+
+impl VocabTable {
+    /// `pieces` = (token id, the exact bytes that token adds to the output text). Special /
+    /// control tokens must be left out (or given empty bytes): they are never allowed.
+    pub fn build(pieces: Vec<(u32, Vec<u8>)>) -> Self {
+        let (v, size) = Vocab::build(pieces);
+        VocabTable { vocab: Arc::new(v), size }
+    }
+
+    /// Number of token ids covered (max id + 1).
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
 }
 
 impl SchemaMask {
@@ -838,10 +1005,102 @@ impl SchemaMask {
         if let Some(hit) = lock(&self.cache).get(&state).cloned() {
             return hit;
         }
-        let bits = self.compute_allowed(state);
-        let arc = Arc::new(bits);
+        let arc = match self.machine(state) {
+            Some(m) => self.allowed_for(&m),
+            None => Arc::new(vec![0u32; self.words]),
+        };
         lock(&self.cache).insert(state, arc.clone());
         arc
+    }
+
+    /// Allowed set of a machine snapshot, shared through `mask_cache` by [`SchemaMask::mask_key`].
+    fn allowed_for(&self, m: &Machine) -> Arc<Vec<u32>> {
+        let key = self.mask_key(m);
+        if let Some(hit) = lock(&self.mask_cache).get(&key).cloned() {
+            return hit;
+        }
+        let a = Arc::new(match self.allowed_len_bounded(m) {
+            Some(bits) => bits,
+            None => self.compute_allowed_machine(m),
+        });
+        lock(&self.mask_cache).insert(key, a.clone());
+        a
+    }
+
+    /// Inside a value string whose minLength / maxLength can refuse the next token, derive the
+    /// allowed set from the length-free set of the same position instead of walking the trie.
+    ///
+    /// The string's character count only gates acceptance: it never changes what the bytes
+    /// parse to. It only grows while a token is fed, and a token is refused by it exactly when
+    /// the count after its last in-string byte exceeds maxLength, or the string closes below
+    /// minLength. From an interior state (no pending escape or UTF-8 sequence) the characters a
+    /// token adds depend only on its bytes ([`Vocab::str_run`]), so
+    ///
+    /// `allowed = base ∩ { t : added(t) <= room  and  (closes(t) ⇒ added(t) >= to_min) }`
+    ///
+    /// where `base` ignores this string's bounds. `base` is one cached mask per position, so the
+    /// last characters before maxLength (and the first before minLength) cost a bitset pass each
+    /// instead of a full trie walk. `None` when the shortcut does not apply.
+    fn allowed_len_bounded(&self, m: &Machine) -> Option<Vec<u32>> {
+        let Some(Frame::Str { si, st }) = m.stack.last() else { return None };
+        let s = &self.schemas[*si as usize];
+        if !s.enum_str.is_empty() || st.free_len || !st.is_closed_interior() || self.vocab.str_run.is_empty() {
+            return None;
+        }
+        if s.min_len.is_none() && s.max_len.is_none() {
+            return None;
+        }
+        let cp = st.cp as u64;
+        let to_min = s.min_len.map_or(0, |lo| lo.saturating_sub(cp));
+        let room = s.max_len.map_or(u64::MAX, |hi| hi.saturating_sub(cp));
+        let mut free = m.clone();
+        if let Some(Frame::Str { st, .. }) = free.stack.last_mut() {
+            st.free_len = true;
+            st.cp = 0;
+        }
+        let base = self.allowed_for(&free);
+        let run = &self.vocab.str_run;
+        let mut bits = vec![0u32; base.len()];
+        for (w, &word) in base.iter().enumerate() {
+            let mut rest = word;
+            while rest != 0 {
+                let b = rest.trailing_zeros();
+                rest &= rest - 1;
+                let t = (w << 5) | b as usize;
+                let r = run.get(t).copied().unwrap_or(STR_RUN_BAD);
+                if r == STR_RUN_BAD {
+                    continue;
+                }
+                let added = (r & !STR_RUN_CLOSES) as u64;
+                if added <= room && (r & STR_RUN_CLOSES == 0 || added >= to_min) {
+                    bits[w] |= 1u32 << b;
+                }
+            }
+        }
+        Some(bits)
+    }
+
+    /// The machine with every value string's character count replaced by what the next token
+    /// can observe of it: the distance to `minLength` and the room left below `maxLength`, each
+    /// capped at one more than the longest piece (a token adds at most that many characters).
+    /// Two states with the same key allow exactly the same tokens. Strings whose content is
+    /// kept (enum values) are left exact.
+    fn mask_key(&self, m: &Machine) -> Machine {
+        let cap = self.vocab.max_piece as u64 + 1;
+        let mut k = m.clone();
+        for f in k.stack.iter_mut() {
+            if let Frame::Str { si, st } = f {
+                let s = &self.schemas[*si as usize];
+                if !s.enum_str.is_empty() || st.free_len {
+                    continue;
+                }
+                let cp = st.cp as u64;
+                let to_min = s.min_len.map_or(0, |lo| lo.saturating_sub(cp).min(cap));
+                let room = s.max_len.map_or(cap, |hi| hi.saturating_sub(cp).min(cap));
+                st.cp = ((to_min << 16) | room) as u32;
+            }
+        }
+        k
     }
 
     /// Advance the machine by ONE EMITTED TOKEN. `None` when the token is unknown, empty, or its
@@ -887,11 +1146,26 @@ impl SchemaMask {
     /// before `allowed()`; also fixes `vocab_size`/`words`. Cached bitsets are dropped because they
     /// were computed against the previous vocabulary.
     pub fn set_vocab(&mut self, pieces: Vec<(u32, Vec<u8>)>) {
-        let (v, size) = Vocab::build(pieces);
-        self.vocab = v;
-        self.vocab_size = size;
-        self.words = vocab_words(size);
+        self.set_vocab_table(&VocabTable::build(pieces));
+    }
+
+    /// `set_vocab` with a prebuilt, shared table (no per-request trie build).
+    pub fn set_vocab_table(&mut self, table: &VocabTable) {
+        self.vocab = table.vocab.clone();
+        self.vocab_size = table.size;
+        self.words = vocab_words(table.size);
         lock(&self.cache).clear();
+        lock(&self.mask_cache).clear();
+    }
+
+    /// Defer the constraint until the lane emits `tok` (see the `defer_until` field).
+    pub fn set_defer_until(&mut self, tok: Option<u32>) {
+        self.defer_until = tok;
+    }
+
+    /// The token that arms the constraint, if the constraint is deferred.
+    pub fn defer_until(&self) -> Option<u32> {
+        self.defer_until
     }
 
     /// A bitset with every token disallowed EXCEPT the model's end-of-generation tokens: when the
@@ -968,24 +1242,41 @@ impl SchemaMask {
             return bits;
         }
         let Some(stored) = self.machine(state) else { return bits };
-        if stored.is_dead() {
+        self.walk_into(&stored, &mut bits);
+        bits
+    }
+
+    /// [`SchemaMask::compute_allowed`] for a machine snapshot that need not be interned.
+    fn compute_allowed_machine(&self, m: &Machine) -> Vec<u32> {
+        let mut bits = vec![0u32; self.words];
+        if self.words == 0 || self.vocab.nodes.is_empty() {
             return bits;
         }
-        let mut m = (*stored).clone();
-        self.trie_walk(&mut m, 0, &mut bits);
+        self.walk_into(m, &mut bits);
         bits
+    }
+
+    fn walk_into(&self, stored: &Machine, bits: &mut Vec<u32>) {
+        if stored.is_dead() {
+            return;
+        }
+        let mut m = stored.clone();
+        self.trie_walk(&mut m, 0, bits);
     }
 
     /// DFS the vocabulary trie from `node`, pruning the moment the machine refuses a byte.
     /// One machine is reused and rolled back per byte (see [`Roll`]) — no per-node clones and no
     /// full-vocab rescan.
     fn trie_walk(&self, m: &mut Machine, node: usize, out: &mut Vec<u32>) {
-        let children = self.vocab.nodes[node].children.clone();
-        for (b, child) in children {
+        // Iterate the shared trie by reference: cloning the child list at every node cost one
+        // allocation per visited node (~1M on a 248K vocabulary inside a free string).
+        let vocab = &*self.vocab;
+        for &(b, child) in &vocab.nodes[node].children {
             let mut roll = Roll::new(m.stack.len());
+            let ws0 = m.ws; // not covered by the Roll undo log (it records frames only)
             let alive = self.feed(m, b, Some(&mut roll));
             if alive {
-                if let Some(tok) = self.vocab.nodes[child].token {
+                if let Some(tok) = vocab.nodes[child].token {
                     let t = tok as usize;
                     if t < self.vocab_size {
                         out[t >> 5] |= 1u32 << (t & 31);
@@ -994,6 +1285,7 @@ impl SchemaMask {
                 self.trie_walk(m, child, out);
             }
             roll.restore(m);
+            m.ws = ws0;
         }
     }
 
@@ -1074,6 +1366,10 @@ impl SchemaMask {
                 if has_enum && !any_int && (b == b'-' || b.is_ascii_digit()) {
                     return false;
                 }
+                // enum values are strings and integers only: an object or array never matches
+                if has_enum && (b == b'{' || b == b'[') {
+                    return false;
+                }
                 match b {
                     b'{' => {
                         push_obj(m, si);
@@ -1130,8 +1426,11 @@ impl SchemaMask {
     /// Value-string constraint check. `closing` = the terminating quote was consumed.
     fn str_value_ok(&self, si: u32, st: &StrState, closing: bool) -> bool {
         let s = &self.schemas[si as usize];
-        if let Some(mx) = s.max_len {
-            if st.cp as u64 > mx {
+        if let Some(mx) = s.max_len.filter(|_| !st.free_len) {
+            // A started escape or UTF-8 sequence already commits one more character: counting it
+            // only once complete let a string at maxLength begin one, after which no byte could
+            // finish it (a dead end that ends the reply mid-document).
+            if st.cp as u64 + pending_char(st) > mx {
                 return false;
             }
         }
@@ -1139,17 +1438,15 @@ impl SchemaMask {
             if !st.is_closed_interior() {
                 return false;
             }
-            if let Some(mn) = s.min_len {
+            if let Some(mn) = s.min_len.filter(|_| !st.free_len) {
                 if (st.cp as u64) < mn {
                     return false;
                 }
             }
-            if !s.enum_str.is_empty() && !s.enum_str.iter().any(|e| e.as_bytes() == st.dec.as_slice()) {
+            if !s.enum_str.is_empty() && !s.enum_str.iter().any(|e| canon_match(e, &st.raw).1) {
                 return false;
             }
-        } else if !s.enum_str.is_empty()
-            && !s.enum_str.iter().any(|e| e.as_bytes().starts_with(&st.dec))
-        {
+        } else if !s.enum_str.is_empty() && !s.enum_str.iter().any(|e| canon_match(e, &st.raw).0) {
             // enum prefix rule: only bytes that keep us on the way to an allowed value.
             return false;
         }
@@ -1166,14 +1463,9 @@ impl SchemaMask {
         if s.ty == Ty::Integer && !matches!(st, NumState::Zero | NumState::Int) {
             return false; // integer forbids fraction/exponent
         }
-        if s.has_enum {
-            if s.enum_str.is_empty() {
-                if !s.enum_int.iter().any(|&e| e as f64 == v) {
-                    return false;
-                }
-            } else {
-                return false; // string enum on a numeric schema cannot match
-            }
+        // a number matches only the enum's integer values (an untyped enum may list strings too)
+        if s.has_enum && !s.enum_int.iter().any(|&e| e as f64 == v) {
+            return false;
         }
         if let Some(m) = s.minimum {
             if v < m {
@@ -1198,49 +1490,85 @@ impl SchemaMask {
         true
     }
 
-    /// Can a number whose bytes so far are `buf` (grammar position `st`) still END UP in range?
+    /// Can a number whose bytes so far are `buf` (grammar position `st`) still END UP valid?
     ///
     /// `num_ok` runs only when the number TERMINATES, so without this check the allowed set let the
-    /// model run an unbounded digit sequence after a value that had already passed the bound — the
-    /// escape the 0.8B probe produced on 2026-09-14 (`{"n":-1000…`, 258 chars, `finish=length`).
+    /// model run an unbounded digit sequence after a prefix that could no longer complete.
     ///
-    /// The rule is deliberately narrow: it returns false only when the prefix is PROVABLY
-    /// unsatisfiable, so it can prune the mask but can never reject a document that `num_ok` would
-    /// accept. That is why it applies to `Ty::Integer` only — for a float, `.`/`e` can still move
-    /// any digit prefix back into range (`70e-1 == 7`), and for `Ty::Any` a fraction is allowed too.
+    /// The rule may prune the mask (refuse a prefix) only when no valid completion exists, or
+    /// when it narrows the spelling of a value that is still reachable another way:
+    ///   - an integer enum: the canonical spelling of a listed value only (as for string enums);
+    ///   - `integer`: no fraction or exponent (`num_ok` refuses them), and the digits must still
+    ///     reach an integer inside the bounds (the values `p*10^k ..= p*10^k + 10^k - 1`);
+    ///   - `number`: a sign the bounds exclude (a nonzero negative with no negative value allowed,
+    ///     a nonzero positive with no positive value allowed). Any other float prefix can still
+    ///     be moved into range by `.`/`e` (`70e-1 == 7`).
     fn num_prefix_viable(&self, si: u32, buf: &[u8], st: NumState) -> bool {
         let s = &self.schemas[si as usize];
-        if s.ty != Ty::Integer {
-            return true;
-        }
-        if !matches!(st, NumState::NegStart | NumState::Zero | NumState::Int) {
-            return true;
+        if !s.enum_int.is_empty() {
+            return s.enum_int.iter().any(|e| e.to_string().as_bytes().starts_with(buf));
         }
         let negative = buf.first() == Some(&b'-');
         let digits = if negative { &buf[1..] } else { buf };
-        if digits.is_empty() {
-            // A bare `-`: viable iff some negative integer could be in range.
-            return !(s.minimum.is_some_and(|mn| mn > 0.0)
-                || s.excl_min.is_some_and(|mn| mn >= 0.0));
+        let lead = digits.first().copied();
+        match s.ty {
+            Ty::Integer => {}
+            Ty::Number => {
+                let neg_ok = s.minimum.map_or(true, |m| m < 0.0) && s.excl_min.map_or(true, |m| m < 0.0);
+                let pos_ok = s.maximum.map_or(true, |m| m > 0.0) && s.excl_max.map_or(true, |m| m > 0.0);
+                let zero_ok = s.minimum.map_or(true, |m| m <= 0.0) && s.excl_min.map_or(true, |m| m < 0.0)
+                    && s.maximum.map_or(true, |m| m >= 0.0) && s.excl_max.map_or(true, |m| m > 0.0);
+                let lower = s.minimum.unwrap_or(f64::NEG_INFINITY).max(s.excl_min.unwrap_or(f64::NEG_INFINITY));
+                let upper = s.maximum.unwrap_or(f64::INFINITY).min(s.excl_max.unwrap_or(f64::INFINITY));
+                return match lead {
+                    None => neg_ok || zero_ok, // a bare `-`: `-0` or a negative
+                    // `0`, `0.x`: a value in [0, 1); `-0`, `-0.x`: a value in (-1, 0]
+                    Some(b'0') if negative => zero_ok || (neg_ok && upper > -1.0),
+                    Some(b'0') => zero_ok || (pos_ok && lower < 1.0),
+                    Some(_) if negative => neg_ok,
+                    Some(_) => pos_ok,
+                };
+            }
+            _ => return true,
         }
-        let Ok(text) = std::str::from_utf8(buf) else { return true };
-        let Ok(v) = text.parse::<f64>() else { return true };
-        // An integer's value is monotone in its digits: appending a digit moves it AWAY from zero,
-        // so a positive prefix above the upper bound can never come back down, and a negative
-        // prefix below the lower bound can never come back up.
-        if negative {
-            if s.minimum.is_some_and(|mn| v < mn) || s.excl_min.is_some_and(|mn| v < mn) {
+        if !matches!(st, NumState::NegStart | NumState::Zero | NumState::Int) {
+            return false;
+        }
+        // the integer bounds
+        let lo = s.minimum.map_or(f64::NEG_INFINITY, f64::ceil)
+            .max(s.excl_min.map_or(f64::NEG_INFINITY, |m| m.floor() + 1.0));
+        let hi = s.maximum.map_or(f64::INFINITY, f64::floor)
+            .min(s.excl_max.map_or(f64::INFINITY, |m| m.ceil() - 1.0));
+        if lo > hi {
+            return false;
+        }
+        if digits.is_empty() {
+            // a bare `-`: `-0` (= 0) or a negative integer
+            return lo <= hi.min(0.0);
+        }
+        // `0` / `-0` cannot be extended by another digit (leading zeros are illegal JSON)
+        if st == NumState::Zero {
+            return self.num_ok(si, buf, st);
+        }
+        let Ok(text) = std::str::from_utf8(digits) else { return true };
+        let Ok(p) = text.parse::<f64>() else { return true };
+        // the magnitudes this prefix can still become: [p*10^k, p*10^k + 10^k - 1], k = 0, 1, ...
+        let mut scale = 1.0f64;
+        loop {
+            let (a, b) = (p * scale, p * scale + scale - 1.0);
+            let (vlo, vhi) = if negative { (-b, -a) } else { (a, b) };
+            if vlo <= hi && vhi >= lo {
+                return true;
+            }
+            // every longer number lies further from zero, so past the bound means never
+            if (!negative && a > hi) || (negative && -a < lo) {
                 return false;
             }
-        } else if s.maximum.is_some_and(|mx| v > mx) || s.excl_max.is_some_and(|mx| v > mx) {
-            return false;
+            if scale > 1e19 {
+                return true; // beyond the integer range checked exactly here; `num_ok` decides
+            }
+            scale *= 10.0;
         }
-        // `0` / `-0` cannot be extended by another digit (leading zeros are illegal JSON), so this
-        // prefix is already final and must be in range on its own.
-        if st == NumState::Zero && !self.num_ok(si, buf, st) {
-            return false;
-        }
-        true
     }
 
     /// Pop a terminal pending number frame (used by `is_complete`); false = it was not valid.
@@ -1255,9 +1583,19 @@ impl SchemaMask {
         true
     }
 
-    fn key_prefix_ok(&self, si: u32, dec: &[u8]) -> bool {
+    /// Can the key being parsed still become a key this object accepts? Declared keys already
+    /// present (`seen`) are excluded: a duplicate is refused when the key closes, so letting it
+    /// through here led into a state with no allowed continuation.
+    fn key_prefix_ok(&self, si: u32, st: &StrState, seen: &[u32]) -> bool {
         let s = &self.schemas[si as usize];
-        s.additional || s.props.iter().any(|(n, _)| n.as_bytes().starts_with(dec))
+        s.additional
+            || s.props.iter().enumerate().any(|(i, (n, _))| !seen.contains(&(i as u32)) && canon_match(n, &st.raw).0)
+    }
+
+    /// May another key start in this object (`"` after `{`, `,` after a member)?
+    fn can_add_key(&self, si: u32, seen: &[u32]) -> bool {
+        let s = &self.schemas[si as usize];
+        s.additional || (0..s.props.len() as u32).any(|i| !seen.contains(&i))
     }
 
     /// Feed ONE byte. Returns true when the byte was consumed by a live machine; false when the
@@ -1265,7 +1603,28 @@ impl SchemaMask {
     ///
     /// Frames are mutated only after being popped, which is what makes the [`Roll`] undo log and
     /// the "pop, then let the parent reprocess the same byte" loop sound.
-    fn feed(&self, m: &mut Machine, b: u8, mut roll: Option<&mut Roll>) -> bool {
+    fn feed(&self, m: &mut Machine, b: u8, roll: Option<&mut Roll>) -> bool {
+        // Trailing whitespace after a complete document (top = DocEnd) is not counted: the
+        // completed state stays one interned state, and the scheduler ends the turn there anyway.
+        let structural_ws = is_ws(b) && !m.in_string() && !matches!(m.stack.last(), Some(Frame::DocEnd));
+        // No whitespace before the root value: the document starts at its first value byte (a
+        // leading run carries no information and only spends tokens).
+        if structural_ws && m.stack.len() == 2 && matches!(m.stack[1], Frame::Value { .. }) {
+            return false;
+        }
+        if structural_ws && m.ws >= MAX_WS_RUN {
+            // Refused without touching the stack: both callers discard the machine (step) or
+            // roll it back (trie_walk) on `false`.
+            return false;
+        }
+        let alive = self.feed_inner(m, b, roll);
+        if alive {
+            m.ws = if structural_ws { m.ws + 1 } else { 0 };
+        }
+        alive
+    }
+
+    fn feed_inner(&self, m: &mut Machine, b: u8, mut roll: Option<&mut Roll>) -> bool {
         loop {
             if m.stack.is_empty() {
                 m.stack.push(Frame::Dead);
@@ -1313,7 +1672,7 @@ impl SchemaMask {
                             m.stack.push(Frame::Dead);
                             return false;
                         }
-                        if b == b'"' {
+                        if b == b'"' && self.can_add_key(si, &seen) {
                             m.stack.push(Frame::Obj {
                                 si,
                                 phase: ObjPhase::Key(StrState::new()),
@@ -1328,7 +1687,7 @@ impl SchemaMask {
                     ObjPhase::Key(mut st) => {
                         match str_advance(&mut st, b, true) {
                             Step::Open => {
-                                if !self.key_prefix_ok(si, &st.dec) {
+                                if !self.key_prefix_ok(si, &st, &seen) {
                                     m.stack.push(Frame::Dead);
                                     return false;
                                 }
@@ -1415,7 +1774,7 @@ impl SchemaMask {
                             m.stack.push(Frame::Obj { si, phase: ObjPhase::AfterValue, seen, extra });
                             return true;
                         }
-                        if b == b',' {
+                        if b == b',' && self.can_add_key(si, &seen) {
                             m.stack.push(Frame::Obj { si, phase: ObjPhase::KeyReq, seen, extra });
                             return true;
                         }
@@ -1464,7 +1823,9 @@ impl SchemaMask {
                             m.stack.push(Frame::Arr { si, n, phase: ArrPhase::AfterItem });
                             return true;
                         }
-                        if b == b',' {
+                        // A `,` must leave room for one more item (maxItems), or the array can only
+                        // dead-end.
+                        if b == b',' && self.schemas[si as usize].max_items.map_or(true, |mx| n < mx) {
                             m.stack.push(Frame::Arr { si, n, phase: ArrPhase::ItemReq });
                             return true;
                         }
@@ -1661,11 +2022,13 @@ fn build_mask(schema: &Value, depth: usize, via: &str) -> Result<SchemaMask, Str
         start: 0,
         interner: Mutex::new(Interner::default()),
         cache: Mutex::new(HashMap::new()),
-        vocab: Vocab::default(),
+        mask_cache: Mutex::new(HashMap::new()),
+        vocab: Arc::new(Vocab::default()),
         vocab_size: 0,
         words: 0,
+        defer_until: None,
     };
-    let start = m.intern(Machine { stack: vec![Frame::DocEnd, Frame::Value { si: root }] });
+    let start = m.intern(Machine { stack: vec![Frame::DocEnd, Frame::Value { si: root }], ws: 0 });
     m.start = start;
     Ok(m)
 }
@@ -2013,10 +2376,10 @@ mod tests {
         assert_eq!(words, 1);
 
         let s0 = m.start_state();
-        // At the start only tokens whose whole byte run is accepted may fire: `{`, `{"`, a space
-        // (leading whitespace is legal) and the complete document.
-        assert_eq!(m.allowed(s0).as_slice(), bits(&[1, 8, 11, 12], words).as_slice());
-        for bad in [2u32, 3, 4, 5, 6, 7, 9, 10] {
+        // At the start only tokens whose whole byte run is accepted may fire: `{`, `{"` and the
+        // complete document (no whitespace before the root value).
+        assert_eq!(m.allowed(s0).as_slice(), bits(&[1, 8, 12], words).as_slice());
+        for bad in [2u32, 3, 4, 5, 6, 7, 9, 10, 11] {
             assert_eq!(m.step(s0, bad), None, "token {bad} must not be usable at the start");
         }
 
@@ -2053,7 +2416,9 @@ mod tests {
         assert_eq!(m.step(after_colon, 4), None, "1 is not a string");
 
         let after_value = m.step(after_colon, 5).unwrap();
-        assert_eq!(m.allowed(after_value).as_slice(), bits(&[3, 7, 11], words).as_slice());
+        // No `,` (7): the only declared key is present and additional properties are off, so a
+        // comma could only lead to a key slot that nothing can fill.
+        assert_eq!(m.allowed(after_value).as_slice(), bits(&[3, 11], words).as_slice());
 
         let done = m.step(after_value, 3).unwrap();
         assert!(m.is_complete(done));
@@ -2244,5 +2609,247 @@ mod tests {
         assert!(!ok(&mask(r#"{"type":"boolean"}"#), "truex"));
         assert!(ok(&mask(r#"{"type":"null"}"#), "null"));
         assert!(!ok(&mask(r#"{"type":"null"}"#), "nul"));
+    }
+
+    // ---- dead-end freedom: every reachable state allows a token or is complete -----------------
+
+    /// Random walks over the allowed sets (single-byte vocabulary). A state that accepts no byte
+    /// and is not a complete document is a dead end: under the token mask the sampler would have
+    /// nothing to pick. Every allowed byte must also step.
+    fn no_dead_ends(schema: &str, walks: usize, max_len: usize) {
+        let m = mask(schema);
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        for w in 0..walks {
+            let mut st = m.start_state();
+            let mut doc = Vec::new();
+            for _ in 0..max_len {
+                if m.is_complete(st) { break; }
+                let bits = m.allowed(st);
+                let ids: Vec<u32> = (0..256u32).filter(|&t| bits[(t >> 5) as usize] >> (t & 31) & 1 == 1).collect();
+                assert!(!ids.is_empty(), "walk {w}: dead end after {:?}", String::from_utf8_lossy(&doc));
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let t = ids[((rng >> 33) as usize) % ids.len()];
+                st = m.step(st, t).unwrap_or_else(|| panic!("walk {w}: allowed byte {t} refused by step"));
+                doc.push(t as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn no_dead_end_at_max_length() {
+        // At maxLength a started escape or UTF-8 sequence could never be finished.
+        no_dead_ends(r#"{"type":"object","properties":{"t":{"type":"string","maxLength":3}},"required":["t"]}"#, 400, 80);
+        no_dead_ends(r#"{"type":"array","items":{"type":"string","minLength":1,"maxLength":1},"minItems":2,"maxItems":2}"#, 400, 80);
+        let m = mask(r#"{"type":"object","properties":{"t":{"type":"string","maxLength":2}}}"#);
+        assert!(walk(&m, r#"{"t":"a\u00"#).is_some(), "an escape may start while there is room for its character");
+        assert!(walk(&m, r#"{"t":"ab\"#).is_none(), "no escape at maxLength");
+        let at_max = walk(&m, r#"{"t":"ab"#).unwrap();
+        assert!(m.step(at_max, 0xC3).is_none(), "no UTF-8 lead byte at maxLength");
+        let closed = m.step(at_max, b'"' as u32).unwrap();
+        assert!(m.step(closed, b'}' as u32).is_some());
+    }
+
+    #[test]
+    fn enum_candidates_respect_length_bounds() {
+        let m = mask(r#"{"type":"string","enum":["a","bbb"],"minLength":3}"#);
+        assert!(walk(&m, r#""a"#).is_none(), "a value shorter than minLength is not a candidate");
+        assert!(ok(&m, r#""bbb""#));
+        let m = mask(r#"{"type":"string","enum":["abc","de"],"maxLength":2}"#);
+        assert!(walk(&m, r#""a"#).is_none(), "a value longer than maxLength is not a candidate");
+        assert!(ok(&m, r#""de""#));
+        assert!(compile_err(r#"{"type":"string","enum":["a"],"minLength":2}"#).contains("enum"));
+        let m = mask(r#"{"type":"integer","enum":[1,20],"maximum":10}"#);
+        assert!(walk(&m, "2").is_none(), "an integer outside the bounds is not a candidate");
+        assert!(ok(&m, "1"));
+    }
+
+    #[test]
+    fn integer_prefixes_must_reach_a_valid_value() {
+        let m = mask(r#"{"type":"integer"}"#);
+        assert!(walk(&m, "1.").is_none(), "no fraction for an integer");
+        assert!(walk(&m, "1e").is_none(), "no exponent for an integer");
+        assert!(ok(&m, "-12"));
+        let m = mask(r#"{"type":"integer","minimum":5,"maximum":10}"#);
+        assert!(walk(&m, "2").is_none(), "2, 20.. are all outside 5..10");
+        assert!(walk(&m, "1").is_some(), "1 can still become 10");
+        assert!(walk(&m, "11").is_none());
+        assert!(walk(&m, "-").is_none());
+        assert!(ok(&m, "5") && ok(&m, "10") && !ok(&m, "1"));
+        let m = mask(r#"{"type":"integer","minimum":-10,"maximum":-5}"#);
+        assert!(walk(&m, "-1").is_some() && walk(&m, "-2").is_none() && walk(&m, "0").is_none());
+        assert!(ok(&m, "-5") && ok(&m, "-10"));
+        let m = mask(r#"{"type":"integer","exclusiveMinimum":4.5,"exclusiveMaximum":7}"#);
+        assert!(walk(&m, "4").is_none() && walk(&m, "7").is_none());
+        assert!(ok(&m, "5") && ok(&m, "6"));
+        let m = mask(r#"{"type":"integer","enum":[1,2]}"#);
+        assert!(walk(&m, "3").is_none() && walk(&m, "10").is_none() && walk(&m, "1.").is_none());
+        assert!(ok(&m, "1") && ok(&m, "2"));
+        let m = mask(r#"{"type":"number","minimum":0}"#);
+        assert!(walk(&m, "-1").is_none(), "no negative number when none is allowed");
+        assert!(ok(&m, "-0") && ok(&m, "2.5"));
+        let m = mask(r#"{"type":"number","maximum":-1}"#);
+        assert!(walk(&m, "5").is_none() && walk(&m, "0").is_none() && walk(&m, "-0").is_none());
+        assert!(ok(&m, "-1.5"));
+        no_dead_ends(r#"{"type":"object","properties":{"a":{"type":"integer","minimum":5,"maximum":10},"b":{"type":"integer","enum":[1,2,30]}},"required":["a","b"]}"#, 400, 80);
+    }
+
+    #[test]
+    fn untyped_enum_admits_only_its_values() {
+        let m = mask(r#"{"enum":["alpha","beta"]}"#);
+        assert!(walk(&m, "{").is_none() && walk(&m, "[").is_none());
+        assert!(ok(&m, r#""alpha""#));
+        let m = mask(r#"{"type":"object","properties":{"k":{"enum":["x",3]}},"required":["k"]}"#);
+        assert!(walk(&m, r#"{"k":{"#).is_none() && walk(&m, r#"{"k":["#).is_none());
+        assert!(ok(&m, r#"{"k":"x"}"#) && ok(&m, r#"{"k":3}"#));
+        assert!(walk(&m, r#"{"k":4"#).is_none());
+    }
+
+    #[test]
+    fn no_lone_surrogate_escape_prefix() {
+        let m = mask(r#"{"type":"string"}"#);
+        assert!(walk(&m, r#""\udc"#).is_none(), "a low surrogate cannot start a pair");
+        assert!(walk(&m, r#""\ud834\u"#).is_some());
+        assert!(walk(&m, r#""\ud834\ue"#).is_none(), "a pair needs a low surrogate second");
+        assert!(walk(&m, r#""\ud834\ud8"#).is_none());
+        assert!(ok(&m, r#""\ud834\udd1e""#));
+        no_dead_ends(r#"{"type":"object","properties":{"t":{"type":"string"}},"required":["t"]}"#, 2000, 60);
+    }
+
+    #[test]
+    fn no_dead_end_enum_with_escapes_and_spaces() {
+        no_dead_ends(r#"{"type":"object","properties":{"color":{"type":"string","enum":["red","green","light blue","naïve","𝄞 clef"]}},"required":["color"]}"#, 400, 200);
+    }
+
+    #[test]
+    fn no_dead_end_object_keys_and_arrays() {
+        no_dead_ends(r#"{"type":"object","properties":{"a":{"type":"integer","minimum":0,"maximum":9},"ab":{"type":"boolean"},"list":{"type":"array","items":{"type":"string","enum":["x","y"]},"maxItems":2}},"required":["a"]}"#, 400, 200);
+    }
+
+    #[test]
+    fn enum_values_and_keys_use_the_canonical_spelling() {
+        let m = mask(r#"{"type":"string","enum":["no","not x","𝄞","say \"hi\"\n"]}"#);
+        assert!(ok(&m, r#""not x""#));
+        assert!(ok(&m, r#""𝄞""#), "non-ASCII is written raw");
+        assert!(ok(&m, r#""say \"hi\"\n""#), "quote and newline use their short escapes");
+        assert!(walk(&m, r#""no\u0074"#).is_none(), "an escaped spelling of a plain character is refused");
+        assert!(walk(&m, r#""\ud834"#).is_none(), "so is a surrogate escape of a raw-written character");
+        assert!(walk(&m, "\"no\u{e9}").is_none(), "a raw multi-byte char no candidate continues with");
+        assert!(walk(&m, r#""no\"#).is_none(), "a backslash no candidate needs");
+        let k = mask(r#"{"type":"object","properties":{"ab":{"type":"integer"}},"required":["ab"]}"#);
+        assert!(ok(&k, r#"{"ab":1}"#));
+        assert!(walk(&k, r#"{"\u0061"#).is_none(), "declared keys too");
+        assert_eq!(canon_match("a\u{1}b", b"a\\u0001b"), (true, true));
+        assert_eq!(canon_match("ab", b"a"), (true, false));
+        assert_eq!(canon_match("ab", b"abc"), (false, false));
+    }
+
+    #[test]
+    fn mask_key_shares_free_string_states() {
+        let m = mask(r#"{"type":"object","properties":{"t":{"type":"string"}}}"#);
+        let a = walk(&m, r#"{"t":"a"#).unwrap();
+        let b = walk(&m, r#"{"t":"abcdef"#).unwrap();
+        assert_ne!(a, b, "distinct machine states");
+        assert!(Arc::ptr_eq(&m.allowed(a), &m.allowed(b)), "one cached mask for both");
+    }
+
+    #[test]
+    fn mask_key_is_exact_near_length_bounds() {
+        // multi-byte pieces, so a token can add several characters at once
+        let mut pieces = byte_vocab();
+        let n = pieces.len() as u32;
+        for (i, p) in ["ab", "abc", "abcd\"", "\"}", "xyz"].iter().enumerate() {
+            pieces.push((n + i as u32, p.as_bytes().to_vec()));
+        }
+        for schema in [r#"{"type":"object","properties":{"t":{"type":"string","minLength":3,"maxLength":7}}}"#,
+                       r#"{"type":"object","properties":{"t":{"type":"string","maxLength":4}}}"#,
+                       r#"{"type":"object","properties":{"t":{"type":"string","minLength":5}}}"#] {
+            let mut m = mask(schema);
+            m.set_vocab(pieces.clone());
+            for len in 0..9 {
+                let Some(st) = walk(&m, &format!(r#"{{"t":"{}"#, "q".repeat(len))) else { continue };
+                assert_eq!(*m.allowed(st), m.compute_allowed(st), "{schema}: {len} chars");
+            }
+        }
+    }
+
+    /// Multi-byte pieces with escapes, UTF-8, closing quotes and structure after the close.
+    fn mixed_vocab() -> Vec<(u32, Vec<u8>)> {
+        let mut pieces = byte_vocab();
+        let n = pieces.len() as u32;
+        let extra: [&[u8]; 14] = [b"ab", b"abc", b"abcd\"", b"\"}", b"xyz", b"\\n", b"q\\t",
+            "\u{e9}".as_bytes(), "a\u{e9}b\"".as_bytes(), b"\\u00e9", b"\\u00", b"e9\"}",
+            b"\", \"", &[0xC3]];
+        for (i, p) in extra.iter().enumerate() {
+            pieces.push((n + i as u32, p.to_vec()));
+        }
+        pieces
+    }
+
+    #[test]
+    fn length_bounded_masks_match_full_walk() {
+        // Every state reached by a random walk over multi-byte pieces: the derived mask near the
+        // length bounds must equal a full trie walk (including mid-escape / mid-UTF-8 states,
+        // which take the full walk).
+        for schema in [r#"{"type":"object","properties":{"t":{"type":"string","minLength":3,"maxLength":7}}}"#,
+                       r#"{"type":"object","properties":{"t":{"type":"string","maxLength":4},"u":{"type":"string","maxLength":2}}}"#,
+                       r#"{"type":"object","properties":{"t":{"type":"string","minLength":5}}}"#,
+                       r#"{"type":"array","items":{"type":"string","maxLength":3},"maxItems":4}"#] {
+            let mut m = mask(schema);
+            m.set_vocab(mixed_vocab());
+            let mut rng = 0x2545_F491_4F6C_DD1Du64;
+            let mut checked = 0;
+            for _ in 0..200 {
+                let mut st = m.start_state();
+                for _ in 0..24 {
+                    if m.is_complete(st) { break; }
+                    let bits = m.allowed(st);
+                    assert_eq!(*bits, m.compute_allowed(st), "{schema}");
+                    checked += 1;
+                    let ids: Vec<u32> = (0..m.vocab_size as u32)
+                        .filter(|&t| bits[(t >> 5) as usize] >> (t & 31) & 1 == 1).collect();
+                    if ids.is_empty() { break; }
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    st = m.step(st, ids[((rng >> 33) as usize) % ids.len()]).expect("allowed token refused");
+                }
+            }
+            assert!(checked > 200, "{schema}: only {checked} states checked");
+        }
+    }
+
+    #[test]
+    fn str_run_counts_characters_not_bytes() {
+        assert_eq!(str_run_of(b"abc"), 3);
+        assert_eq!(str_run_of(b"ab\"}"), 2 | STR_RUN_CLOSES);
+        assert_eq!(str_run_of(b"\\n"), 1);
+        assert_eq!(str_run_of(b"\\u00e9x"), 2);
+        assert_eq!(str_run_of(b"\\u00"), 1); // escape still open: its character is committed
+        assert_eq!(str_run_of("\u{e9}\u{e9}".as_bytes()), 2);
+        assert_eq!(str_run_of(&[0xC3]), 1); // UTF-8 sequence still open: same
+        assert_eq!(str_run_of(&[0x01]), STR_RUN_BAD);
+    }
+
+    #[test]
+    fn structural_whitespace_is_capped() {
+        let m = mask(r#"{"type":"object","properties":{"a":{"type":"string"}}}"#);
+        let lead = " ".repeat(MAX_WS_RUN as usize);
+        assert!(walk(&m, " ").is_none(), "no whitespace before the root value");
+        assert!(ok(&m, &format!("{{{lead}\"a\":\"x\"}}")), "a run up to the cap is fine");
+        assert!(walk(&m, &format!("{{{lead} ")).is_none(), "one more is refused");
+        assert!(ok(&m, &format!("{{\"a\":\"{}\"}}", " ".repeat(100))), "string content is not structural");
+        assert!(ok(&m, &format!("{{{lead}\"a\"{lead}:{lead}\"x\"{lead}}}")), "the run resets at every token");
+    }
+
+    #[test]
+    fn no_key_or_item_slot_that_cannot_be_filled() {
+        let m = mask(r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}}}"#);
+        assert!(walk(&m, r#"{"a":1,"a"#).is_none(), "a duplicate declared key cannot start");
+        assert!(ok(&m, r#"{"a":1,"b":2}"#));
+        assert!(walk(&m, r#"{"a":1,"b":2,"#).is_none(), "no key left: the comma is refused");
+        let arr = mask(r#"{"type":"array","items":{"type":"integer"},"maxItems":2}"#);
+        assert!(ok(&arr, "[1,2]"));
+        assert!(walk(&arr, "[1,2,").is_none(), "maxItems reached: the comma is refused");
+        let none = mask(r#"{"type":"object","properties":{},"additionalProperties":false}"#);
+        assert!(ok(&none, "{}"));
+        assert!(walk(&none, "{\"").is_none(), "no key can ever be accepted");
     }
 }

@@ -38,6 +38,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/auxv.h>   /* CPUIDLE: getauxval(AT_HWCAP) & HWCAP_EVTSTRM */
+#include <sys/prctl.h>  /* CPUIDLE: PR_SET_TIMERSLACK for the proxy's idle sleeps */
 
 #define LOGE(fmt, ...) fprintf(stderr, "[net_shim] " fmt "\n", ##__VA_ARGS__)
 
@@ -295,6 +297,120 @@ static inline void tp_host_backoff(uint64_t dt) {
     } else cpu_relax();
 }
 uint64_t net_wait_sleeps(void) { return __atomic_load_n(&g_tp_wait_sleeps, __ATOMIC_RELAXED); }
+
+/* CPUIDLE (2026-11-06): the proxy's idle tier. The proxy loops spun (plain load + YIELD) on their pinned big
+ * core for the whole TP session, so a server with no request in flight still kept one X925 core per rank
+ * at full clock around the clock. YIELD is only a hint: on a core without SMT it changes nothing, power
+ * included. Now, after --proxy-idle-us of continuous no-work WITH NOTHING OWED (every posted epoch matched;
+ * the critical-path wait for a slow peer keeps spinning), the loop waits with WFE: the core clock-gates
+ * until the GPU_READY line it watches is written (the local GPU's first post of the next collective) or the
+ * kernel's 10 kHz timer event stream ticks (<= 100 us), then polls everything once more. Leaving the tier
+ * costs at most one tick, on the first collective after a quiet gap; at the recommended threshold (20 ms) the
+ * gaps inside a request (decode steps, prefill layers, host work between rounds) do not reach it. Timing
+ * only: no value, order or protocol change. The watched load is a load-exclusive (no store, no RMW: I6
+ * holds). Without the event stream (HWCAP_EVTSTRM absent) the tier sleeps 50 us per poll instead.
+ * OPT-IN (owner 2026-11-06): --proxy-idle-us 20000 turns it on; 0 (the default) = never park, as before. */
+#define TP_PROXY_IDLE_RECOMMENDED_US 20000ull   /* the value to pass; the tier is OPT-IN (owner 2026-11-06) */
+static unsigned long long g_opt_proxy_idle_us = 0;
+static uint64_t g_proxy_parks = 0;     /* entries into the idle tier (all proxies) */
+static uint64_t g_proxy_park_ns = 0;   /* time spent in it */
+static int g_proxy_wfe = -1;           /* -1 = unresolved, 1 = WFE + event stream, 0 = 50 us sleeps */
+void net_set_proxy_idle(unsigned long long us) { g_opt_proxy_idle_us = us; }
+uint64_t net_proxy_parks(void) { return __atomic_load_n(&g_proxy_parks, __ATOMIC_RELAXED); }
+uint64_t net_proxy_park_ns(void) { return __atomic_load_n(&g_proxy_park_ns, __ATOMIC_RELAXED); }
+
+#define TP_PROXY_DEEP_NS   1000000000ull   /* after 1 s parked: real sleeps instead of WFE */
+#define TP_PROXY_SLEEP_NS  250000ull        /* the deep tier's sleep (<= ~0.25 ms on the next request) */
+typedef struct { uint64_t idle_ns, idle_since, park_t0, park_start, win_t0; unsigned ticks, wakes; int parked; } ProxyIdle;
+
+static void proxy_idle_init(ProxyIdle* s) {
+    memset(s, 0, sizeof(*s));
+    s->idle_ns = (uint64_t)g_opt_proxy_idle_us * 1000ull;
+    if (g_proxy_wfe < 0) {
+#if defined(__aarch64__)
+        g_proxy_wfe = (getauxval(AT_HWCAP) & HWCAP_EVTSTRM) ? 1 : 0;
+#else
+        g_proxy_wfe = 0;
+#endif
+    }
+    if (s->idle_ns) prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);   // this (proxy) thread: 1 us sleep slack
+    if (s->idle_ns)
+        fprintf(stderr, "[net] proxy idle tier: park after %llu us with nothing owed (%s, then 250 us sleeps after 1 s)%s\n",
+                (unsigned long long)g_opt_proxy_idle_us,
+                g_proxy_wfe ? "WFE, <= 100 us wake" : "50 us sleeps, no event stream",
+                g_opt_proxy_idle_us == TP_PROXY_IDLE_RECOMMENDED_US ? " (--proxy-idle-us, recommended value)" : " (--proxy-idle-us)");
+    else
+        fprintf(stderr, "[net] proxy idle tier: off (default; --proxy-idle-us 20000 turns it on): the proxy spins for the whole session\n");
+}
+
+// One loop iteration's ending. `did_work` resets the tier; `owed` (posted epochs the peers have not
+// matched) keeps the critical-path spin; `watch`/`seen`: the GPU_READY line and the epoch the loop waits
+// for — a value already >= seen means work is pending, so never sleep on it.
+static inline void proxy_idle_step(ProxyIdle* s, int did_work, int owed, volatile uint64_t* watch,
+                                   uint64_t seen) {
+    if (did_work || owed) {
+        if (s->parked) {
+            __atomic_fetch_add(&g_proxy_park_ns, now_ns() - s->park_t0, __ATOMIC_RELAXED);
+            s->parked = 0;
+        }
+        s->idle_since = 0; s->ticks = 0;
+        if (!did_work) cpu_relax();
+        return;
+    }
+    if (!s->idle_ns) { cpu_relax(); return; }
+    if (!s->parked) {
+        // Read the clock only every 1024 idle spins: the first idle iterations after work stay a plain
+        // load + yield, exactly as before.
+        if (((++s->ticks) & 0x3FF) == 0) {
+            uint64_t t = now_ns();
+            if (!s->idle_since) s->idle_since = t;
+            else if (t - s->idle_since >= s->idle_ns) {
+                s->parked = 1; s->park_t0 = t; s->park_start = t; s->win_t0 = t; s->wakes = 0;
+                __atomic_fetch_add(&g_proxy_parks, 1, __ATOMIC_RELAXED);
+            }
+        }
+        cpu_relax();
+        return;
+    }
+    // Two depths. The first second of quiet waits with WFE: the core clock-gates (no OS sleep, so /proc
+    // still counts it as running) and wakes the instant the GPU posts — right for the long gaps INSIDE a
+    // request (a big model's prefill layer). After a second the server is idle between requests: real
+    // sleeps let the core reach its idle states, at a cost of <= ~0.25 ms on the next request's first
+    // collective.
+    int deep = s->park_t0 - s->park_start >= TP_PROXY_DEEP_NS;
+#if defined(__aarch64__)
+    if (g_proxy_wfe && !deep) {
+        // The kernel's __cmpwait sequence: SEVL+WFE first consumes any event already pending (an exception
+        // return, the tick that just woke us), so the second WFE really waits for the next one — the monitor
+        // armed by LDXR (a write to the GPU_READY line) or the 10 kHz event stream. (The first version armed
+        // the monitor without clearing a pending event; on GB10 its WFE returned at once and the "parked"
+        // proxy still spun a full core.)
+        uint64_t v;
+        __asm__ __volatile__("sevl\n\twfe" ::: "memory");
+        __asm__ __volatile__("ldxr %0, [%1]" : "=r"(v) : "r"(watch) : "memory");   // arm the monitor
+        if (v < seen) __asm__ __volatile__("wfe" ::: "memory");
+    } else
+#endif
+    {
+        (void)watch; (void)seen;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = deep ? (long)TP_PROXY_SLEEP_NS : 50000L };
+        nanosleep(&ts, NULL);
+    }
+    // Live accounting (the metric moves during a long park, not only when it ends) + a guard: 4096 wakes
+    // in under 100 ms (> 40 kHz, 4x the event stream's rate) means WFE is not waiting on this machine —
+    // fall back to 50 us sleeps for every proxy, once, and say so.
+    uint64_t t = now_ns();
+    __atomic_fetch_add(&g_proxy_park_ns, t - s->park_t0, __ATOMIC_RELAXED);
+    s->park_t0 = t;
+    if (((++s->wakes) & 0xFFF) == 0) {
+        if (g_proxy_wfe && !deep && t - s->win_t0 < 100000000ull) {
+            g_proxy_wfe = 0;
+            fprintf(stderr, "[net] proxy idle tier: WFE returned %u times in %.1f ms (not waiting on this "
+                            "machine) — using 50 us sleeps instead\n", 4096u, (t - s->win_t0) / 1e6);
+        }
+        s->win_t0 = t;
+    }
+}
 
 static inline volatile uint64_t* flagp(NetCtx* c, size_t off) {
     return (volatile uint64_t*)((char*)c->hbuf + off);
@@ -1753,6 +1869,7 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
     // threshold works. Idle periods have nothing outstanding and never engage it.
     uint64_t wdog_since = 0;       // when the current outstanding-debt window opened (0 = none)
     unsigned  wdog_ticks = 0;      // spin counter so the clock is read rarely
+    ProxyIdle idle; proxy_idle_init(&idle);   // CPUIDLE: park after --proxy-idle-us with nothing owed
 
     while (!c->aborted && !__atomic_load_n(flagp(c, TP_F_ABORT), __ATOMIC_ACQUIRE)) {
         int did_work = 0;
@@ -1996,8 +2113,16 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
         }
         }
 
-        if (!did_work) cpu_relax();   // plain load + yield, never an atomic RMW (I6)
+        // plain load + yield (I6) while work flows or a peer owes us an epoch; WFE once quiet (CPUIDLE)
+        if (did_work) proxy_idle_step(&idle, 1, 0, NULL, 0);
+        else {
+            uint64_t rxd = c->recv_gpu ? *flagp(c, TP_F_RX_DONE) : 0;   // the watchdog's debt, recomputed
+            uint64_t m = c->recv_gpu ? (next_release > rxd + 1 ? next_release : rxd + 1)
+                                     : (next_release > rxd ? next_release : rxd);
+            proxy_idle_step(&idle, 0, next_to_post > m, flagp(c, TP_F_GPU_READY), next_to_post);
+        }
     }
+    if (idle.parked) __atomic_fetch_add(&g_proxy_park_ns, now_ns() - idle.park_t0, __ATOMIC_RELAXED);
 }
 
 // N-way (world > 2) proxy: the SAME doorbell invariants as the world==2 loop, per QP, with the round
@@ -2024,6 +2149,7 @@ static void net_proxy_loop_nway(NetCtx* c, int core) {
     // every posted epoch is owed by SOME peer and the round schedule is symmetric across ranks.
     uint64_t wdog_since = 0;
     unsigned  wdog_ticks = 0;
+    ProxyIdle idle; proxy_idle_init(&idle);   // CPUIDLE: park after --proxy-idle-us with nothing owed
 
     while (!c->aborted && !__atomic_load_n(flagp(c, TP_F_ABORT), __ATOMIC_ACQUIRE)) {
         int did_work = 0;
@@ -2214,8 +2340,16 @@ recv_out:
             }
         }
 
-        if (!did_work) cpu_relax();
+        // CPUIDLE: same tier as world==2 (the global debt, as the watchdog computes it)
+        if (did_work) proxy_idle_step(&idle, 1, 0, NULL, 0);
+        else {
+            uint64_t rxd = c->recv_gpu ? *flagp(c, TP_F_RX_DONE) : 0;
+            uint64_t m = c->recv_gpu ? (next_release > rxd + 1 ? next_release : rxd + 1)
+                                     : (next_release > rxd ? next_release : rxd);
+            proxy_idle_step(&idle, 0, next_to_post > m, flagp(c, TP_F_GPU_READY), next_to_post);
+        }
     }
+    if (idle.parked) __atomic_fetch_add(&g_proxy_park_ns, now_ns() - idle.park_t0, __ATOMIC_RELAXED);
 
     // B8 §1.5-7: cross-rank abort fan-out epilogue. If WE aborted (code from a kernel, the watchdog,
     // a guard, or a mirrored peer), ship our code to every peer's abort slot so a one-rank abort
@@ -2461,7 +2595,15 @@ int net_exchange(NetCtx* c, int nbytes) {
 // Deadline: without one, a peer whose main thread hangs (proxy/NIC still alive, so no error CQE ever)
 // hangs THIS thread forever, mid-step, silently. TP_WDOG_NS is ~10^5x the expected RTT; the wait spins
 // for the TP-E budget (tp_host_backoff, default 20 ms), then 1 ms nanosleeps. Abort code 7.
-uint64_t net_agree(NetCtx* c, uint64_t val, uint64_t step_mask, uint64_t step_val) {
+// TP-D boot variant: `net_agree` with an explicit deadline. The BOOT agree is the FIRST
+// cross-rank rendezvous of a session, right after two INDEPENDENT model loads (raw pack on
+// the head, converted cache on a warm node): 50-400 s of LEGITIMATE skew the 10 s per-step
+// watchdog cannot cover (2026-10-30 Lygodactylus 4bpw + 2.05bpw TP boot aborts, code 7
+// "peer token did not arrive within 10s"). Same rationale as arming the doorbell watchdog
+// only AFTER the first rendezvous. A peer that DIED (vs merely slow) is still caught by the
+// out-of-band liveness probe / abort flag, exactly as in net_exchange's probe-tolerant wait.
+uint64_t net_agree_dl(NetCtx* c, uint64_t val, uint64_t step_mask, uint64_t step_val,
+                      uint64_t deadline_ns) {
     __atomic_store_n(flagp(c, TP_F_AGREE_OUT), val, __ATOMIC_RELEASE);
     const uint64_t t0 = now_ns();
     for (;;) {
@@ -2474,14 +2616,20 @@ uint64_t net_agree(NetCtx* c, uint64_t val, uint64_t step_mask, uint64_t step_va
         if (in != 0 && (in & step_mask) == step_val) return in;
         if (c->aborted || *flagp(c, TP_F_ABORT)) return 0;
         uint64_t dt = now_ns() - t0;
-        if (dt >= TP_WDOG_NS) {
+        if (dt >= deadline_ns) {
             LOGE("net_agree: peer token for step %llu did not arrive within %llus — aborting",
-                 (unsigned long long)step_val, (unsigned long long)(TP_WDOG_NS / 1000000000ull));
+                 (unsigned long long)step_val, (unsigned long long)(deadline_ns / 1000000000ull));
             tp_set_abort(c, 7);
             return 0;
         }
         tp_host_backoff(dt);
     }
+}
+
+// The per-step agree: the 10 s TP_WDOG_NS deadline (a mid-run hang must tear the link down
+// fast; legitimate mid-run unmatched skew is ms-scale — see the comment above).
+uint64_t net_agree(NetCtx* c, uint64_t val, uint64_t step_mask, uint64_t step_val) {
+    return net_agree_dl(c, val, step_mask, step_val, TP_WDOG_NS);
 }
 
 // P5: one world>2 control-plane rendezvous with a SPECIFIC peer (head<->node), over the dedicated

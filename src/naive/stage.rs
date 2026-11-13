@@ -773,6 +773,8 @@ where F: FnMut(Item<'_>) -> Result<()>
         cache_writes: AtomicBool::new(true),
     };
     let mut consume_err: Option<anyhow::Error> = None;
+    // BASICS (owner 2026-11-02): layers handed up, as a percentage at the normal level
+    let prog = crate::boot_report::Progress::new("loading weights", n_layers as u64, crate::boot_report::Unit::Items("layers"));
     if opts.workers <= 1 {
         // the old serial shape: stage, then hand up, one layer at a time
         for l in 0..n_layers {
@@ -780,6 +782,7 @@ where F: FnMut(Item<'_>) -> Result<()>
             match shared.order.next(l) {
                 Ok(Some(s)) => {
                     if let Err(e) = consume(Item::Layer(l, &s)) { consume_err = Some(e); break; }
+                    prog.add(1);
                 }
                 Ok(None) => break,
                 Err(e) => { consume_err = Some(e); break; }
@@ -804,6 +807,7 @@ where F: FnMut(Item<'_>) -> Result<()>
                             break;
                         }
                         shared.gate.consumed();
+                        prog.add(1);
                     }
                     Ok(None) => break,
                     Err(e) => { consume_err = Some(e); shared.gate.fail(); break; }
@@ -812,6 +816,7 @@ where F: FnMut(Item<'_>) -> Result<()>
         });
     }
     if let Some(e) = consume_err { return Err(e); }
+    prog.finish();
     let stats = Stats {
         warm: shared.warm.load(Ordering::Relaxed),
         cold: shared.cold.load(Ordering::Relaxed),

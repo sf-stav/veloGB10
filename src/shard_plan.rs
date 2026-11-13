@@ -20,10 +20,10 @@ pub const PLAN_VERSION: u32 = 1;
 pub const SHARD_FILE: &str = "gb10_shard.json";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ShardFormat { Exl3, Nvfp4, Naive }
+pub enum ShardFormat { Exl3, Nvfp4, Naive, Fp4l }
 
 impl ShardFormat {
-    pub fn name(self) -> &'static str { match self { ShardFormat::Exl3 => "exl3", ShardFormat::Nvfp4 => "nvfp4", ShardFormat::Naive => "naive" } }
+    pub fn name(self) -> &'static str { match self { ShardFormat::Exl3 => "exl3", ShardFormat::Nvfp4 => "nvfp4", ShardFormat::Naive => "naive", ShardFormat::Fp4l => "fp4l" } }
 }
 
 /// One tensor of a segment: `len` bytes at absolute offset `off` of `src`, stored as `dtype`/`shape`.
@@ -195,6 +195,8 @@ pub fn detect_format(dir: &Path) -> Option<ShardFormat> {
     // NAIVE S5b: a Naive-N0.5 pack is an EXL3 pack by quant_method; its own plan (naive::shipplan) comes first
     if crate::naive::config::NaiveConfig::is_naive_dir(&dir.to_string_lossy()) { return Some(ShardFormat::Naive); }
     if crate::exl3::is_exl3_dir(&dir.to_string_lossy()) { return Some(ShardFormat::Exl3); }
+    // FP4L: NVIDIA's ModelOpt mixed-precision Flash-Next (served by the EXL3 trunk) — before the qwen4_exp NVFP4 match
+    if crate::fp4l::pack::is_fp4l_dir(dir) { return Some(ShardFormat::Fp4l); }
     let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let mt = v.get("text_config").and_then(|t| t.get("model_type")).or_else(|| v.get("model_type"))?.as_str()?;
@@ -264,12 +266,19 @@ pub fn shard_plan(dir: &Path, fmt: ShardFormat, world: usize, rank: usize, deal:
     anyhow::ensure!(world >= 2 && rank < world, "shard plan: rank {rank} of world {world}");
     match fmt {
         ShardFormat::Exl3 => plan_exl3(dir, world, rank, deal),
+        // FP4L: the EXL3 per-expert plan verbatim (same tensor names: `layers.L.mlp.experts.E.*` go to the
+        // rank that owns E in the deal; everything else ships whole in common segments; the tower stays on the head)
+        ShardFormat::Fp4l => plan_exl3_fmt(dir, world, rank, deal, ShardFormat::Fp4l),
         ShardFormat::Nvfp4 => plan_nvfp4(dir, world, rank),
         ShardFormat::Naive => crate::naive::shipplan::plan_deal(dir, world, rank, deal),
     }
 }
 
 fn plan_exl3(dir: &Path, world: usize, rank: usize, deal: &str) -> Result<RankPlan> {
+    plan_exl3_fmt(dir, world, rank, deal, ShardFormat::Exl3)
+}
+
+fn plan_exl3_fmt(dir: &Path, world: usize, rank: usize, deal: &str, fmt: ShardFormat) -> Result<RankPlan> {
     let cfg = crate::qwen::Config::from_config_json(&dir.join("config.json").to_string_lossy())?;
     let (ne, nl) = (cfg.num_experts, cfg.num_layers);
     anyhow::ensure!(ne > 0 && ne % world == 0, "shard plan (exl3): {ne} experts do not divide by world {world}");
@@ -328,10 +337,19 @@ fn plan_exl3(dir: &Path, world: usize, rank: usize, deal: &str) -> Result<RankPl
         if f == "model.safetensors.index.json" { continue; }
         if dir.join(f).is_file() { out.push(PlanFile { logical: f.to_string(), src: PlanSrc::Whole(dir.join(f)) }); }
     }
-    let mut plan = RankPlan { format: ShardFormat::Exl3, world, rank, deal: deal.into(), files: out, presliced: Vec::new() };
+    // FP4L: an EXL3 MTP-head sidecar dropped into the pack directory (--fp4l-mtp-sidecar auto) goes to every rank whole,
+    // so every rank resolves the same sidecar in its own model directory (EXL3 packs: unchanged)
+    if fmt == ShardFormat::Fp4l {
+        if let Some(p) = crate::fp4l::mtp_sidecar_in_dir(dir) {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                out.push(PlanFile { logical: name.to_string(), src: PlanSrc::Whole(p.clone()) });
+            }
+        }
+    }
+    let mut plan = RankPlan { format: fmt, world, rank, deal: deal.into(), files: out, presliced: Vec::new() };
     let total = plan.total_bytes()?;
     plan.files.push(PlanFile { logical: "model.safetensors.index.json".into(), src: PlanSrc::Bytes(index_bytes(&new_map, total)?) });
-    plan.files.push(PlanFile { logical: SHARD_FILE.into(), src: PlanSrc::Bytes(shard_info_bytes(ShardFormat::Exl3, world, rank, deal, dir, &[])?) });
+    plan.files.push(PlanFile { logical: SHARD_FILE.into(), src: PlanSrc::Bytes(shard_info_bytes(fmt, world, rank, deal, dir, &[])?) });
     plan.files.sort_by(|a, b| a.logical.cmp(&b.logical));
     Ok(plan)
 }
@@ -465,7 +483,7 @@ pub fn probe(dir: &Path, worlds: &[usize], deals: &[String], tmp: &Path) -> Resu
             for n in &src_names {
                 let holders: Vec<usize> = (0..world).filter(|&r| sets[r].contains(n)).collect();
                 let want: Vec<usize> = match fmt {
-                    ShardFormat::Exl3 => match exl3_trunk_expert(n) {
+                    ShardFormat::Exl3 | ShardFormat::Fp4l => match exl3_trunk_expert(n) {
                         Some((l, e)) => vec![crate::exl3_forward::xtp::ep_layer_owners_kind(deal, cfg.num_experts, world, l)?[e]],
                         None => (0..world).collect(),
                     },
@@ -497,6 +515,20 @@ pub fn probe(dir: &Path, worlds: &[usize], deals: &[String], tmp: &Path) -> Resu
                     }
                 }
                 match fmt {
+                    ShardFormat::Fp4l => {
+                        // FP4L: the sparse shard dir opens as an FP4-Local pack holding exactly this rank's experts
+                        let pk = crate::fp4l::pack::Fp4lPack::open(&d)?;
+                        let mut need_missing = 0usize;
+                        let own: Vec<Vec<usize>> = (0..cfg.num_layers).map(|l| crate::exl3_forward::xtp::ep_layer_owners_kind(deal, cfg.num_experts, world, l)).collect::<Result<_>>()?;
+                        for l in 0..cfg.num_layers {
+                            for e in 0..cfg.num_experts {
+                                let has = pk.has(&format!("model.language_model.layers.{l}.mlp.experts.{e}.gate_proj.weight"));
+                                if has != (own[l][e] == p.rank) { need_missing += 1; }
+                            }
+                        }
+                        println!("  rank {}: fp4l shard opens: {} tensors, expert ownership mismatches {need_missing}", p.rank, pk.t.len());
+                        if need_missing == 0 { open_ok += 1; }
+                    }
                     ShardFormat::Naive => {
                         // the sparse dir opens as a shard (gb10_shard.json) with this rank's inventory
                         let pack = crate::naive::pack::NaivePack::open(&d.to_string_lossy())?;

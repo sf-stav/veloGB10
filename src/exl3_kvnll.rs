@@ -83,6 +83,56 @@ pub(crate) fn q8_dequant_row(row: &[u8], hd: usize) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// q4k host reference (docs/KV_CACHE_Q4K.md)
+// ---------------------------------------------------------------------------------------------
+//
+// Same rotation and per-32-group f16 scale as q8, 4 bits per dim on the midpoint grid:
+//   code    = clamp(floor(v/s * 8 + 8), 0, 15)
+//   dequant = (code - 7.5) * (s / 8)
+// Packing: dim d lives in byte d/2, low nibble for even dims. Scales follow the packed codes.
+
+/// Packed code bytes of a q4k row (before the scales): hd/2.
+pub(crate) fn q4k_code_bytes(hd: usize) -> usize {
+    hd / 2
+}
+
+/// One K/V row -> the cache row bytes of the q4k format. Mirrors `q8_quant_row`'s op order:
+/// h32r, f16 scale of (absmax + 1e-10), fdiv/fmul, floor.
+pub(crate) fn q4k_quant_row(x: &[f32]) -> Vec<u8> {
+    let hd = x.len();
+    assert!(hd % 32 == 0, "q4k rows need hd % 32 == 0");
+    let mut row = vec![0u8; kv_rowbytes(KV_Q4K, hd)];
+    let mut v = x.to_vec();
+    h32r(&mut v);
+    for (g, grp) in v.chunks_exact(32).enumerate() {
+        let s = grp.iter().fold(0.0f32, |m, &a| m.max(a.abs())) + 1e-10f32;
+        let inv_s = 1.0f32 / s;
+        for (j, &a) in grp.iter().enumerate() {
+            let vs = a * inv_s;
+            let q = (vs.mul_add(8.0, 8.0).floor() as i32).clamp(0, 15);
+            let d = g * 32 + j;
+            row[d / 2] |= (q as u8) << ((d % 2) * 4);
+        }
+        let sb = f16::from_f32(s).to_bits().to_le_bytes();
+        row[hd / 2 + 2 * g] = sb[0];
+        row[hd / 2 + 2 * g + 1] = sb[1];
+    }
+    row
+}
+
+/// Cache row -> values in the ROTATED basis: (code - 7.5) * (f16 scale / 8), one rounding.
+pub(crate) fn q4k_dequant_row(row: &[u8], hd: usize) -> Vec<f32> {
+    (0..hd).map(|d| {
+        let g = d / 32;
+        let s = f16::from_bits(u16::from_le_bytes(
+            [row[hd / 2 + 2 * g], row[hd / 2 + 2 * g + 1]])).to_f32();
+        let sm = s / 8.0f32;
+        let code = ((row[d / 2] >> ((d % 2) * 4)) & 0xF) as f32;
+        (code - 8.0).mul_add(sm, 0.5 * sm)
+    }).collect()
+}
+
+// ---------------------------------------------------------------------------------------------
 // --probe-exl3-kvq: device helpers vs host reference, no model
 // ---------------------------------------------------------------------------------------------
 
@@ -128,7 +178,7 @@ pub fn probe_kv_q8_selftest() -> Result<()> {
     let x = kvq_rows(n, hd);
     let x_d = dev.htod_sync_copy(&x)?;
     let mut all_ok = true;
-    for fmt in [KV_F32, KV_F16, KV_FP8, KV_Q8, KV_Q4X] {
+    for fmt in [KV_F32, KV_F16, KV_FP8, KV_Q8, KV_Q4X, KV_Q4K] {
         let rb = kv_rowbytes(fmt, hd);
         let mut rows_d = dev.alloc_zeros::<u8>(n * rb)?;
         let mut deq_d = dev.alloc_zeros::<f32>(n * hd)?;
@@ -178,6 +228,26 @@ pub fn probe_kv_q8_selftest() -> Result<()> {
                 ok &= zero_ok;
                 extra = format!("host-ref mismatches: bytes {byte_ne} deq {deq_ne} rec {rec_ne}; zero-row exact {zero_ok}");
             }
+            KV_Q4K => {
+                let code_bytes = q4k_code_bytes(hd);
+                let (mut byte_ne, mut deq_ne, mut rec_ne) = (0usize, 0usize, 0usize);
+                for r in 0..n {
+                    let xr = &x[r * hd..(r + 1) * hd];
+                    let href = q4k_quant_row(xr);
+                    let drow = &rows[r * rb..(r + 1) * rb];
+                    byte_ne += href[..code_bytes + hd / 16].iter()
+                        .zip(&drow[..code_bytes + hd / 16]).filter(|(a, b)| a != b).count();
+                    let hdq = q4k_dequant_row(drow, hd);
+                    deq_ne += bits_ne(&hdq, &deq[r * hd..(r + 1) * hd]);
+                    let mut hrec = hdq.clone();
+                    h32r(&mut hrec);
+                    rec_ne += bits_ne(&hrec, &rec[r * hd..(r + 1) * hd]);
+                }
+                ok &= byte_ne == 0 && deq_ne == 0 && rec_ne == 0;
+                let zero_ok = rec[..hd].iter().all(|&v| v == 0.0);
+                ok &= zero_ok;
+                extra = format!("host-ref mismatches: bytes {byte_ne} deq {deq_ne} rec {rec_ne}; zero-row exact {zero_ok}");
+            }
             _ => {}
         }
         // reconstruction SNR over the Gaussian+outlier rows (rows >= 3) and the tiny row
@@ -187,6 +257,8 @@ pub fn probe_kv_q8_selftest() -> Result<()> {
                  kv_fmt_name(fmt), if ok { "PASS" } else { "FAIL" });
         all_ok &= ok;
     }
+    // q4k has a host reference in this commit; the device helpers land next.
+    all_ok &= probe_q4k_host(&x, n, hd);
     if all_ok {
         println!("KVQ_SELFTEST RESULT: PASS (device helpers == host reference; ld8 == ld on every format)");
         Ok(())
@@ -662,6 +734,53 @@ pub fn probe_kv_nll(a: &KvNllArgs) -> Result<()> {
     Ok(())
 }
 
+/// q4k host reference, independent re-derivation: checks the host quant/dequant against the
+/// formula written out here (packing bit order, code range, scale placement, padding, zero row,
+/// SNR).
+fn probe_q4k_host(x: &[f32], n: usize, hd: usize) -> bool {
+    let code_bytes = q4k_code_bytes(hd);
+    let rb = kv_rowbytes(KV_Q4K, hd);
+    let (mut byte_ne, mut pad_ne, mut scale_ne, mut code_range_bad) = (0usize, 0usize, 0usize, 0usize);
+    let mut rec_all = vec![0f32; n * hd];
+    for r in 0..n {
+        let xr = &x[r * hd..(r + 1) * hd];
+        let row = q4k_quant_row(xr);
+        assert_eq!(row.len(), rb);
+        let mut v = xr.to_vec();
+        h32r(&mut v);
+        for g in 0..hd / 32 {
+            let grp = &v[g * 32..(g + 1) * 32];
+            let s = grp.iter().fold(0.0f32, |m, &a| m.max(a.abs())) + 1e-10f32;
+            let inv_s = 1.0f32 / s;
+            for (j, &a) in grp.iter().enumerate() {
+                let vs = a * inv_s;
+                let q = (vs.mul_add(8.0, 8.0).floor() as i32).clamp(0, 15);
+                if !(0..16).contains(&q) { code_range_bad += 1; }
+                let d = g * 32 + j;
+                let got = (row[d / 2] >> ((d % 2) * 4)) & 0xF;
+                if got != q as u8 { byte_ne += 1; }
+            }
+            let want = f16::from_f32(s).to_bits().to_le_bytes();
+            if row[code_bytes + 2 * g..code_bytes + 2 * g + 2] != want { scale_ne += 1; }
+        }
+        if row[code_bytes + hd / 16..].iter().any(|&b| b != 0) { pad_ne += 1; }
+        if q4k_quant_row(xr) != row { byte_ne += 1; }
+        let mut dq = q4k_dequant_row(&row, hd);
+        h32r(&mut dq);
+        rec_all[r * hd..(r + 1) * hd].copy_from_slice(&dq);
+    }
+    let zero_ok = rec_all[..hd].iter().all(|&v| v == 0.0);
+    let body = snr_db(&x[3 * hd..], &rec_all[3 * hd..]);
+    let tiny = snr_db(&x[2 * hd..3 * hd], &rec_all[2 * hd..3 * hd]);
+    let ok = byte_ne == 0 && pad_ne == 0 && scale_ne == 0 && code_range_bad == 0 && zero_ok;
+    println!("Q4K_HOST rowbytes={rb:<4} codes {code_bytes} B scales {hd}/32 f16; \
+              packing mismatches {byte_ne}; scale mismatches {scale_ne}; pad mismatches {pad_ne}; \
+              code-range bad {code_range_bad}; zero-row exact {zero_ok}; \
+              SNR body {body:.2} dB tiny-row {tiny:.2} dB -> {}",
+             if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +875,67 @@ mod tests {
         for g in 0..8 {
             let s = f16::from_bits(u16::from_le_bytes([r[256 + 2 * g], r[257 + 2 * g]])).to_f32();
             assert!(s > 0.0 && s.is_finite());
+        }
+    }
+
+    #[test]
+    fn q4k_layout_and_rowbytes() {
+        assert_eq!(kv_rowbytes(KV_Q4K, 256), 144);
+        assert_eq!(kv_rowbytes(KV_Q4K, 128), 80);
+        let x = rows(8, 256);
+        let r = q4k_quant_row(&x[5 * 256..6 * 256]);
+        assert_eq!(r.len(), 144);
+        assert!(r[128 + 16..].iter().all(|&b| b == 0), "padding must stay zero");
+        for g in 0..8 {
+            let s = f16::from_bits(u16::from_le_bytes([r[128 + 2 * g], r[129 + 2 * g]])).to_f32();
+            assert!(s > 0.0 && s.is_finite());
+        }
+    }
+
+    #[test]
+    fn q4k_packing_bit_order() {
+        // dim d -> byte d/2, low nibble for even dims; check every field against the formula.
+        let x = rows(3, 256);
+        let row = q4k_quant_row(&x[2 * 256..3 * 256]);
+        let mut rot = x[2 * 256..3 * 256].to_vec();
+        h32r(&mut rot);
+        for g in 0..8 {
+            let grp = &rot[g * 32..(g + 1) * 32];
+            let s = grp.iter().fold(0.0f32, |m, &a| m.max(a.abs())) + 1e-10f32;
+            let inv_s = 1.0f32 / s;
+            for (j, &a) in grp.iter().enumerate() {
+                let d = g * 32 + j;
+                let q = ((a * inv_s).mul_add(8.0, 8.0).floor() as i32).clamp(0, 15) as u8;
+                let got = (row[d / 2] >> ((d % 2) * 4)) & 0xF;
+                assert_eq!(got, q, "dim {d} (byte {}, field {})", d / 2, d % 2);
+            }
+        }
+    }
+
+    #[test]
+    fn q4k_zero_row_reads_zero() {
+        let r = q4k_quant_row(&[0.0f32; 256]);
+        let d = q4k_dequant_row(&r, 256);
+        assert!(d.iter().all(|&v| v == 0.0), "f16(1e-10) underflows: scale 0 -> exact zeros");
+    }
+
+    #[test]
+    fn q4k_error_is_bounded_by_half_a_step() {
+        let x = rows(64, 256);
+        for r in 3..64 {
+            let xr = &x[r * 256..(r + 1) * 256];
+            let mut rot = xr.to_vec();
+            h32r(&mut rot);
+            let row = q4k_quant_row(xr);
+            let d = q4k_dequant_row(&row, 256);
+            for (g, (dg, rg)) in d.chunks(32).zip(rot.chunks(32)).enumerate() {
+                let s = f16::from_bits(u16::from_le_bytes([row[128 + 2 * g], row[129 + 2 * g]])).to_f32();
+                let smax = rg.iter().fold(0.0f32, |m, &a| m.max(a.abs()));
+                for (a, b) in dg.iter().zip(rg) {
+                    // half a grid step (s/16) plus the f16 scale rounding
+                    assert!((a - b).abs() <= s / 16.0 + smax * 1.0e-3 + 1e-6, "row {r} g {g}: {a} vs {b}");
+                }
+            }
         }
     }
 

@@ -51,6 +51,10 @@ extern "C" {
     fn net_device_epoch(c: *mut NetCtx) -> u64;
     fn net_gate_waits(c: *mut NetCtx) -> u64;
     fn net_wait_sleeps() -> u64;
+    /// CPUIDLE: the proxy idle tier (--proxy-idle-us) and its counters (all proxies, process-wide).
+    fn net_set_proxy_idle(us: u64);
+    fn net_proxy_parks() -> u64;
+    fn net_proxy_park_ns() -> u64;
     fn net_bench_cq_hold(c: *mut NetCtx, hold: u32, hold_us: u32) -> c_int;
     fn net_gpu_ready(c: *mut NetCtx) -> u64;
     fn net_tail_fires(c: *mut NetCtx) -> u64;
@@ -69,6 +73,7 @@ extern "C" {
     fn net_agree(c: *mut NetCtx, val: u64, step_mask: u64, step_val: u64) -> u64;
     fn net_exchange_one(c: *mut NetCtx, peer_rank: c_int, nbytes: c_int) -> c_int;
     fn net_exchange_one_dl(c: *mut NetCtx, peer_rank: c_int, nbytes: c_int, deadline_ns: u64) -> c_int;
+    fn net_agree_dl(c: *mut NetCtx, val: u64, step_mask: u64, step_val: u64, deadline_ns: u64) -> u64;
     fn net_ctrl_recv_hptr(c: *mut NetCtx, src: c_int) -> *mut c_void;
     fn net_ctrl_send_hptr(c: *mut NetCtx) -> *mut c_void;
     fn net_world(c: *mut NetCtx) -> c_int;
@@ -113,6 +118,11 @@ pub const GTS_K2_GO: usize = 3;
 /// TP-E: 1 ms sleeps taken so far by the host rendezvous waits (net_agree / net_exchange / the proxy's
 /// placement waits), process-wide. Mid-request this should stay 0 under the TP-E spin budget.
 pub fn wait_sleeps() -> u64 { unsafe { net_wait_sleeps() } }
+
+/// CPUIDLE: times a TP proxy entered its idle tier (WFE wait after --proxy-idle-us with nothing owed),
+/// and the seconds it spent there. Process-wide; 0 parks with an idle server up = the tier never ran.
+pub fn proxy_parks() -> u64 { unsafe { net_proxy_parks() } }
+pub fn proxy_parked_secs() -> f64 { (unsafe { net_proxy_park_ns() }) as f64 / 1e9 }
 
 /// Pin the CALLING thread to `core` and VERIFY the affinity read back (GB10 is big.LITTLE; a launch or
 /// poll thread parked on a little A725 balloons latency and drains the GPU stream mid-token). Returns
@@ -293,6 +303,52 @@ pub fn agree_token(step: u64, accept_count: u8, k_verify: u8, hash: u32) -> u64 
 /// What a rank reads back from the peer's token: (accept count, agree_word).
 pub fn agree_token_reply(token: u64) -> (u8, u32) {
     (((token >> 32) & 0xFF) as u8, (token & 0xFFFF_FFFF) as u32)
+}
+
+/// TP-D: the BOOT-time world-2 agree. The boot agree is the FIRST cross-rank rendezvous of a
+/// session, immediately after two INDEPENDENT model loads (raw pack on the head, 50-400 s;
+/// converted cache on a warm node, ~60-90 s) — legitimate skew the 10 s per-step watchdog
+/// (TP_WDOG_NS) cannot cover: the 2026-10-30 Lygodactylus-4bpw and 2.05bpw TP boots aborted
+/// as "peer token did not arrive within 10s" (code 7) while the head was still loading
+/// weights, on a node whose cache was already warm. The deadline here is therefore 10 minutes;
+/// world>2's hub boot agree is already unbounded for the same reason (see `exchange_u32s_all`).
+/// A DEAD peer (vs merely slow) is still caught inside the wait by the liveness probe / abort
+/// flag, so the longer deadline cannot hang a session whose peer is gone.
+pub fn agree_boot(step: u64, hash: u32) -> Option<(u8, u32)> {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { return None; }
+    const BOOT_AGREE_DEADLINE_NS: u64 = 600_000_000_000;
+    let val = agree_token(step, 0, 0, hash);
+    let ctx = c as *mut NetCtx;
+    let got = unsafe {
+        net_agree_dl(ctx, val, 0xFF_FFFF << 40, (step & 0xFF_FFFF) << 40, BOOT_AGREE_DEADLINE_NS)
+    };
+    if got == 0 { return None; }
+    Some(agree_token_reply(got))
+}
+
+/// TP boot barrier (2026-11-09, runner Final_Run): every rank waits here, under the BOOT deadline, before the first
+/// collective of a boot phase that follows independent per-rank work. The trunk's "measuring the speculation cost"
+/// (MTP calibration) ran straight after per-rank setup whose length differs by box (the DFlash2 borrowed-head bf16 ->
+/// NVFP4 quantization took 2.2 s on two ranks and 21-24 s on the others), so its first all-reduce sat under the 10 s
+/// per-step watchdog and the fast ranks declared the slow ones dead (Qwen3.8-27B-FP8 + DF2 TP=4, Qwen3.5-122B-MIXED +
+/// DF2 TP=4: link abort, first request 503). World 2: `agree_boot` (10-minute deadline); world > 2: the head hub,
+/// unbounded (a DEAD peer is still caught by the liveness probe). No-op without a TP link.
+pub fn boot_barrier(tag: u32) -> anyhow::Result<()> {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { return Ok(()); }
+    let world = unsafe { net_world(c as *mut NetCtx) };
+    if world <= 2 {
+        match agree_boot(0xBB_0000 | (tag as u64 & 0xFFFF), tag) {
+            Some((_, w)) if w == agree_word(0, tag) => Ok(()),
+            Some((_, w)) => anyhow::bail!("TP boot barrier {tag:#x}: peer answered {w:#x}"),
+            None => anyhow::bail!("TP boot barrier {tag:#x}: link aborted or the peer did not arrive within the boot deadline"),
+        }
+    } else {
+        let all = exchange_u32s_all(&[0xB007_BA77, tag], 4)?;
+        anyhow::ensure!(all.iter().all(|p| p.len() >= 2 && p[1] == tag), "TP boot barrier {tag:#x}: ranks at different barriers");
+        Ok(())
+    }
 }
 
 /// B8/G1 EXTENDED determinism token: `(step | k_verify | accept_count | hash_of_ids)`.
@@ -843,6 +899,9 @@ fn push_net_opts() {
     let diag = opts::var(opt!("tp-diag")).is_ok() as c_int;
     let probe: u32 = opts::var(opt!("tp-race-probe")).ok()
         .and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+    // CPUIDLE: --proxy-idle-us (opt-in; 0 = never park, the default)
+    let idle_us: Option<u64> = opts::var(opt!("proxy-idle-us")).ok().and_then(|v| v.trim().parse::<u64>().ok());
+    if let Some(us) = idle_us { unsafe { net_set_proxy_idle(us) } }
     unsafe { net_set_opts(spin, tail, oneshot, diag); net_set_probe(probe);
               net_set_abort_fd(HEAD_LIVENESS_FD.load(std::sync::atomic::Ordering::Relaxed)) }
 }

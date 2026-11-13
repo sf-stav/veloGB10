@@ -178,6 +178,28 @@ impl EpShard {
         for (li, &e) in local.iter().enumerate() { lut[e] = li as i32; }
         Ok(EpShard { lut: dev.htod_sync_copy(&lut)?, rank, world, n_local: n, shared_split: false })
     }
+
+    /// FP4L: the same deal checks for an NVFP4 expert stack (fp4l_fwd::FxMoe) — the trellis-table
+    /// size asserts become "the stack holds exactly the local experts".
+    pub fn new_fx(dev: &Arc<CudaDevice>, ne: usize, rank: usize, world: usize, local: &[usize], tag: &str,
+                  n_stacked: usize) -> Result<Self> {
+        anyhow::ensure!(world >= 2 && rank < world && ne % world == 0,
+            "EP shard @{tag}: bad geometry ne={ne} rank={rank} world={world}");
+        let kind = ep_deal_kind();
+        let li: usize = tag.strip_prefix('L').and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        let own = ep_layer_owners(ne, world, li)?;
+        let mut seen = vec![0u8; ne];
+        for r in 0..world {
+            for e in (0..ne).filter(|&e| own[e] == r) { seen[e] += 1; }
+        }
+        anyhow::ensure!(seen.iter().all(|&c| c == 1), "EP shard @{tag}: deal '{kind}' does not cover every expert exactly once");
+        let n = local.len();
+        anyhow::ensure!(n == ne / world && n_stacked == n,
+                        "EP shard @{tag}: rank {rank} holds {n} experts ({n_stacked} stacked), expected ne/W = {}", ne / world);
+        let mut lut = vec![-1i32; ne];
+        for (li, &e) in local.iter().enumerate() { lut[e] = li as i32; }
+        Ok(EpShard { lut: dev.htod_sync_copy(&lut)?, rank, world, n_local: n, shared_split: false })
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -643,6 +665,8 @@ pub(super) struct PfHook {
     pub y: u64,
     pub inj: u64,
     pub norm: u64,
+    /// FP4L --fp4l-norms f32: `norm` points at the stored fp32 norm and the consumer is xf_pf_hc_inj_norm_f
+    pub norm_f32: bool,
     pub h: usize,
     pub hcn: usize,
     pub eps: f32,
@@ -660,6 +684,11 @@ impl PfHook {
     /// arithmetic on those rows, bit for bit.
     pub fn inj_norm(&self, l: &Launcher, r0: usize, r1: usize) -> Result<()> {
         let (h, hc, b) = (self.h, self.hcn, r1 - r0);
+        if self.norm_f32 {
+            return super::fp4l_fwd::pf_hc_inj_norm_f(l, self.hn + (r0 * hc * h * 2) as u64, self.resid + (r0 * hc * h * 4) as u64,
+                                                     self.y + (r0 * h * 2) as u64, self.inj + (r0 * hc * 4) as u64, self.norm,
+                                                     h, hc, b, self.eps);
+        }
         xqlaunch!(l, "xq_pf_hc_inj_norm", ((hc * b) as u32, 1, 1), (128, 1, 1), 0,
                   (self.hn + (r0 * hc * h * 2) as u64, self.resid + (r0 * hc * h * 4) as u64,
                    self.y + (r0 * h * 2) as u64, self.inj + (r0 * hc * 4) as u64, self.norm,
@@ -671,6 +700,9 @@ impl PfHook {
     pub fn inj_norm_k2(&self, l: &Launcher, ctx: u64, lag: u32, part: u64, r0: usize, r1: usize) -> Result<()> {
         let (h, hc) = (self.h, self.hcn);
         anyhow::ensure!(hc == 4 && h % 512 == 0 && h <= 4096, "prefill fold: hc {hc} h {h} outside the fused kernel's shape");
+        // FP4L --fp4l-norms f32 has no fold twin: the loader turns `fold` into the default dual:128 (one boot line)
+        anyhow::ensure!(!self.norm_f32, "prefill fold with fp32 norms (FP4L --fp4l-norms f32): the loader should have \
+                                         switched --tp-prefill-overlap fold to dual:128");
         xqlaunch!(l, "xq_pf_hc_inj_norm_k2", ((r1 - r0) as u32, 1, 1), (512, 1, 1), 0,
                   (ctx, lag, part + (r0 * h * 4) as u64, self.hn + (r0 * hc * h * 2) as u64,
                    self.resid + (r0 * hc * h * 4) as u64, self.inj + (r0 * hc * 4) as u64, self.norm,
@@ -744,8 +776,7 @@ pub fn single_nway_base(world: i32) -> Result<u16> {
 }
 
 fn rail2_dev() -> String {
-    crate::opts::var(crate::opt!("rdma-dev")).ok().and_then(|s| s.split(',').nth(1).map(|x| x.trim().to_string()))
-        .filter(|s| !s.is_empty()).unwrap_or_else(|| "roceP2p1s0f1".to_string())
+    crate::tp::rdma_dev_rail2()   // explicit --rdma-dev's second entry, else the auto-detected rail 2
 }
 
 /// TP-4E: every TCP port one rail's bring-up may bind or dial at `world` — the world-2 control port `base`
@@ -990,7 +1021,7 @@ fn rail2_preflight(rank: i32, dev2: &str) -> Result<()> {
     let bad = preflight_failures(&all.iter().map(|f| f[0]).collect::<Vec<_>>());
     anyhow::ensure!(bad.is_empty(),
         "TP-4E dual-rail bring-up refused before any rail-2 dial: {} (this rank: {why}). Every rank needs the second RDMA device \
-         (--rdma-dev <first>,<second>; default second entry roceP2p1s0f1) present with port 1 state 4 (ACTIVE) and a non-zero \
+         (--rdma-dev <first>,<second>; default: the auto-detected active port pair) present with port 1 state 4 (ACTIVE) and a non-zero \
          RoCE v2 GID at index {}; run with --tp-prefill-xport single only as an explicit, owner-consented opt-out",
         bad.join("; "), gid_idx);
     Ok(())
@@ -1458,7 +1489,8 @@ impl FwdModel {
     /// -> merged ids in sc.argmax). Only a greedy, unpenalized, non-ratio-rule step / verify round
     /// with <= 16 rows takes it; everything else runs the replicated head.
     pub(super) fn vp_greedy(&self, sc: &Scratch, m: usize) -> bool {
-        self.vp_greedy_st(sc.samp_live, sc.pen_live, sc.rq_live, m)
+        // a logprobs step (sc.lp_live) needs full logits rows: it takes the sampled rows' tail
+        self.vp_greedy_st(sc.samp_live || sc.lp_live, sc.pen_live, sc.rq_live, m)
     }
 
     /// `vp_greedy` for an explicit sampler state (S-B9-CF-PACK5: the packed graph FAMILIES are keyed
@@ -1471,7 +1503,7 @@ impl FwdModel {
     /// TP-H2 (`--tp-vp-sampled`): the rows vp_greedy refuses (sampled / penalized / ratio-rule) take the
     /// shard GEMM + row all-gather tail (vp_gather_rows) and then the unchanged pen / argmax / sampler.
     pub(super) fn vp_gather(&self, sc: &Scratch, m: usize) -> bool {
-        self.vp_gather_st(sc.samp_live, sc.pen_live, sc.rq_live, m)
+        self.vp_gather_st(sc.samp_live || sc.lp_live, sc.pen_live, sc.rq_live, m)
     }
 
     /// `vp_gather` for an explicit sampler state (see `vp_greedy_st`).
@@ -1488,7 +1520,7 @@ impl FwdModel {
     /// Graph-key bits for the vp tails: bit 45 = the greedy key-exchange tail (TP-H #4), bit 46 = the
     /// TP-H2 row all-gather tail. Both are capture-time properties of the graph.
     pub(super) fn vp_key(&self, sc: &Scratch, m: usize) -> usize {
-        self.vp_key_st(sc.samp_live, sc.pen_live, sc.rq_live, m)
+        self.vp_key_st(sc.samp_live || sc.lp_live, sc.pen_live, sc.rq_live, m)
     }
 
     /// `vp_key` for an explicit sampler state (see `vp_greedy_st`).
@@ -1631,17 +1663,19 @@ impl FwdModel {
         let n = m * h;
         anyhow::ensure!(n <= tp.part.len(), "EP combine: m={m} exceeds the partial buffer ({TP_MAX_ROWS} rows)");
         let part = *tp.part.device_ptr() as u64;
+        // FP4L stored-bf16 gate: the channels moe_inner's xf_sg_gate wrote (moe.sg = their constants)
+        let gx = self.gate_x(sc, moe);
         if let Some(d) = tp.dec_ok(n) {
             // TP-G: combine + K1 in one launch, then K2 writes moe_out (f16) directly
             let arrive = *d.arrive.device_ptr() as u64;
             xqlaunch_raw!(l, "xq_moe_combine_ep_k1l", (m as u32, 1, 1), (1024, 1, 1), 4096,
-                     (tp.dec_ctx(), part, &sc.yd, &sc.ysh, &sc.ids, &sc.wts, &sc.slotmap, &moe.sg, &sc.x,
+                     (tp.dec_ctx(), part, &sc.yd, &sc.ysh, &sc.ids, &sc.wts, &sc.slotmap, &moe.sg, gx,
                       topk as i32, h as i32, m as i32, (ep.shared_split || ep.rank == 0) as i32, arrive))?;
             let mo = *sc.moe_out.device_ptr() as u64;
             return tp.dec_sum_finish(l, d, mo, part, n);
         }
         xqlaunch!(l, "xq_moe_combine_ep", (m as u32, 1, 1), (1024, 1, 1), 4096,
-                 (part, &sc.yd, &sc.ysh, &sc.ids, &sc.wts, &sc.slotmap, &moe.sg, &sc.x,
+                 (part, &sc.yd, &sc.ysh, &sc.ids, &sc.wts, &sc.slotmap, &moe.sg, gx,
                   topk as i32, h as i32, m as i32, (ep.shared_split || ep.rank == 0) as i32))?;
         tp.all_reduce_f32(l, part, n)?;
         xqlaunch!(l, "xq_cvt_f32_f16", ((n as u32).div_ceil(256), 1, 1), (256, 1, 1), 0,
@@ -1688,6 +1722,9 @@ impl FwdModel {
     fn chain_rowpar(&self, l: &Launcher, q: &Quad, x: &CudaSlice<u16>, xh: &mut CudaSlice<u16>,
                     yraw: &mut CudaSlice<u16>, y: &mut CudaSlice<u16>, m: usize, ws: &CudaSlice<f32>,
                     rb: Option<&ReconBufs>, hook: Option<PfHook>, sp: Option<SpRows>) -> Result<bool> {
+        if let Some(fx) = q.fx.as_deref() {
+            return self.fx_chain_rowpar(l, q, fx, x, yraw, y, m, ws, rb, hook, sp);
+        }
         let tp = self.tp.as_ref().context("a row-parallel Quad without a TP attachment")?;
         let n = q.n as usize;
         let mn = m * n;
@@ -1797,6 +1834,80 @@ impl FwdModel {
         Ok(false)
     }
 
+    /// FP4L twin of `chain_rowpar` (an FP4-Local weight, fp4l_fwd.rs): y = Σ_ranks x_r · W_r^T with NO
+    /// input or output transform. Same transports, same canonical fp32 sum and single f16 rounding as the
+    /// trellis path; where that path applies exl3_had_svh to the reduced y_raw this one copies y_raw -> y
+    /// (per landed row range under the prefill hooks). m <= 16: the xf GEMM's fp32 result (ks == 1) or its
+    /// fp32 slabs + the trunk's ascending xq_ks_combine_f32*; m > 16: the wide arm's f16 y_raw partial.
+    /// The TP-I3 K2+svh fold has no FP4L twin (the hook runs unfolded).
+    #[allow(clippy::too_many_arguments)]
+    fn fx_chain_rowpar(&self, l: &Launcher, q: &Quad, fx: &super::fp4l_fwd::FxW, x: &CudaSlice<u16>,
+                       yraw: &mut CudaSlice<u16>, y: &mut CudaSlice<u16>, m: usize, ws: &CudaSlice<f32>,
+                       rb: Option<&ReconBufs>, hook: Option<PfHook>, sp: Option<SpRows>) -> Result<bool> {
+        let tp = self.tp.as_ref().context("a row-parallel Quad without a TP attachment")?;
+        let n = q.n as usize;
+        let mn = m * n;
+        anyhow::ensure!(mn <= tp.part.len(), "FP4L row-parallel chain m={m} N={n} exceeds the TP partial buffer ({})", tp.part.len());
+        anyhow::ensure!(mn <= yraw.len() && mn <= y.len(), "FP4L row-parallel chain m={m} N={n}: y_raw/y too small");
+        let part = tp.part_ptr();
+        let g = |e: usize| (((e + 255) / 256) as u32, 1, 1);
+        let (yp, yo) = (*yraw.device_ptr() as u64, *y.device_ptr() as u64);
+        let copy_rows = |r0: usize, r1: usize| -> Result<()> {
+            let ne = ((r1 - r0) * n) as i64;
+            xqlaunch!(l, "xq_copy_u16", (((ne as u32) + 255) / 256, 1, 1), (256, 1, 1), 0,
+                      (yo + (r0 * n * 2) as u64, yp + (r0 * n * 2) as u64, ne, 0i64, 0i64))
+        };
+        if m <= 16 {
+            super::fp4l_fwd::fx_rowpar_small(l, q, fx, x, ws, m)?;
+            let ks = q.ks.max(1) as i32;
+            if let Some(d) = tp.dec_ok(mn) {
+                // TP-G: the combine carries K1 (slabs -> part); K2 writes the f16 y_raw
+                let arrive = *d.arrive.device_ptr() as u64;
+                xqlaunch!(l, "xq_ks_combine_f32_k1l", g(mn), (256, 1, 1), 0,
+                         (tp.dec_ctx(), ws, part, m as i32, q.n, ks, arrive))?;
+                tp.dec_sum_finish(l, d, yp, part, mn)?;
+                copy_rows(0, m)?;
+                return Ok(false);
+            }
+            xqlaunch!(l, "xq_ks_combine_f32", g(mn), (256, 1, 1), 0, (ws, part, m as i32, q.n, ks))?;
+        } else {
+            let r = rb.context("FP4L row-parallel m > 16 chain without recon buffers")?;
+            crate::metrics::fp4l_gemm(fx.kind(), m);
+            super::fp4l_fwd::fx_wide(l, q, fx, *x.device_ptr() as u64, yp, m, r)?;
+            if let Some(sp) = sp {
+                anyhow::ensure!(sp.c == m, "TP-SP: chunk {} vs chain m {m}", sp.c);
+                let io = crate::tp_xport::Io { src: yp, src_f16: true, out: yp, out_f16: true, wire_f16: true, mid: 0 };
+                if let Some(hk) = hook {
+                    anyhow::ensure!(hk.y == yo, "prefill overlap hook: y {:#x} is not this chain's output {yo:#x}", hk.y);
+                    let mut f = |r0: usize, r1: usize| -> Result<()> { copy_rows(r0, r1)?; hk.inj_norm(l, r0, r1) };
+                    tp.sp_reduce_scatter(l, io, n, &sp, Some(crate::tp_xport::SpHook { min_rows: hk.rows, side: hk.dual, f: &mut f }))?;
+                    return Ok(true);
+                }
+                tp.sp_reduce_scatter(l, io, n, &sp, None)?;
+                let (r0, r1) = sp.own;
+                copy_rows(r0, r1)?;
+                return Ok(false);
+            }
+            if let Some(io) = tp.all_reduce_io(crate::tp_xport::Io { src: yp, src_f16: true, out: yp, out_f16: true, wire_f16: true, mid: 0 }, mn)? {
+                if let Some(hk) = hook {
+                    anyhow::ensure!(hk.y == yo, "prefill overlap hook: y {:#x} is not this chain's output {yo:#x}", hk.y);
+                    let mut f = |r0: usize, r1: usize| -> Result<()> { copy_rows(r0, r1)?; hk.inj_norm(l, r0, r1) };
+                    tp.reduce_io_hooked(l, io, mn, Some(crate::tp_xport::RowHook { row_len: n, min_rows: hk.rows, f: &mut f,
+                                                                                   side: hk.dual, fold: None }))?;
+                    return Ok(true);
+                }
+                tp.reduce_io(l, io, mn)?;
+                copy_rows(0, m)?;
+                return Ok(false);
+            }
+            xqlaunch!(l, "xq_cvt_f16_f32", g(mn), (256, 1, 1), 0, (part, &*yraw, mn as i64))?;
+        }
+        tp.all_reduce_f32(l, part, mn)?;
+        xqlaunch!(l, "xq_cvt_f32_f16", g(mn), (256, 1, 1), 0, (&mut *yraw, part, mn as i64))?;
+        copy_rows(0, m)?;
+        Ok(false)
+    }
+
     /// TP-B: the EP prefill combine — this rank's FP32 partial over its local picks (+ its shared
     /// term), one (chunked) all-reduce, one f16 rounding into psc.moe_out.
     pub(super) fn ep_combine_reduce_rows(&self, l: &Launcher, psc: &mut PrefillScratch, moe: &MoeLayer,
@@ -1813,18 +1924,20 @@ impl FwdModel {
         // TP-4M1: the vectorised combine (bitwise equal: same per-element fma chain, same 1024-lane sgv tree) when the
         // shapes / alignment it needs hold (h == 2560, topk <= 16, every base 16-B aligned); else the original kernel.
         let al16 = |p: u64| p % 16 == 0;
+        // FP4L stored-bf16 gate: the chunk's gate channels (moe_prefill_tail's xf_sg_gate; moe.sg = their constants)
+        let gx = self.gate_x_rows(psc, moe);
         let ep2 = if h == 2560 && topk <= 16 && al16(part)
             && al16(*psc.yd.device_ptr() as u64) && al16(*psc.ysh.device_ptr() as u64)
-            && al16(*moe.sg.device_ptr() as u64) && al16(*psc.x.device_ptr() as u64) {
+            && al16(*moe.sg.device_ptr() as u64) && al16(gx) {
             Some(if topk <= 10 { "xq_moe_combine_rows_ep2_k10" } else { "xq_moe_combine_rows_ep2_k16" })
         } else { None };
         if let Some(name) = ep2 {
             xqlaunch!(l, name, (c as u32, 1, 1), (320, 1, 1), 0,
-                     (part, &psc.yd, &psc.ysh, &psc.cand, &psc.wts, &moe.sg, &psc.x,
+                     (part, &psc.yd, &psc.ysh, &psc.cand, &psc.wts, &moe.sg, gx,
                       topk as i32, h as i32, c as i32, add_sh))?;
         } else {
             xqlaunch!(l, "xq_moe_combine_rows_ep", (c as u32, 1, 1), (1024, 1, 1), 4096,
-                     (part, &psc.yd, &psc.ysh, &psc.cand, &psc.wts, &moe.sg, &psc.x,
+                     (part, &psc.yd, &psc.ysh, &psc.cand, &psc.wts, &moe.sg, gx,
                       topk as i32, h as i32, c as i32, add_sh))?;
         }
         // TP-F: the fp32 partial -> canonical sum -> moe_out (f16), the cvt pass fused into K2m
@@ -2222,6 +2335,7 @@ fn quad_from_host(dev: &Arc<CudaDevice>, tr: &[i16], suh: &[u16], svh: &[u16], k
         lmh: false,
         cnt: dev.htod_sync_copy(&vec![0u32; (n / 128).max(1)])?,
         rowpar: false,
+        fx: None,
     })
 }
 

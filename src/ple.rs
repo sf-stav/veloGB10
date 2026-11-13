@@ -226,6 +226,14 @@ impl PleSsd {
             let res: Vec<std::io::Result<()>> = std::thread::scope(|sc| {
                 let hs: Vec<_> = misses.chunks(per).map(|chunk| {
                     sc.spawn(move || -> std::io::Result<()> {
+                        // PR #32 (andersc), the trunk's twin of the EXL3 prefill prefetch: queue every row of this
+                        // thread's share first (posix_fadvise WILLNEED; advisory, reads nothing), so all of the
+                        // gather's misses are in flight at once instead of one synchronous pread per thread.
+                        use std::os::unix::io::AsRawFd;
+                        for &(_, r) in chunk {
+                            // SAFETY: a valid fd and an advisory range; the call reads or writes no memory of ours.
+                            unsafe { libc::posix_fadvise(file.as_raw_fd(), r * RB as i64, RB as i64, libc::POSIX_FADV_WILLNEED); }
+                        }
                         for &(i, r) in chunk {
                             // SAFETY: rows are unique per index i → disjoint 96-B slices of `out`.
                             let dst = unsafe { std::slice::from_raw_parts_mut((out_ptr + i * RB) as *mut u8, RB) };

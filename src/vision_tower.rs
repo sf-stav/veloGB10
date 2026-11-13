@@ -308,6 +308,35 @@ impl Map {
     /// GPU kernels' exact semantics — no bf16 intermediate).
     fn get_linear(&self, stem: &str, m: usize, k: usize) -> Result<Vec<f32>> {
         let raw = format!("{stem}.weight");
+        // FP4L: NVIDIA ModelOpt layouts (nvidia/Qwen3.8-Flash-Next-FP4-Local's tower): MXFP8 attention
+        // (E4M3 `weight` + UE8M0 `weight_scale` per 32) and NVFP4 MLP / merger (U8 nibbles + E4M3
+        // `weight_scale` per 16 + `weight_scale_2`). Dequantized to f32 exactly at load (the f32 tower's
+        // input; the nvfp4 global multiplier is one f32 rounding).
+        if let Some((dt, data, _)) = self.m.get(&raw) {
+            if dt == "F8_E4M3" {
+                let (_, sc, _) = self.m.get(&format!("{stem}.weight_scale"))
+                    .ok_or_else(|| anyhow!("{stem}: MXFP8 weight without weight_scale"))?;
+                if data.len() != m * k || sc.len() != m * k / 32 {
+                    return Err(anyhow!("{stem}: MXFP8 sizes {} / {} for [{m}, {k}]", data.len(), sc.len()));
+                }
+                return Ok((0..m * k).map(|i| crate::fp4l::pack::e4m3(data[i]) * crate::fp4l::pack::ue8m0(sc[i / 32])).collect());
+            }
+            if dt == "U8" {
+                let (_, sc, _) = self.m.get(&format!("{stem}.weight_scale"))
+                    .ok_or_else(|| anyhow!("{stem}: NVFP4 weight without weight_scale"))?;
+                let (_, g, _) = self.m.get(&format!("{stem}.weight_scale_2"))
+                    .ok_or_else(|| anyhow!("{stem}: NVFP4 weight without weight_scale_2"))?;
+                if data.len() * 2 != m * k || sc.len() != m * k / 16 || g.len() != 4 {
+                    return Err(anyhow!("{stem}: NVFP4 sizes {} / {} / {} for [{m}, {k}]", data.len(), sc.len(), g.len()));
+                }
+                let gs = f32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+                return Ok((0..m * k).map(|i| {
+                    let b = data[i / 2];
+                    let q = if i % 2 == 0 { b & 0xF } else { b >> 4 };
+                    crate::fp4l::pack::E2M1[q as usize] * crate::fp4l::pack::e4m3(sc[i / 16]) * gs
+                }).collect());
+            }
+        }
         if self.m.contains_key(&raw) {
             return self.get(&raw, m * k);
         }
@@ -529,7 +558,8 @@ impl VisualTower {
                 norm1_b: map.get(&format!("{p}norm1.bias"), hidden)?,
                 norm2_w: map.get(&format!("{p}norm2.weight"), hidden)?,
                 norm2_b: map.get(&format!("{p}norm2.bias"), hidden)?,
-                qkv_w: map.get(&format!("{p}attn.qkv.weight"), 3 * hidden * hidden)?,
+                // get_linear: the raw .weight as before for every other pack; FP4L's MXFP8 qkv dequantized exactly
+                qkv_w: map.get_linear(&format!("{p}attn.qkv"), 3 * hidden, hidden)?,
                 qkv_b: map.get(&format!("{p}attn.qkv.bias"), 3 * hidden)?,
                 proj_w: map.get_linear(&format!("{p}attn.proj"), hidden, hidden)?,
                 proj_b: map.get(&format!("{p}attn.proj.bias"), hidden)?,
@@ -557,6 +587,9 @@ impl VisualTower {
         consumed.insert("model.visual.merger.linear_fc2.weight_packed".into());
         consumed.insert("model.visual.merger.linear_fc2.weight_scale".into());
         consumed.insert("model.visual.merger.linear_fc2.weight_global_scale".into());
+        // FP4L (ModelOpt): the merger's NVFP4 global multipliers
+        consumed.insert("model.visual.merger.linear_fc1.weight_scale_2".into());
+        consumed.insert("model.visual.merger.linear_fc2.weight_scale_2".into());
         consumed.insert("model.visual.merger.linear_fc2.bias".into());
         for lin in ["linear_fc1", "linear_fc2"] {
             for suf in crate::exl3::EXL3_SUFFIXES {
@@ -635,6 +668,13 @@ fn block_names_consumed(bp: &str) -> Vec<String> {
     }
     for lin in ["attn.q_proj", "attn.k_proj", "attn.v_proj"] {
         v.push(format!("model.visual.{bp}{lin}.bias"));
+    }
+    // FP4L (ModelOpt): MXFP8 attention scales, NVFP4 MLP global multipliers
+    for lin in ["attn.qkv", "attn.proj"] {
+        v.push(format!("model.visual.{bp}{lin}.weight_scale"));
+    }
+    for lin in ["mlp.linear_fc1", "mlp.linear_fc2"] {
+        v.push(format!("model.visual.{bp}{lin}.weight_scale_2"));
     }
     v
 }

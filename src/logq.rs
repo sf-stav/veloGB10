@@ -408,16 +408,19 @@ mod h5_direct_print_baseline_tests {
             ("src/dsv4_graph.rs", 5),
             ("src/dsv4_model.rs", 13),
             ("src/engine.rs", 1),
-            ("src/exl3.rs", 17),
+            ("src/exl3.rs", 20), // K35 (2026-10-31): master already read 20 vs this row's 18 (drifted, never re-pinned); K35 adds no direct print here: re-pinned consciously // was 18 // P7 B1: the honest load-time width-refusal line (+1)
             ("src/exl3_autotune.rs", 15),
-            ("src/exl3_bench.rs", 128),
-            ("src/exl3_forward.rs", 327), // P7 merge: 325 -> 327 (df2trace ttr timing lines + df2 head-quantization one-time notices auto-merged from the 1.5bpw branch; conscious update). EXL27C: 324 -> 325 (split-MoE EP deal one-time boot line; conscious update). Earlier: 315 -> 323 (--df2-trace gated diagnostics + Fix5 comment; conscious update). OUT2: 317 -> 315 (the two PLE SSD/RAM decision lines -> boot_report::notice(), one normal line each)
+            ("src/exl3_bench.rs", 153), // K8EXP merge (2026-11-07): 152 -> 153 — + the bitwidths section-7 PASS println (probe-only). PFHALF (2026-11-06): 151 -> 152 — the fractional-width (K 1.5/2.5/3.5) PASS println of the moe_pf probe (probe-only, output IS the product). PR #32 port: +1, the EXL3-MOE-PF-HASH line of the synthetic moe_pf probe (probe path). K35 (2026-10-31): master already read 151 vs this row's 149 (PR#27-D3/P7 rows drifted, never re-pinned); K35 removes the fractional-k2 SKIP println (the grouped probe now runs those widths) and adds nothing outside tests: 150, re-pinned consciously // was 149 // PR#27-D3 (2026-10-30): 141 -> 149 - the bitwidths gate prints 8 direct lines (banner, dense/wide/ks per-cell PASS, refusal-predicates PASS, ALL-CELLS verdict, synth8 header+PASS; probe-only, output IS the product) // P7 B10 (2026-10-30): 139 -> 141 — the two explicit-nst smem-cap SKIP lines (per-bits + k4 twin scheds loops; b6/b7 gu-s8 rings over the opt-in cap, the served plan falls back by design; probe-only). P7 B10: 137 -> 139 — the per-width W4 persistent-rows PASS println + the skip line for widths without epi rows (probe-only). P7 B6 (2026-10-30): 136 -> 137 — the synth7 K=7 CHAIN PASS println (probe-only). P7 B5 (2026-10-29): 134 -> 136 — the synth7 leg header + K=7 PASS printlns (probe-only). P7 B3 leg 2 (2026-10-29): 131 -> 134 — the three EPI-ATTR receipt eprintln!s (xh static-smem/opt-in/regs/dev-copy dump; probe-only diagnostic, the 46224>46080 lesson). Earlier: B2 ref-verify + B3 WP20 b5 + B4 MoE-PF bits param prints (+3, probe paths only)
+            ("src/exl3_forward.rs", 332), // K35 (2026-10-31): master already read 329 vs this row's 326 (drifted, never re-pinned); K35 adds the three boot-visible once-per-boot eprintln!s (K=x.5 experts ENGAGED decode + PREFILL, the --moe-coop override): 332, re-pinned consciously // was 326 // P7 B9 (2026-10-29): 330 -> 326 — three dprintln! PLE K= lines promoted to boot_report::notice (always-visible width receipt; the notice() call carries no println) + the w4moe plan line folded. P7 B6 (2026-10-30): 329 -> 330 — the PSK width-guard once-per-boot line (boot class, dprintln! inside a OnceLock; the counter is /metrics). P7 B1/B4: width-refusal + pf-predicate boot lines (+2) // P7 merge: 325 -> 327 (df2trace ttr timing lines + df2 head-quantization one-time notices auto-merged from the 1.5bpw branch; conscious update). EXL27C: 324 -> 325 (split-MoE EP deal one-time boot line; conscious update). Earlier: 315 -> 323 (--df2-trace gated diagnostics + Fix5 comment; conscious update). OUT2: 317 -> 315 (the two PLE SSD/RAM decision lines -> boot_report::notice(), one normal line each)
             ("src/exl3_forward/dense.rs", 12),
             ("src/exl3_forward/dhead.rs", 11),
             ("src/exl3_forward/w4s.rs", 8),
             ("src/exl3_forward/wp16.rs", 12),
             ("src/exl3_forward/xtp.rs", 75), // S-B9-REL-INTEG A5: +1, the harness's RANK_IDENTITY FAIL line when pass 1 errors (a probe, not a served path)
-            ("src/exl3_kvnll.rs", 9),
+            ("src/exl3_kvnll.rs", 10),
+            // Q4K: 9 -> 10, the Q4K_HOST line of --probe-exl3-kvq (the q4k host reference's own
+            // verdict line: probe-only, one-shot, the same class as the KVQ_SELFTEST lines above;
+            // conscious update).
             // S-B9-REL-PPL: the one-shot `--perplexity` EXL3 tool prints its identity / per-window /
             // reference / RESULT lines directly (a CLI measurement tool, not a served path; the order
             // and immediacy of its output is the product, like exl3_kvnll.rs above).
@@ -469,7 +472,12 @@ mod h5_direct_print_baseline_tests {
             // one-time banner class, printed by http_listen before the socket exists) and the
             // FATAL line of fatal_option (direct by the H7 rule above: printed, then flush_and_exit)
             ("src/server.rs", 21),
-            ("src/shard_plan.rs", 8), // NAIVE: +1, the `owner mismatch` line of the Naive arm of --probe-shard-plan (probe path)
+            ("src/shard_plan.rs", 9), // FP4L (2026-10-29): +1, the `fp4l shard opens` line of the --probe-shard-plan FP4L arm (probe path). NAIVE: +1, the `owner mismatch` line of the Naive arm of --probe-shard-plan (probe path)
+            ("src/exl3_forward/fp4l_fwd.rs", 13), // FP4L: the --probe-fp4l-gpu verdict lines (probe path; the served FP4L paths log via rprintln!/drprintln!); +1 (2026-10-30) FP4L_GPU_PAIR
+            ("src/fp4l/probe.rs", 29), // FP4L-0 (2026-10-29): the --probe-fp4l CPU receipts print to stdout (probe verdict lines; never a served path); +2 (2026-10-30): the FP4L_PROBE_FAIL / FP4L_GPU_FAIL exit lines of the probe dispatch (moved out of main.rs).
+            // BASICS (owner 2026-11-02): the version line (stdout, or stderr under --print-config) and the
+            // configuration block: boot banners, which stay direct by this module's rule.
+            ("src/startup.rs", 3),
             ("src/tokenizer.rs", 9),
             // S-B9-REL-SURFACE2 item 10: + 2, the ignored `tool_quote_probe` instrument (test code).
             // S-B9-REL-SURFACE2B R1: + 5, the count tables of `exhaustive_small_blocks` and the
@@ -505,10 +513,11 @@ mod h5_direct_print_baseline_tests {
             // help lines above); re-pinned to the count of the MERGED tree (1547 + 33 + 15 = 1595, counted with this
             // module's counter on the merged main.rs before the build). The row below is OPERATIVE (find() takes the
             // first); naive-n05's original row is kept verbatim after it for the port's line-identity check.
-            ("src/main.rs", 1603), // TOPKM1 hygiene (2026-10-28): 1595 -> 1603, the --quantize recipe help text (b612145e: +9/-1 println! in the usage printer; conscious update). Earlier: OPERATIVE at the port merge: 1547 + 33 (naive) + 15 (master) = 1595 on the merged tree. (A second, stale `src/main.rs` row of 1580 sat below this one; `find` takes the first row, so it never applied — removed.)
+            ("src/main.rs", 1637), // SELFUPD: 1632 -> 1637 (--update/--no-update-check help + notices)
+        ("src/self_update.rs", 23), // SELFUPD: updater is an offline-exit path (no serving), direct prints intended
             // NAIVE history of src/main.rs: +33, the --probe-naive-* dispatches' NAIVE_*_FAIL exit-path lines, their usage expect()s' siblings, and the head/node Naive TP boot lines (probe/boot classes)
             // Conscious updates, not conversion misses.
-        ("src/tp.rs", 12),
+        ("src/tp.rs", 13),
             ("src/tp_bench.rs", 75),
             ("src/w4a4.rs", 1),
             ("src/wp24.rs", 8),

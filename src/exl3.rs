@@ -252,6 +252,16 @@ pub(crate) fn shard_header(path: &str) -> anyhow::Result<BTreeMap<String, HdrEnt
 
 /// Classify a module/tensor name. Order matters: lm_head before the generic
 /// suffix walk; ngram shards carry "ngram_embedding".
+/// K35: an expert module (routed `layers.N.mlp.experts.E.*` or the MTP head's `mtp.layers.0.mlp.experts.E.*`) is
+/// served by the EXPERT kernel family whatever its TensorClass says (the head's experts are classed Mtp).
+pub fn is_expert_module(name: &str) -> bool { name.contains(".mlp.experts.") }
+
+/// K35: can this build serve a module of half-bit width `k2` under `name`? Expert modules against the expert
+/// bodies, everything else against the dense bodies — the one predicate the MTP pre-scan and the catalog audit use.
+pub fn width_supported(name: &str, k2: usize) -> bool {
+    if is_expert_module(name) { crate::exl3_forward::expert_k2_supported(k2) } else { crate::exl3_forward::quad_k2_supported(k2) }
+}
+
 fn classify(name: &str) -> TensorClass {
     if name.starts_with("lm_head") {
         TensorClass::LmHead
@@ -300,10 +310,6 @@ impl Exl3Pack {
             mtp_bits: q["mtp_bits"].as_f64().unwrap_or(0.0),
             codebook: q["codebook"].as_str().unwrap_or("").to_string(),
         };
-        // CF-P1g: a pack with a K = 6 module needs the K = 6 kernel module (decided here, before any module loads).
-        let max_k2 = q["tensor_storage"].as_object()
-            .map(|o| o.values().filter_map(|v| v["bits_per_weight"].as_f64().map(|k| k2_from_bpw(k) as usize)).max().unwrap_or(0)).unwrap_or(0);
-        crate::exl3_bench::set_k6_module(max_k2 >= 12);
         if quant.quant_method != "exl3" {
             bail!(
                 "EXL3 pack {dir}: quant_method={:?} (wanted \"exl3\") — refusing to guess",
@@ -343,6 +349,49 @@ impl Exl3Pack {
                 shapes.insert(name, (shard.clone(), e.shape, e.dtype, e.n_bytes, e.offset));
             }
         }
+        // 4b. MTP draft-sidecar shadow (HermiHg mtp-*.safetensors): a sidecar dropped into
+        // the pack dir carries REPLACEMENT tensors for the pack's MTP head (same tensor
+        // names, its own bit widths). Redirect those reads to the sidecar before any
+        // module loads; only names already present in the pack are shadowed (a name
+        // mismatch shows up as redirected < sidecar tensors). Several sidecars: the
+        // lexicographically LAST wins (mtp- sorts after model-*, vendor shadow order).
+        // Note: "mtp_hyper_connection_mixer_patch.safetensors" starts "mtp_" (underscore)
+        // and is deliberately NOT matched.
+        let mut sc_files: Vec<String> = std::fs::read_dir(&dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|f| f.starts_with("mtp-") && f.ends_with(".safetensors"))
+            .collect();
+        sc_files.sort();
+        if !sc_files.is_empty() {
+            let fname = sc_files[sc_files.len() - 1].clone();
+            let hdr = shard_header(&format!("{dir}/{fname}"))
+                .with_context(|| format!("EXL3 pack {dir}: MTP sidecar {fname}"))?;
+            let mut n = 0usize;
+            for (name, e) in &hdr {
+                if shapes.contains_key(name) {
+                    shapes.insert(name.clone(), (fname.clone(), e.shape.clone(), e.dtype.clone(), e.n_bytes, e.offset));
+                    n += 1;
+                }
+            }
+            println!("[exl3] MTP sidecar shadow: {fname} — {n} of {} sidecar tensor(s) redirected", hdr.len());
+        }
+        // 4c. MTP mixer-patch fallback: the h4/h5-branch packs ship the MTP head's mixer
+        // tensors ONLY in mtp_hyper_connection_mixer_patch.safetensors (no main-shard
+        // copies). Spec 6.3 keeps main-shard copies preferred, so insert-if-absent only.
+        let mp = format!("{dir}/mtp_hyper_connection_mixer_patch.safetensors");
+        if std::path::Path::new(&mp).exists() {
+            let hdr = shard_header(&mp)
+                .with_context(|| format!("EXL3 pack {dir}: mixer patch sidecar"))?;
+            let mut n = 0usize;
+            for (name, e) in &hdr {
+                if !shapes.contains_key(name) {
+                    shapes.insert(name.clone(), ("mtp_hyper_connection_mixer_patch.safetensors".to_string(), e.shape.clone(), e.dtype.clone(), e.n_bytes, e.offset));
+                    n += 1;
+                }
+            }
+            if n > 0 { println!("[exl3] MTP mixer patch: {n} missing tensor(s) filled from sidecar"); }
+        }
 
         // 5. Census (suffix -> counts/bytes/dtypes).
         let mut census = Census::default();
@@ -357,6 +406,35 @@ impl Exl3Pack {
         }
 
         // 6. Module catalog from .trellis entries (quadruple completeness enforced).
+        // TP2BIT5 #26 Fix 4 pre-scan: if ANY mtp.* trellis module has an unsupported k2
+        // (Pack A: mtp.fc_embedding K=8/k2 16), skip the WHOLE draft head and serve without
+        // speculation — one line at load, a counter on /metrics, never a boot abort.
+        // K35 (2026-10-31): the width a module can serve is decided per KERNEL FAMILY — routed and
+        // MTP-head experts (`.mlp.experts.`) by the expert bodies, everything else by the dense
+        // bodies (width_supported below; the pre-scan used the dense set for the head's experts,
+        // which would have skipped the 3.68 / 2.68 packs' K = 3.5 / 2.5 draft experts and admitted
+        // a K = 7 draft expert without a body).
+        let skip_mtp_head = shapes
+            .iter()
+            .filter(|(n, (_, shape, _, _, _))| {
+                n.starts_with("mtp.") && n.ends_with(".trellis") && shape.len() == 3
+            })
+            .filter_map(|(n, (_, shape, _, _, _))| {
+                k2_from_words(shape[2]).ok().map(|k2| (n, k2))
+            })
+            .find(|(n, k2)| !width_supported(n, *k2))
+            .map(|(n, k2)| {
+                crate::metrics::exl3_mtp_skipped();
+                eprintln!(
+                    "[exl3] #26 Fix 4: MTP draft head SKIPPED — {n}: K={} (k2 {k2}) has no {} kernel \
+in this build ({}); serving WITHOUT speculation (plain decode; this pack cannot use MTP until that width lands).",
+                    k2 as f32 / 2.0,
+                    if is_expert_module(n) { "expert" } else { "dense" },
+                    crate::exl3_forward::width_support_text()
+                );
+                true
+            })
+            .unwrap_or(false);
         let mut modules = Vec::new();
         let mut class_counts: BTreeMap<TensorClass, usize> = BTreeMap::new();
         let mut incomplete = 0usize;
@@ -391,19 +469,32 @@ impl Exl3Pack {
                 }
             };
             let k2 = k2_from_words(shape[2]).map_err(|e| anyhow::anyhow!("EXL3 pack {dir}: {name}: {e}"))?;
+            let class = classify(&module);
+            // TP2BIT5 #26 Fix 4: a draft head wider than the served set is SKIPPED WHOLE (the
+            // loader addresses mtp.layers.0.* directly, so a partial head would fail the boot
+            // later); the model then serves WITHOUT speculation. §1b-bis.8: no refusal.
+            if skip_mtp_head && matches!(class, TensorClass::Mtp) {
+                continue;
+            }
             // Capability audit (S-B9-REL-INTEG D1 class: a width whose kernel body does not exist must
-            // REFUSE here, never reach a `default: break` switch that writes nothing = garbage). Fractional
-            // (odd k2) bodies land with the W3/W4 kernels of this branch; until then odd k2 refuses here.
-            // 7/8-bit (k2 14/16) have no bodies in either PTX module and always refuse.
-            if !crate::exl3_forward::quad_k2_supported(k2) {
+            // REFUSE here, never reach a `default: break` switch that writes nothing = garbage with a
+            // 200). Per kernel family (K35): expert modules — routed and MTP-head — against the expert
+            // bodies (expert_k2_supported), every other module against the dense bodies
+            // (quad_k2_supported). The text names what IS served, from the predicates themselves
+            // (roadmap ISSUES 183: the old hand-typed line said "experts serve K=3..=6" after K=1.5 and
+            // K=2 experts were admitted). This is a would-serve-wrong-output case: the §1b-bis.8
+            // honest-refusal carve-out.
+            if !width_supported(name, k2) {
+                let expert = is_expert_module(name);
                 bail!(
-                    "EXL3 pack {dir}: {name}: K={} (k2 {}) has no decode kernel in this build{}",
+                    "EXL3 pack {dir}: {name}: K={} (k2 {k2}) {} modules have no decode kernel in this build. {}. \
+Serve a pack whose {} modules are in that set.",
                     k2 as f32 / 2.0,
-                    k2,
-                    if k2 % 2 == 1 { " (fractional-K kernels land with W3/W4 of this branch)" } else { "" }
+                    if expert { "expert" } else { "dense" },
+                    crate::exl3_forward::width_support_text(),
+                    if expert { "expert" } else { "dense" },
                 );
             }
-            let class = classify(&module);
             *class_counts.entry(class).or_insert(0) += 1;
             modules.push(ModuleMeta {
                 name: module,
@@ -916,6 +1007,20 @@ mod tests {
         assert!(k2_from_words(144).is_err()); // k2=18 -> K=9
     }
 
+    /// PR#27-D4 (2026-10-30): loader trust boundary. Width capability is decided from the
+    /// ACTUAL TRELLIS HEADER (k2_from_words on the tensor's ring-word shape), never from the
+    /// pack's advisory tensor_storage.bits_per_weight float (k2_from_bpw has no callers —
+    /// advisory only). The two derivations must AGREE for every legal rate, so an advisory
+    /// lie can never silently select a different kernel than the header says.
+    #[test]
+    fn advisory_bpw_agrees_with_header_k2() {
+        for k2 in [2usize, 3, 4, 6, 8, 10, 12, 14, 16] {
+            let header = k2_from_words(8 * k2).unwrap(); // 16*K ring words
+            let advisory = k2_from_bpw(k2 as f64 / 2.0) as usize; // bits_per_weight float
+            assert_eq!(header, advisory, "k2={k2}: header {header} != advisory {advisory}");
+        }
+    }
+
     #[test]
     fn decode_block_half_zero_ring_decodes_to_cb0_and_wraps() {
         // K=1.5 (ka=1): 12 uint32 per tile. All-zero ring: every window fetch is 0 -> cb[0]
@@ -965,4 +1070,125 @@ mod tests {
         decode_block(&ring, 3, &cb, &mut out);
         assert!(out.iter().all(|v| *v == cb[0]));
     }
+}
+
+
+// -------------------------------------------------------------------------------------------
+// LEG-B 166 (2026-10-30): wheel-golden cross-check for the k2=3 (K = 1.5 fractional) decode.
+// The 1.66bpw pack's damage was localized to the FIRST k2=3 expert layer (L4) by per-layer
+// drift vs the exllamav3 1.6.3 wheel's own taps (tests/fixtures note in PLAN report). This
+// test decodes a REAL L4 expert quad (layers.4.mlp.experts.7.up_proj, trellis (160, 40, 24))
+// with our host oracle and requires bit-identity with the wheel's own CUDA reconstruct
+// (LinearEXL3::get_inner_weight_tensor). Cross-implementation per the standing rule: our
+// kernel-vs-oracle checks (probe_kernel_decode) are self-consistency and cannot catch this.
+// Fixture: tests/k23_golden_l4e7up.json (wheel-built on .13, /tmp/k23_golden_l4e7up.json).
+// -------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod k23_wheel_golden {
+    use super::*;
+
+    #[test]
+    fn k23_expert_wheel_golden_inner() {
+        let j = std::fs::read_to_string("tests/k23_golden_l4e7up.json").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        let kb = v["kb"].as_u64().unwrap() as usize;
+        let nb = v["nb"].as_u64().unwrap() as usize;
+        let trellis: Vec<i16> = v["trellis_i16"].as_array().unwrap()
+            .iter().map(|x| x.as_i64().unwrap() as i16).collect();
+        let want: Vec<u16> = v["inner_f16_bits"].as_array().unwrap()
+            .iter().map(|x| x.as_i64().unwrap() as u16).collect();
+        let got = decode_trellis_host(&trellis, kb, nb, 3);
+        assert_eq!(got.len(), want.len(), "decoded size mismatch");
+        let nbad = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+        assert!(
+            nbad == 0,
+            "k2=3 inner decode differs from wheel golden: {nbad}/{} values, first diffs {:?}",
+            got.len(),
+            got.iter().zip(want.iter()).enumerate()
+                .filter_map(|(i, (a, b))| if a != b { Some((i, *a, *b)) } else { None })
+                .take(8).collect::<Vec<_>>()
+        );
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// K35 (2026-10-31): wheel-golden cross-check for the FRACTIONAL expert widths beyond K = 1.5 —
+// K = 3.5 (k2 7; the 3.18 / 3.68 packs) and, when its fixture lands, K = 2.5 (k2 5; 2.68 / 2.18).
+// A REAL expert quad of turboderp's self-calibrated pack, decoded by the exllamav3 1.6.3 wheel's
+// own CUDA reconstruct (LinearEXL3.get_inner_weight_tensor = ext.reconstruct; generator
+// k35_golden.py, see PLAN/K35_EXPERT_REPORT_2026-10-31.md), must equal our host oracle bit for
+// bit. Cross-implementation per the standing rule: our kernel-vs-oracle checks are
+// self-consistency and cannot catch a window formula both sides share.
+// Fixture: tests/k35_golden_<pack>_<quad>.json (meta) + .u16le (trellis words, inner f16 bits
+// [k][n], suh f16 bits [k], svh f16 bits [n]; little-endian u16).
+// -------------------------------------------------------------------------------------------
+#[cfg(test)]
+pub(crate) mod k35_wheel_golden {
+    use super::*;
+
+    pub struct Golden {
+        pub base: String,
+        pub k2: usize,
+        pub kb: usize,
+        pub nb: usize,
+        pub trellis: Vec<u16>,
+        pub inner: Vec<u16>,
+        pub suh: Vec<u16>,
+        pub svh: Vec<u16>,
+    }
+
+    pub fn load(stem: &str) -> Golden {
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("tests/{stem}.json")).unwrap()).unwrap();
+        let raw = std::fs::read(format!("tests/{stem}.u16le")).unwrap();
+        let words: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u = |k: &str| meta[k].as_u64().unwrap() as usize;
+        let (k2, kb, nb) = (u("k2"), u("kb"), u("nb"));
+        let (nt, ni, ns, nv) = (u("n_trellis"), u("n_inner"), u("n_suh"), u("n_svh"));
+        assert_eq!(nt, kb * nb * 8 * k2, "trellis words vs (kb, nb, k2)");
+        assert_eq!(ni, kb * 16 * nb * 16);
+        assert_eq!(words.len(), nt + ni + ns + nv, "fixture size");
+        Golden {
+            base: meta["base"].as_str().unwrap().to_string(),
+            k2, kb, nb,
+            trellis: words[..nt].to_vec(),
+            inner: words[nt..nt + ni].to_vec(),
+            suh: words[nt + ni..nt + ni + ns].to_vec(),
+            svh: words[nt + ni + ns..].to_vec(),
+        }
+    }
+
+    fn host_decode_matches(stem: &str, want_k2: usize) {
+        let g = load(stem);
+        assert_eq!(g.k2, want_k2, "{stem}: fixture k2");
+        let tr: Vec<i16> = g.trellis.iter().map(|w| *w as i16).collect();
+        let got = decode_trellis_host(&tr, g.kb, g.nb, g.k2);
+        assert_eq!(got.len(), g.inner.len(), "decoded size mismatch");
+        let nbad = got.iter().zip(g.inner.iter()).filter(|(a, b)| a != b).count();
+        assert!(
+            nbad == 0,
+            "{}: k2={} host decode differs from the wheel golden: {nbad}/{} values, first diffs {:?}",
+            g.base, g.k2, got.len(),
+            got.iter().zip(g.inner.iter()).enumerate()
+                .filter_map(|(i, (a, b))| if a != b { Some((i, *a, *b)) } else { None })
+                .take(8).collect::<Vec<_>>()
+        );
+        // the fixture is not degenerate: a real quad has many distinct codes
+        // (the mul1 codebook has at most 1021 distinct outputs: (1024 + byte-sum) * k_inv + k_bias)
+        let distinct = g.inner.iter().collect::<std::collections::HashSet<_>>().len();
+        assert!(distinct > 256, "{stem}: only {distinct} distinct inner values");
+    }
+
+    #[test]
+    fn k35_318_up_host_decode_vs_wheel() { host_decode_matches("k35_golden_318_l0e7up_proj", 7); }
+
+    #[test]
+    fn k35_318_down_host_decode_vs_wheel() { host_decode_matches("k35_golden_318_l0e7down_proj", 7); }
+
+    // K = 2.5 (k2 5): a layer-4 expert quad of the 2.68 pack (layers 4..43 and the MTP head are K = 2.5 there)
+    #[test]
+    fn k25_268_up_host_decode_vs_wheel() { host_decode_matches("k35_golden_268_l4e7up_proj", 5); }
+
+    #[test]
+    fn k25_268_down_host_decode_vs_wheel() { host_decode_matches("k35_golden_268_l4e7down_proj", 5); }
 }

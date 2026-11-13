@@ -478,7 +478,9 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("cached-models-remove-all", false, Vis::Adv),
     ("capture-layers", false, Vis::Adv),
     ("chat", false, Vis::Adv),
+    ("chat-template", true, Vis::Adv),
     ("check", false, Vis::Adv),
+    ("chunk-sizes", true, Vis::Adv),
     ("chunk-sizes", true, Vis::Adv),
     ("chunked", false, Vis::Adv),
     ("classes", true, Vis::Adv),
@@ -543,6 +545,8 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("exl3-widths", true, Vis::Adv),
     ("extract-dspark", false, Vis::Adv),
     ("floats", false, Vis::Adv),
+    ("fp4l-ref", true, Vis::Adv),
+    ("fp4l-threads", true, Vis::Adv),
     ("from", true, Vis::Adv),
     ("gemm-m", true, Vis::Adv),
     ("gen", true, Vis::Adv),
@@ -559,6 +563,7 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("help", false, Vis::Adv),
     ("help-advanced", false, Vis::Adv),
     ("help-diag", false, Vis::Adv),
+    ("hf-cache", true, Vis::Adv),
     ("ids", true, Vis::Adv),
     ("imatrix", true, Vis::Adv),
     ("in-x", true, Vis::Adv),
@@ -616,6 +621,7 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("nll-tokens", true, Vis::Adv),
     ("no-chat", false, Vis::Adv),
     ("no-shard-mixers", false, Vis::Adv),
+    ("no-update-check", false, Vis::Adv),
     ("node", false, Vis::Day),
     ("nodes", true, Vis::Adv),
     ("offset", true, Vis::Adv),
@@ -681,6 +687,7 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("probe-dsv4", false, Vis::Adv),
     ("probe-exl3", false, Vis::Adv),
     ("probe-exl3-binv", false, Vis::Adv),
+    ("probe-exl3-bitwidths", false, Vis::Adv), // PR#27-D3: synthetic width-matrix gate (no model dir)
     ("probe-exl3-flashpf", false, Vis::Adv),
     ("probe-exl3-hcw4", false, Vis::Adv),
     ("probe-exl3-kernel", false, Vis::Adv),
@@ -705,6 +712,8 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("probe-exl3-xchain", false, Vis::Adv),
     ("probe-exl3-xtp", false, Vis::Adv),
     ("probe-fold-xchain-compare", true, Vis::Adv),
+    ("probe-fp4l", false, Vis::Adv),
+    ("probe-fp4l-gpu", false, Vis::Adv),
     ("probe-gemm", false, Vis::Adv),
     ("probe-moe", false, Vis::Adv),
     ("probe-moe-gemm", false, Vis::Adv),
@@ -845,7 +854,9 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("tune-draft", false, Vis::Adv),
     ("tune-profile", false, Vis::Adv),
     ("tune-table", false, Vis::Adv),
+    ("update", false, Vis::Adv),
     ("verify", false, Vis::Adv),
+    ("version", false, Vis::Adv),
     ("vision-fail-gemm-x", false, Vis::Adv),
     ("warmup", false, Vis::Adv),
     ("with-trunk", false, Vis::Adv),
@@ -1667,7 +1678,7 @@ mod tests {
         assert!(body.contains("not a cap") && body.contains("[EXL3: unlimited; NVFP4: 8192]"));
         // --default-presence-penalty: the EXL3 server's default is 0.0
         assert!(!body.contains("Presence penalty       [2.0 on 2B, else 1.5]"));
-        assert!(body.contains("[EXL3: 0.0; NVFP4: 2.0 on 2B, else 1.5]"));
+        assert!(body.contains("[EXL3: 0.0; NVFP4: 2.0 on Qwen3.5 0.8B/2B, else 1.5]"));
         // unsent sampler values: the thinking-mode values of the EXL3 chat path are named
         assert!(!body.contains("defaults 0.7 / 0.8 / 20)"));
         // FLASHNEXT-DF2-B (ISSUES work[113]): the unsent values come from the pack's
@@ -1856,11 +1867,11 @@ mod tests {
         format!("--{flag} needs a value, but it is the last argument; to give a value that starts with \"--\" write --{flag}=<value>")
     }
 
-    /// Every Text/Path row (40 Text + 28 Path = 68): the four cases of the addendum.
+    /// Every Text/Path row (41 Text + 28 Path = 69; THINKBUDGET1 added --reasoning-config): the four cases of the addendum.
     #[test]
     fn f7_text_path_rows_never_eat_a_flag_shaped_token() {
         let rows: Vec<&Opt> = REG.iter().filter(|o| matches!(o.ty, Ty::Text | Ty::Path)).collect();
-        assert_eq!(rows.len(), 68, "40 Text + 28 Path");
+        assert_eq!(rows.len(), 69, "41 Text + 28 Path (fp4l-mtp-sidecar is a Choice since 2026-11-01)");
         let args = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
         for o in rows {
             let id = lookup(o.flag).unwrap();
