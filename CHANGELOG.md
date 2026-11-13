@@ -98,13 +98,42 @@ reads.
 wait (kernel WFE sequence) with deep sleep after 1 s. MTP calibration and bench timers always spin
 (`SpinScope`), so measurements are unaffected. Both features are opt-in.
 
-### New: EXL3 width coverage
+### New: EXL3 width coverage — the bit-width ladder is now complete
 
-- **K=7 and K=8 routed and MTP experts** (`k2` 14/16) — this is what lets turboderp's ng8 packs
-  serve *with* speculation rather than with the draft head skipped.
-- **Fractional expert widths K=2.5/3.5** — turboderp 2.18 / 2.68 / 3.18 / 3.68 bpw.
-- **K=1.5 and K=2 experts** admitted (coop case-2 bodies).
+The EXL3 fast-lane kernels now cover **every integer width from 2 to 8 bits, plus the fractional
+1.5 / 2.5 / 3.5**, on both the dense/quad path and the expert (routed and MTP) path. Fractions on
+the expert path are the piece that was missing before, not the low integers:
+
+| K (bpw) | `k2` | quad/dense | experts |
+|---|---|---|---|
+| 1.5 | 3 | already (v0.7.8) | **new** |
+| 2 | 4 | already (v0.7.8) | **new** |
+| 2.5 | 5 | **new** | **new** |
+| 3 | 6 | already (v0.7.8) | yes |
+| 3.5 | 7 | **new** | **new** |
+| 4 | 8 | already (v0.7.8) | yes |
+| 5 | 10 | already (v0.7.8) | yes |
+| 6 | 12 | already (v0.7.8) | yes |
+| 7 | 14 | **new** | **new** |
+| 8 | 16 | **new** | **new** |
+
+So the accurate headline is: v0.7.8 served 2–6 bit on the dense path; **v0.7.9 adds 7- and 8-bit
+and makes the fractional widths (1.5 / 2.5 / 3.5) work on the expert path as well as the dense
+one.** Turboderp's fractional packs (2.18 / 2.68 / 3.18 / 3.68 bpw) and the ng8 packs (which need
+K=7/8 experts to serve *with* speculation rather than with the draft head skipped) both became
+servable through this.
+
+- **K=7 and K=8 routed and MTP experts** (`k2` 14/16) — what lets turboderp's ng8 packs serve
+  *with* speculation rather than with the draft head skipped.
+- **Fractional expert widths K=2.5/3.5** (`k2` 5/7) — turboderp 2.18 / 2.68 / 3.18 / 3.68 bpw.
+- **K=1.5 and K=2 experts** admitted (coop case-2 bodies); the expert gate was widened to
+  `k2 3|4|5|6|7|8|10|12|14|16` and a width the engine cannot serve now **refuses loudly at load**
+  naming the nearest working path, instead of reaching a `default: break` and doing nothing.
 - **MTP draft sidecars** with plain-map mirrors and a mixer-patch fallback.
+
+A caveat that belongs with this: the fast lane is a *kernel* claim. Fractional expert widths are
+served at TP=1 (all four turboderp packs) and TP=2 (3.68 + 2.68 only); TP=4 remains owed, and
+fractional *prefill* runs on the wide-tiles HALF body rather than a fractional `xq_moe_pf` body.
 
 ### New: other surfaces
 
