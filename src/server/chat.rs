@@ -224,8 +224,9 @@ and the NVFP4 server do)", m.summary()));
             // the CPU tower is multi-second and must never run on the async handler thread.
             Err(e) => vision_panic_fallback(cpu_fb, urls_fb, toks_fb, e).await,
         };
-        crate::reprintln!("[vision] dispatch {} images, prepare took {} ms, len={}",
-            urls.len(), vt0.elapsed().as_millis(), prep.as_ref().map(|p| p.image_embeds.len()).unwrap_or(0));
+        crate::reprintln!("[vision] dispatch {} images, prepare took {} ms, len={} cache={}/{}",
+            urls.len(), vt0.elapsed().as_millis(), prep.as_ref().map(|p| p.image_embeds.len()).unwrap_or(0),
+            prep.as_ref().map(|p| p.cache_hits).unwrap_or(0), urls.len());
         match prep {
             Ok(prep) => {
                 prompt_tokens = prep.expanded_tokens;
