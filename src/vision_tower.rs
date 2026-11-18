@@ -379,10 +379,15 @@ impl Map {
         let fetch = |suf: &str| self.m.get(&format!("{stem}.{suf}"))
             .ok_or_else(|| anyhow!("missing tensor: {stem}.{suf}"));
         let (tdt, tdata, tshape) = fetch("trellis")?;
-        if tdt != "I16" || tshape.len() != 3 || tshape[2] % 16 != 0 {
-            return Err(anyhow!("{stem}.trellis: expected I16 [K/16, N/16, 16*bits], got {tdt} {tshape:?}"));
+        if tdt != "I16" || tshape.len() != 3 {
+            return Err(anyhow!("{stem}.trellis: expected I16 [K/16, N/16, 8*k2], got {tdt} {tshape:?}"));
         }
-        let (kb, nb, bits) = (tshape[0], tshape[1], tshape[2] / 16);
+        // NIGHT1 (forum report 2026-11-16, v0.7.9 vision garbage on the 4.18bpw pack): the host decoder takes the
+        // HALF-BIT width k2 = 2K since W2 (d9704709, 2026-10-18); this call kept passing K, so every pack without
+        // vision_tower_bf16.safetensors decoded its tower at half width (cos ~0 vs the bf16 weights). The width
+        // comes from the trellis header exactly as the text loader reads it.
+        let (kb, nb) = (tshape[0], tshape[1]);
+        let k2 = tower_trellis_k2(tshape[2]).map_err(|e| anyhow!("{stem}.trellis: {e}"))?;
         let (kp, np) = (kb * 16, nb * 16);
         if kp < k || np < m || kp % 128 != 0 || np % 128 != 0 {
             return Err(anyhow!("{stem}: padded shape {kp}x{np} cannot hold in={k} out={m} (or is not 128-aligned)"));
@@ -404,7 +409,7 @@ impl Map {
             return Err(anyhow!("{stem}: padded output columns {m}..{np} have non-zero svh — cannot drop them"));
         }
         let trellis: Vec<i16> = tdata.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
-        let dec = crate::exl3::decode_trellis_host(&trellis, kb, nb, bits);
+        let dec = crate::exl3::decode_trellis_host(&trellis, kb, nb, k2);
         let mut w: Vec<f32> = dec.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect(); // [kp][np]
         let s = 1.0f32 / (128f32).sqrt();
         // left: H over each 128-row block of every column, then scale row i by suh[i]
@@ -455,6 +460,19 @@ impl Map {
         }
         self.get(name, n)
     }
+}
+
+/// The half-bit width `k2` (= 2K) of a vision-tower trellis from its last dimension (`8 * k2` int16 words per
+/// 16x16 tile) — the unit `exl3::decode_trellis_host` takes. Same validation as the text loader.
+fn tower_trellis_k2(words: usize) -> std::result::Result<usize, String> {
+    crate::exl3::k2_from_words(words)
+}
+
+/// ||a - b|| / ||b|| in f64 (the load-time decode check).
+fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
+    let (mut num, mut den) = (0f64, 0f64);
+    for (x, y) in a.iter().zip(b) { num += ((x - y) as f64).powi(2); den += (*y as f64).powi(2); }
+    (num / den.max(1e-30)).sqrt()
 }
 
 /// In-place unnormalized Walsh-Hadamard butterfly on 128 values (natural / Sylvester order — the
@@ -570,6 +588,22 @@ impl VisualTower {
             };
             block_names.extend(block_names_consumed(&bp));
             blocks.push(b);
+        }
+        // NIGHT1: assert the decode, not the absence of errors. An EXL3 pack stores the tower's attention twice:
+        // the exact bf16 fused `attn.qkv.weight` (served) and quantized `attn.{q,k,v}_proj` trellis copies of it.
+        // Decoding block 0's q_proj copy through the SAME path the tower's proj / MLP / merger weights take and
+        // comparing it with the bf16 rows it was quantized from catches a wrong trellis decode at load (the
+        // half-width slip served garbage image descriptions with nothing in the log). A mismatch refuses the
+        // tower: images are then refused with this message instead of being described wrongly.
+        if map.m.contains_key("model.visual.blocks.0.attn.q_proj.trellis") {
+            let q = map.get_exl3("model.visual.blocks.0.attn.q_proj", hidden, hidden)?;
+            let rel = rel_l2(&q, &blocks[0].qkv_w[..hidden * hidden]);
+            if !(rel < 0.25) {
+                return Err(anyhow!(
+                    "vision tower EXL3 decode check failed: block 0 q_proj trellis vs its bf16 source rel-L2 {rel:.3} \
+                     (expected < 0.25; a quantized copy decodes within a few percent). The tower's quantized weights \
+                     would describe images wrongly, so the tower is not loaded"));
+            }
         }
         // aggregate the consumed names for the strict "unexpected" check (incl. NVFP4 variants)
         let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -810,5 +844,118 @@ mod tests {
         assert!(geometry_from_config_json(r#"{"vision_config":{"hidden_size":1152}}"#)
             .unwrap().unwrap().to_dims().is_err(),
             "partial geometry is rejected");
+    }
+
+    /// NIGHT1: the tower trellis width is the HALF-BIT k2 the host decoder takes (K=5 -> 10, K=6 -> 12), and a
+    /// decode with it consumes exactly kb*nb tiles (the K-for-k2 slip read every tile at half width).
+    #[test]
+    fn tower_trellis_width_is_half_bits() {
+        assert_eq!(tower_trellis_k2(80).unwrap(), 10, "K=5 tower (3.05bpw pack)");
+        assert_eq!(tower_trellis_k2(96).unwrap(), 12, "K=6 tower (4.18bpw pack)");
+        assert!(tower_trellis_k2(84).is_err());
+        let (kb, nb, k2) = (2usize, 3usize, tower_trellis_k2(96).unwrap());
+        let w = crate::exl3::decode_trellis_host(&vec![0i16; kb * nb * 8 * k2], kb, nb, k2);
+        assert_eq!(w.len(), kb * 16 * nb * 16);
+    }
+
+    /// Issue sf-stav/veloGB10#40 (2026-11-15): Qwen3.6-35B-A3B-exl3-3.5bpw ships no `vision_tower_bf16.safetensors`,
+    /// so its tower loads from 6-bit trellis copies (proj / fc1 / fc2 / merger, plus q/k/v copies of the bf16 qkv).
+    /// v0.7.5..v0.7.9 decoded them at half width (the bug fixed by NIGHT1 3087f658) and images were invented.
+    /// (a) every block's q/k/v trellis copy decodes to its bf16 qkv rows (the pack's own exact reference, same
+    /// decode path and width as the other tower matrices); (b) when the original bf16 tower is present as
+    /// `models/3.6-35b-nvfp4-mixed` (333 bf16 model.visual.* tensors of Qwen/Qwen3.6-35B-A3B), every quantized
+    /// matrix of the loaded tower points the same way as the original. SKIPS loudly without the fixtures.
+    #[test]
+    fn issue40_35b_exl3_tower_decodes_at_its_real_width() {
+        let Some(pack) = test_model_dir("Qwen3.6-35B-A3B-exl3-3.5bpw") else {
+            eprintln!("SKIP issue40_35b_exl3_tower_decodes_at_its_real_width: no models/Qwen3.6-35B-A3B-exl3-3.5bpw");
+            return;
+        };
+        let cos = |x: &[f32], y: &[f32]| {
+            let (mut d, mut nx, mut ny) = (0f64, 0f64, 0f64);
+            for (p, q) in x.iter().zip(y) { d += (*p as f64) * (*q as f64); nx += (*p as f64).powi(2); ny += (*q as f64).powi(2); }
+            d / (nx.sqrt() * ny.sqrt())
+        };
+        let raw_cfg = std::fs::read_to_string(pack.join("config.json")).unwrap();
+        let dims = geometry_from_config_json(&raw_cfg).unwrap().unwrap().to_dims().unwrap();
+        let h = dims.hidden;
+        let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(pack.join("model.safetensors.index.json")).unwrap()).unwrap();
+        let shards: std::collections::BTreeSet<String> = idx["weight_map"].as_object().unwrap().values()
+            .map(|v| pack.join(v.as_str().unwrap()).to_string_lossy().to_string()).collect();
+        let map = Map::build_sliced(&shards.into_iter().collect::<Vec<_>>()).unwrap();
+        // (a) the pack's own exact reference: q/k/v trellis copies vs the bf16 fused qkv rows, every block
+        let mut worst = 1f64;
+        for b in 0..dims.depth {
+            let qkv = map.get(&format!("model.visual.blocks.{b}.attn.qkv.weight"), 3 * h * h).unwrap();
+            for (j, lin) in ["q_proj", "k_proj", "v_proj"].iter().enumerate() {
+                let dec = map.get_exl3(&format!("model.visual.blocks.{b}.attn.{lin}"), h, h).unwrap();
+                let c = cos(&dec, &qkv[j * h * h..(j + 1) * h * h]);
+                worst = worst.min(c);
+                assert!(c > 0.99, "block {b} {lin}: cos {c:.4} between the trellis decode and the pack's bf16 qkv rows");
+            }
+        }
+        eprintln!("issue40 (a): {} blocks x q/k/v trellis copies vs bf16 qkv, worst cos {worst:.5}", dims.depth);
+        // (b) the loaded tower (EXL3 path) vs the original bf16 tower, every quantized matrix
+        let t = VisualTower::load(pack.to_str().unwrap()).expect("embedded EXL3 tower");
+        assert!(t.source.contains("shards"), "the 35B EXL3 pack must load its tower from the shards: {}", t.source);
+        let Some(orig) = test_model_dir("3.6-35b-nvfp4-mixed") else {
+            eprintln!("SKIP issue40 (b): no models/3.6-35b-nvfp4-mixed (the original bf16 tower)");
+            return;
+        };
+        let o = VisualTower::load(orig.to_str().unwrap()).expect("original bf16 tower");
+        let mut worst = 1f64;
+        let mut check = |name: String, x: &[f32], y: &[f32]| {
+            let c = cos(x, y);
+            worst = worst.min(c);
+            assert!(c > 0.99, "{name}: cos {c:.4} between the 35B EXL3 tower and the original bf16 tower");
+        };
+        for b in 0..dims.depth {
+            check(format!("blocks.{b}.attn.proj"), &t.blocks[b].proj_w, &o.blocks[b].proj_w);
+            check(format!("blocks.{b}.mlp.linear_fc1"), &t.blocks[b].fc1_w, &o.blocks[b].fc1_w);
+            check(format!("blocks.{b}.mlp.linear_fc2"), &t.blocks[b].fc2_w, &o.blocks[b].fc2_w);
+        }
+        check("merger.linear_fc1".into(), &t.merger_fc1_w, &o.merger_fc1_w);
+        check("merger.linear_fc2".into(), &t.merger_fc2_w, &o.merger_fc2_w);
+        eprintln!("issue40 (b): {} blocks x proj/fc1/fc2 + merger vs the original bf16 tower, worst cos {worst:.5}", dims.depth);
+    }
+
+    /// NIGHT1 (forum report 2026-11-16): a Flash-Next EXL3 pack WITHOUT vision_tower_bf16.safetensors (the
+    /// 4.18bpw packs) loads its tower from the trellis copies in the shards. Class-different reference: the same
+    /// pack's ORIGINAL bf16 tower file. Every quantized matrix must point the same way (cos > 0.99). SKIPS loudly
+    /// without the fixture pack.
+    #[test]
+    fn embedded_exl3_tower_matches_the_bf16_tower() {
+        let Some(pack) = test_model_dir("Qwen3.8-Flash-Next-EXL3-3.05bpw-DotH-MTP") else {
+            eprintln!("SKIP embedded_exl3_tower_matches_the_bf16_tower: no models/Qwen3.8-Flash-Next-EXL3-3.05bpw-DotH-MTP");
+            return;
+        };
+        if !pack.join(VISION_BF16_FILE).is_file() { eprintln!("SKIP: the fixture pack has no {VISION_BF16_FILE}"); return; }
+        let farm = std::env::temp_dir().join(format!("night1_novis_{}", std::process::id()));
+        std::fs::create_dir_all(&farm).unwrap();
+        for e in std::fs::read_dir(&pack).unwrap() {
+            let e = e.unwrap();
+            if e.file_name() == VISION_BF16_FILE { continue; }
+            let _ = std::os::unix::fs::symlink(e.path(), farm.join(e.file_name()));
+        }
+        let a = VisualTower::load(pack.to_str().unwrap()).expect("bf16 tower");
+        let b = VisualTower::load(farm.to_str().unwrap()).expect("embedded EXL3 tower");
+        let _ = std::fs::remove_dir_all(&farm);
+        assert!(b.source.contains("shards"), "the farm must load from the shards: {}", b.source);
+        let cos = |x: &[f32], y: &[f32]| {
+            let (mut d, mut nx, mut ny) = (0f64, 0f64, 0f64);
+            for (p, q) in x.iter().zip(y) { d += (*p as f64) * (*q as f64); nx += (*p as f64).powi(2); ny += (*q as f64).powi(2); }
+            d / (nx.sqrt() * ny.sqrt())
+        };
+        let last = a.blocks.len() - 1;
+        for (name, x, y) in [
+            ("blocks.0.attn.proj", &a.blocks[0].proj_w, &b.blocks[0].proj_w),
+            ("blocks.0.mlp.linear_fc1", &a.blocks[0].fc1_w, &b.blocks[0].fc1_w),
+            ("blocks.last.mlp.linear_fc2", &a.blocks[last].fc2_w, &b.blocks[last].fc2_w),
+            ("merger.linear_fc1", &a.merger_fc1_w, &b.merger_fc1_w),
+            ("merger.linear_fc2", &a.merger_fc2_w, &b.merger_fc2_w),
+        ] {
+            let c = cos(x, y);
+            assert!(c > 0.99, "{name}: cos {c:.4} between the embedded EXL3 decode and the bf16 tower");
+        }
     }
 }

@@ -298,7 +298,7 @@ mod tests {
     /// chunk written in between; the greedy branch's role chunk comes after its prefill.
     #[test]
     fn the_dsv4_server_writes_no_chunk_before_decode_request() {
-        let src = include_str!("main.rs");
+        let src = src_text!("main");
         let a = src.find("if let Some(st) = dspark_state.as_mut() {\n            let _gen = if stream {").expect("the DSpark streaming branch");
         let branch = &src[a..];
         let call = branch.find("st.decode_request(").unwrap();
@@ -332,7 +332,7 @@ mod tests {
         assert!(late.prompt_per_second > 1e8, "prompt tokens over microseconds: {late:?}");
         // source pin (src/main.rs is the binary): in the greedy path ONE clock is started, before
         // the prefill, and both of its `timings` blocks read that clock
-        let src = include_str!("main.rs");
+        let src = src_text!("main");
         let g = src.find("let m = m.as_mut().expect(\"greedy server owns the model\");").unwrap();
         let end = g + src[g..].find("\nfn ").expect("the end of dsv4_tp_serve_server");
         let greedy = &src[g..end];

@@ -369,9 +369,9 @@ impl FwdModel {
     /// the conv state over all layers (b = the reference).
     pub fn ckpt_rel(&self, a: &RecurCkpt, b: &RecurCkpt) -> Result<(f64, f64, f64)> {
         let lay = self.ckpt_layout();
-        self.dev.synchronize()?;
-        let ha = self.dev.dtoh_sync_copy(&a.buf)?;
-        let hb = self.dev.dtoh_sync_copy(&b.buf)?;
+        self.dsync()?;
+        let ha = self.dtoh(&a.buf)?;
+        let hb = self.dtoh(&b.buf)?;
         let rel = |o: usize, n: usize| -> f64 {
             let (mut d, mut r) = (0f64, 0f64);
             for (x, y) in ha[o..o + n].iter().zip(&hb[o..o + n]) {
@@ -391,9 +391,9 @@ impl FwdModel {
     /// Bitwise diff of two checkpoints (host readback; diagnostics only).
     pub fn ckpt_diff(&self, a: &RecurCkpt, b: &RecurCkpt) -> Result<CkptDiff> {
         let lay = self.ckpt_layout();
-        self.dev.synchronize()?;
-        let ha = self.dev.dtoh_sync_copy(&a.buf)?;
-        let hb = self.dev.dtoh_sync_copy(&b.buf)?;
+        self.dsync()?;
+        let ha = self.dtoh(&a.buf)?;
+        let hb = self.dtoh(&b.buf)?;
         let cnt = |o: usize, n: usize| -> (usize, usize) {
             (ha[o..o + n].iter().zip(&hb[o..o + n]).filter(|(x, y)| x.to_bits() != y.to_bits()).count(), n)
         };

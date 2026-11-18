@@ -899,7 +899,7 @@ mod pdl_entry_tests {
     /// 2026-10-20: `nv_idx_score_wide` lacked it and scored stale keys on long prompts.
     #[test]
     fn every_naive_entry_kernel_waits_for_its_predecessor() {
-        let src = include_str!("../../kernels/gpu_naive.cu");
+        let src = src_text!("kernels/gpu_naive");
         let mut missing = Vec::new();
         let mut n = 0;
         for (i, _) in src.match_indices("extern \"C\" __global__") {

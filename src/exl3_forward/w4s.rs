@@ -227,13 +227,13 @@ impl FwdModel {
         if w4s_xcheck(W4S_ROUTER) && !self.stream_capturing() {
             // snapshot the new outputs, re-run the OLD fold on the same inputs (it rewrites the same
             // buffers; its self re-arming counter reads 0 after the new kernel's tail), diff bitwise
-            self.dev.synchronize()?;
-            let (l1, i1, w1) = (self.dev.dtoh_sync_copy(&sc.logits_r)?, self.dev.dtoh_sync_copy(&sc.ids)?,
-                                self.dev.dtoh_sync_copy(&sc.wts)?);
-            let (s1, x1, e1) = (self.dev.dtoh_sync_copy(&sc.slotmap)?, self.dev.dtoh_sync_copy(&sc.idxmap)?,
-                                self.dev.dtoh_sync_copy(&sc.esel)?);
-            let (g1, d1) = (self.dev.dtoh_sync_copy(&sc.offs_gu)?, self.dev.dtoh_sync_copy(&sc.offs_d)?);
-            let cnt1 = self.dev.dtoh_sync_copy(&sc.fold_cnt)?[0];
+            self.dsync()?;
+            let (l1, i1, w1) = (self.dtoh(&sc.logits_r)?, self.dtoh(&sc.ids)?,
+                                self.dtoh(&sc.wts)?);
+            let (s1, x1, e1) = (self.dtoh(&sc.slotmap)?, self.dtoh(&sc.idxmap)?,
+                                self.dtoh(&sc.esel)?);
+            let (g1, d1) = (self.dtoh(&sc.offs_gu)?, self.dtoh(&sc.offs_d)?);
+            let cnt1 = self.dtoh(&sc.fold_cnt)?[0];
             let fo = xq_raw_fn(if wp10_gemv_remap() { "xq_router_fold" } else { "xq_router_fold_m0" })
                 .ok_or_else(|| anyhow::anyhow!("xq_router_fold raw fn unavailable"))?;
             let r = unsafe {
@@ -241,12 +241,12 @@ impl FwdModel {
                     args.as_mut_ptr(), std::ptr::null_mut())
             };
             anyhow::ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "xq_router_fold (xcheck) launch ({r:?})");
-            self.dev.synchronize()?;
-            let (l0, i0, w0) = (self.dev.dtoh_sync_copy(&sc.logits_r)?, self.dev.dtoh_sync_copy(&sc.ids)?,
-                                self.dev.dtoh_sync_copy(&sc.wts)?);
-            let (s0, x0, e0) = (self.dev.dtoh_sync_copy(&sc.slotmap)?, self.dev.dtoh_sync_copy(&sc.idxmap)?,
-                                self.dev.dtoh_sync_copy(&sc.esel)?);
-            let (g0, d0) = (self.dev.dtoh_sync_copy(&sc.offs_gu)?, self.dev.dtoh_sync_copy(&sc.offs_d)?);
+            self.dsync()?;
+            let (l0, i0, w0) = (self.dtoh(&sc.logits_r)?, self.dtoh(&sc.ids)?,
+                                self.dtoh(&sc.wts)?);
+            let (s0, x0, e0) = (self.dtoh(&sc.slotmap)?, self.dtoh(&sc.idxmap)?,
+                                self.dtoh(&sc.esel)?);
+            let (g0, d0) = (self.dtoh(&sc.offs_gu)?, self.dtoh(&sc.offs_d)?);
             let (nl, nk) = (m * ne, m * topk);
             let ns = (e0[0].max(0) as usize).min(x0.len());
             let (dl, first) = diff_f32(&l1[..nl], &l0[..nl]);
@@ -286,9 +286,9 @@ impl FwdModel {
             let mut vo = self.dev.alloc_zeros::<u16>(m * NB)?;
             xqlaunch!(l, "xq_gemm_f16_rows_km", (100u32, 1, 1), (128, 1, 1), 0,
                      (&mut ko, kk, NA as i32, 80i32, &mut vo, vk, NB as i32, &sc.ple_emb, m as i32, K as i32))?;
-            self.dev.synchronize()?;
-            let (kn, vn) = (self.dev.dtoh_sync_copy(&sc.ple_key16)?, self.dev.dtoh_sync_copy(&sc.ple_val)?);
-            let (ko, vo) = (self.dev.dtoh_sync_copy(&ko)?, self.dev.dtoh_sync_copy(&vo)?);
+            self.dsync()?;
+            let (kn, vn) = (self.dtoh(&sc.ple_key16)?, self.dtoh(&sc.ple_val)?);
+            let (ko, vo) = (self.dtoh(&ko)?, self.dtoh(&vo)?);
             let (b1, f1) = diff_u16(&kn[..m * NA], &ko);
             let (b2, f2) = diff_u16(&vn[..m * NB], &vo);
             w4s_report(W4S_PLE, &format!("m={m} {kname} vs xq_gemm_f16_rows_km (key {b1}, value {b2})"),
@@ -314,7 +314,7 @@ impl FwdModel {
         let nring = nh * (vd / 32);
         let gx = (nring + conv_dim.div_ceil(128)).max(10240usize.div_ceil(128));
         let gy = nl + ple as usize;
-        let ring_ls = ((MTP_MAX_K + 1) * nh * GDN_RS) as i64;
+        let ring_ls = (sc.vrows * nh * GDN_RS) as i64; // WIDEVERIFY1: the scratch's ring plane stride (MTP_MAX_K+1 by default)
         let raw_ls = (SAVE_PLANE_ROWS * conv_dim) as i64; // PACK2/D1: qkv_save planes are SAVE_PLANE_ROWS rows (was MTP_MAX_K+1 — read the wrong layer's raws)
         let nh_kd = (nh | (kd << 16)) as i32;
         let vd_conv = (vd | (conv_dim << 16)) as i32;
@@ -350,7 +350,7 @@ impl FwdModel {
                           // stride (16 rows) like every other plane site — the old (MTP_MAX_K+1) stride
                           // read the WRONG LAYER's raws here (false XCHECK mismatches; diagnostic only).
                           (i * SAVE_PLANE_ROWS * conv_dim) as i64, &sc.acc2))?;
-                let ring_p = (*sc.gdn_ring.device_ptr()) as u64 + (i * (MTP_MAX_K + 1) * nh * GDN_RS * 4) as u64;
+                let ring_p = (*sc.gdn_ring.device_ptr()) as u64 + (i * sc.vrows * nh * GDN_RS * 4) as u64;
                 xqlaunch!(l, "xq_gdn_commit_ring", ((nh * (vd / 32)) as u32, 1, 1), (kd as u32, 1, 1), 0,
                          ((*rs[i].device_ptr()) as u64, ring_p, nh as i32, kd as i32, vd as i32, &sc.acc2))?;
             }
@@ -364,25 +364,25 @@ impl FwdModel {
                  (&self.w4s_lptr, nl as i32, &sc.gdn_ring, ring_ls, &sc.qkv_save, raw_ls,
                   nh_kd, vd_conv, ck as i32, &sc.acc2, &sc.ple_normed, ple_st))?;
         if let Some((rs, rc, rp)) = refs {
-            self.dev.synchronize()?;
+            self.dsync()?;
             let (mut bad, mut tot, mut first) = (0usize, 0usize, String::new());
             for i in 0..nl {
-                let (a, b) = (self.dev.dtoh_sync_copy(&self.s_state[i])?, self.dev.dtoh_sync_copy(&rs[i])?);
+                let (a, b) = (self.dtoh(&self.s_state[i])?, self.dtoh(&rs[i])?);
                 let (d, f) = diff_f32(&a, &b);
                 if d > 0 && first.is_empty() { first = format!(" [S layer {i}]{f}"); }
                 bad += d; tot += a.len();
-                let (a, b) = (self.dev.dtoh_sync_copy(&self.conv_state[i])?, self.dev.dtoh_sync_copy(&rc[i])?);
+                let (a, b) = (self.dtoh(&self.conv_state[i])?, self.dtoh(&rc[i])?);
                 let (d, f) = diff_f32(&a, &b);
                 if d > 0 && first.is_empty() { first = format!(" [conv layer {i}]{f}"); }
                 bad += d; tot += a.len();
             }
             if ple {
-                let (a, b) = (self.dev.dtoh_sync_copy(&self.ple_state)?, self.dev.dtoh_sync_copy(&rp)?);
+                let (a, b) = (self.dtoh(&self.ple_state)?, self.dtoh(&rp)?);
                 let (d, f) = diff_u16(&a, &b);
                 if d > 0 && first.is_empty() { first = format!(" [ple]{f}"); }
                 bad += d; tot += a.len();
             }
-            let acc = self.dev.dtoh_sync_copy(&sc.acc2)?;
+            let acc = self.dtoh(&sc.acc2)?;
             w4s_report(W4S_GDN, &format!("commit a={} xq_gdn_commit_all_w4 vs per-layer conv/ring{} commits ({nl} layers, whole planes)",
                                          acc.get(1).copied().unwrap_or(-1), if ple { "/ple" } else { "" }),
                        bad, tot, first);
@@ -411,10 +411,10 @@ impl FwdModel {
         let mut side = self.dev.alloc_zeros::<u16>(n)?;
         xqlaunch!(l, old, ((cfg.head_dim / sd) as u32, cfg.num_kv_heads as u32, m as u32), (block, 1, 1), 0,
                   (&mut side, &sc.dv3_s, &sc.dv3_pm, kv, &sc.qg, &sc.slots, nh_p, hd_p, self.mpf()))?;
-        self.dev.synchronize()?;
-        let (a, b) = (self.dev.dtoh_sync_copy(&sc.normed)?, self.dev.dtoh_sync_copy(&side)?);
+        self.dsync()?;
+        let (a, b) = (self.dtoh(&sc.normed)?, self.dtoh(&side)?);
         let (bad, first) = diff_u16(&a[..n], &b);
-        let sp = self.dev.dtoh_sync_copy(&sc.slots)?;
+        let sp = self.dtoh(&sc.slots)?;
         w4s_report(W4S_DATTN, &format!("m={m} p0={} {kname} vs {old}", sp.get(1).copied().unwrap_or(-1)), bad, n, first);
         Ok(())
     }
@@ -450,13 +450,13 @@ impl FwdModel {
         if w4s_xcheck(W4S_DRAFT) && !self.stream_capturing() {
             // the old chain on side buffers (xq_attn_prep rewrites the same K/V words and qstage
             // rows — identical when the check passes; qstage is compared after it)
-            self.dev.synchronize()?;
+            self.dsync()?;
             let nq = m * cfg.num_heads * cfg.head_dim;
             let np = m * cfg.num_heads * DRAFT_ATTN_SPLITS;
-            let q1 = self.dev.dtoh_sync_copy(&sc.qstage)?;
-            let (pm1, pl1, pa1) = (self.dev.dtoh_sync_copy(&sc.dpm)?, self.dev.dtoh_sync_copy(&sc.dpl)?,
-                                   self.dev.dtoh_sync_copy(&sc.dpacc)?);
-            let o1 = self.dev.dtoh_sync_copy(&sc.normed)?;
+            let q1 = self.dtoh(&sc.qstage)?;
+            let (pm1, pl1, pa1) = (self.dtoh(&sc.dpm)?, self.dtoh(&sc.dpl)?,
+                                   self.dtoh(&sc.dpacc)?);
+            let o1 = self.dtoh(&sc.normed)?;
             let mut xm = self.dev.alloc_zeros::<f32>(np)?;
             let mut xl = self.dev.alloc_zeros::<f32>(np)?;
             let mut xa = self.dev.alloc_zeros::<f32>(np * cfg.head_dim)?;
@@ -468,16 +468,16 @@ impl FwdModel {
                       (&mut xm, &mut xl, &mut xa, &sc.qstage, kvp, &sc.slots, nh_p, geom as i64))?;
             xqlaunch!(l, "xq_attn_sel_combine", ((m * cfg.num_heads) as u32, 1, 1), (cfg.head_dim as u32, 1, 1), 0,
                       (&mut xo, &xm, &xl, &xa, &sc.qg, nh_p, DRAFT_ATTN_SPLITS as i32, self.rows_kvf(m)))?;
-            self.dev.synchronize()?;
-            let q0 = self.dev.dtoh_sync_copy(&sc.qstage)?;
-            let (pm0, pl0, pa0) = (self.dev.dtoh_sync_copy(&xm)?, self.dev.dtoh_sync_copy(&xl)?, self.dev.dtoh_sync_copy(&xa)?);
-            let o0 = self.dev.dtoh_sync_copy(&xo)?;
+            self.dsync()?;
+            let q0 = self.dtoh(&sc.qstage)?;
+            let (pm0, pl0, pa0) = (self.dtoh(&xm)?, self.dtoh(&xl)?, self.dtoh(&xa)?);
+            let o0 = self.dtoh(&xo)?;
             let (bq, fq) = diff_f32(&q1[..nq], &q0[..nq]);
             let (bm, fm) = diff_f32(&pm1[..np], &pm0);
             let (bl, _) = diff_f32(&pl1[..np], &pl0);
             let (ba, _) = diff_f32(&pa1[..np * cfg.head_dim], &pa0);
             let (bo, fo) = diff_u16(&o1[..nq], &o0);
-            let sp = self.dev.dtoh_sync_copy(&sc.slots)?;
+            let sp = self.dtoh(&sc.slots)?;
             w4s_report(W4S_DRAFT, &format!("m={m} p={} dense_prep/splitk4_w4/combine_w4 vs prep/splitk4/combine: \
                                             qstage {bq}, pm {bm}, pl {bl}, pacc {ba}, attn {bo}", sp.get(1).copied().unwrap_or(-1)),
                        bq + bm + bl + ba + bo, nq * 2 + np * (2 + cfg.head_dim), format!("{fq}{fm}{fo}"));

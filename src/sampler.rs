@@ -169,7 +169,7 @@ mod gpu_top_k_tests {
 
     #[test]
     fn the_kernel_limit_matches_gpu_batch_cu() {
-        let cu = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/kernels/gpu_batch.cu")).unwrap();
+        let cu = src_text!("kernels/gpu_batch");
         let line = cu.lines().find(|l| l.starts_with("#define SAMPLE_K_MAX ")).expect("SAMPLE_K_MAX in gpu_batch.cu");
         assert_eq!(line.trim_end(), format!("#define SAMPLE_K_MAX {GPU_SAMPLE_K_MAX}"));
     }

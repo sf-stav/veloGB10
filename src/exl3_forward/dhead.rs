@@ -528,19 +528,19 @@ impl FwdModel {
     /// outside the candidate blocks, or a served q' that does not sum to 1.
     fn dhead_rq_xcheck_pass(&self, l: &Launcher, sc: &mut Scratch, dh: &DHead, q: &Quad, i: usize) -> Result<()> {
         use crate::wp24::{RQ_K, RQ_ROW};
-        self.dev.synchronize()?;
-        let new_id = self.dev.dtoh_sync_copy(&sc.argmax)?[0];
-        let lst = self.dev.dtoh_sync_copy(&sc.rq_list)?;
-        let ws = self.dev.dtoh_sync_copy(&dh.ws)?;
+        self.dsync()?;
+        let new_id = self.dtoh(&sc.argmax)?[0];
+        let lst = self.dtoh(&sc.rq_list)?;
+        let ws = self.dtoh(&dh.ws)?;
         let v = dh.n;
         anyhow::ensure!(crate::wp24::draft_fits(v), "RQDH XCHECK: slice {v} outside the xq_rq_draft envelope");
         exl3_chain(l, q, &sc.x, &mut sc.chain_xh, &mut sc.chain_yraw, &mut sc.logits, 1, &sc.chain_ws)?;
         xqlaunch!(l, "xq_rq_draft", (crate::wp24::draft_nb(v) as u32, 1, 1), (256, 1, 1), 0,
                   (&dh.xc_id, &sc.logits, v as i32, &mut sc.rq_part, &mut sc.rq_cnt,
                    &dh.xc_list, &sc.rq_dsamp, &sc.draft_meta, i as i32, 2i32))?;
-        self.dev.synchronize()?;
-        let full_id = self.dev.dtoh_sync_copy(&dh.xc_id)?[0];
-        let fl = self.dev.dtoh_sync_copy(&dh.xc_list)?;
+        self.dsync()?;
+        let full_id = self.dtoh(&dh.xc_id)?[0];
+        let fl = self.dtoh(&dh.xc_list)?;
         let row = |b: &[u32]| -> (Vec<i32>, Vec<f32>) {
             let r = &b[i * RQ_ROW..(i + 1) * RQ_ROW];
             ((0..RQ_K).map(|j| r[j] as i32).collect(), (0..RQ_K).map(|j| f32::from_bits(r[64 + j])).collect())
@@ -635,13 +635,13 @@ impl FwdModel {
     /// bookkeeping: was the old argmax's block rescored (C1, or C2 via the expansion)?
     fn dheadp_xcheck_pass(&self, l: &Launcher, sc: &mut Scratch, dh: &DHead, q: &Quad, i: usize) -> Result<()> {
         let p = dh.p.as_ref().unwrap();
-        self.dev.synchronize()?;
-        let new_id = self.dev.dtoh_sync_copy(&sc.argmax)?[0];
-        let new_conf = self.dev.dtoh_sync_copy(&sc.dconf)?[i];
-        let ws = self.dev.dtoh_sync_copy(&dh.ws)?;
+        self.dsync()?;
+        let new_id = self.dtoh(&sc.argmax)?[0];
+        let new_conf = self.dtoh(&sc.dconf)?[i];
+        let ws = self.dtoh(&dh.ws)?;
         let (_, c2_off, _, _) = pws_layout(dh.nblk, dh.s);
         let mut hdr = vec![0u32; c2_off + dh.nblk];
-        self.dev.dtoh_sync_copy_into(&p.pws.slice(0..c2_off + dh.nblk), &mut hdr)?;
+        self.dtoh_into(&p.pws.slice(0..c2_off + dh.nblk), &mut hdr)?;
         let v = dh.n as i32;
         exl3_chain(l, q, &sc.x, &mut sc.chain_xh, &mut sc.chain_yraw, &mut sc.logits, 1, &sc.chain_ws)?;
         xqlaunch!(l, "xq_pen_draft", (dh.n.div_ceil(PEN_SPAN) as u32, 1, 1), (256, 1, 1), 0,
@@ -651,9 +651,9 @@ impl FwdModel {
                   (&dh.xc_id, 0i32, &sc.logits, 0i64, v))?;
         xqlaunch!(l, "xq_rowmax_f16", (1, 1, 1), (1024, 1, 1), 0,
                   (&dh.xc_conf, 0i64, &sc.logits, 0i64, v))?;
-        self.dev.synchronize()?;
-        let old_id = self.dev.dtoh_sync_copy(&dh.xc_id)?[0];
-        let old_conf = self.dev.dtoh_sync_copy(&dh.xc_conf)?[0];
+        self.dsync()?;
+        let old_id = self.dtoh(&dh.xc_id)?[0];
+        let old_conf = self.dtoh(&dh.xc_conf)?[0];
         let (o_bmax, _, o_dbg, _, _) = ws_layout(dh.k, dh.nblk, dh.s);
         let ns = (ws[o_dbg] as usize).min(DH_TCAP);
         let c1: Vec<usize> = ws[o_dbg + 1..o_dbg + 1 + ns].iter().map(|&c| c as usize).collect();
@@ -662,14 +662,14 @@ impl FwdModel {
         let c2: Vec<usize> = hdr[c2_off..c2_off + n2.min(dh.nblk)].iter().map(|&c| c as usize).collect();
         // the bound's host mirror on the device's own inputs (bmax, bsig, sigma, C1, L, cap, params):
         // pass A's expansion list and flags must be exactly expansion_set's
-        let pen = self.dev.dtoh_sync_copy(&sc.pen)?;
+        let pen = self.dtoh(&sc.pen)?;
         let (pflag, rep, pres, freq) = (pen[0], f32::from_bits(pen[1]), f32::from_bits(pen[2]), f32::from_bits(pen[3]));
         let mono = !((pflag & 1 != 0 && !(rep >= 1.0)) || (pflag & 2 != 0 && !(pres >= 0.0 && freq >= 0.0)));
         let bound_ok = if pflag == 0 {
             fl == DHP_F_UNPEN && n2 == 0
         } else {
             let bm: Vec<f32> = ws[o_bmax..o_bmax + dh.nblk].iter().map(|&u| f32::from_bits(u)).collect();
-            let bs = self.dev.dtoh_sync_copy(&dh.bsig)?;
+            let bs = self.dtoh(&dh.bsig)?;
             let sig = f32::from_bits(ws[dh.k / 4 + 2]);
             let mut in_c1v = vec![false; dh.nblk];
             for &c in &c1 { in_c1v[c] = true; }
@@ -724,10 +724,10 @@ impl FwdModel {
     /// xq_rowmax_f16 into private buffers — the new pass's argmax / dconf / d_dev / toks are left
     /// as the new head wrote them, so the served trajectory is the new head's) and compare.
     fn dhead_xcheck_pass(&self, l: &Launcher, sc: &mut Scratch, dh: &DHead, q: &Quad, i: usize) -> Result<()> {
-        self.dev.synchronize()?;
-        let new_id = self.dev.dtoh_sync_copy(&sc.argmax)?[0];
-        let new_conf = self.dev.dtoh_sync_copy(&sc.dconf)?[i];
-        let ws = self.dev.dtoh_sync_copy(&dh.ws)?;
+        self.dsync()?;
+        let new_id = self.dtoh(&sc.argmax)?[0];
+        let new_conf = self.dtoh(&sc.dconf)?[i];
+        let ws = self.dtoh(&dh.ws)?;
         // chain_xh gets the identical xh; chain_yraw / logits are dead after a draft pass
         exl3_chain(l, q, &sc.x, &mut sc.chain_xh, &mut sc.chain_yraw, &mut sc.logits, 1, &sc.chain_ws)?;
         let v = dh.n as i32;
@@ -735,9 +735,9 @@ impl FwdModel {
                   (&dh.xc_id, 0i32, &sc.logits, 0i64, v))?;
         xqlaunch!(l, "xq_rowmax_f16", (1, 1, 1), (1024, 1, 1), 0,
                   (&dh.xc_conf, 0i64, &sc.logits, 0i64, v))?;
-        self.dev.synchronize()?;
-        let old_id = self.dev.dtoh_sync_copy(&dh.xc_id)?[0];
-        let old_conf = self.dev.dtoh_sync_copy(&dh.xc_conf)?[0];
+        self.dsync()?;
+        let old_id = self.dtoh(&dh.xc_id)?[0];
+        let old_conf = self.dtoh(&dh.xc_conf)?[0];
         let (o_bmax, _, o_dbg, _, _) = ws_layout(dh.k, dh.nblk, dh.s);
         let ns = (ws[o_dbg] as usize).min(DH_TCAP);
         let cands: Vec<usize> = ws[o_dbg + 1..o_dbg + 1 + ns].iter().map(|&c| c as usize).collect();
@@ -788,7 +788,7 @@ impl FwdModel {
         if let Some(p) = dh.p.as_ref() {
             if p.seen.swap(false, Ordering::Relaxed) {
                 let mut now = [0u32; 8];
-                match self.dev.dtoh_sync_copy_into(&p.pws.slice(DHP_STAT..DHP_STAT + 8), &mut now) {
+                match self.dtoh_into(&p.pws.slice(DHP_STAT..DHP_STAT + 8), &mut now) {
                     Ok(()) => {
                         let mut s0 = p.stat0.lock().unwrap();
                         let d: Vec<u32> = (0..8).map(|j| now[j].wrapping_sub(s0[j])).collect();

@@ -257,8 +257,8 @@ mod tests {
     /// here; a deliberate W=2 change must update the hash in the same commit and say why.
     #[test]
     fn w2_gather_code_is_byte_identical_to_the_base_commit() {
-        let xtp = include_str!("exl3_forward/xtp.rs");
-        let cu = include_str!("../kernels/exl3_bench.cu");
+        let xtp = src_text!("exl3_forward/xtp");
+        let cu = src_text!("kernels/exl3_bench");
         let cases: [(&str, &str, &str, &str, usize, u64); 5] = [
             // vp_gather_rows: len/hash re-pinned for d6ac6c4, which changed ONLY the world-2 `ensure!` message text (no logic).
             ("vp_gather_rows", xtp, "    pub(super) fn vp_gather_rows(", "\n    }\n", 2401, 0x43f198b746bfb54e),

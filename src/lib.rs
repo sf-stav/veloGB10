@@ -1,3 +1,4 @@
+#[cfg(test)] #[macro_use] mod src_text;
 /// CLI-1: the options registry (every engine option is a command-line flag; AGENTS §7).
 pub mod opts;
 pub mod hf_cache;
@@ -59,6 +60,12 @@ pub mod fp4l; // FP4L: nvidia/Qwen3.8-Flash-Next-FP4-Local (ModelOpt MXFP8 + NVF
 pub mod exl3_tune;
 pub mod exl3_serve;
 pub mod exl3_wp27;
+pub mod copy_span; // WIDEVERIFY1 R1/R4: host-side copy-span proposer (n-gram index + copy cursor; no GPU)
+pub mod copy_record; // COPYREC1: --copy-span-record cross-request copy record (ids, dedup, landing rates, disk; no GPU)
+pub mod lane_wide; // LANEWIDE: --lane-wide-verify host logic (resolution, lane eligibility, measured-rate policy, counters; no GPU)
+pub mod copy_prefill; // COPYPF1: --copy-span-prefill host logic (schedule, accept prefix, decision, counters; no GPU)
+pub mod family_defaults; // V0710: family/TP-scoped resolved defaults (copy-span, dense-resident, mid-gemm on Flash-Next; arm meter by TP)
+pub mod copy_lanes; // COPYLANES: --copy-span-lanes host logic (resolution, the per-lane batch price, counters; no GPU)
 pub mod logq;
 pub mod loop_detect;
 pub mod startup; // BASICS (owner 2026-11-02): line 1 = app name + version (--version), then the run's configuration
@@ -81,12 +88,14 @@ pub mod mtp_reprobe;
 pub mod lane_pack; // S-B9-CF-PACK4: --lane-pack (pure decision; the arm lives in exl3_serve)
 pub mod lane_reserve; // LANERES1: --lane-reserve (pure admission policy; the arm lives in exl3_serve)
 pub mod kv_spill; // LANERES2: --kv-spill (pure spill policy + disk store; the arm lives in exl3_serve/exl3_forward)
+pub mod turn_resume; // TURNRESUME: --turn-resume / --next-turn-prefill (hints, pick rules, counters; the arm lives in exl3_serve)
 pub mod prefix_pool; // PFXPOOL: prompt states kept in memory across lanes (policy; the arm lives in exl3_serve/exl3_forward)
 pub mod otel;
 pub mod net;
 // HOST / RO-7: big-core detection + pinning of the serving engine's critical host threads.
 pub mod cpu_affinity;
-pub mod host_wait; // CPUIDLE: --gpu-wait spin|hybrid (how the host waits for the GPU)
+pub mod host_wait; // CPUIDLE: --gpu-wait spin|hybrid|block (how the host waits for the GPU)
+pub mod thermal; // NIGHT1: the thermal governor (--thermal-guard / --thermal-soft-c / --thermal-hard-c)
 pub mod pp;
 pub mod cluster;
 pub mod tp;

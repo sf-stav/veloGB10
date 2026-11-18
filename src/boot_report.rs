@@ -321,8 +321,8 @@ mod tests {
     fn progress_lines_are_frozen() {
         assert_eq!(progress_str("loading weights", 12, 48, Unit::Items("layers"), 9.4),
             "[boot] loading weights:  25% (12 of 48 layers, 9 s)");
-        assert_eq!(progress_str("shipping to node 192.168.0.2:29500", 24_100_000_000, 53_500_000_000, Unit::Bytes, 18.3),
-            "[boot] shipping to node 192.168.0.2:29500:  45% (24.1 of 53.5 GB, 18 s, 1.32 GB/s)");
+        assert_eq!(progress_str("shipping to node <peer-ip>:29500", 24_100_000_000, 53_500_000_000, Unit::Bytes, 18.3),
+            "[boot] shipping to node <peer-ip>:29500:  45% (24.1 of 53.5 GB, 18 s, 1.32 GB/s)");
         assert_eq!(progress_str("hashing the model files", 7, 7, Unit::Bytes, 0.0),
             "[boot] hashing the model files: 100% (0.0 of 0.0 GB, 0 s)");
         // done beyond the total is clamped (a loader that reads a little more than it planned)

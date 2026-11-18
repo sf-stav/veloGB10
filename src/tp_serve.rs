@@ -111,6 +111,9 @@ pub fn fnv64(b: &[u8]) -> u64 {
 pub enum TpEvent {
     Admit(WireRequest),
     Cancel { lane: usize },
+    /// COPYREC1 (EXL3 serve): `DELETE /v1/copy-record` — every rank empties its copy record at this point of the
+    /// step's events (after its cancels, before its admits). The NVFP4 mirror never receives it.
+    RecordClear,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

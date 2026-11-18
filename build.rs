@@ -29,6 +29,8 @@ fn main() {
     // Keeps ibverbs struct complexity in C; src/net.rs is a thin FFI. Links libibverbs (data plane) and
     // cudart (already linked) for cudaHostAlloc. Compiled into the crate; a compile error fails the build.
     println!("cargo:rerun-if-changed=native/net_shim.c");
+    // SPLIT1 Wave 3: net_shim.c is include-split (`native/net_shim/*.inc`, one translation unit).
+    for f in net_shim_sections() { println!("cargo:rerun-if-changed={f}"); }
     println!("cargo:rerun-if-changed=native/tp_doorbell.h");
     cc::Build::new()
         .file("native/net_shim.c")
@@ -83,6 +85,8 @@ fn main() {
 
     for (src_name, _, _) in &kernels {
         println!("cargo:rerun-if-changed={}", kernel_dir.join(src_name).display());
+        // SPLIT1 Wave 3: a .cu may be an include-split (`kernels/<stem>/*.cuh`); every section file is a source too.
+        for f in kernel_sections(src_name) { println!("cargo:rerun-if-changed={f}"); }
     }
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -102,6 +106,11 @@ fn main() {
         std::fs::read(kernel_dir.join(src_name))
             .unwrap_or_else(|e| panic!("cannot read kernels/{src_name}: {e}"))
             .hash(&mut hasher);
+        // SPLIT1 Wave 3: the section files of an include-split .cu are part of its text (sorted path = include
+        // order). Without them a .cuh edit would leave KERNEL_BUILD_ID unchanged -- the stale-PTX hazard above.
+        for f in kernel_sections(src_name) {
+            std::fs::read(&f).unwrap_or_else(|e| panic!("cannot read {f}: {e}")).hash(&mut hasher);
+        }
     }
     // gpu_batch.cu #includes native/tp_doorbell.h (the TP=2 wire layout, shared with net_shim.c). It is
     // NOT a .cu, so hashing only the kernel sources would let an offset change slip through with an
@@ -128,11 +137,152 @@ fn main() {
         // T2 (review): + the files that decide which graphs are captured and how (the WP27 capture
         // DAG, the DHEAD draft tail, the served posture / precapture in exl3_serve, MODULE_FNS and
         // smem opt-ins in exl3_bench).
-        for f in ["kernels/exl3_bench.cu", "kernels/gpu_batch.cu", "native/tp_doorbell.h",
-                  "src/exl3_forward.rs", "src/exl3_tune.rs", "src/exl3.rs", "src/exl3_wp27.rs",
-                  "src/exl3_forward/dhead.rs", "src/exl3_serve.rs", "src/exl3_bench.rs",
+        // SPLIT1 Wave 3: exl3_bench.cu / gpu_batch.cu are include-split; their section files decide kernel code too.
+        let mut tune_files: Vec<String> = ["kernels/exl3_bench.cu", "kernels/gpu_batch.cu"].iter().map(|s| s.to_string()).collect();
+        tune_files.extend(kernel_sections("exl3_bench.cu"));
+        tune_files.extend(kernel_sections("gpu_batch.cu"));
+        tune_files.extend(["native/tp_doorbell.h",
+                  "src/exl3_forward/mod.rs",
+                  "src/exl3_forward/attn.rs",
+                  "src/exl3_forward/attn_gates.rs",
+                  "src/exl3_forward/bench.rs",
+                  "src/exl3_forward/chain.rs",
+                  "src/exl3_forward/consts.rs",
+                  "src/exl3_forward/cublaslt.rs",
+                  "src/exl3_forward/df2.rs",
+                  "src/exl3_forward/draft.rs",
+                  "src/exl3_forward/forward_step.rs",
+                  "src/exl3_forward/graph_keys.rs",
+                  "src/exl3_forward/hc.rs",
+                  "src/exl3_forward/ladder.rs",
+                  "src/exl3_forward/lmh.rs",
+                  "src/exl3_forward/load.rs",
+                  "src/exl3_forward/moe.rs",
+                  "src/exl3_forward/moe_wp20.rs",
+                  "src/exl3_forward/mpk.rs",
+                  "src/exl3_forward/mtp_tap.rs",
+                  "src/exl3_forward/pack.rs",
+                  "src/exl3_forward/ple.rs",
+                  "src/exl3_forward/prefill.rs",
+                  "src/exl3_forward/prefill_attn.rs",
+                  "src/exl3_forward/prefill_hc.rs",
+                  "src/exl3_forward/prefill_moe.rs",
+                  "src/exl3_forward/prefill_warmup.rs",
+                  "src/exl3_forward/probes_lt.rs",
+                  "src/exl3_forward/probes_pack23.rs",
+                  "src/exl3_forward/probes_packstate.rs",
+                  "src/exl3_forward/probes_prefillx.rs",
+                  "src/exl3_forward/psk.rs",
+                  "src/exl3_forward/reprime.rs",
+                  "src/exl3_forward/rounds.rs",
+                  "src/exl3_forward/router_r16.rs",
+                  "src/exl3_forward/sampling.rs",
+                  "src/exl3_forward/scratch.rs",
+                  "src/exl3_forward/slot_state.rs",
+                  "src/exl3_forward/spec_pass.rs",
+                  "src/exl3_forward/tensors.rs",
+                  "src/exl3_forward/tune_hc.rs",
+                  "src/exl3_forward/verify.rs",
+                  "src/exl3_forward/vision.rs",
+                  "src/exl3_forward/widths.rs",
+                  "src/exl3_forward/wp21.rs",
+                  "src/exl3_forward/wp_levers.rs",
+                  "src/exl3_forward/dsplitk_tests.rs",
+                  "src/exl3_forward/flash256_stage_tests.rs",
+                  "src/exl3_forward/l10_prefillx_tests.rs",
+                  "src/exl3_forward/pfx1_tests.rs",
+                  "src/exl3_forward/ple_headroom_tests.rs",
+                  "src/exl3_forward/ple_k_tests.rs",
+                  "src/exl3_forward/ple_ngram_tests.rs",
+                  "src/exl3_forward/qsaregime_tests.rs",
+                  "src/exl3_forward/rel_fixb_router_selection.rs",
+                  "src/exl3_forward/rel_gates2_reprime_words_tests.rs",
+                  "src/exl3_forward/reprime_tests.rs",
+                  "src/exl3_forward/rope_tests.rs",
+                  "src/exl3_forward/served_window_tests.rs",
+                  "src/exl3_forward/spill_region_tests.rs",
+                  "src/exl3_forward/tp4g_dv3_tests.rs",
+                  "src/exl3_forward/vis2_tests.rs",
+                  "src/exl3_forward/wide_bits_guard_tests.rs",
+                  "src/exl3_forward/wp05_tests.rs",
+                  "src/exl3_forward/wp18_tests.rs",
+                  "src/exl3_forward/wp20_b5_tests.rs",
+                  "src/exl3_forward/wp24_key_tests.rs",
+                  "src/exl3_tune/mod.rs", "src/exl3_tune/boot.rs", "src/exl3_tune/order.rs", "src/exl3_tune/registry.rs", "src/exl3_tune/report.rs", "src/exl3_tune/state.rs", "src/exl3_tune/stats.rs", "src/exl3_tune/table.rs", "src/exl3_tune/tests.rs", "src/exl3.rs", "src/exl3_wp27.rs",
+                  "src/exl3_forward/dhead.rs",
+                  "src/exl3_serve/admission.rs",
+                  "src/exl3_serve/agree16b_tests.rs",
+                  "src/exl3_serve/builder.rs",
+                  "src/exl3_serve/copy.rs",
+                  "src/exl3_serve/copy_span_arm_tests.rs",
+                  "src/exl3_serve/ctx_clamp_tests.rs",
+                  "src/exl3_serve/dds.rs",
+                  "src/exl3_serve/dds_prior_w4_tests.rs",
+                  "src/exl3_serve/df2.rs",
+                  "src/exl3_serve/df2_gate_tests.rs",
+                  "src/exl3_serve/fit.rs",
+                  "src/exl3_serve/fit_tests.rs",
+                  "src/exl3_serve/lane_pack_penalty_warning_tests.rs",
+                  "src/exl3_serve/lane_pack_sampled_tp_tests.rs",
+                  "src/exl3_serve/lane_pack_wiring_tests.rs",
+                  "src/exl3_serve/lanes.rs",
+                  "src/exl3_serve/lockstep.rs",
+                  "src/exl3_serve/mod.rs",
+                  "src/exl3_serve/mtp_round.rs",
+                  "src/exl3_serve/mtp_switch_tests.rs",
+                  "src/exl3_serve/pack.rs",
+                  "src/exl3_serve/pack_prefill.rs",
+                  "src/exl3_serve/policy.rs",
+                  "src/exl3_serve/pool.rs",
+                  "src/exl3_serve/prefill.rs",
+                  "src/exl3_serve/prefill_interleave_tests.rs",
+                  "src/exl3_serve/regime_sched_tests.rs",
+                  "src/exl3_serve/review_p0_pins.rs",
+                  "src/exl3_serve/s1_eq_aware_arg_tests.rs",
+                  "src/exl3_serve/scheduler.rs",
+                  "src/exl3_serve/serve.rs",
+                  "src/exl3_serve/spec_lanes_tests.rs",
+                  "src/exl3_serve/spec_program.rs",
+                  "src/exl3_serve/spill_agree_tests.rs",
+                  "src/exl3_serve/step.rs",
+                  "src/exl3_serve/step_image_payload_tests.rs",
+                  "src/exl3_serve/stop_info_tests.rs",
+                  "src/exl3_serve/token_logprobs_tests.rs",
+                  "src/exl3_serve/tp_agree_width_tests.rs",
+                  "src/exl3_serve/tp_hub_tests.rs",
+                  "src/exl3_serve/tp_preflight_tests.rs",
+                  "src/exl3_serve/tp_serve.rs",
+                  "src/exl3_serve/tpship_kv_tests.rs",
+                  "src/exl3_serve/vision_drill_flag_tests.rs",
+                  "src/exl3_serve/wp23_tests.rs",
+                  "src/exl3_serve/wp24_gate.rs",
+                  "src/exl3_bench/attn.rs",
+                  "src/exl3_bench/bitwidths.rs",
+                  "src/exl3_bench/dense.rs",
+                  "src/exl3_bench/gemm.rs",
+                  "src/exl3_bench/hc.rs",
+                  "src/exl3_bench/k23_kernel_wheel_golden.rs",
+                  "src/exl3_bench/k23_serving_gemm_layout_golden.rs",
+                  "src/exl3_bench/k23_serving_gemm_wheel_golden.rs",
+                  "src/exl3_bench/k23_serving_real_call.rs",
+                  "src/exl3_bench/k35_kernel_wheel_golden.rs",
+                  "src/exl3_bench/lmh_tests.rs",
+                  "src/exl3_bench/mod.rs",
+                  "src/exl3_bench/moe_epi.rs",
+                  "src/exl3_bench/moe_epi_k4.rs",
+                  "src/exl3_bench/moe_pf.rs",
+                  "src/exl3_bench/mpk_tests.rs",
+                  "src/exl3_bench/pf_ring_source_tests.rs",
+                  "src/exl3_bench/rel_fixb_accept_rule.rs",
+                  "src/exl3_bench/router.rs",
+                  "src/exl3_bench/sampler.rs",
+                  "src/exl3_bench/select.rs",
+                  "src/exl3_bench/tp4.rs",
+                  "src/exl3_bench/wide.rs",
+                  "src/exl3_bench/wp20_suh_tests.rs",
                   // T0c (p5e): the W4 packages' host sides (dispatch, grids, registry entries)
-                  "src/exl3_forward/dense.rs", "src/exl3_forward/w4s.rs"] {
+                  "src/exl3_forward/dense.rs", "src/exl3_forward/w4s.rs"].iter().map(|s| s.to_string()));
+        for f in &tune_files {
             println!("cargo:rerun-if-changed={f}");
             let bytes = std::fs::read(f).unwrap_or_default();
             feed(f.as_bytes());
@@ -214,6 +364,8 @@ fn main() {
     for f in ["native/net_shim.c", "Cargo.lock", "Cargo.toml", "build.rs"] {
         src_files.push(f.to_string());
     }
+    // SPLIT1 Wave 3: the section files of the include-split C shim are part of its text (so of the version stamp).
+    src_files.extend(net_shim_sections());
     // NOT in the stamp: tests/fixtures/loop_detect_vectors.txt (included by src/loop_detect.rs inside
     // `#[cfg(test)]`). It is not an engine input, and a stamp that hashed it "when present" gave one tree
     // two tokens depending on build history (with / without tests/); the include-target test
@@ -247,6 +399,7 @@ fn main() {
     println!("cargo:rustc-env=SOURCE_BUILD_FILES={}", src_files.join(";"));
     // what KERNEL_BUILD_ID hashes (the other half of `cluster::binary_version`), for the same test
     let mut kernel_files: Vec<String> = kernels.iter().map(|(s, _, _)| format!("kernels/{s}")).collect();
+    for (s, _, _) in &kernels { kernel_files.extend(kernel_sections(s)); } // SPLIT1 Wave 3: include-split sections
     kernel_files.push("native/tp_doorbell.h".to_string());
     println!("cargo:rustc-env=KERNEL_BUILD_FILES={}", kernel_files.join(";"));
     // EMB1: cu:ptx pairs for every module this script emits (the loaders embed via src/ptx_embed.rs).
@@ -336,4 +489,35 @@ fn main() {
             );
         }
     }
+}
+
+/// SPLIT1 Wave 3: the section files of an include-split kernel, `kernels/<stem>/*.cuh` for `<stem>.cu`, as
+/// `kernels/<stem>/<name>.cuh` strings in sorted (= include) order. Empty for a kernel that is one file.
+fn kernel_sections(src_name: &str) -> Vec<String> {
+    let stem = src_name.strip_suffix(".cu").unwrap_or(src_name);
+    let dir = format!("kernels/{stem}");
+    let mut v: Vec<String> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".cuh"))
+            .map(|n| format!("{dir}/{n}")).collect(),
+        Err(_) => Vec::new(),
+    };
+    v.sort();
+    v
+}
+
+/// SPLIT1 Wave 3: the section files of the include-split C shim, `native/net_shim/*.inc`, as
+/// `native/net_shim/<name>.inc` strings in sorted (= include) order.
+fn net_shim_sections() -> Vec<String> {
+    let dir = "native/net_shim";
+    let mut v: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".inc"))
+            .map(|n| format!("{dir}/{n}")).collect(),
+        Err(_) => Vec::new(),
+    };
+    v.sort();
+    v
 }

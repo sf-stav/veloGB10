@@ -381,7 +381,13 @@ mod h5_direct_print_baseline_tests {
         let baseline: &[(&str, u32)] = &[
             // FIX1 #76 (master): +2 = the two [dspark] 1-per-50-step meters (chain + sampled lanes).
             // OUT1: -1 = the graphs-skipped boot line became boot_report::notice(). 35+2-1 = 36.
-            ("src/batch.rs", 36),
+            // (src/batch.rs split into src/batch/*.rs by SPLIT1; the 36 prints are spread over the rows below, mod.rs has none.)
+            ("src/batch/admission.rs", 3),
+            ("src/batch/df2.rs", 6),
+            ("src/batch/dspark.rs", 10),
+            ("src/batch/lifecycle.rs", 13),
+            ("src/batch/mtp_lane.rs", 1),
+            ("src/batch/mtp_policy.rs", 3),
             ("src/bin/dsv4_attn_replay.rs", 9),
             ("src/bin/dsv4_convert.rs", 3),
             ("src/bin/dsv4_replay.rs", 10),
@@ -397,26 +403,106 @@ mod h5_direct_print_baseline_tests {
             ("src/boot_report.rs", 2),
             // OUT2 (2026-10-16): boot_report.rs = 2 — the dprintln!/deprintln! macro bodies
             // (direct println!/eprintln! behind the --log-level debug check; zero direct prints at normal).
-            ("src/cluster.rs", 57), // NAIVE: +1, the one-time `[head] Naive drafter manifest` boot line (ISSUES 98 drafter shipping)
+            // SPLIT1 cluster.rs (57) -> per-file rows; the sum is 58 because pack_manifest_tests.rs (a moved test module, no cfg(test) wrapper in its own file) is counted raw (+1 print that sat inside the stripped module)
+            ("src/cluster/head.rs", 19), // NAIVE: +1, the one-time `[head] Naive drafter manifest` boot line (ISSUES 98 drafter shipping)
+            ("src/cluster/models.rs", 13),
+            ("src/cluster/node.rs", 12),
+            ("src/cluster/mod.rs", 9),
+            ("src/cluster/discovery.rs", 4),
+            ("src/cluster/pack_manifest_tests.rs", 1),
+            ("src/copy_span/tests.rs", 2), // SPLIT1 copy_span: no row before (0 outside cfg(test)); the moved test file (no cfg(test) wrapper in its own file) is counted raw: +2
             ("src/dflash.rs", 2),
-            ("src/dflash2/round.rs", 7),
+            // SPLIT1: src/dflash2/round.rs split into src/dflash2/round/*.rs; the 7 prints are spread over the rows below.
+            ("src/dflash2/round/draft.rs", 6),
+            ("src/dflash2/round/load.rs", 1),
             ("src/dflash2/stepdump.rs", 4),
             ("src/dspark/round.rs", 4),
-            ("src/dsv4_attn.rs", 1),
+            // SPLIT1: src/dsv4_attn.rs split into src/dsv4_attn/*.rs; the 1 prints are spread over the rows below.
+            ("src/dsv4_attn/attn.rs", 1),
             ("src/dsv4_convert.rs", 9),
             ("src/dsv4_dspark.rs", 7),
             ("src/dsv4_graph.rs", 5),
-            ("src/dsv4_model.rs", 13),
+            // SPLIT1: src/dsv4_model.rs split into src/dsv4_model/*.rs; the 13 prints are spread over the rows below.
+            ("src/dsv4_model/forward.rs", 6),
+            ("src/dsv4_model/load.rs", 7),
             ("src/engine.rs", 1),
             ("src/exl3.rs", 20), // K35 (2026-10-31): master already read 20 vs this row's 18 (drifted, never re-pinned); K35 adds no direct print here: re-pinned consciously // was 18 // P7 B1: the honest load-time width-refusal line (+1)
-            ("src/exl3_autotune.rs", 15),
-            ("src/exl3_bench.rs", 153), // K8EXP merge (2026-11-07): 152 -> 153 — + the bitwidths section-7 PASS println (probe-only). PFHALF (2026-11-06): 151 -> 152 — the fractional-width (K 1.5/2.5/3.5) PASS println of the moe_pf probe (probe-only, output IS the product). PR #32 port: +1, the EXL3-MOE-PF-HASH line of the synthetic moe_pf probe (probe path). K35 (2026-10-31): master already read 151 vs this row's 149 (PR#27-D3/P7 rows drifted, never re-pinned); K35 removes the fractional-k2 SKIP println (the grouped probe now runs those widths) and adds nothing outside tests: 150, re-pinned consciously // was 149 // PR#27-D3 (2026-10-30): 141 -> 149 - the bitwidths gate prints 8 direct lines (banner, dense/wide/ks per-cell PASS, refusal-predicates PASS, ALL-CELLS verdict, synth8 header+PASS; probe-only, output IS the product) // P7 B10 (2026-10-30): 139 -> 141 — the two explicit-nst smem-cap SKIP lines (per-bits + k4 twin scheds loops; b6/b7 gu-s8 rings over the opt-in cap, the served plan falls back by design; probe-only). P7 B10: 137 -> 139 — the per-width W4 persistent-rows PASS println + the skip line for widths without epi rows (probe-only). P7 B6 (2026-10-30): 136 -> 137 — the synth7 K=7 CHAIN PASS println (probe-only). P7 B5 (2026-10-29): 134 -> 136 — the synth7 leg header + K=7 PASS printlns (probe-only). P7 B3 leg 2 (2026-10-29): 131 -> 134 — the three EPI-ATTR receipt eprintln!s (xh static-smem/opt-in/regs/dev-copy dump; probe-only diagnostic, the 46224>46080 lesson). Earlier: B2 ref-verify + B3 WP20 b5 + B4 MoE-PF bits param prints (+3, probe paths only)
-            ("src/exl3_forward.rs", 332), // K35 (2026-10-31): master already read 329 vs this row's 326 (drifted, never re-pinned); K35 adds the three boot-visible once-per-boot eprintln!s (K=x.5 experts ENGAGED decode + PREFILL, the --moe-coop override): 332, re-pinned consciously // was 326 // P7 B9 (2026-10-29): 330 -> 326 — three dprintln! PLE K= lines promoted to boot_report::notice (always-visible width receipt; the notice() call carries no println) + the w4moe plan line folded. P7 B6 (2026-10-30): 329 -> 330 — the PSK width-guard once-per-boot line (boot class, dprintln! inside a OnceLock; the counter is /metrics). P7 B1/B4: width-refusal + pf-predicate boot lines (+2) // P7 merge: 325 -> 327 (df2trace ttr timing lines + df2 head-quantization one-time notices auto-merged from the 1.5bpw branch; conscious update). EXL27C: 324 -> 325 (split-MoE EP deal one-time boot line; conscious update). Earlier: 315 -> 323 (--df2-trace gated diagnostics + Fix5 comment; conscious update). OUT2: 317 -> 315 (the two PLE SSD/RAM decision lines -> boot_report::notice(), one normal line each)
+            ("src/exl3_autotune/cli_main.rs", 5), // SPLIT1 exl3_autotune: the old row "src/exl3_autotune.rs" (15 outside cfg(test)) is split per file; the moved test file (no cfg(test) wrapper in its own file) is counted raw: +1, so the rows sum to 16
+            ("src/exl3_autotune/session.rs", 1),
+            ("src/exl3_autotune/tests.rs", 1),
+            ("src/exl3_autotune/tune_cli.rs", 8),
+            ("src/exl3_autotune/tuner_plan.rs", 1),
+            // SPLIT1 exl3_bench: the old row "src/exl3_bench.rs" (153 outside cfg(test)) is split per file below; the moved test files (no cfg(test) wrapper in their own file) are counted raw: +9 = 2+1+1+3 (k23/k35 goldens) +2 (wp20_suh_tests). Old row history: // K8EXP merge (2026-11-07): 152 -> 153 — + the bitwidths section-7 PASS println (probe-only). PFHALF (2026-11-06): 151 -> 152 — the fractional-width (K 1.5/2.5/3.5) PASS println of the moe_pf probe (probe-only, output IS the product). PR #32 port: +1, the EXL3-MOE-PF-HASH line of the synthetic moe_pf probe (probe path). K35 (2026-10-31): master already read 151 vs this row's 149 (PR#27-D3/P7 rows drifted, never re-pinned); K35 removes the fractional-k2 SKIP println (the grouped probe now runs those widths) and adds nothing outside tests: 150, re-pinned consciously // was 149 // PR#27-D3 (2026-10-30): 141 -> 149 - the bitwidths gate prints 8 direct lines (banner, dense/wide/ks per-cell PASS, refusal-predicates PASS, ALL-CELLS verdict, synth8 header+PASS; probe-only, output IS the product) // P7 B10 (2026-10-30): 139 -> 141 — the two explicit-nst smem-cap SKIP lines (per-bits + k4 twin scheds loops; b6/b7 gu-s8 rings over the opt-in cap, the served plan falls back by design; probe-only). P7 B10: 137 -> 139 — the per-width W4 persistent-rows PASS println + the skip line for widths without epi rows (probe-only). P7 B6 (2026-10-30): 136 -> 137 — the synth7 K=7 CHAIN PASS println (probe-only). P7 B5 (2026-10-29): 134 -> 136 — the synth7 leg header + K=7 PASS printlns (probe-only). P7 B3 leg 2 (2026-10-29): 131 -> 134 — the three EPI-ATTR receipt eprintln!s (xh static-smem/opt-in/regs/dev-copy dump; probe-only diagnostic, the 46224>46080 lesson). Earlier: B2 ref-verify + B3 WP20 b5 + B4 MoE-PF bits param prints (+3, probe paths only)
+            ("src/exl3_bench/attn.rs", 8),
+            ("src/exl3_bench/bitwidths.rs", 7),
+            ("src/exl3_bench/dense.rs", 23),
+            ("src/exl3_bench/gemm.rs", 21),
+            ("src/exl3_bench/hc.rs", 13),
+            ("src/exl3_bench/k23_kernel_wheel_golden.rs", 1),
+            ("src/exl3_bench/k23_serving_gemm_layout_golden.rs", 3),
+            ("src/exl3_bench/k23_serving_gemm_wheel_golden.rs", 2),
+            ("src/exl3_bench/k23_serving_real_call.rs", 2),
+            ("src/exl3_bench/k35_kernel_wheel_golden.rs", 3),
+            ("src/exl3_bench/moe_epi.rs", 11),
+            ("src/exl3_bench/moe_epi_k4.rs", 4),
+            ("src/exl3_bench/moe_pf.rs", 6),
+            ("src/exl3_bench/router.rs", 16),
+            ("src/exl3_bench/sampler.rs", 9),
+            ("src/exl3_bench/select.rs", 6),
+            ("src/exl3_bench/tp4.rs", 12),
+            ("src/exl3_bench/wide.rs", 17),
+            ("src/exl3_bench/wp20_suh_tests.rs", 2),
+            ("src/exl3_forward/mod.rs", 0), // SPLIT1 exl3_forward: the old single-file row (332 outside cfg(test)) is split per file below (mod.rs itself prints nothing; the moved test file flash256_stage_tests is counted raw: +2, so the rows sum to 334). Old row history: K35 (2026-10-31): master already read 329 vs this row's 326 (drifted, never re-pinned); K35 adds the three boot-visible once-per-boot eprintln!s (K=x.5 experts ENGAGED decode + PREFILL, the --moe-coop override): 332, re-pinned consciously // was 326 // P7 B9 (2026-10-29): 330 -> 326 — three dprintln! PLE K= lines promoted to boot_report::notice (always-visible width receipt; the notice() call carries no println) + the w4moe plan line folded. P7 B6 (2026-10-30): 329 -> 330 — the PSK width-guard once-per-boot line (boot class, dprintln! inside a OnceLock; the counter is /metrics). P7 B1/B4: width-refusal + pf-predicate boot lines (+2) // P7 merge: 325 -> 327 (df2trace ttr timing lines + df2 head-quantization one-time notices auto-merged from the 1.5bpw branch; conscious update). EXL27C: 324 -> 325 (split-MoE EP deal one-time boot line; conscious update). Earlier: 315 -> 323 (--df2-trace gated diagnostics + Fix5 comment; conscious update). OUT2: 317 -> 315 (the two PLE SSD/RAM decision lines -> boot_report::notice(), one normal line each)
+            ("src/exl3_forward/attn.rs", 6),
+            ("src/exl3_forward/attn_gates.rs", 3),
+            ("src/exl3_forward/bench.rs", 42),
+            ("src/exl3_forward/consts.rs", 2),
+            ("src/exl3_forward/df2.rs", 10),
+            ("src/exl3_forward/draft.rs", 2),
+            ("src/exl3_forward/forward_step.rs", 1),
+            ("src/exl3_forward/hc.rs", 4),
+            ("src/exl3_forward/ladder.rs", 1),
+            ("src/exl3_forward/lmh.rs", 8),
+            ("src/exl3_forward/load.rs", 28),
+            ("src/exl3_forward/moe.rs", 8),
+            ("src/exl3_forward/moe_wp20.rs", 6),
+            ("src/exl3_forward/mpk.rs", 5),
+            ("src/exl3_forward/mtp_tap.rs", 3),
+            ("src/exl3_forward/ple.rs", 5),
+            ("src/exl3_forward/prefill.rs", 5),
+            ("src/exl3_forward/prefill_attn.rs", 4),
+            ("src/exl3_forward/prefill_hc.rs", 4),
+            ("src/exl3_forward/prefill_moe.rs", 7),
+            ("src/exl3_forward/prefill_warmup.rs", 10),
+            ("src/exl3_forward/probes_lt.rs", 12),
+            ("src/exl3_forward/probes_pack23.rs", 31),
+            ("src/exl3_forward/probes_packstate.rs", 32),
+            ("src/exl3_forward/probes_prefillx.rs", 31),
+            ("src/exl3_forward/psk.rs", 8),
+            ("src/exl3_forward/reprime.rs", 3),
+            ("src/exl3_forward/rounds.rs", 1),
+            ("src/exl3_forward/router_r16.rs", 6),
+            ("src/exl3_forward/scratch.rs", 2),
+            ("src/exl3_forward/spec_pass.rs", 3),
+            ("src/exl3_forward/tensors.rs", 6),
+            ("src/exl3_forward/tune_hc.rs", 2),
+            ("src/exl3_forward/verify.rs", 2),
+            ("src/exl3_forward/widths.rs", 5),
+            ("src/exl3_forward/wp21.rs", 9),
+            ("src/exl3_forward/wp_levers.rs", 15),
+            ("src/exl3_forward/flash256_stage_tests.rs", 2), // SPLIT1 exl3_forward: a moved test module (no cfg(test) wrapper in its own file) is counted raw
+            ("src/exl3_forward/dres.rs", 10), // LANEWIDE-MID (2026-11-13): 6 -> 10, the --probe-mid-gemm report lines. LANEWIDE-DRES (2026-11-12): the --probe-dense-resident report lines (dprintln!, probe-only)
+            ("src/exl3_forward/lwv.rs", 17), // LANEWIDE-EXACT (2026-11-13): 9 -> 17, the XCLASS_TAPS / XCLASS_HID / XCLASS_TIME / XCLASS_SEGSTART and --probe-lane-wide-pin report lines (probe-only). LANEWIDE (2026-11-13): 6 -> 9, the --probe-lane-wide-xclass report lines (probe-only). LANEWIDE (2026-11-12): the --probe-lane-wide-cost report lines (dprintln!, probe-only; output IS the product)
+            ("src/exl3_forward/cpv.rs", 7), // COPYPF1 (2026-11-12): the --probe-copy-prefill report lines (dprintln!, probe-only; output IS the product)
             ("src/exl3_forward/dense.rs", 12),
             ("src/exl3_forward/dhead.rs", 11),
             ("src/exl3_forward/w4s.rs", 8),
             ("src/exl3_forward/wp16.rs", 12),
-            ("src/exl3_forward/xtp.rs", 75), // S-B9-REL-INTEG A5: +1, the harness's RANK_IDENTITY FAIL line when pass 1 errors (a probe, not a served path)
+            ("src/exl3_forward/xtp/xtp_ref.rs", 42), // S-B9-REL-INTEG A5: +1, the harness's RANK_IDENTITY FAIL line when pass 1 errors (a probe, not a served path). SPLIT1: the former xtp.rs row (75) now spans these five files
+            ("src/exl3_forward/xtp/tp_state.rs", 17),
+            ("src/exl3_forward/xtp/slice_probe.rs", 8),
+            ("src/exl3_forward/xtp/tp_config.rs", 5),
+            ("src/exl3_forward/xtp/spine.rs", 3),
             ("src/exl3_kvnll.rs", 10),
             // Q4K: 9 -> 10, the Q4K_HOST line of --probe-exl3-kvq (the q4k host reference's own
             // verdict line: probe-only, one-shot, the same class as the KVQ_SELFTEST lines above;
@@ -430,18 +516,77 @@ mod h5_direct_print_baseline_tests {
             // PPL_BOUNDS lines and RESULT are written through a `&mut dyn Write` handed to `score_all` /
             // `finish_run` (stdout in the tool, a buffer in the unit tests that prove a failed run prints no
             // RESULT line); what is left direct is the header, PPL_IDENT and the decode-reference lines.
-            ("src/exl3_ppl.rs", 4),
+            ("src/exl3_ppl/mod.rs", 4),
             ("src/exl3_regime.rs", 1), // S-B9-REL-QSAREGIME: the probe prints through one closure (not a served path)
             // MTPREPROBE2 W1.5: +2 = the two step_plain a-xcheck record-failure branches
         // (eprintln, matching the existing sibling site in finish()/xcheck drain).
         // S-B9-REL-SMALLFIXES item 1: 87 -> 86, the two MTP boot-banner println! became one
         // (the line is built by the testable mtp_banner()).
-        ("src/exl3_serve.rs", 106), // MTPAGREE1 (v0.7.7): 103 -> 106, the [df2-tp2] lane dump on the lockstep-failure arm, the [round-trace] line behind --round-trace and the [tp-ident] differing-digest line (failure / diagnostic paths; TOPKM1 hygiene, conscious update). Earlier: EXL27C: 88 -> 97 (--df2-trace gated dispatch/round prints; conscious update). +1 AGREE16: the width drill's line (test drill; one-shot since AGREE16B, right before a link abort)
-            ("src/exl3_tune.rs", 7),
+        ("src/exl3_serve/mod.rs", 3), // COPYPF1 (2026-11-12): 107 -> 108, the [round-trace] copy-prefill line behind --round-trace (diagnostic; the tree already read 107 at cb891dbe, drift not re-pinned then: re-pinned consciously). MTPAGREE1 (v0.7.7): 103 -> 106, the [df2-tp2] lane dump on the lockstep-failure arm, the [round-trace] line behind --round-trace and the [tp-ident] differing-digest line (failure / diagnostic paths; TOPKM1 hygiene, conscious update). Earlier: EXL27C: 88 -> 97 (--df2-trace gated dispatch/round prints; conscious update). +1 AGREE16: the width drill's line (test drill; one-shot since AGREE16B, right before a link abort)
+        // SPLIT1: src/exl3_serve.rs (108) became src/exl3_serve/*.rs. The rows below sum to 113, not 108: the old counter's brace match of one inline test module
+        // lost its string parity and swallowed the code to the end of the file (1 print, prime_batch_boot_log), and the 4 prints of three former inline test
+        // modules (the dprintln!/eprintln! lines of mtp_switch_tests / stop_info_tests / token_logprobs_tests) are now whole files, which the cfg(test)-mod stripper cannot skip.
+        ("src/exl3_serve/admission.rs", 2),
+        ("src/exl3_serve/builder.rs", 32),
+        ("src/exl3_serve/copy.rs", 2),
+        ("src/exl3_serve/df2.rs", 2),
+        ("src/exl3_serve/lockstep.rs", 3),
+        ("src/exl3_serve/mtp_round.rs", 5),
+        ("src/exl3_serve/mtp_switch_tests.rs", 1),
+        ("src/exl3_serve/prefill.rs", 3),
+        ("src/exl3_serve/scheduler.rs", 7),
+        ("src/exl3_serve/serve.rs", 13),
+        ("src/exl3_serve/spec_program.rs", 15),
+        ("src/exl3_serve/stop_info_tests.rs", 2),
+        ("src/exl3_serve/token_logprobs_tests.rs", 1),
+        ("src/exl3_serve/tp_serve.rs", 15),
+        ("src/exl3_serve/wp24_gate.rs", 7),
+            ("src/exl3_tune/boot.rs", 7), // SPLIT1 exl3_tune: the old row "src/exl3_tune.rs" (7 outside cfg(test)) moved with the boot code; tests.rs prints nothing
             ("src/exl3_wp27.rs", 8),
-            ("src/gptq.rs", 42),
-            ("src/gpu.rs", 323),
-            ("src/json_schema.rs", 1),
+            // SPLIT1: src/gptq.rs split into src/gptq/*.rs; the 42 prints are spread over the rows below.
+            ("src/gptq/calib.rs", 8),
+            ("src/gptq/dflash2.rs", 7),
+            ("src/gptq/igs.rs", 5),
+            ("src/gptq/io.rs", 2),
+            ("src/gptq/lmhead.rs", 4),
+            ("src/gptq/mod.rs", 4),
+            ("src/gptq/run.rs", 12),
+            ("src/gpu/attn_batch.rs", 5), // SPLIT1 gpu: the old row "src/gpu.rs" (323 outside cfg(test)) is split per file below; the moved test file shard_raw_real_tests.rs (no cfg(test) wrapper in its own file) is counted raw: +3, so the sum is 326
+            ("src/gpu/bandwidth.rs", 11),
+            ("src/gpu/bench_mtp.rs", 8),
+            ("src/gpu/bench_tree.rs", 4),
+            ("src/gpu/construct.rs", 3),
+            ("src/gpu/debug.rs", 7),
+            ("src/gpu/decode.rs", 2),
+            ("src/gpu/df2_capture.rs", 2),
+            ("src/gpu/e9.rs", 3),
+            ("src/gpu/forward_batch.rs", 2),
+            ("src/gpu/gates.rs", 1),
+            ("src/gpu/gemm_policy.rs", 1),
+            ("src/gpu/gemm_prefill.rs", 15),
+            ("src/gpu/generate.rs", 20),
+            ("src/gpu/gptq_gpu.rs", 1),
+            ("src/gpu/gptq_rot.rs", 1),
+            ("src/gpu/graphs.rs", 2),
+            ("src/gpu/launch_gemm.rs", 2),
+            ("src/gpu/load.rs", 22),
+            ("src/gpu/moe_batch.rs", 2),
+            ("src/gpu/mtp.rs", 5),
+            ("src/gpu/pool.rs", 28),
+            ("src/gpu/prefill.rs", 17),
+            ("src/gpu/probes_gemm.rs", 31),
+            ("src/gpu/probes_mxfp4.rs", 46),
+            ("src/gpu/probes_verify.rs", 27),
+            ("src/gpu/qsa.rs", 4),
+            ("src/gpu/qwen4_exp.rs", 2),
+            ("src/gpu/shard_ops.rs", 1),
+            ("src/gpu/shard_raw_real_tests.rs", 3),
+            ("src/gpu/tp_comm.rs", 5),
+            ("src/gpu/tp_shard.rs", 22),
+            ("src/gpu/verify.rs", 4),
+            ("src/gpu/w4a4.rs", 5),
+            ("src/gpu/xchain.rs", 12),
+            ("src/json_schema/mod.rs", 1),
             ("src/kernels.rs", 3),
             ("src/logq.rs", 3),
             // +3 (S-B9-REL-PRPORT4): the --prefill-interleave lines of --help (one-time banner class);
@@ -460,33 +605,51 @@ mod h5_direct_print_baseline_tests {
              // F9b: +1 the bare-tp info line (stderr, one line, once) // S-B9-REL-INTEG A1: +2 --help lines (the two TP drill flags, one line each)
             ("src/memwatch.rs", 3),
             ("src/model.rs", 3),
-            ("src/net.rs", 14), // +1 AGREE16: the width-refusal line of agree_ext (printed once, right before the link abort)
+            ("src/net/mod.rs", 14), // +1 AGREE16: the width-refusal line of agree_ext (printed once, right before the link abort)
             // S-B9-REL-FINALFIX F7 (2026-10-11): opts.rs = 2 direct prints.
             // 1 = the FATAL env-var rejection line at boot (served, pre-router, by design);
             // +1 = the #[ignore]d f7_differential long-run progress line (test-only).
-            ("src/opts.rs", 3), // F9: +1 the f9_differential count line, test code read with --nocapture
+            // SPLIT1 opts: the old row (3) is split per file: mod.rs = the FATAL env-var rejection line (1), tests.rs = the two
+            // test-code lines (the #[ignore]d f7_differential progress line and the f9_differential count line, 2; counted raw
+            // now that the test module is its own file). Sum unchanged: 3.
+            ("src/opts/mod.rs", 1),
+            ("src/opts/tests.rs", 2), // F9: +1 the f9_differential count line, test code read with --nocapture
             ("src/pp.rs", 14),
-            ("src/quant.rs", 5),
+            // SPLIT1: src/quant.rs split into src/quant/*.rs; the 5 prints are spread over the rows below (sum now 7: a former inline test module became a whole file and its prints count).
+            ("src/quant/q2_tests.rs", 2),
+            ("src/quant/recipe.rs", 5),
             ("src/qwen.rs", 7),
             // S-B9-REL-BENCHFIX2: +2 = the "[serve] sse keep-alive: ..." boot line (println!, the
             // one-time banner class, printed by http_listen before the socket exists) and the
             // FATAL line of fatal_option (direct by the H7 rule above: printed, then flush_and_exit)
-            ("src/server.rs", 21),
+            ("src/server/mod.rs", 3),
+            ("src/server/chat_params.rs", 2),
+            ("src/server/engine.rs", 1),
+            ("src/server/helpers.rs", 13),
+            ("src/server/reasoning.rs", 1),
+            ("src/server/sse.rs", 1),
             ("src/shard_plan.rs", 9), // FP4L (2026-10-29): +1, the `fp4l shard opens` line of the --probe-shard-plan FP4L arm (probe path). NAIVE: +1, the `owner mismatch` line of the Naive arm of --probe-shard-plan (probe path)
-            ("src/exl3_forward/fp4l_fwd.rs", 13), // FP4L: the --probe-fp4l-gpu verdict lines (probe path; the served FP4L paths log via rprintln!/drprintln!); +1 (2026-10-30) FP4L_GPU_PAIR
+            ("src/exl3_forward/fp4l_fwd/probe_gpu.rs", 13), // FP4L: the --probe-fp4l-gpu verdict lines (probe path; the served FP4L paths log via rprintln!/drprintln!); +1 (2026-10-30) FP4L_GPU_PAIR // SPLIT1 fp4l_fwd: all 13 prints sit in probe_gpu.rs
             ("src/fp4l/probe.rs", 29), // FP4L-0 (2026-10-29): the --probe-fp4l CPU receipts print to stdout (probe verdict lines; never a served path); +2 (2026-10-30): the FP4L_PROBE_FAIL / FP4L_GPU_FAIL exit lines of the probe dispatch (moved out of main.rs).
             // BASICS (owner 2026-11-02): the version line (stdout, or stderr under --print-config) and the
             // configuration block: boot banners, which stay direct by this module's rule.
             ("src/startup.rs", 3),
-            ("src/tokenizer.rs", 9),
+            // SPLIT1 tokenizer: the old row "src/tokenizer.rs" (9, the inline test module stripped by the counter) is split per file below; the moved test file tests.rs has no cfg(test) wrapper in its own file and is counted raw: +14 (the wp01 / template test prints). 2+4+3 = 9 outside tests.
+            ("src/tokenizer/jinja.rs", 2),
+            ("src/tokenizer/qwen.rs", 4),
+            ("src/tokenizer/stream.rs", 3),
+            ("src/tokenizer/tests.rs", 13),
             // S-B9-REL-SURFACE2 item 10: + 2, the ignored `tool_quote_probe` instrument (test code).
             // S-B9-REL-SURFACE2B R1: + 5, the count tables of `exhaustive_small_blocks` and the
             // timing line of the 1 MB test (test code, read with --nocapture).
             // S-B9-TOOLPARSE3: + 4 in tools.rs (the megabyte-block and shadow-cost instrument lines, test
             // code, read with --nocapture), and src/tools/cost.rs: 32, the measurement tables of the
             // cost model (ignored instruments and one pinned test, test code only).
-            ("src/tools.rs", 15),
-            ("src/tools/cost.rs", 32),
+            // SPLIT1 tools: the old row "src/tools.rs" (15) is split per file: 2 in calls.rs, 13 in the moved test module tests.rs (counted raw; the old brace-match did not strip `pub(in crate::tools) mod tests`, so the old 15 held them too).
+            ("src/tools/calls.rs", 2),
+            ("src/tools/tests.rs", 13),
+            // SPLIT1 tools/cost: the old row "src/tools/cost.rs" (32) is all in the moved test module; mod.rs has none.
+            ("src/tools/cost/tests.rs", 32),
             // S-B9-TOOLPARSE3 part B: the in-tree default-identity test and the frozen v0.7.3 parser it
             // compares with (test builds only; the frozen copy keeps the original's two alarm prints).
             ("src/tools/default_identity.rs", 3),
@@ -513,12 +676,38 @@ mod h5_direct_print_baseline_tests {
             // help lines above); re-pinned to the count of the MERGED tree (1547 + 33 + 15 = 1595, counted with this
             // module's counter on the merged main.rs before the build). The row below is OPERATIVE (find() takes the
             // first); naive-n05's original row is kept verbatim after it for the port's line-identity check.
-            ("src/main.rs", 1637), // SELFUPD: 1632 -> 1637 (--update/--no-update-check help + notices)
+            ("src/main.rs", 142), // NIGHT1 (2026-11-17): 1644 -> 1645, the FAIL-path eprintln of the --probe-gpu-wait dispatch (probe-only). V0710 port (2026-11-14): 1644 counted by this test on the merged tree (master 1637 + the fork's probe-only FAIL-path eprintlns). SELFUPD: 1632 -> 1637 (--update/--no-update-check help + notices). Fork history: ULTRA merge of lanewide-tp (2026-11-13): 1623 -> 1624, LANEWIDE-EXACT the FAIL-path eprintln of --probe-lane-wide-pin (probe-only). ULTRA merge (2026-11-13): PACKPF +1 and LANEWIDE-MID / XCLASS +2 (the FAIL-path eprintlns of --probe-mid-gemm and --probe-lane-wide-xclass, probe-only) = 1623. PACKPF (2026-11-13): 1620 -> 1621, the FAIL-path eprintln of --probe-exl3-packpf (probe-only). LANEWIDE-DRES (2026-11-12): 1619 -> 1620, the FAIL-path eprintln of --probe-dense-resident (probe-only). LANEWIDE (2026-11-12): 1618 -> 1619, the FAIL-path eprintln of the --probe-lane-wide-cost dispatch (probe-only). COPYPF1 (2026-11-12): 1617 -> 1618, the FAIL-path eprintln of the --probe-copy-prefill dispatch (probe-only; the tree already read 1617 at cb891dbe, drift not re-pinned then: re-pinned consciously). BASICS (2026-11-02): 1607 -> 1616, the --version print, the help's version line (+1: the old first line split in two), the --version help entry and six --quantize recipe-example help lines (one-time banner/help class; conscious update). PR#27-D3 (2026-10-30): +4 - 3 help lines + the FAIL-path eprintln in the probe dispatch (probe-only) // TOPKM1 hygiene (2026-10-28): 1595 -> 1603, the --quantize recipe help text (b612145e: +9/-1 println! in the usage printer; conscious update). Earlier: OPERATIVE at the port merge: 1547 + 33 (naive) + 15 (master) = 1595 on the merged tree. (A second, stale `src/main.rs` row of 1580 sat below this one; `find` takes the first row, so it never applied — removed.)
+            // SPLIT1 main: the old row "src/main.rs" (1645 outside cfg(test)) is split per file below (main.rs keeps `fn main`, the 142 above; the rest moved to src/cli/*, sum unchanged). The row comments here and below are the history of the whole former file.
+            ("src/cli/args.rs", 21),
+            ("src/cli/bench_basic.rs", 78),
+            ("src/cli/bench_df2.rs", 18),
+            ("src/cli/bench_mtp.rs", 56),
+            ("src/cli/dsv4_serve.rs", 43),
+            ("src/cli/dsv4_serve/dspark_driver.rs", 43),
+            ("src/cli/help.rs", 597),
+            ("src/cli/probe_df2_draft.rs", 53),
+            ("src/cli/probe_df2_misc.rs", 33),
+            ("src/cli/probe_df2_round.rs", 66),
+            ("src/cli/probe_dspark.rs", 83),
+            ("src/cli/probe_dspark_round.rs", 27),
+            ("src/cli/probe_tq.rs", 18),
+            ("src/cli/probes_dsv4.rs", 60),
+            ("src/cli/probes_serve.rs", 10),
+            ("src/cli/probes_state.rs", 34),
+            ("src/cli/quantize.rs", 36),
+            ("src/cli/replay.rs", 19),
+            ("src/cli/serve.rs", 54),
+            ("src/cli/stq.rs", 19),
+            ("src/cli/tp_cluster.rs", 50),
+            ("src/cli/tp_heads.rs", 55),
+            ("src/cli/tp_serve_trunk.rs", 30),
         ("src/self_update.rs", 23), // SELFUPD: updater is an offline-exit path (no serving), direct prints intended
             // NAIVE history of src/main.rs: +33, the --probe-naive-* dispatches' NAIVE_*_FAIL exit-path lines, their usage expect()s' siblings, and the head/node Naive TP boot lines (probe/boot classes)
             // Conscious updates, not conversion misses.
         ("src/tp.rs", 13),
-            ("src/tp_bench.rs", 75),
+            ("src/tp_bench/mod.rs", 37), // SPLIT1: the former tp_bench.rs row (75) now spans these three files
+            ("src/tp_bench/nway.rs", 28),
+            ("src/tp_bench/reduce_w4.rs", 10),
             ("src/w4a4.rs", 1),
             ("src/wp24.rs", 8),
             // NAIVE (the Naive-N0.5-Flash family tree, src/naive/*, ported from the naive-n05 line 2026-10-21): the family's
@@ -531,9 +720,18 @@ mod h5_direct_print_baseline_tests {
             ("src/naive/drafter_gpu.rs", 12),
             ("src/naive/frac.rs", 2),
             ("src/naive/gpu.rs", 23),
-            ("src/naive/model.rs", 33), // LOADFAST (f2571038): the per-layer routed up_proj scale println! removed, the layer-loaded line is a dprintln! (34 -> 33; TOPKM1 hygiene, conscious update)
+            // SPLIT1: src/naive/model.rs split into src/naive/model/*.rs; the 33 prints are spread over the rows below (sum now 34: a former inline test module became a whole file and its prints count).
+            // (old row comment: // LOADFAST (f2571038): the per-layer routed up_proj scale println! removed, the layer-loaded line is a dprintln! (34 -> 33; TOPKM1 hygiene, conscious update))
+            ("src/naive/model/load.rs", 3),
+            ("src/naive/model/probes.rs", 30),
+            ("src/naive/model/t0c_tests.rs", 1),
             ("src/naive/pack.rs", 11),
-            ("src/naive/serve.rs", 68),
+            // SPLIT1: src/naive/serve.rs split into src/naive/serve/*.rs; the 68 prints are spread over the rows below.
+            ("src/naive/serve/engine.rs", 6),
+            ("src/naive/serve/flags.rs", 2),
+            ("src/naive/serve/head.rs", 11),
+            ("src/naive/serve/loops.rs", 5),
+            ("src/naive/serve/probes.rs", 44),
             ("src/naive/shard.rs", 3),
             ("src/naive/stage.rs", 10), // LOADFAST (f2571038): the staged-layer loader's cache/stage progress + warning lines, shipped in v0.7.6 without a baseline row (TOPKM1 hygiene; conscious update)
             ("src/naive/tp.rs", 7),

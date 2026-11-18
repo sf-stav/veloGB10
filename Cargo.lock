@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "gb10_inference"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "anyhow",
  "async-stream",

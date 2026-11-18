@@ -1,3 +1,60 @@
+## v0.7.10 — source-tree split, Qwen3.6 vision-tower fix, template compatibility
+
+A maintenance release. The large source files that had grown monolithic over the
+first ten releases are split into focused modules (547 Rust files where there
+were 129; the kernel sources are sectioned per component under `kernels/*/` and
+`native/net_shim/`). No behaviour change is intended from the split itself; two
+real fixes and two community issues ship with it.
+
+**Thanks to [@gabriel-v](https://github.com/gabriel-v)** for issue
+[#40](https://github.com/sf-stav/veloGB10/issues/40) — Qwen3.6-35B-A3B EXL3 packs
+without `vision_tower_bf16.safetensors` decoded their vision tower at HALF the
+real bit width (a regression from v0.7.6's width handling), busting vision. The
+tower now decodes at its true width; verified against the pack's own bf16 q/k/v
+rows and the original tower (worst cosine 0.9998 across all 27 blocks and every
+merger matrix).
+
+**Thanks to [@AbsolomBane](https://github.com/AbsolomBane)** for issue
+[#41](https://github.com/sf-stav/veloGB10/issues/41) — pooled QSA key planes were
+allocated and copied at the CEIL lane stride while the kernels read the FLOOR
+stride, so a cross-lane prefix-pool restore shifted pooled keys. Both sides now
+agree at the kernels' lane stride.
+
+**Thanks to [@ablake4427](https://github.com/ablake4427)** for issue
+[#39](https://github.com/sf-stav/veloGB10/issues/39) — a v0.7.9 regression: the
+TP head's new pack-width preflight opened every pack as an EXL3 pack, and an
+FP4-Local pack in NVIDIA's ModelOpt layout has no `quantization_config.json`,
+so v0.7.9 could not start FP4-Local at TP=2 or TP=4 at all (the stock pack
+included). An FP4-Local pack now goes through its own format check at that
+point; reproduced on a stock-layout pack at TP=2 across two GB10s with the
+reporter's flags.
+
+Also in this release:
+
+- **Qwen3.6 chat templates now compile.** The family's templates carry HF's
+  `{% generation %}` training statements, which our template engine rejected —
+  the server silently fell back to the legacy manual template, losing
+  `chat_template_kwargs`/`enable_thinking` control. Training-only tags are now
+  stripped at load (they are loss-mask spans, inert for inference).
+- The public test suite no longer fails on the lab-only golden fixtures: tests
+  that need `tests/` fixtures skip with a note when the fixture is absent.
+
+### What this build does NOT do for the posture
+
+Read this first. The posture is `--max-seq-len 262144 --max-batch 4 --max-tokens
+65536 --prefix-cache on --mtp=auto`, thinking on, 1–4 concurrent streamed
+requests.
+
+- **The source split is byte-neutral by intent but is a big mechanical change.**
+  The release suite is green (1223 tests) and the curated tree builds clean, but
+  treat the first days on your workload as the real soak.
+- **Issue #40's fix is EXL3 vision only.** BF16/NVFP4 vision towers were not
+  affected and are unchanged.
+- **Issue #41's fix touches the EXL3 pooled-QSA restore path at TP>1 only.**
+  TP=1 servers never restore pooled keys cross-lane.
+- Nothing in this release changes sampler defaults, speculation behaviour, or
+  the FP4/NVFP4 numerics.
+
 ## v0.7.9 — NVIDIA FP4-Local support, EXL3 long-context attention, prefix pool, and twelve community issues
 
 The largest release since v0.7.4. It adds a second model family (NVIDIA's

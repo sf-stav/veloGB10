@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn single_stage_k2_is_in_the_embedded_ptx() {
         for k in [SINGLE_K2, SINGLE_K2_GPU, SINGLE_K1_MB] {
-            assert!(include_str!("../../kernels/gpu_batch.cu").contains(&format!("void {k}(")), "{k} not defined in gpu_batch.cu");
+            assert!(src_text!("kernels/gpu_batch").contains(&format!("void {k}(")), "{k} not defined in gpu_batch.cu");
             assert!(crate::ptx_embed::GPU_BATCH.contains(&format!(".entry {k}(")), "{k} missing from the embedded gpu_batch.ptx");
         }
     }

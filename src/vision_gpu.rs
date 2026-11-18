@@ -557,7 +557,7 @@ mod drill_tests {
     /// (The behaviour itself is tested on a device in tests/vision_capture_race_test.rs.)
     #[test]
     fn the_request_path_names_no_legacy_stream_helper() {
-        let src = include_str!("vision_gpu.rs");
+        let src = src_text!("vision_gpu");
         let forbidden: Vec<String> = [("htod_sync", "_copy"), ("dtoh_sync", "_copy"), ("alloc_", "zeros"), ("memset_", "zeros"),
                                       ("dev.synchronize", "()"), ("htod_", "copy("), ("dtoh_", "copy("), ("dev.alloc", "("), ("memcpy_htod_", "sync"),
                                       ("memcpy_dtoh_", "sync"), ("malloc_", "sync"), ("free_", "sync"),

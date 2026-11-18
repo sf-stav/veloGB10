@@ -409,7 +409,7 @@ mod fix1_tests {
     /// #76 class (stats accumulated, /metrics blind) by losing its tel:: call.
     #[test]
     fn every_spec_lane_step_publishes_its_window() {
-        let src = include_str!("batch.rs");
+        let src = src_text!("batch");
         for marker in ["df2_stat_published", "dspark_stat_published", "df2_tree_stat_published"] {
             assert!(src.contains(marker), "batch.rs lost the watermark publish field {marker}");
         }
