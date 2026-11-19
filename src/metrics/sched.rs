@@ -112,6 +112,16 @@ pub fn kv_spill_hit(tokens: u64) {
     KV_SPILL_SAVED.fetch_add(tokens, Relaxed);
 }
 pub fn kv_spill_miss_recompute() { KV_SPILL_MISSES.fetch_add(1, Relaxed); }
+// VISCACHE: vision-tower embed cache (--vision-embed-cache-mb) — bytes held now, images served
+// from it, images that ran the tower, and entries shifted out by the LRU cap.
+pub static VISION_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static VISION_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static VISION_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+pub static VISION_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+pub fn vision_cache_hit() { VISION_CACHE_HITS.fetch_add(1, Relaxed); }
+pub fn vision_cache_miss() { VISION_CACHE_MISSES.fetch_add(1, Relaxed); }
+pub fn vision_cache_evictions(n: u64) { VISION_CACHE_EVICTIONS.fetch_add(n, Relaxed); }
+pub fn vision_cache_bytes(n: u64) { VISION_CACHE_BYTES.store(n, Relaxed); }
 // PFXPOOL: the prefix pool (prompt states kept in memory across lanes, --prefix-pool-gb).
 pub static PFX_POOL_CAP: AtomicU64 = AtomicU64::new(0);
 pub static PFX_POOL_BYTES: AtomicU64 = AtomicU64::new(0);

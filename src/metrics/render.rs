@@ -417,6 +417,11 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str(&format!("velogb10_kv_spill_restore_peer_miss_total {}\n", KV_SPILL_RESTORE_PEER_MISSES.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_bytes {}\n", KV_SPILL_BYTES.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_tokens_recompute_saved_total {}\n", KV_SPILL_SAVED.load(Relaxed)));
+    o.push_str("# HELP velogb10_vision_cache vision-tower embed cache (--vision-embed-cache-mb): bytes = merged embeddings held now; hits = images served from the cache (the tower never ran for them); misses = images that ran the tower and were inserted; evictions = images shifted out by the LRU cap\n");
+    o.push_str(&format!("velogb10_vision_cache_bytes {}\n", VISION_CACHE_BYTES.load(Relaxed)));
+    o.push_str(&format!("velogb10_vision_cache_hits_total {}\n", VISION_CACHE_HITS.load(Relaxed)));
+    o.push_str(&format!("velogb10_vision_cache_misses_total {}\n", VISION_CACHE_MISSES.load(Relaxed)));
+    o.push_str(&format!("velogb10_vision_cache_evictions_total {}\n", VISION_CACHE_EVICTIONS.load(Relaxed)));
     let (steps, drafts, accepted, emitted) = crate::tel::spec_totals();
     o.push_str("# HELP velogb10_spec_draft_tokens_total Speculative draft tokens proposed (MTP / DFlash2 / DFlash).\n# TYPE velogb10_spec_draft_tokens_total counter\n");
     o.push_str(&format!("velogb10_spec_draft_tokens_total {drafts}\n"));
