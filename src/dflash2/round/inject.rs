@@ -282,7 +282,7 @@ impl Df2Round {
                  d(&wrow_dev), ring_stride() as i32, nkv as i32, head_dim() as i32,
                  n as i32, d(&slot_dev)));
         }
-        self.dev.synchronize()?;
+        self.dsync()?;
         self.nprev = pos_start + n;
         Ok(())
     }

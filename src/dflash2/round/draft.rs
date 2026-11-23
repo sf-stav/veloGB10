@@ -4,6 +4,17 @@
 use super::*;
 
 impl Df2Round {
+    /// NIGHT1 follow-up: the DFlash2 twin of `FwdModel::dsync` — wait for this round's stream through `host_wait`
+    /// (`--gpu-wait`), THEN the original device synchronize, unchanged. The round's kernels and graph replays run on
+    /// `self.stream`, so the driver call that follows only waits for whatever is still queued elsewhere. A stream
+    /// error is reported by the first wait instead of by the synchronize. `#[track_caller]`: each call site keeps its
+    /// own prediction.
+    #[track_caller]
+    pub(crate) fn dsync(&self) -> std::result::Result<(), cudarc::driver::DriverError> {
+        crate::host_wait::stream_wait(self.stream.stream)?;
+        self.dev.synchronize()
+    }
+
     /// One draft round. Requires `nprev ≥ 1`. `window` = the attention band (2048; the
     /// negative control passes a huge value). `flip_unary` negates the unary term inside the
     /// walk (the selector sign-flip control). `ctl_dual_write` additionally writes the block
@@ -132,7 +143,7 @@ impl Df2Round {
         self.anchor_dev = anchor_save;
         r?;
         // ---- read back ONLY the 7 tokens ----
-        self.dev.synchronize()?;
+        self.dsync()?;
         let tokens: Vec<u32> = self.dev.dtoh_sync_copy(&self.walk_tokens)?.to_vec();
         Ok(tokens)
     }
@@ -234,7 +245,7 @@ impl Df2Round {
         self.ntot_dev = ntot_save;
         self.anchor_dev = anchor_save;
         r?;
-        self.dev.synchronize()?;
+        self.dsync()?;
         let out_tok: Vec<u32> = self.dev.dtoh_sync_copy(&self.walk_out_tok)?.to_vec();
         let out_q: Vec<f32> = self.dev.dtoh_sync_copy(&self.walk_out_q)?.to_vec();
         let tokens: Vec<u32> = out_tok[..l_].to_vec();
@@ -388,11 +399,11 @@ impl Df2Round {
         if tr { eprintln!("[round-trace] h2d inputs: {:.3} ms", t.elapsed().as_secs_f32() * 1e3); t = std::time::Instant::now(); }
         self.gather_rope(&self.blk.cos8, &self.blk.sin8, d(&self.pos_blk), block());
         if tr { eprintln!("[round-trace] gather_rope launch: {:.3} ms", t.elapsed().as_secs_f32() * 1e3); t = std::time::Instant::now(); }
-        self.dev.synchronize()?;
+        self.dsync()?;
         if tr { eprintln!("[round-trace] pre-replay sync: {:.3} ms", t.elapsed().as_secs_f32() * 1e3); t = std::time::Instant::now(); }
         g.launch();
         if tr { eprintln!("[round-trace] graph launch (async): {:.3} ms", t.elapsed().as_secs_f32() * 1e3); t = std::time::Instant::now(); }
-        self.dev.synchronize()?;
+        self.dsync()?;
         if tr { eprintln!("[round-trace] replay wait: {:.3} ms", t.elapsed().as_secs_f32() * 1e3); t = std::time::Instant::now(); }
         let tokens: Vec<u32> = self.dev.dtoh_sync_copy(&self.walk_tokens)?.to_vec();
         if tr { eprintln!("[round-trace] tokens dtoh: {:.3} ms", t.elapsed().as_secs_f32() * 1e3); }
