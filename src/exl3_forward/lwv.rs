@@ -606,6 +606,9 @@ impl FwdModel {
             xqlaunch!(l, "xq_sample_rows", (r as u32, 1, 1), (1024, 1, 1), 0, (&mut wb.argmax, &wb.logits, v as i32, &wb.samp))?;
         }
         if samp_live {
+            // NIGHT1 follow-up: this blocking NULL-stream upload would wait for the whole packed verify above inside the
+            // driver (a spin under --gpu-wait hybrid); wait for the compute stream through host_wait first, then upload.
+            self.dsync()?;
             // greedy staging for the next round (a later all-greedy round uploads nothing)
             self.dev.htod_sync_copy_into(&vec![0u32; r * 8], &mut wb.samp.slice_mut(0..r * 8))?;
         }

@@ -503,11 +503,13 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         // in the kernel, matching this pack's moe_intermediate_size).
         self.dsync()?;
         psc.moerows = self.dev.htod_sync_copy(&[r as i32])?;
-        xqlaunch!(l, "xq_moe_gate_mul", (((r * mi) as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
-                 (&mut psc.din, &psc.ygu, mi as i64, &psc.moerows))?;
-        // down side (din is already compact: row_tok pass uses the IDENTITY map)
+        // down side (din is already compact: row_tok pass uses the IDENTITY map). NIGHT1 follow-up: uploaded here, with
+        // the stream drained, rather than after the gate-mul launch, where the blocking upload waited for that kernel
+        // inside the driver.
         let ident: Vec<i32> = (0..r as i32).collect();
         let d_ident = self.dev.htod_sync_copy(&ident)?;
+        xqlaunch!(l, "xq_moe_gate_mul", (((r * mi) as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
+                 (&mut psc.din, &psc.ygu, mi as i64, &psc.moerows))?;
         xqlaunch!(l, "xq_had_suh_rows", ((r * (mi / 128)) as u32, 1, 1), (32, 1, 1), 0,
                  (&psc.din, &moe.suh_d, &psc.idxmap, &d_ident, &psc.row_eidx, &mut psc.xhd, r as i32, mi as i32))?;
         {

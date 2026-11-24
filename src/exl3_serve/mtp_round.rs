@@ -196,7 +196,7 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
             let ctrl_new = af.ctrl != 2;
             let tc = if ctrl_new {
                 self.model.mtp_plain_prime(&mut self.sc, head, s, b, p, tap_row)?;
-                self.model.dev().synchronize()?; // the control's plain-cost timing stays the step alone
+                self.model.dsync()?; // the control's plain-cost timing stays the step alone (NIGHT1 follow-up: through host_wait)
                 std::time::Instant::now()
             } else {
                 t0
