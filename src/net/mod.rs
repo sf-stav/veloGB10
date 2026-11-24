@@ -60,6 +60,8 @@ extern "C" {
     fn net_wait_sleeps() -> u64;
     /// CPUIDLE: the proxy idle tier (--proxy-idle-us) and its counters (all proxies, process-wide).
     fn net_set_proxy_idle(us: u64);
+    /// --proxy-owed-wait: 1 = park the owed wait in WFET (FEAT_WFxT), 0 = spin (the default).
+    fn net_set_proxy_owed(wfet: c_int);
     fn net_proxy_parks() -> u64;
     fn net_proxy_park_ns() -> u64;
     fn net_bench_cq_hold(c: *mut NetCtx, hold: u32, hold_us: u32) -> c_int;
@@ -720,9 +722,12 @@ fn push_net_opts() {
     // CPUIDLE: --proxy-idle-us. NIGHT1 (2026-11-16, owner's overheating plan + jetspark's report that the proxy held its
     // core through the whole generation): default 300 us, so the proxy also parks in the gaps INSIDE a request, not only
     // on an idle server. TP=4 Flash-Next 3.05bpw greedy decode, 4 boots ABAB: 300 us 109.3 / 110.2 tok/s vs 20000 us
-    // 110.3 / 110.3 (no cost); ~10,400 parks per run instead of ~180. 0 = always spin (the pre-CPUIDLE behaviour).
+    // 110.3 / 110.3 (no cost); ~10,400 parks per run instead of ~180. 0 = the debt-free idle tier is off (the pre-CPUIDLE behaviour; --proxy-owed-wait is separate).
     let idle_us: u64 = opts::var(opt!("proxy-idle-us")).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(PROXY_IDLE_US_DEFAULT);
     unsafe { net_set_proxy_idle(idle_us) }
+    // --proxy-owed-wait (opt-in): park the proxy while a posted epoch is unmatched (see native/net_shim, TP_OWED_SPIN_NS).
+    let owed_wfet = opts::var(opt!("proxy-owed-wait")).map_or(false, |v| v.trim() == "wfet") as c_int;
+    unsafe { net_set_proxy_owed(owed_wfet) }
     unsafe { net_set_opts(spin, tail, oneshot, diag); net_set_probe(probe);
               net_set_abort_fd(HEAD_LIVENESS_FD.load(std::sync::atomic::Ordering::Relaxed)) }
 }

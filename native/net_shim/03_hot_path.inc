@@ -460,7 +460,7 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
     // threshold works. Idle periods have nothing outstanding and never engage it.
     uint64_t wdog_since = 0;       // when the current outstanding-debt window opened (0 = none)
     unsigned  wdog_ticks = 0;      // spin counter so the clock is read rarely
-    ProxyIdle idle; proxy_idle_init(&idle);   // CPUIDLE: park after --proxy-idle-us with nothing owed
+    ProxyIdle idle; proxy_idle_init(&idle, c->recv_gpu ? 1 : 2);   // CPUIDLE: park after --proxy-idle-us with nothing owed; owed park on the line the wait needs
 
     while (!c->aborted && !__atomic_load_n(flagp(c, TP_F_ABORT), __ATOMIC_ACQUIRE)) {
         int did_work = 0;
@@ -661,8 +661,8 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
         }
         }
 
-        // plain load + yield (I6) while work flows or a peer owes us an epoch; WFE once quiet (CPUIDLE)
-        if (did_work) proxy_idle_step(&idle, 1, 0, NULL, 0);
+        // plain load + yield (I6) while work flows; owed: spin, or with --proxy-owed-wait wfet a short spin then WFET parks on the awaited line; WFE once quiet (CPUIDLE)
+        if (did_work) proxy_idle_step(&idle, 1, 0, NULL, 0, NULL, 0);
         else {
             // World-2 dual-rail abort mirror (parent -> child): checked only when idle every 1024 polls
             // (0 loads when did_work == 1 or c->parent == NULL).
@@ -673,7 +673,9 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
             uint64_t rxd = c->recv_gpu ? *flagp(c, TP_F_RX_DONE) : 0;   // the watchdog's debt, recomputed
             uint64_t m = c->recv_gpu ? (next_release > rxd + 1 ? next_release : rxd + 1)
                                      : (next_release > rxd ? next_release : rxd);
-            proxy_idle_step(&idle, 0, next_to_post > m, flagp(c, TP_F_GPU_READY), next_to_post);
+            proxy_idle_step(&idle, 0, next_to_post > m, flagp(c, TP_F_GPU_READY), next_to_post,
+                            c->recv_gpu ? flagp(c, TP_F_GPU_READY) : flagp(c, TP_F_PEER_COMMITTED),
+                            c->recv_gpu ? next_to_post : next_release);   // owed: v2 waits for the GPU's next post, v1 for the peer's commit
         }
     }
     if (idle.parked) __atomic_fetch_add(&g_proxy_park_ns, now_ns() - idle.park_t0, __ATOMIC_RELAXED);
@@ -709,7 +711,7 @@ static void net_proxy_loop_nway(NetCtx* c, int core) {
     // every posted epoch is owed by SOME peer and the round schedule is symmetric across ranks.
     uint64_t wdog_since = 0;
     unsigned  wdog_ticks = 0;
-    ProxyIdle idle; proxy_idle_init(&idle);   // CPUIDLE: park after --proxy-idle-us with nothing owed
+    ProxyIdle idle; proxy_idle_init(&idle, c->recv_gpu ? 1 : 0);   // CPUIDLE: park after --proxy-idle-us with nothing owed; owed park only with GPU receive
 
     while (!c->aborted && !__atomic_load_n(flagp(c, TP_F_ABORT), __ATOMIC_ACQUIRE)) {
         int did_work = 0;
@@ -893,12 +895,13 @@ recv_out:
         }
 
         // CPUIDLE: same tier as world==2 (the global debt, as the watchdog computes it)
-        if (did_work) proxy_idle_step(&idle, 1, 0, NULL, 0);
+        if (did_work) proxy_idle_step(&idle, 1, 0, NULL, 0, NULL, 0);
         else {
             uint64_t rxd = c->recv_gpu ? *flagp(c, TP_F_RX_DONE) : 0;
             uint64_t m = c->recv_gpu ? (next_release > rxd + 1 ? next_release : rxd + 1)
                                      : (next_release > rxd ? next_release : rxd);
-            proxy_idle_step(&idle, 0, next_to_post > m, flagp(c, TP_F_GPU_READY), next_to_post);
+            proxy_idle_step(&idle, 0, next_to_post > m, flagp(c, TP_F_GPU_READY), next_to_post,
+                            c->recv_gpu ? flagp(c, TP_F_GPU_READY) : NULL, next_to_post);   // owed: v2 waits for the GPU's next post; the v1 commits land on per-peer lines (spin)
         }
     }
     if (idle.parked) __atomic_fetch_add(&g_proxy_park_ns, now_ns() - idle.park_t0, __ATOMIC_RELAXED);

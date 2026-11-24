@@ -104,21 +104,82 @@ uint64_t net_wait_sleeps(void) { return __atomic_load_n(&g_tp_wait_sleeps, __ATO
  * only: no value, order or protocol change. The watched load is a load-exclusive (no store, no RMW: I6
  * holds). Without the event stream (HWCAP_EVTSTRM absent) the tier sleeps 50 us per poll instead.
  * NIGHT1 (2026-11-16): ON by default at 300 us (set from Rust: PROXY_IDLE_US_DEFAULT), so the proxy also parks in the
- * gaps inside a request; --proxy-idle-us 0 = never park (the pre-CPUIDLE spin). */
+ * gaps inside a request; --proxy-idle-us 0 = this debt-free idle tier is off (the pre-CPUIDLE spin; --proxy-owed-wait is separate). */
 #define TP_PROXY_IDLE_RECOMMENDED_US 300ull     /* the default (NIGHT1) */
 static unsigned long long g_opt_proxy_idle_us = 0;
 static uint64_t g_proxy_parks = 0;     /* entries into the idle tier (all proxies) */
 static uint64_t g_proxy_park_ns = 0;   /* time spent in it */
 static int g_proxy_wfe = -1;           /* -1 = unresolved, 1 = WFE + event stream, 0 = 50 us sleeps */
 void net_set_proxy_idle(unsigned long long us) { g_opt_proxy_idle_us = us; }
+static int g_opt_proxy_owed = 0;       /* --proxy-owed-wait: 0 = spin (default), 1 = wfet (see TP_OWED_SPIN_NS) */
+void net_set_proxy_owed(int wfet) { g_opt_proxy_owed = wfet ? 1 : 0; }
 uint64_t net_proxy_parks(void) { return __atomic_load_n(&g_proxy_parks, __ATOMIC_RELAXED); }
 uint64_t net_proxy_park_ns(void) { return __atomic_load_n(&g_proxy_park_ns, __ATOMIC_RELAXED); }
 
 #define TP_PROXY_DEEP_NS   1000000000ull   /* after 1 s parked: real sleeps instead of WFE */
 #define TP_PROXY_SLEEP_NS  250000ull        /* the deep tier's sleep (<= ~0.25 ms on the next request) */
-typedef struct { uint64_t idle_ns, idle_since, park_t0, park_start, win_t0; unsigned ticks, wakes; int parked; } ProxyIdle;
 
-static void proxy_idle_init(ProxyIdle* s) {
+/* --proxy-owed-wait wfet (opt-in; default spin). The tier above parks only with NOTHING owed, so between the
+ * collectives of a request, while a posted epoch waits for its match, the proxy still spins its pinned core. With
+ * this option and FEAT_WFxT (HWCAP2_WFXT: the X925/A725 of GB10), a proxy that is owed an epoch and has had no work for
+ * TP_OWED_SPIN_NS parks in WFET, with the exclusive monitor armed on the line it prefers to be woken by and an absolute
+ * deadline TP_OWED_PARK_NS ahead, then runs the loop once more:
+ *   - CPU receive (world 2, v1): the PEER_COMMITTED line, written by the NIC (the peer's inline commit);
+ *   - GPU receive (v2, any world): the GPU_READY line; with no receive stage, the proxy's next job is the GPU's post.
+ * The watch is a wake preference, not the only dependency: everything else the loop services (the CQ drain and so
+ * tx_retired, the agree token, the exchange handoff, the abort flags, the watchdog, a GPU post while the loop waits
+ * on the NIC) is polled on the following passes; the deadline bounds one WFET, not their service. Timing only: no value,
+ * order or protocol change; the load-exclusive is a load (no store, no RMW: I6 holds). The N-way CPU receive (its
+ * commits land on per-peer lines) keeps spinning. Both times are untuned.
+ * Measured on two DGX Spark (GB10, ConnectX-7 RoCE v2, 8-byte inline RDMA writes into registered host memory, plain
+ * and cudaHostAlloc): a NIC write wakes an LDXR-armed WFET-parked X925 core with ping-pong RTT p50 3.46 us vs 3.23-3.34
+ * us spinning, p99 3.73-3.78 vs 3.66-3.73; unarmed (plain LDR) 63-65 / 130-133 us, i.e. the timer event stream.
+ * A GPU store over NVLink-C2C wakes it the same way (p50 1.50 vs 1.43 us spinning). */
+#define TP_OWED_SPIN_NS    5000ull   /* spin this long after the last work before the first owed park */
+#define TP_OWED_PARK_NS   10000ull   /* each WFET's counter deadline: bounds one park, not the service of off-line work */
+
+typedef struct { uint64_t idle_ns, idle_since, park_t0, park_start, win_t0; unsigned ticks, wakes; int parked;
+                 /* --proxy-owed-wait wfet (aarch64 + FEAT_WFxT only) */
+                 uint64_t owed_t0, owed_spin_ticks, owed_park_ticks; int owed_park; } ProxyIdle;
+
+#if defined(__aarch64__)
+#ifndef HWCAP2_WFXT
+#define HWCAP2_WFXT (1UL << 31)
+#endif
+static inline uint64_t proxy_cntvct(void) {
+    uint64_t t;
+    __asm__ __volatile__("isb\n\tmrs %0, cntvct_el0" : "=r"(t) :: "memory");
+    return t;
+}
+static inline uint64_t proxy_cntfrq(void) {
+    uint64_t f;
+    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(f));
+    return f;
+}
+/* Park until *p may have reached `seen`, an event arrives, or CNTVCT reaches `deadline`: the kernel's __cmpwait
+ * sequence with WFET. SEVL+WFE consumes any pending event, LDXR arms the monitor on *p's line, and WFET waits only
+ * while the value is still below `seen`. Returns early and spuriously by design; the caller re-reads.
+ * Requires HWCAP2_WFXT. */
+static inline void proxy_wait_ge(volatile uint64_t* p, uint64_t seen, uint64_t deadline) {
+    uint64_t tmp;
+    __asm__ __volatile__("mov x9, %[dl]\n\t"
+                         "sevl\n\t"
+                         "wfe\n\t"
+                         "ldxr %[tmp], %[v]\n\t"
+                         "cmp %[tmp], %[seen]\n\t"
+                         "b.hs 1f\n\t"
+                         ".inst 0xd5031009\n"    /* wfet x9 */
+                         "1:"
+                         : [tmp] "=&r"(tmp)
+                         : [v] "Q"(*p), [seen] "r"(seen), [dl] "r"(deadline)
+                         : "x9", "cc", "memory");
+    (void)tmp;
+}
+#endif
+
+// `owed_kind`: what this ctx's owed wait is waiting for. 0 = no owed parking (the N-way CPU receive, whose
+// commits land on per-peer lines), 1 = the GPU_READY line (GPU receive), 2 = the PEER_COMMITTED line (world 2, CPU receive).
+static void proxy_idle_init(ProxyIdle* s, int owed_kind) {
     memset(s, 0, sizeof(*s));
     s->idle_ns = (uint64_t)g_opt_proxy_idle_us * 1000ull;
     if (g_proxy_wfe < 0) {
@@ -135,23 +196,60 @@ static void proxy_idle_init(ProxyIdle* s) {
                 g_proxy_wfe ? "WFE, <= 100 us wake" : "50 us sleeps, no event stream",
                 g_opt_proxy_idle_us == TP_PROXY_IDLE_RECOMMENDED_US ? " (--proxy-idle-us default)" : " (--proxy-idle-us)");
     else
-        fprintf(stderr, "[net] proxy idle tier: off (--proxy-idle-us 0): the proxy spins for the whole session\n");
+        fprintf(stderr, "[net] proxy idle tier: off (--proxy-idle-us 0): the debt-free idle tier is disabled\n");
+    int wfxt = 0;
+#if defined(__aarch64__)
+    wfxt = (getauxval(AT_HWCAP2) & HWCAP2_WFXT) != 0;
+    if (g_opt_proxy_owed && owed_kind && wfxt) {
+        uint64_t hz = proxy_cntfrq();
+        s->owed_spin_ticks = hz * TP_OWED_SPIN_NS / 1000000000ull;
+        s->owed_park_ticks = hz * TP_OWED_PARK_NS / 1000000000ull;
+        if (!s->owed_park_ticks) s->owed_park_ticks = 1;
+        s->owed_park = 1;
+    }
+#endif
+    if (s->owed_park)
+        fprintf(stderr, "[net] proxy owed wait: spin %llu us, then WFET parks of <= %llu us on the %s line (--proxy-owed-wait wfet)\n",
+                (unsigned long long)(TP_OWED_SPIN_NS / 1000ull), (unsigned long long)(TP_OWED_PARK_NS / 1000ull),
+                owed_kind == 2 ? "peer-commit (NIC-written)" : "GPU_READY");
+    else
+        fprintf(stderr, "[net] proxy owed wait: spin (%s)\n",
+                !g_opt_proxy_owed ? "--proxy-owed-wait spin, the default" :
+                !owed_kind ? "N-way CPU receive: per-peer commit lines" : !wfxt ? "no FEAT_WFxT" : "?");
 }
 
+#if defined(__aarch64__)
+// The owed wait of one loop iteration with nothing done: spin for TP_OWED_SPIN_NS after the last work, then park on `w`
+// until it may have reached `seen`, an event arrives, or the deadline. The loop re-reads everything after it returns.
+static inline void proxy_owed_park(ProxyIdle* s, volatile uint64_t* w, uint64_t seen) {
+    uint64_t t = proxy_cntvct();
+    if (!s->owed_t0) s->owed_t0 = t;
+    if (t - s->owed_t0 < s->owed_spin_ticks) { cpu_relax(); return; }
+    proxy_wait_ge(w, seen, t + s->owed_park_ticks);
+}
+#endif
+
 // One loop iteration's ending. `did_work` resets the tier; `owed` (posted epochs the peers have not
-// matched) keeps the critical-path spin; `watch`/`seen`: the GPU_READY line and the epoch the loop waits
+// matched) keeps the critical-path wait: a spin, or with --proxy-owed-wait wfet the owed park on `owed_watch` until it
+// reaches `owed_seen` (NULL = spin); `watch`/`seen`: the GPU_READY line and the epoch the loop waits
 // for — a value already >= seen means work is pending, so never sleep on it.
 static inline void proxy_idle_step(ProxyIdle* s, int did_work, int owed, volatile uint64_t* watch,
-                                   uint64_t seen) {
+                                   uint64_t seen, volatile uint64_t* owed_watch, uint64_t owed_seen) {
     if (did_work || owed) {
         if (s->parked) {
             __atomic_fetch_add(&g_proxy_park_ns, now_ns() - s->park_t0, __ATOMIC_RELAXED);
             s->parked = 0;
         }
         s->idle_since = 0; s->ticks = 0;
-        if (!did_work) cpu_relax();
+        if (did_work) { s->owed_t0 = 0; return; }
+#if defined(__aarch64__)
+        if (s->owed_park && owed_watch) { proxy_owed_park(s, owed_watch, owed_seen); return; }
+#endif
+        (void)owed_watch; (void)owed_seen;
+        cpu_relax();
         return;
     }
+    s->owed_t0 = 0;
     if (!s->idle_ns) { cpu_relax(); return; }
     if (!s->parked) {
         // Read the clock only every 1024 idle spins: the first idle iterations after work stay a plain
