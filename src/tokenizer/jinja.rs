@@ -49,12 +49,7 @@ pub(super) fn load_chat_env(tokenizer_path: &str) -> Result<Option<(minijinja::E
     // statement, so the template fails to compile and the model silently falls back to the legacy
     // manual template — losing thinking-kwarg control on the flagship family. For inference the
     // spans are inert: strip the two statements (with any whitespace controls) before compiling.
-    static STRIP: [(&str, &str); 4] = [
-        ("{%- generation %}", ""), ("{% generation %}", ""),
-        ("{%- endgeneration %}", ""), ("{% endgeneration %}", ""),
-    ];
-    let mut source = source.to_string();
-    for (tag, repl) in STRIP { source = source.replace(tag, repl); }
+    let source = strip_generation_tags(&source);
     // The template source must outlive the environment. The server is a long-running
     // process that loads each model exactly once, so a one-time leak of a few KB is
     // acceptable and avoids per-request recompilation.
@@ -86,33 +81,91 @@ pub(super) fn load_chat_env(tokenizer_path: &str) -> Result<Option<(minijinja::E
 /// minijinja) this makes the template's `tojson` byte-identical to transformers' `tojson`
 /// filter for the same catalog. Non-ASCII passes through unescaped, as in Python with
 /// ensure_ascii=False.
-struct PyJsonFormatter;
+struct PyJsonFormatter { item: String, key: String, ascii: bool }
 impl serde_json::ser::Formatter for PyJsonFormatter {
     fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, first: bool)
         -> std::io::Result<()> {
-        if first { Ok(()) } else { writer.write_all(b", ") }
+        if first { Ok(()) } else { writer.write_all(self.item.as_bytes()) }
     }
     fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, first: bool)
         -> std::io::Result<()> {
-        if first { Ok(()) } else { writer.write_all(b", ") }
+        if first { Ok(()) } else { writer.write_all(self.item.as_bytes()) }
     }
     fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, writer: &mut W)
         -> std::io::Result<()> {
-        writer.write_all(b": ")
+        writer.write_all(self.key.as_bytes())
+    }
+    /// `ensure_ascii=True`: every non-ASCII character leaves as `\uXXXX` (lower-case hex, UTF-16
+    /// surrogate pairs above the BMP), exactly as Python's `json.dumps` does.
+    fn write_string_fragment<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, fragment: &str)
+        -> std::io::Result<()> {
+        if !self.ascii || fragment.is_ascii() { return writer.write_all(fragment.as_bytes()); }
+        let mut buf = [0u16; 2];
+        for c in fragment.chars() {
+            if c.is_ascii() { writer.write_all(&[c as u8])?; }
+            else { for u in c.encode_utf16(&mut buf) { write!(writer, "\\u{:04x}", u)?; } }
+        }
+        Ok(())
     }
 }
 
-/// Serialize a minijinja value the way Python's `json.dumps(x, ensure_ascii=False)` does
-/// (default separators, insertion order). Used by the `tojson` filter — the only JSON the
-/// templates emit into the prompt.
-fn to_python_json(v: &minijinja::value::Value) -> Result<String, minijinja::Error> {
+/// Recursively sort every object's keys (Python `sort_keys=True`; code-point order == UTF-8 byte order).
+fn sort_json_keys(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut e: Vec<(String, serde_json::Value)> = m.into_iter().collect();
+            e.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(e.into_iter().map(|(k, v)| (k, sort_json_keys(v))).collect())
+        }
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.into_iter().map(sort_json_keys).collect()),
+        o => o,
+    }
+}
+
+/// Serialize a minijinja value the way Python's `json.dumps(x, ensure_ascii=..., sort_keys=...,
+/// separators=...)` does. Defaults (no kwargs) are the HF `tojson` defaults: `ensure_ascii=False`,
+/// insertion order, `", "` / `": "`. Used by the `tojson` filter, the only JSON templates emit.
+fn to_python_json(v: &minijinja::value::Value, sort_keys: bool, ascii: bool, seps: Option<(String, String)>)
+    -> Result<String, minijinja::Error> {
     use serde::Serialize;
+    let err = |e: String| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}"));
     let mut buf: Vec<u8> = Vec::with_capacity(256);
-    let mut ser = serde_json::Serializer::with_formatter(&mut buf, PyJsonFormatter);
-    v.serialize(&mut ser).map_err(|e| minijinja::Error::new(
-        minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
-    String::from_utf8(buf).map_err(|e| minijinja::Error::new(
-        minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}")))
+    let (item, key) = seps.unwrap_or_else(|| (", ".to_string(), ": ".to_string()));
+    let fmt = PyJsonFormatter { item, key, ascii };
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+    if sort_keys {
+        let j = serde_json::to_value(v).map_err(|e| err(e.to_string()))?;
+        sort_json_keys(j).serialize(&mut ser).map_err(|e| err(e.to_string()))?;
+    } else {
+        v.serialize(&mut ser).map_err(|e| err(e.to_string()))?;
+    }
+    String::from_utf8(buf).map_err(|e| err(e.to_string()))
+}
+
+/// Statement-level HF training tags `{% generation %}` / `{% endgeneration %}` (loss-mask spans; inert for
+/// inference) become `{% if true %}` / `{% endif %}`: the tag keeps its own whitespace controls (`-` / `+`
+/// on either side), so the surrounding whitespace is trimmed exactly as Jinja does for any block tag.
+/// Handles every spelling (`{%- generation -%}`, `{% generation %}`, ...).
+pub(super) fn strip_generation_tags(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(p) = rest.find("{%") {
+        out.push_str(&rest[..p]);
+        let tail = &rest[p..];
+        let Some(q) = tail.find("%}") else { out.push_str(tail); return out; };
+        let inner = &tail[2..q];
+        let l = if inner.starts_with(['-', '+']) { &inner[..1] } else { "" };
+        let r = if inner.ends_with(['-', '+']) && inner.len() > l.len() { &inner[inner.len() - 1..] } else { "" };
+        let body = inner[l.len()..inner.len() - r.len()].trim();
+        match body {
+            "generation" => out.push_str(&format!("{{%{l} if true {r}%}}")),
+            "endgeneration" => out.push_str(&format!("{{%{l} endif {r}%}}")),
+            _ => out.push_str(&tail[..q + 2]),
+        }
+        rest = &tail[q + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Register an `unknown_method_callback` that bridges Jinja2/Python string methods —
@@ -135,12 +188,15 @@ pub(super) fn register_pycompat(env: &mut minijinja::Environment<'static>) {
     //                    fail with "unknown function" instead of the template's own diagnostic.
     env.add_filter("tojson", |v: minijinja::value::Value, kwargs: minijinja::value::Kwargs|
                    -> Result<String, minijinja::Error> {
-        // The hy_v3 template calls `value | tojson(ensure_ascii=False)` when replaying non-string
-        // tool_call arguments. Python's json.dumps(ensure_ascii=False) emits literal UTF-8, which
-        // is what to_python_json does, so the kwarg is consumed and ignored; WITHOUT this a
-        // kwarg'd call raises "too many arguments" and the whole request 500s.
-        let _ = kwargs.get::<Option<bool>>("ensure_ascii").ok().flatten();
-        to_python_json(&v)
+        // Python `json.dumps` kwargs templates use: `ensure_ascii` (HF default False: literal UTF-8; True
+        // escapes non-ASCII as \uXXXX), `sort_keys` (recursive), `separators=(item, key)`. All three are
+        // honoured; before 2026-11 only `ensure_ascii` was consumed and the other two were silently ignored
+        // (the Inkling-2 tool declaration rendered with the wrong separators and key order).
+        let ascii = kwargs.get::<Option<bool>>("ensure_ascii").ok().flatten().unwrap_or(false);
+        let sort_keys = kwargs.get::<Option<bool>>("sort_keys").ok().flatten().unwrap_or(false);
+        let seps: Option<Vec<String>> = kwargs.get::<Option<Vec<String>>>("separators").ok().flatten();
+        let seps = match seps { Some(mut p) if p.len() == 2 => { let k = p.pop().unwrap(); Some((p.pop().unwrap(), k)) } _ => None };
+        to_python_json(&v, sort_keys, ascii, seps)
     });
     env.add_function("raise_exception", |msg: String| -> Result<minijinja::value::Value, minijinja::Error> {
         Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
@@ -154,8 +210,11 @@ pub(super) fn register_pycompat(env: &mut minijinja::Environment<'static>) {
             // `[0]` / `[-1]`. Build a real Vec so indexing works.
             ("split", Some(s)) => match arg_str(args, 0) {
                 Ok(sep) => {
-                    let parts: Vec<minijinja::value::Value> =
-                        s.split(sep).map(minijinja::value::Value::from).collect();
+                    // Python `str.split(sep, maxsplit)`: the second argument bounds the number of splits
+                    let parts: Vec<minijinja::value::Value> = match args.get(1).and_then(|v| i64::try_from(v.clone()).ok()) {
+                        Some(n) if n >= 0 => s.splitn(n as usize + 1, sep).map(minijinja::value::Value::from).collect(),
+                        _ => s.split(sep).map(minijinja::value::Value::from).collect(),
+                    };
                     Some(minijinja::value::Value::from(parts))
                 }
                 Err(()) => {
@@ -164,6 +223,13 @@ pub(super) fn register_pycompat(env: &mut minijinja::Environment<'static>) {
                     Some(minijinja::value::Value::from(parts))
                 }
             },
+            // dict.get(key[, default]): the DeepSeek-V4.1 template reads optional message fields this way.
+            // minijinja maps have no `get`, so this used to fall through to a filter and fail with
+            // "unknown filter"; a template that did not call it renders exactly as before.
+            ("get", None) if value.kind() == minijinja::value::ValueKind::Map && !args.is_empty() => {
+                let hit = value.get_item(&args[0]).ok().filter(|v| !v.is_undefined());
+                Some(hit.unwrap_or_else(|| args.get(1).cloned().unwrap_or_else(|| minijinja::value::Value::from(()))))
+            }
             ("startswith", Some(s)) => match arg_str(args, 0) {
                 Ok(prefix) => Some(minijinja::value::Value::from(s.starts_with(prefix))),
                 Err(()) => None,

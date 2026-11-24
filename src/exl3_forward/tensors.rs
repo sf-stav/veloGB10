@@ -326,8 +326,16 @@ pub(super) fn gdn_tc_min_rows() -> usize {
 /// planes are carried too); 5 = issue #41 (the pooled QSA key planes are captured at the kernels' lane stride: a
 /// version-4 file written by a lane other than 0 with max_pos % ratio != 0 holds that lane's pooled blocks shifted).
 /// Files of another version are dropped at the restore check (graceful re-prefill); version-1 files held 1/4 of each
-/// f32 and 1/2 of each u16 per-slot plane.
-pub(crate) const SPILL_PAYLOAD_VERSION: u32 = 5;
+/// f32 and 1/2 of each u16 per-slot plane. SPILLTRUNC bumped 5 -> 6: the payload gained the checkpoint section
+/// after the hist tail (nck, grid C, fixed-bytes, the (pos, prefix-key, hist) table, and the ckpt words themselves)
+/// so a prompt that is a TRUNCATED prefix of a snapshot can resume at a carried boundary. The section format and
+/// version live in `kv_spill` (the boot scanner validates exactly what the restore accepts).
+pub(crate) const SPILL_PAYLOAD_VERSION: u32 = crate::kv_spill::SPILL_PAYLOAD_VERSION;
+
+/// KVPOOL (fork): rows mapped AHEAD of the highest row a caller names (kv_vmm.rs; > the deepest draft chain, the
+/// dense-v3 tile prefetch and one pooled-key block), and the rows every lane keeps mapped while empty.
+pub(crate) const VMM_MARGIN_ROWS: usize = 1024;
+pub(crate) const VMM_FLOOR_ROWS: usize = 4096;
 
 /// One slot's region of a `[width x per_slot]` device plane: (byte address, byte length). `elems` = the plane's
 /// element count, `elem_bytes` = size_of the element type (ISSUES 122: the stride must be in BYTES).
@@ -340,6 +348,13 @@ pub(crate) fn spill_slot_region(base: u64, elems: usize, elem_bytes: usize, widt
 /// keys): through the end of the `ratio`-row block that holds position `tokens` — the restore resumes at `tokens`, rows
 /// at or past it are rewritten before they are read, and a pooled block is recomputed from all `ratio` raw rows of its
 /// block, so that whole block is carried bit for bit as an own-lane hit has it. Capped at `max_pos`.
+/// KVPOOL / TPPOOL (design v3 step 4): units of one position plane a lane holds for `rows` rows: a row per unit, or a
+/// pooled QSA block (`div` rows) plus one block of read-ahead, clamped to the plane (`cap`). The one formula
+/// `vmm_ensure`, `vmm_truncate` and their dry runs share.
+pub(crate) fn plane_units(rows: usize, div: usize, cap: usize) -> usize {
+    (if div > 1 { rows.div_ceil(div) + 1 } else { rows }).min(cap)
+}
+
 pub(crate) fn spill_rows(tokens: usize, ratio: usize, max_pos: usize) -> usize {
     let r = ratio.max(1);
     ((tokens + 1).div_ceil(r) * r).min(max_pos)

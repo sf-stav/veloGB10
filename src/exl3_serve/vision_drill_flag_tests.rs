@@ -134,7 +134,7 @@
     /// S-B9-REL-VISIONFIX2 V5 (the list of bare-and-still-misread names is empty and may not grow).
     #[test]
     fn no_registry_flag_is_read_with_a_value_readers_is_some() {
-        const TAKES_A_VALUE: [&str; 4] = ["server-port", "bench-file", "model-dir", "model"];
+        const TAKES_A_VALUE: [&str; 5] = ["server-port", "bench-file", "model-dir", "model", "chat-template"];
         const BARE_AND_STILL_MISREAD: [&str; 0] = [];
         let serve = src_text!("exl3_serve");
         assert_eq!(serve.matches(&["vision_boot(model_dir, ", "vision_fail_gemm_armed())"].concat()).count(), 1, "the serve path asks the registry");

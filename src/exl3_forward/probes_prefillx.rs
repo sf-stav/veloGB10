@@ -16,6 +16,10 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
     let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim, model.max_pos)?;
     let ids = gate_prompt_ids(a)?;
     let n = ids.len();
+    // KVPOOL: --prefillx-qsa-keys / -rel / -tier memset or read back WHOLE position planes (rows never mapped under lazy)
+    anyhow::ensure!(!model.vmm_lazy() || [crate::opt!("prefillx-qsa-keys"), crate::opt!("prefillx-rel"), crate::opt!("prefillx-tier")]
+                        .iter().all(|o| crate::opts::var(*o).is_err()),
+                    "KVPOOL: --prefillx-qsa-keys / --prefillx-rel / --prefillx-tier need --kv-pool off or full");
     crate::dprintln!("EXL3 prefill-equivalence probe: prompt={n} tokens");
 
     // S-A3-r: with --prefillx-qsa-keys the indexer key planes are zeroed before each arm, so
@@ -586,6 +590,7 @@ pub fn pack2_probe_exl3(dir: &str, max_pos: usize) -> Result<()> {
 /// rounds run serially (lone verify per request through the served verify_block).
 pub fn packstate_probe_exl3(dir: &str, max_pos: usize) -> Result<()> {
     let model = FwdModel::load(dir, 2, max_pos)?; // 2 slots: the probe primes 0 and 1
+    anyhow::ensure!(!model.vmm_lazy(), "KVPOOL: packstate probe needs --kv-pool off or full");
     crate::dprintln!("PACKSTATE: model {} loaded (vocab {}, max_pos {max_pos})", dir, model.cfg.vocab_size);
     model.probe_packstate()
 }

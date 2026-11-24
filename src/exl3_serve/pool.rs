@@ -63,9 +63,12 @@ impl Exl3Scheduler {
     /// first agrees that shifting entries out CAN make room.
     pub(super) fn pool_capture_slot(&mut self, slot: usize, old: &[u32]) -> Result<bool> {
         if !self.pool.on() { return Ok(false); }
-        // text only (image rows carry ids >= 2^31 and per-lane vision rope rows a snapshot does not hold);
+        // PFXPOOL4: image-bearing prompts ARE capturable. Main-attention RoPE is baked into K rows at write,
+        // and the per-slot vision arm is request-scoped (`vision_setup` / `clear_slot_vision` runs before any
+        // restore). Image rows key on `image_row_key(pixel_hash, j)`, so any moved/changed image mismatches at
+        // its first row and truncates to the deepest provable prefix.
         // short prompts are cheaper to read again than to keep
-        if old.len() < POOL_MIN_TOKENS || old.iter().any(|&t| t >= 0x8000_0000) {
+        if old.len() < POOL_MIN_TOKENS {
             crate::metrics::pfx_pool_skip();
             return Ok(false);
         }
@@ -110,10 +113,20 @@ impl Exl3Scheduler {
             return Ok(false);
         }
         let t0 = std::time::Instant::now();
-        // the cap: shift out least recently used entries; their slabs become spares
+        // the cap: shift out ascending by re-prefill cost (PFXPOOL3); refuse if room would displace deeper entries
         let mut nev = 0u64;
         loop {
-            let ev = self.pool.make_room(bytes);
+            let ev = match self.pool.make_room(bytes, n) {
+                Some(ev) => ev,
+                None => {
+                    crate::metrics::pfx_pool_refused();
+                    self.pool_publish();
+                    crate::drprintln!("[exl3-serve] prefix pool: {n} tokens not kept (room here would cost a deeper \
+                                       entry than it: {} entries, {} of {} MiB untouched)",
+                                      self.pool.len(), self.pool.bytes() >> 20, self.pool.cap_bytes() >> 20);
+                    return Ok(false);
+                }
+            };
             nev += ev.len() as u64;
             for e in ev { if let Some(b) = e.buf.buf { self.pool_spare.push(b); } }
             if parent.map_or(false, |(id, _)| self.pool.index_of(id).is_none()) {
@@ -324,7 +337,8 @@ impl Exl3Scheduler {
     /// on a single box. PFXPOOL2: rows come through the entry's parent chain, the recurrent state from the entry; the
     /// lane's row lineage becomes the entry's.
     pub(super) fn pool_restore_slot(&mut self, slot: usize, key: &[u32], end: usize, own_q: usize) -> Result<Option<PoolHit>> {
-        if !self.pool.on() || self.pool.is_empty() || key.iter().any(|&t| t >= 0x8000_0000) {
+        // PFXPOOL4: image-bearing keys restore like text ones (`vision_setup` already armed the slot for this prompt)
+        if !self.pool.on() || self.pool.is_empty() {
             return Ok(None);
         }
         let c = self.chunk.max(1);
@@ -419,28 +433,44 @@ impl Exl3Scheduler {
         let Some(st) = self.spill.clone() else { return Ok(()) };
         let key = crate::kv_spill::conv_key(old);
         let tokens = old.len() as u64;
+        // SPILLTRUNC: the lane's checkpoints for THIS conversation ride the file (spill_capture) so a later
+        // prompt that is a truncated prefix of `old` can restore rows + one carried checkpoint.
+        let (c0, ckrefs) = self.wp16
+            .as_ref()
+            .map_or((0usize, Vec::new()), |st| st.ckpts_under(slot, old, old.len()));
+        let poss: Vec<u64> = ckrefs.iter().map(|(p, _)| *p as u64).collect();
+        let keys = crate::kv_spill::prefix_keys(old, &poss);
+        let cks: Vec<(u64, u64, &crate::exl3_forward::RecurCkpt)> =
+            ckrefs.iter().zip(&keys).map(|((p, b), k)| (*p as u64, *k, *b)).collect();
         // LANERES3 (TP>=2): every decision in this hook must come out IDENTICALLY on all
         // ranks — the policy state it feeds decides future restores in lockstep. So under
-        // TP the budget gate reads the deterministic policy bytes (not the live writer
-        // queue), the write is synchronous at this lockstep point (no async completion to
-        // race), and the outcome is agreed across ranks with one SpillFlag: a disk that
-        // failed on ANY rank drops the key EVERYWHERE (counted), so the replicated policy
-        // can never diverge. One capture is in flight at a time (admission is serial), so
-        // the sync write costs the round one D2H + one local NVMe write at an eviction —
-        // the same transient the single-box path pays, minus the queue.
+        // TP the budget gate reads the deterministic policy (would_admit, SPILLDUR2), the
+        // write is synchronous at this lockstep point (no async completion to race), and
+        // the outcome is agreed across ranks with one SpillFlag: a disk or capture failure
+        // on ANY rank drops the key EVERYWHERE (counted), so the replicated policy can
+        // never diverge.
+        let est = tokens * crate::kv_spill::KV_BYTES_PER_TOKEN;
+        if !self.spill_pol.would_admit(key, est, tokens) {
+            crate::metrics::kv_spill_miss_recompute();
+            crate::drprintln!("[kv-spill] capture refused before D2H: {tokens} tokens (est {} MiB) would exceed cap or displace deeper snapshots", est >> 20);
+            return Ok(());
+        }
         if self.tp.is_some() {
-            let est = tokens * crate::kv_spill::KV_BYTES_PER_TOKEN;
-            if self.spill_pol.bytes() + est > self.spill_pol.cap_bytes() {
-                crate::metrics::kv_spill_miss_recompute();
-                crate::drprintln!("[kv-spill] capture refused: policy over budget ({} + est {est} bytes)", self.spill_pol.bytes());
-                return Ok(());
-            }
             let mut buf = Vec::new();
-            if let Err(e) = self.model.spill_capture(slot, old.len(), &mut buf) {
-                crate::metrics::kv_spill_miss_recompute();
-                crate::dreprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
-                return Ok(());
-            }
+            let fixed = match self.model.spill_capture(slot, old.len(), &mut buf, c0 as u32, &cks) {
+                Ok(f) => f,
+                Err(e) => {
+                    crate::metrics::kv_spill_miss_recompute();
+                    crate::dreprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
+                    // veloGB10 #44: a rank-local capture failure still casts its vote so peers stay paired.
+                    if let Some(t) = self.tp.as_mut() {
+                        if let Err(e2) = t.spill_agree(false) {
+                            anyhow::bail!("kv spill: capture agree failed slot={slot}: {e2:#}");
+                        }
+                    }
+                    return Ok(());
+                }
+            };
             crate::kv_spill::finalize_header(&mut buf, tokens);
             let wrote = st.put_sync(key, self.spill_rank, &buf);
             let all_ok = match self.tp.as_mut().map(|t| t.spill_agree(wrote.is_ok())) {
@@ -455,8 +485,22 @@ impl Exl3Scheduler {
                 return Ok(());
             }
             let bytes = wrote.unwrap_or(0);
-            for v in self.spill_pol.put(key, bytes, tokens) {
+            let snap = crate::kv_spill::Snap {
+                conv: key,
+                bytes,
+                tokens,
+                fixed,
+                ck_c: c0,
+                ck: cks.iter().map(|(p, k, _)| (*p, *k)).collect(),
+            };
+            for v in self.spill_pol.put_snap(snap) {
                 st.remove(v, self.spill_rank);
+            }
+            if !self.spill_pol.contains(key) {
+                // SPILLDUR2: actual serialized size exceeded what est predicted and could not displace deeper entries
+                st.remove(key, self.spill_rank);
+                crate::drprintln!("[kv-spill] capture not kept: admitting {tokens} tokens ({} MiB) would evict deeper snapshots", bytes >> 20);
+                return Ok(());
             }
             crate::metrics::kv_spill_write(bytes, tokens);
             return Ok(());
@@ -466,25 +510,39 @@ impl Exl3Scheduler {
         // box's memwatch floor under churn (the b5x10 lesson).
         {
             let st = self.spill.as_ref().unwrap();
-            if st.pending.load(std::sync::atomic::Ordering::Relaxed) + tokens * crate::kv_spill::KV_BYTES_PER_TOKEN
-                > st.max_pending
-            {
-                crate::drprintln!("[kv-spill] capture refused: queue over budget (est {} bytes)", tokens * crate::kv_spill::KV_BYTES_PER_TOKEN);
+            if st.pending.load(std::sync::atomic::Ordering::Relaxed) + est > st.max_pending {
+                crate::drprintln!("[kv-spill] capture refused: queue over budget (est {est} bytes)");
                 crate::metrics::kv_spill_miss_recompute();
                 return Ok(());
             }
         }
         let mut buf = Vec::new();
-        if let Err(e) = self.model.spill_capture(slot, old.len(), &mut buf) {
-            crate::metrics::kv_spill_miss_recompute();
-            crate::drprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
-            return Ok(());
-        }
+        let fixed = match self.model.spill_capture(slot, old.len(), &mut buf, c0 as u32, &cks) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::metrics::kv_spill_miss_recompute();
+                crate::drprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
+                return Ok(());
+            }
+        };
         crate::kv_spill::finalize_header(&mut buf, tokens);
         match st.put_prebuilt(key, self.spill_rank, buf) {
             Ok(bytes) => {
-                for v in self.spill_pol.put(key, bytes, tokens) {
+                let snap = crate::kv_spill::Snap {
+                    conv: key,
+                    bytes,
+                    tokens,
+                    fixed,
+                    ck_c: c0,
+                    ck: cks.iter().map(|(p, k, _)| (*p, *k)).collect(),
+                };
+                for v in self.spill_pol.put_snap(snap) {
                     st.remove(v, self.spill_rank);
+                }
+                if !self.spill_pol.contains(key) {
+                    st.remove(key, self.spill_rank);
+                    crate::drprintln!("[kv-spill] capture not kept: admitting {tokens} tokens ({} MiB) would evict deeper snapshots", bytes >> 20);
+                    return Ok(());
                 }
                 crate::metrics::kv_spill_write(bytes, tokens);
             }
@@ -501,15 +559,75 @@ impl Exl3Scheduler {
     /// is synchronous in the admission path, like the prefill it replaces, only ~50x shorter.
     /// Err only under TP, when the cross-rank agree failed or a restore failed AFTER every rank agreed to it (the ranks'
     /// KV would differ): the admission stops there with this message (ISSUES 121, as `spill_capture_slot`).
-    pub(super) fn spill_restore_slot(&mut self, slot: usize, key: &[u32], end: usize) -> Result<Option<usize>> {
-        if self.spill.is_none() || self.spill_pol.is_empty() {
+    pub(super) fn spill_restore_slot(&mut self, slot: usize, key: &[u32], end: usize) -> Result<Option<SpillHit>> {
+        if self.spill.is_none() || self.spill_pol.is_empty() || end == 0 {
             return Ok(None);
         }
         let st = self.spill.clone().unwrap();
-        let Some((conv, _)) = self.spill_pol.lookup(key, crate::kv_spill::NVME_READ_BPS, crate::kv_spill::PREFILL_TPS) else {
+        let c = if self.wp16.is_some() { self.chunk.max(1) } else { 0 };
+        let prefix = &key[..end.min(key.len())];
+        // SPILLTRUNC: lookup picks Full (n <= end) or Trunc (q <= end) from replicated policy state only (TP-identical).
+        let Some(hit) = self.spill_pol.lookup_at(prefix, c, crate::kv_spill::NVME_READ_BPS, crate::kv_spill::PREFILL_TPS) else {
             crate::metrics::kv_spill_miss_recompute();
             return Ok(None);
         };
+        let conv = hit.conv();
+        // SPILLDUR: on single-box, if the async capture for `conv` is still queued in the writer thread,
+        // join it (condvar wait bounded by cost-model headroom, capped at SPILL_WAIT_MAX_SECS) before reading.
+        // Skipped under TP where captures use `put_sync`.
+        if self.tp.is_none() && st.is_pending(conv) {
+            let (priced, saved) = match hit {
+                crate::kv_spill::Hit::Full { n, bytes, .. } =>
+                    (bytes.max((n as u64) * crate::kv_spill::KV_BYTES_PER_TOKEN), n as u64),
+                crate::kv_spill::Hit::Trunc { q, read_bytes, .. } => (read_bytes, q as u64),
+            };
+            let budget = self.spill_pol.wait_budget_secs(priced, saved, crate::kv_spill::NVME_READ_BPS,
+                                                         crate::kv_spill::PREFILL_TPS);
+            let t0 = std::time::Instant::now();
+            let joined = st.await_durable(conv, budget);
+            let us = t0.elapsed().as_micros() as u64;
+            crate::metrics::kv_spill_durability_wait(us, joined);
+            crate::drprintln!("[kv-spill] capture still queued (conv {conv:016x}, {priced} bytes): waited {} ms, \
+                               joined={joined} (budget {budget:.2} s)", us / 1000);
+        }
+        if let crate::kv_spill::Hit::Trunc { n, .. } = hit {
+            let want = prefix.len();
+            let rdres = self.model.spill_trunc_restore(slot, prefix, c, &mut |off: u64, len: usize| -> Result<Vec<u8>> {
+                st.read_at(conv, self.spill_rank, 36 + off, len)
+                    .map_err(|e| anyhow::anyhow!("span read at {off}+{len}: {e}"))
+            });
+            let all_ok = match self.tp.as_mut().map(|t| t.spill_agree(rdres.is_ok())) {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => anyhow::bail!("kv spill: truncated-restore agree failed slot={slot}: {e:#}"),
+                None => rdres.is_ok(),
+            };
+            if !all_ok {
+                let why = rdres.err().map(|e| format!("{e:#}")).unwrap_or_default();
+                crate::dreprintln!("[kv-spill] truncated restore dropped: conv {conv:016x} slot={slot} \
+                                    rank={} ({why}) - dropped on all ranks, re-prefill", self.spill_rank);
+                self.spill_pol.remove(conv);
+                st.remove(conv, self.spill_rank);
+                crate::metrics::kv_spill_restore_peer_miss();
+                return Ok(None);
+            }
+            let (q, ck) = match rdres {
+                Ok(v) => v,
+                Err(e) => anyhow::bail!("kv spill: truncated restore failed slot={slot} ({e:#}) after the \
+                                         cross-rank agree — ranks would diverge"),
+            };
+            if let Some(s16) = self.wp16.as_mut() {
+                s16.install(slot, c, &key[..q], q, ck);
+            }
+            self.segs_set(slot, None, q);
+            self.spill_pol.remove(conv);
+            st.remove(conv, self.spill_rank);
+            crate::metrics::kv_spill_hit(q as u64);
+            crate::metrics::kv_spill_truncated_restore();
+            crate::drprintln!("[exl3-serve] kv spill: truncated restore slot={slot}: rows 0..{q} + carried \
+                               checkpoint of a {n}-token snapshot ({want}-token resumable prefix; priced {} MiB)",
+                              hit.read_bytes() >> 20);
+            return Ok(Some(SpillHit::Trunc(q)));
+        }
         // LANERES3 (TP>=2): the lookup and cost model are pure replicated state (identical
         // on every rank); the local read's outcome is agreed with one SpillFlag, so a
         // snapshot only ONE rank can read is dropped on BOTH (counted) and both re-prefill
@@ -577,7 +695,7 @@ impl Exl3Scheduler {
         st.remove(conv, self.spill_rank);
         crate::metrics::kv_spill_hit(n as u64);
         crate::drprintln!("[exl3-serve] kv spill: restored slot={slot}: {n} of {end} prompt tokens (read {} MiB)", payload.len() >> 20);
-        Ok(Some(n))
+        Ok(Some(SpillHit::Full(n)))
     }
 
     // ---------------------------------------------------------- LANERES1: --lane-reserve

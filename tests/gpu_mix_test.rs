@@ -8,8 +8,10 @@ fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn test_gpu_mixers_vs_cpu() {
-    let model_path = std::env::var("GB10_TEST_MODEL")
-        .expect("GB10_TEST_MODEL must point at model.safetensors (test fixture)");
+    let Some(model_path) = std::env::var("GB10_TEST_MODEL").ok() else {
+        eprintln!("skip: GB10_TEST_MODEL not set (lab fixture; set GB10_TEST_MODEL to run)");
+        return;
+    };
     let host = Model::load(&model_path).expect("load");
     let gpu = GpuModel::new(&host).expect("gpu");
     let h = host.config.hidden_size;

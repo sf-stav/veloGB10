@@ -78,9 +78,15 @@ fn main() {
         // NAIVE S8: the DSpark drafter round (plain f16 weights, small-M mma GEMM, Markov + confidence);
         // loaded by src/naive/drafter_gpu.rs only.
         ("gpu_naive_draft.cu", "gpu_naive_draft.ptx", "sm_121"),
+        // DSV41 (PLAN/DSV41_PLAN_2026-11-18.md, leg I0): the DeepSeek-V4.1-Flash module; its sections are
+        // kernels/gpu_dsv41/*.cuh (bands per leg, see the .cu). sm_121a for the FP4 / FP8 block-scaled MMA.
+        ("gpu_dsv41.cu", "gpu_dsv41.ptx", "sm_121a"),
         // FP4L (PLAN/FP4L_DESIGN.md): nvidia/Qwen3.8-Flash-Next-FP4-Local weight kernels (MXFP8 W8A16,
         // f16-weight, NVFP4 experts) for the EXL3 trunk; sm_121a for the e2m1x2 -> f16x2 cvt (SM12x family form).
         ("gpu_fp4l.cu", "gpu_fp4l.ptx", "sm_121a"),
+        // INKLING2 (PLAN/INKLING2_MINI_PORT.md): the Inkling-2 family module; sections are kernels/gpu_inkling2/*.cuh
+        // (bands per leg, see the .cu). sm_121a for the FP4 / FP8 expert paths. Loaded by src/inkling2/gpu/ only.
+        ("gpu_inkling2.cu", "gpu_inkling2.ptx", "sm_121a"),
     ];
 
     for (src_name, _, _) in &kernels {
@@ -364,6 +370,10 @@ fn main() {
     for f in ["native/net_shim.c", "Cargo.lock", "Cargo.toml", "build.rs"] {
         src_files.push(f.to_string());
     }
+    // DSV41 (leg INT1): the Engram layout reference dump is compiled in by src/dsv41/engram/manifest.rs
+    // (include_str!), so it is an input of the binary: it belongs to the source stamp. (kernels/gpu_dsv41/*.cuh
+    // are already covered by the kernel stamp via kernel_sections("gpu_dsv41.cu").)
+    src_files.push("tools/dsv41_ref/engram_layout_1017.json".to_string());
     // SPLIT1 Wave 3: the section files of the include-split C shim are part of its text (so of the version stamp).
     src_files.extend(net_shim_sections());
     // NOT in the stamp: tests/fixtures/loop_detect_vectors.txt (included by src/loop_detect.rs inside

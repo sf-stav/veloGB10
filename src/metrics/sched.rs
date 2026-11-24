@@ -98,6 +98,14 @@ pub static KV_SPILL_HITS: AtomicU64 = AtomicU64::new(0);
 pub static KV_SPILL_MISSES: AtomicU64 = AtomicU64::new(0);
 pub static KV_SPILL_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static KV_SPILL_SAVED: AtomicU64 = AtomicU64::new(0);
+/// SPILLDUR: bounded waits on the writer queue — a restore lookup that hit a capture still being written.
+/// waits = joins attempted, joins = the wait ended with the snapshot durable (the read then proceeds as a hit),
+/// wait_us_total = time actually spent waiting (the admission path blocks here at most SPILL_WAIT_MAX_SECS).
+pub static KV_SPILL_DURABILITY_WAITS: AtomicU64 = AtomicU64::new(0);
+pub static KV_SPILL_DURABILITY_JOINS: AtomicU64 = AtomicU64::new(0);
+pub static KV_SPILL_DURABILITY_WAIT_US: AtomicU64 = AtomicU64::new(0);
+/// SPILLTRUNC: spill restores satisfied by truncating a deeper snapshot to a carried WP16 checkpoint.
+pub static KV_SPILL_TRUNCATED_RESTORES: AtomicU64 = AtomicU64::new(0);
 /// LANERES3: TP spill-agreement outcomes — a capture dropped because SOME rank's write
 /// failed, and a restore skipped because some rank could not read the snapshot (both
 /// re-prefill; the counters prove the cross-rank safety net engaged, not that disks fail).
@@ -112,6 +120,26 @@ pub fn kv_spill_hit(tokens: u64) {
     KV_SPILL_SAVED.fetch_add(tokens, Relaxed);
 }
 pub fn kv_spill_miss_recompute() { KV_SPILL_MISSES.fetch_add(1, Relaxed); }
+/// SPILLDUR: one bounded writer-queue wait during a restore (`us` = time spent, `joined` = the capture landed).
+pub fn kv_spill_durability_wait(us: u64, joined: bool) {
+    KV_SPILL_DURABILITY_WAITS.fetch_add(1, Relaxed);
+    KV_SPILL_DURABILITY_WAIT_US.fetch_add(us, Relaxed);
+    if joined {
+        KV_SPILL_DURABILITY_JOINS.fetch_add(1, Relaxed);
+    }
+}
+/// SPILLTRUNC: count one truncated restore from a deeper spill snapshot.
+pub fn kv_spill_truncated_restore() { KV_SPILL_TRUNCATED_RESTORES.fetch_add(1, Relaxed); }
+// VISCACHE: vision-tower embed cache (--vision-embed-cache-mb) — bytes held now, images served
+// from it, images that ran the tower, and entries shifted out by the LRU cap.
+pub static VISION_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static VISION_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static VISION_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+pub static VISION_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+pub fn vision_cache_hit() { VISION_CACHE_HITS.fetch_add(1, Relaxed); }
+pub fn vision_cache_miss() { VISION_CACHE_MISSES.fetch_add(1, Relaxed); }
+pub fn vision_cache_evictions(n: u64) { VISION_CACHE_EVICTIONS.fetch_add(n, Relaxed); }
+pub fn vision_cache_bytes(n: u64) { VISION_CACHE_BYTES.store(n, Relaxed); }
 // PFXPOOL: the prefix pool (prompt states kept in memory across lanes, --prefix-pool-gb).
 pub static PFX_POOL_CAP: AtomicU64 = AtomicU64::new(0);
 pub static PFX_POOL_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -137,7 +165,8 @@ pub fn pfx_pool_state(cap: u64, bytes: u64, entries: u64) {
 pub fn pfx_pool_capture(us: u64) { PFX_POOL_CAPTURES.fetch_add(1, Relaxed); PFX_POOL_CAPTURE_US.fetch_add(us, Relaxed); }
 /// PFXPOOL: not captured because the pool already holds these tokens, or the prompt is too short to be worth it.
 pub fn pfx_pool_skip() { PFX_POOL_SKIPS.fetch_add(1, Relaxed); }
-/// PFXPOOL: not captured: larger than the cap, the memory floor (on any rank), or a copy that failed (on any rank).
+/// PFXPOOL: not kept: larger than the cap, room would cost a deeper entry than it (PFXPOOL3), the memory floor
+/// (on any rank), or a copy that failed (on any rank).
 pub fn pfx_pool_refused() { PFX_POOL_REFUSED.fetch_add(1, Relaxed); }
 pub fn pfx_pool_evict(n: u64) { PFX_POOL_EVICTIONS.fetch_add(n, Relaxed); }
 pub fn pfx_pool_emergency(n: u64) { PFX_POOL_EMERGENCY.fetch_add(n, Relaxed); }

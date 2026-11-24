@@ -31,8 +31,10 @@ fn read_npz(path: &str) -> HashMap<String, Vec<f32>> {
 
 #[test]
 fn test_gpu_forward_matches_reference() {
-    let model_path = std::env::var("GB10_TEST_MODEL")
-        .expect("GB10_TEST_MODEL must point at model.safetensors (test fixture)");
+    let Some(model_path) = std::env::var("GB10_TEST_MODEL").ok() else {
+        eprintln!("skip: GB10_TEST_MODEL not set (lab fixture; set GB10_TEST_MODEL to run)");
+        return;
+    };
     let npz_path = std::env::var("GB10_TEST_REF_NPZ")
         .expect("GB10_TEST_REF_NPZ must point at ref_data.npz (test fixture; run ref/ref_forward.py)");
     let host = Model::load(&model_path).expect("load");

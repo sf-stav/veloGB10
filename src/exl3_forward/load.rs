@@ -424,6 +424,13 @@ cores ({}: this rank holds {gqa} query heads per key head); /metrics velogb10_ex
             && dev.get_func("gpu_batch", "qsa_score_pooled_b").is_some();
         let mut qsa_keys_plane: Option<CudaSlice<u16>> = None;
         let mut qsa_pool_plane: Option<CudaSlice<u16>> = None;
+        // KVPOOL (fork): --kv-pool full|lazy backs the position planes with CUDA virtual memory (kv_vmm.rs).
+        // On a TP rank the asked-for pool falls back to the stock slabs (kv_vmm::mode_from_opts; said at bind).
+        if tp_rw.is_some() { crate::kv_vmm::note_tp_role(); }
+        let mut kvvmm: Option<crate::kv_vmm::KvVmm> = match crate::kv_vmm::mode_from_opts() {
+            Some(m) => Some(crate::kv_vmm::KvVmm::new(m, dev.ordinal(), crate::kv_vmm::pool_bytes_from_opts())?),
+            None => None,
+        };
         let mut bytes_round = 0u64;
         // Stacked-experts loader, shared by the trunk layers and the MTP draft head (S-A3-e M1).
         let mk_moe = |p: String, tag: String, ep_rank: Option<(usize, usize)>| -> Result<MoeLayer> {
@@ -868,13 +875,13 @@ cores ({}: this rank holds {gqa} query heads per key head); /metrics velogb10_ex
                     } else { None };
                     if idx.is_some() {
                         let plane = width * max_pos * cfg.indexer_head_dim;
-                        qsa_keys_plane = Some(dev.htod_sync_copy(&vec![0u16; plane])?);
+                        qsa_keys_plane = Some(vmm_plane_u16z(&dev, &mut kvvmm, plane)?);
                         crate::metrics::kv_pool_add_bytes(1, 2 * plane as u64); // issue #24 (bf16 plane)
                         if pool_on {
                             // Issue #41: exactly the kernels' per-lane block stride (floor; the kernels never
                             // write a partial last block), so the spill / prefix-pool copies agree with them.
                             let pl = qsa_pool_plane_elems(width, max_pos, cfg.indexer_compress_ratio, cfg.indexer_head_dim);
-                            qsa_pool_plane = Some(dev.htod_sync_copy(&vec![0u16; pl])?);
+                            qsa_pool_plane = Some(vmm_plane_u16z(&dev, &mut kvvmm, pl)?);
                             crate::metrics::kv_pool_add_bytes(1, 2 * pl as u64);
                         }
                     }
@@ -1032,12 +1039,12 @@ cores ({}: this rank holds {gqa} query heads per key head); /metrics velogb10_ex
             };
             let head_qsa_keys = if attn.idx.is_some() {
                 crate::metrics::kv_pool_add_bytes(2, 2 * (width * max_pos * cfg.indexer_head_dim) as u64); // issue #24
-                Some(dev.htod_sync_copy(&vec![0u16; width * max_pos * cfg.indexer_head_dim])?)
+                Some(vmm_plane_u16z(&dev, &mut kvvmm, width * max_pos * cfg.indexer_head_dim)?)
             } else { None };
             let head_qsa_pool = if attn.idx.is_some() && pool_on {
                 let pl = qsa_pool_plane_elems(width, max_pos, cfg.indexer_compress_ratio, cfg.indexer_head_dim); // issue #41
                 crate::metrics::kv_pool_add_bytes(2, 2 * pl as u64);
-                Some(dev.htod_sync_copy(&vec![0u16; pl])?)
+                Some(vmm_plane_u16z(&dev, &mut kvvmm, pl)?)
             } else { None };
             // TP-A (T1): the MTP head is REPLICATED on every rank — no EP shard, no reduce sites.
             let moe = mk_moe(format!("{hp}.mlp"), "mtp".to_string(), None)?;
@@ -1079,7 +1086,7 @@ cores ({}: this rank holds {gqa} query heads per key head); /metrics velogb10_ex
             } };
             let nkv = cfg.num_kv_heads;
             let hd = cfg.head_dim;
-            let kv = dev.alloc_zeros::<u8>(width * 2 * nkv * max_pos * kv_rowbytes(kv_fmt, hd))?;
+            let kv = vmm_plane_u8(&dev, &mut kvvmm, width * 2 * nkv * max_pos * kv_rowbytes(kv_fmt, hd))?;
             crate::metrics::kv_pool_add_bytes(2, (width * 2 * nkv * max_pos * kv_rowbytes(kv_fmt, hd)) as u64); // issue #24
             // PR #27 (lesserevil): the widths this pack's head actually carries (the line used to print the 3.05
             // pack's M1 widths for every pack)
@@ -1134,7 +1141,7 @@ cores ({}: this rank holds {gqa} query heads per key head); /metrics velogb10_ex
         }
         let mut k_cache = Vec::new();
         for _ in 0..n_attn {
-            k_cache.push(dev.alloc_zeros::<u8>(width * 2 * tc.num_kv_heads * max_pos * kv_rowbytes(kv_fmt, tc.head_dim))?);
+            k_cache.push(vmm_plane_u8(&dev, &mut kvvmm, width * 2 * tc.num_kv_heads * max_pos * kv_rowbytes(kv_fmt, tc.head_dim))?);
             crate::metrics::kv_pool_add_bytes(0, (width * 2 * tc.num_kv_heads * max_pos * kv_rowbytes(kv_fmt, tc.head_dim)) as u64); // issue #24
         }
 
@@ -1906,7 +1913,7 @@ cores ({}: this rank holds {gqa} query heads per key head); /metrics velogb10_ex
             Some(fp4l_fwd::FxCtx { plain: fx_plain, norms: fx_norms, hc_cap })
         } else { None };
 
-        Ok(Arc::new(FwdModel {
+        let model = Arc::new(FwdModel {
             tc,
             dev,
             cfg,
@@ -1926,6 +1933,9 @@ cores ({}: this rank holds {gqa} query heads per key head); /metrics velogb10_ex
             w4s_lptr,
             width,
             k_cache,
+            vmm: kvvmm.map(|mut v| { v.seal(); std::sync::Mutex::new(v) }),
+            vmm_rows: (0..width).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect(),
+            vmm_pool_rows: (0..width).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect(),
             kv_fmt,
             max_pos,
             bytes_per_round: bytes_round,
@@ -1969,6 +1979,27 @@ cores ({}: this rank holds {gqa} query heads per key head); /metrics velogb10_ex
             df2_head_bf16: std::sync::Mutex::new(None),
             df2_embed_bf16: std::sync::Mutex::new(None),
             df2_q_head: std::sync::OnceLock::new(),
-        }))
+        });
+        model.vmm_boot()?; // KVPOOL
+        Ok(model)
+    }
+
+    /// KVPOOL: map every lane's floor rows and report the pool (boot, once).
+    fn vmm_boot(&self) -> Result<()> {
+        if self.vmm.is_none() { return Ok(()); }
+        for s in 0..self.width { self.vmm_ensure(s, VMM_FLOOR_ROWS)?; }
+        if let Some((pool, mapped, reserved)) = self.vmm_stats() {
+            use std::sync::atomic::Ordering::Relaxed;
+            crate::kv_vmm::note_engaged(if self.vmm_lazy() { crate::kv_vmm::Mode::Lazy } else { crate::kv_vmm::Mode::Full });
+            crate::kv_vmm::POOL_BYTES.store(pool as u64, Relaxed);
+            crate::kv_vmm::MAPPED_BYTES.store(mapped as u64, Relaxed);
+            crate::kv_vmm::RESERVED_BYTES.store(reserved as u64, Relaxed);
+            crate::rprintln!("[kv-vmm] position planes on CUDA virtual memory ({}): pool {:.2} GB in {} MiB pages, {:.2} GB of address \
+                              space reserved for {} lane(s) x {} rows, {:.2} GB mapped at boot",
+                             if self.vmm_lazy() { "lazy: rows mapped on demand" } else { "full: every row mapped" },
+                             pool as f64 / 1e9, crate::kv_vmm::PAGE >> 20, reserved as f64 / 1e9, self.width, self.max_pos,
+                             mapped as f64 / 1e9);
+        }
+        Ok(())
     }
 }

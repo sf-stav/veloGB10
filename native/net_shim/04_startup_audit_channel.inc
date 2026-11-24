@@ -209,12 +209,13 @@ static int exchange_one_impl(NetCtx* c, int peer_rank, int nbytes, uint64_t dead
     // Tail tag BEFORE the post: it ships inside the same RDMA_WRITE payload.
     *(uint64_t*)(ctrl_send_slot(c) + nbytes - TP_TAIL_BYTES) = tag;
 
+    const int use_inl = ((unsigned)nbytes <= c->max_inline);
     struct ibv_sge sge; memset(&sge, 0, sizeof(sge));
-    sge.addr = (uint64_t)ctrl_send_slot(c); sge.length = (uint32_t)nbytes; sge.lkey = c->mr->lkey;
+    sge.addr = (uint64_t)ctrl_send_slot(c); sge.length = (uint32_t)nbytes; sge.lkey = use_inl ? 0 : c->mr->lkey;
     struct ibv_send_wr wr, *bad; memset(&wr, 0, sizeof(wr));
     wr.wr_id = TP_XCHG_WR_ID;
     wr.sg_list = &sge; wr.num_sge = 1;
-    wr.opcode = IBV_WR_RDMA_WRITE; wr.send_flags = IBV_SEND_SIGNALED;
+    wr.opcode = IBV_WR_RDMA_WRITE; wr.send_flags = IBV_SEND_SIGNALED | (use_inl ? IBV_SEND_INLINE : 0);
     wr.wr.rdma.remote_addr = ctrl_recv_raddr(c, peer_rank, g);
     wr.wr.rdma.rkey = peer_remote_rkey(c, peer_rank);
 
@@ -316,6 +317,122 @@ int net_exchange_one_dl(NetCtx* c, int peer_rank, int nbytes, uint64_t deadline_
     return exchange_one_impl(c, peer_rank, nbytes, deadline_ns);
 }
 
+// Phase 2B: parallel head <-> all-peers control exchange (1 RTT instead of world-1 serial RTTs).
+// Rank 0 posts the staged ctrl_send_slot payload to all peers 1..world upfront (inline when <= max_inline),
+// waits for all world-1 send CQEs and all world-1 peer tail tags concurrently, then copies each into
+// ctrl_last_slot(r) and zeroes the consumed ring slots. Wire-identical to world-1 calls of net_exchange_one
+// on the peers (nodes 1..world continue calling net_exchange_one(ctx, 0, nbytes) unchanged).
+int net_exchange_all_peers(NetCtx* c, int nbytes, uint64_t deadline_ns) {
+    if (c->world <= 2 || c->rank != 0) { LOGE("net_exchange_all_peers: requires world>2, rank==0"); return -1; }
+    if (nbytes < 16 || (size_t)nbytes > c->slot_stride - TP_TAIL_BYTES) return -1;
+    const int n_peers = c->world - 1;
+    const int use_inl = ((unsigned)nbytes <= c->max_inline && nbytes <= 512);
+    if (!use_inl) {
+        int any_err = 0;
+        for (int r = 1; r < c->world; r++) {
+            int rc = exchange_one_impl(c, r, nbytes, deadline_ns);
+            if (rc != 0 && any_err == 0) any_err = rc;
+        }
+        return any_err;
+    }
+
+    uint64_t gens[TP_NWAY_MAX_WORLD];
+    unsigned char ibuf[512];
+    memcpy(ibuf, ctrl_send_slot(c), (size_t)(nbytes - TP_TAIL_BYTES));
+    const uint64_t send_seq_before = __atomic_load_n(&c->xchg_send_seq, __ATOMIC_ACQUIRE);
+
+    int posted = 0;
+    for (int r = 1; r < c->world; r++) {
+        if (!c->peers[r].valid) { LOGE("exchange_all: peer %d QP not valid", r); return -1; }
+        const uint64_t g = ++c->xchg_gen[r];
+        gens[r] = g;
+        const uint64_t tag = (g << 8) | (uint64_t)c->rank;
+        memcpy(ibuf + nbytes - TP_TAIL_BYTES, &tag, TP_TAIL_BYTES);
+        struct ibv_sge sge = { .addr = (uint64_t)(uintptr_t)ibuf, .length = (uint32_t)nbytes, .lkey = 0 };
+        struct ibv_send_wr wr, *bad = NULL; memset(&wr, 0, sizeof(wr));
+        wr.wr_id = TP_XCHG_WR_ID;
+        wr.sg_list = &sge; wr.num_sge = 1;
+        wr.opcode = IBV_WR_RDMA_WRITE;
+        wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+        wr.wr.rdma.remote_addr = ctrl_recv_raddr(c, r, g);
+        wr.wr.rdma.rkey = peer_remote_rkey(c, r);
+        if (ibv_post_send(peer_qp(c, r), &wr, &bad)) { LOGE("exchange_all post_send(%d)", r); return -1; }
+        posted++;
+    }
+
+    // Wait for all `posted` send CQEs in parallel.
+    int got_sends = 0;
+    const uint64_t s_t0 = now_ns();
+    uint64_t s_last_probe = s_t0;
+    for (;;) {
+        if (!__atomic_load_n(&c->proxy_running, __ATOMIC_ACQUIRE)) {
+            struct ibv_wc wc[16]; int n = ibv_poll_cq(c->cq_send, 16, wc);
+            if (n < 0) { LOGE("exchange_all poll_cq"); return -1; }
+            for (int i = 0; i < n; i++) {
+                if (wc[i].status != IBV_WC_SUCCESS) { LOGE("exchange_all send wc %d", wc[i].status); return -3; }
+                if (wc[i].wr_id == TP_XCHG_WR_ID) got_sends++;
+            }
+        } else {
+            uint64_t cur = __atomic_load_n(&c->xchg_send_seq, __ATOMIC_ACQUIRE);
+            if (cur >= send_seq_before + (uint64_t)posted) got_sends = posted;
+        }
+        if (got_sends >= posted) break;
+        if (c->aborted || *flagp(c, TP_F_ABORT)) return -2;
+        uint64_t s_dt = now_ns() - s_t0;
+        if (deadline_ns && s_dt >= deadline_ns) { tp_set_abort(c, 12); return -4; }
+        if (s_dt >= TP_LIVE_PROBE_NS && now_ns() - s_last_probe >= TP_LIVE_PROBE_NS) {
+            s_last_probe = now_ns();
+            for (int r = 1; r < c->world; r++) {
+                if (!peer_alive_at(c, r)) {
+                    LOGE("exchange_all: peer %d unreachable (send CQE) — DEAD (code 10)", r);
+                    tp_set_abort(c, 10);
+                    return -3;
+                }
+            }
+        }
+        cpu_relax();
+    }
+
+    // Wait for all world-1 peer tail tags in parallel.
+    unsigned done_mask = 0u;
+    const unsigned full_mask = ((1u << c->world) - 1u) & ~1u;
+    const uint64_t t0 = now_ns();
+    uint64_t last_probe = t0;
+    for (;;) {
+        for (int r = 1; r < c->world; r++) {
+            if (done_mask & (1u << r)) continue;
+            volatile uint64_t* tailp = (volatile uint64_t*)(ctrl_recv_slot(c, r, gens[r]) + nbytes - TP_TAIL_BYTES);
+            if (*tailp == ((gens[r] << 8) | (uint64_t)r)) done_mask |= (1u << r);
+        }
+        if (done_mask == full_mask) break;
+        if (c->aborted || *flagp(c, TP_F_ABORT)) return -2;
+        uint64_t dt = now_ns() - t0;
+        if (deadline_ns && dt >= deadline_ns) { tp_set_abort(c, 12); return -4; }
+        if (dt >= TP_LIVE_PROBE_NS && now_ns() - last_probe >= TP_LIVE_PROBE_NS) {
+            last_probe = now_ns();
+            for (int r = 1; r < c->world; r++) {
+                if (done_mask & (1u << r)) continue;
+                if (!peer_alive_at(c, r)) {
+                    LOGE("exchange_all: peer %d unreachable (recv) — DEAD (code 10)", r);
+                    tp_set_abort(c, 10);
+                    return -3;
+                }
+            }
+        }
+        tp_host_backoff(dt);
+    }
+
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    for (int r = 1; r < c->world; r++) {
+        char* rslot = ctrl_recv_slot(c, r, gens[r]);
+        memcpy(ctrl_last_slot(c, r), (const void*)rslot, (size_t)nbytes);
+        memset((void*)rslot, 0, (size_t)nbytes);
+    }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    (void)n_peers;
+    return 0;
+}
+
 void net_abort(NetCtx* c){ if (c) tp_set_abort(c, 1); }
 
 void net_shutdown(NetCtx* c) {
@@ -332,9 +449,12 @@ void net_shutdown(NetCtx* c) {
     if (c->hbuf) cudaFreeHost(c->hbuf);
     if (c->dev_ctx_h) cudaFreeHost(c->dev_ctx_h);
     if (c->gpu_ts_h) cudaFreeHost(c->gpu_ts_h);
+    if (c->qp_mask_dev) cudaFree(c->qp_mask_dev);
     if (c->cpu_ts) free(c->cpu_ts);
     if (c->cq_send) ibv_destroy_cq(c->cq_send);
     if (c->cq_startup) ibv_destroy_cq(c->cq_startup);
+    if (c->td_pd) ibv_dealloc_pd(c->td_pd);
+    if (c->td) ibv_dealloc_td(c->td);
     if (c->pd) ibv_dealloc_pd(c->pd);
     if (c->ctx) ibv_close_device(c->ctx);
     free(c);

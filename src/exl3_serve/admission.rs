@@ -24,11 +24,10 @@ impl Exl3Scheduler {
         let mut key = req.prompt.clone();
         let mut off = 0usize;
         for sp in &req.image_spans {
-            let hh = (sp.pixel_hash as u32) ^ ((sp.pixel_hash >> 32) as u32);
             for j in 0..sp.num_tokens {
                 src[sp.start + j] = (off + j) as i32;
                 // ids >= 2^31 never collide with a vocabulary id; only the cache compares them
-                key[sp.start + j] = 0x8000_0000 | (hh.wrapping_add((j as u32).wrapping_mul(0x9E37_79B1)) & 0x7FFF_FFFF);
+                key[sp.start + j] = image_row_key(sp.pixel_hash, j);
             }
             off += sp.num_tokens;
         }
@@ -51,12 +50,24 @@ impl Exl3Scheduler {
         Ok((key, usize::MAX))
     }
 
+    /// Issue #46 (LRUPICK): record that lane `s` was released now. A monotonic counter, never a wall clock, so
+    /// every TP rank running the same releases in the same order holds the identical table (0 = never released).
+    fn stamp_lru(&mut self, s: usize) {
+        let next = self.lru.iter().copied().max().unwrap_or(0) + 1;
+        self.lru[s] = next;
+    }
+
+    /// Issue #46 (LRUPICK): among `free`, pick the lane released longest ago (never-released first; ties to lower slot).
+    pub(super) fn lru_free(&self, free: &[usize]) -> Option<usize> {
+        lru_pick_slot(free, &self.lru)
+    }
+
     /// LANERES1: every lane release of the single-box paths goes through one helper so no site
     /// is missed. `normal` = the request completed its turn (stop / length / a stop string / a
     /// tool call / loop-detected); only a normal release is eligible for a reservation. Cancels,
     /// errors and failed prefills never reserve. No stamping while the policy is off.
     pub(super) fn release_lane(&mut self, s: usize, normal: bool) {
-        if let Some(mut lane) = self.lanes[s].take() { self.record_release(&mut lane); }
+        if let Some(mut lane) = self.lanes[s].take() { self.record_release(&mut lane); self.stamp_lru(s); }
         if self.reserve.is_some() {
             self.rel[s] = Some((std::time::Instant::now(), normal));
         }
@@ -65,7 +76,7 @@ impl Exl3Scheduler {
     /// `release_lane` for the sites that still need the lane (`take()`): stamp, then hand over.
     pub(super) fn take_lane(&mut self, s: usize, normal: bool) -> Option<Lane> {
         let mut lane = self.lanes[s].take();
-        if let Some(l) = lane.as_mut() { self.record_release(l); }
+        if let Some(l) = lane.as_mut() { self.record_release(l); self.stamp_lru(s); }
         if lane.is_some() && self.reserve.is_some() {
             self.rel[s] = Some((std::time::Instant::now(), normal));
         }
@@ -109,46 +120,56 @@ impl Exl3Scheduler {
         self.publish_kv();
     }
 
+    /// The lane `admit_req` takes for `req`: the free lane whose snapshot is the longest prefix of this prompt,
+    /// then a lane with no snapshot, then any free lane (see `admit_req`). Read-only. `pending_free`: lanes that are
+    /// still occupied now but free by the time the admit applies (TPPOOL (design v3 step 4): a Cancel shipped in the
+    /// same step), so the head's capacity gate predicts the very lane the apply will pick; `admit_req` passes none.
+    pub(super) fn pick_lane(&self, req: &BatchRequest, scoped: Option<&[usize]>, pending_free: &[usize]) -> Option<usize> {
+        // PACKPF: a lane holding an in-flight packed prefill is not free for this admit
+        let free: Vec<usize> = (0..self.lanes.len())
+            .filter(|&i| (self.lanes[i].is_none() || pending_free.contains(&i)) && !self.pf_busy(i)).collect();
+        let free: Vec<usize> = match scoped {
+            Some(allowed) => free.into_iter().filter(|i| allowed.contains(i)).collect(),
+            None => free,
+        };
+        // PACKPF: the lane a packed prefill already filled with this prompt comes first
+        let packed = if scoped.is_none() {
+            free.iter().copied().find(|i| self.pf_done.get(i).map_or(false, |d| d.key == req.prompt))
+        } else { None };
+        let hit = free.iter().copied().filter_map(|i| match &self.cache[i] {
+            Some(t) if t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..] => Some((t.len(), i)),
+            _ => None,
+        }).max();
+        packed.or(hit.map(|(_, i)| i))
+            .or_else(|| {
+                // LANERES1: a scoped admit that did not come through the snapshot-hit arm
+                // picks its owner-change victim among the allowed lanes only.
+                if scoped.is_some() {
+                    return crate::lane_reserve::victim(&free, &self.slot_views(), &self.wp16_depths(&req.prompt));
+                }
+                // WP16: else the free lane whose checkpoints resume this prompt deepest
+                let st = self.wp16.as_ref()?;
+                let end = req.prompt.len().saturating_sub(1);
+                free.iter().copied()
+                    .map(|i| (st.resume_point(i, &req.prompt, end, self.chunk.max(1)).0, i))
+                    .filter(|&(q, _)| q > 0).max().map(|(_, i)| i)
+            })
+            .or_else(|| free.iter().copied().find(|&i| self.cache[i].is_none()))
+            // Issue #46 (LRUPICK): no empty lane left — take the free lane released longest ago rather than
+            // `free.first()` (slot 0), which otherwise evicted the conversation that just finished there.
+            .or_else(|| self.lru_free(&free))
+            .or_else(|| free.first().copied())
+    }
+
     fn admit_req(&mut self, mut req: BatchRequest, scoped: Option<(&[usize], crate::lane_reserve::Kind)>) {
         let t_admit = std::time::Instant::now();
         // prefix cache: prefer the free lane whose snapshot is the longest prefix of this prompt,
         // then a lane with no snapshot, then any free lane.
         // LANERES1: with the reservation policy on (`scoped`), every candidate list is restricted
         // to the policy's `allowed` lanes, and the fallback after the snapshot hit is the
-        // policy's victim order (empty > deepest WP16 > least recently released) instead of
-        // "slot 0". `scoped == None` keeps today's pick byte-for-byte.
-        let pick = {
-            // PACKPF: a lane holding an in-flight packed prefill is not free for this admit
-            let free: Vec<usize> = (0..self.lanes.len()).filter(|&i| self.lanes[i].is_none() && !self.pf_busy(i)).collect();
-            let free: Vec<usize> = match scoped {
-                Some((allowed, _)) => free.into_iter().filter(|i| allowed.contains(i)).collect(),
-                None => free,
-            };
-            // PACKPF: the lane a packed prefill already filled with this prompt comes first
-            let packed = if scoped.is_none() {
-                free.iter().copied().find(|i| self.pf_done.get(i).map_or(false, |d| d.key == req.prompt))
-            } else { None };
-            let hit = free.iter().copied().filter_map(|i| match &self.cache[i] {
-                Some(t) if t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..] => Some((t.len(), i)),
-                _ => None,
-            }).max();
-            packed.or(hit.map(|(_, i)| i))
-                .or_else(|| {
-                    // LANERES1: a scoped admit that did not come through the snapshot-hit arm
-                    // picks its owner-change victim among the allowed lanes only.
-                    if scoped.is_some() {
-                        return crate::lane_reserve::victim(&free, &self.slot_views(), &self.wp16_depths(&req.prompt));
-                    }
-                    // WP16: else the free lane whose checkpoints resume this prompt deepest
-                    let st = self.wp16.as_ref()?;
-                    let end = req.prompt.len().saturating_sub(1);
-                    free.iter().copied()
-                        .map(|i| (st.resume_point(i, &req.prompt, end, self.chunk.max(1)).0, i))
-                        .filter(|&(q, _)| q > 0).max().map(|(_, i)| i)
-                })
-                .or_else(|| free.iter().copied().find(|&i| self.cache[i].is_none()))
-                .or_else(|| free.first().copied())
-        };
+        // policy's victim order (empty > deepest WP16 > least recently released). With `scoped == None`,
+        // `pick_lane` uses the same LRU tie-breaker (LRUPICK, issue #46) instead of always taking slot 0.
+        let pick = self.pick_lane(&req, scoped.as_ref().map(|s| s.0), &[]);
         let free = match pick {
             Some(i) => i,
             None => {
@@ -210,12 +231,16 @@ impl Exl3Scheduler {
                     let _ = self.model.clear_slot_vision(free);
                     if let Some(p) = self.psc.as_mut() { p.vis_img = None; p.vis_src.clear(); }
                     let msg = format!("{e:#}");
-                    let reason = if msg.starts_with("bad request:") || msg.starts_with("unprocessable:") {
+                    let client = msg.starts_with("bad request:") || msg.starts_with("unprocessable:");
+                    let reason = if client {
                         format!("error: {msg}")
                     } else {
                         format!("error: vision setup failed: {msg}") // an engine fault, not the client's
                     };
                     let _ = req.tx.send(TokEvent::Finish { reason });
+                    // veloGB10 #44: a client error is decided from the shipped request alike on every rank (all ranks
+                    // skip); an engine fault (H2D / alloc in vision_setup) is rank-local. TP-D: never a one-rank skip.
+                    if !client && self.tp.is_some() { self.fatal = Some(msg); }
                     return;
                 }
             }
@@ -227,6 +252,27 @@ impl Exl3Scheduler {
             // WP02: the client left mid-prefill — the slot is free again, nobody to tell
             Ok(false) => return,
             Err(e) => {
+                // KVPOOL: the pool is full and no idle lane could give way, but other lanes still decode. The prompt's rows
+                // are mapped before any restore or prefill write (prefill_plan / prefill_range), so nothing of this request
+                // ran yet: it waits at the head of the queue and is admitted again after the next decode round.
+                if crate::kv_vmm::is_exhausted(&e) && self.tp.is_none() && req.image_spans.is_empty()
+                    && self.lanes.iter().any(|l| l.is_some()) {
+                    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); // one line per 10 s
+                    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                    let now_s = T0.get_or_init(std::time::Instant::now).elapsed().as_secs();
+                    if now_s >= SAID.load(std::sync::atomic::Ordering::Relaxed) {
+                        SAID.store(now_s + 10, std::sync::atomic::Ordering::Relaxed);
+                        crate::drprintln!("[kv-vmm] the shared KV pool is full; a {}-token request waits for a running lane to finish", req.prompt.len());
+                    }
+                    // count each waiting request once (it is retried after every decode round)
+                    static LAST: std::sync::Mutex<Option<(std::time::Instant, usize)>> = std::sync::Mutex::new(None);
+                    let me = (req.received_at, req.prompt.len());
+                    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+                    if *last != Some(me) { *last = Some(me); crate::kv_vmm::WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    drop(last);
+                    self.vmm_wait = Some(req);
+                    return;
+                }
                 crate::reprintln!("[exl3-serve] prefill failed (slot {free}): {e:#}");
                 let _ = req.tx.send(TokEvent::Finish { reason: format!("error: prefill failed: {e}") });
                 if self.tp.is_some() || sticky_cuda_error(&e) { self.fatal = Some(format!("{e:#}")); }
@@ -307,6 +353,7 @@ this line prints once per boot)"));
         };
         if let Err(e) = vstaged {
             let _ = req.tx.send(TokEvent::Finish { reason: format!("error: schema mask staging failed: {e}") });
+            if self.tp.is_some() { self.fatal = Some(format!("{e:#}")); } // veloGB10 #44 / TP-D: never a one-rank skip
             return;
         }
         let last = match self.model.forward_step(
@@ -527,5 +574,38 @@ this line prints once per boot)"));
         self.admit_req(req, Some((allowed, kind)));
         self.kv_pf = None;
         self.publish_kv();
+    }
+}
+
+/// Issue #46 (LRUPICK): among `free` lane indices, pick the one released longest ago
+/// (`0` = never released first; ties broken by lower slot index).
+fn lru_pick_slot(free: &[usize], lru: &[u64]) -> Option<usize> {
+    free.iter().copied().min_by_key(|&i| (lru[i], i))
+}
+
+#[cfg(test)]
+mod lru_pick_tests {
+    use super::lru_pick_slot;
+
+    #[test]
+    fn lru_pick_rotates_free_lanes_instead_of_re_evicting_slot_zero() {
+        let mut lru = vec![0u64; 6];
+        let free: Vec<usize> = (0..6).collect();
+        // Fill all 6 lanes once in order 0..6, releasing each.
+        for s in 0..6 {
+            assert_eq!(lru_pick_slot(&free, &lru), Some(s));
+            let next = lru.iter().copied().max().unwrap_or(0) + 1;
+            lru[s] = next;
+        }
+        // Conversation A finishes on slot 0 (making slot 0 most recently released).
+        lru[0] = lru.iter().copied().max().unwrap_or(0) + 1;
+        // Five sequential unrelated requests must land on slots 1, 2, 3, 4, 5 — slot 0 survives all 5!
+        for expected in 1..6 {
+            let pick = lru_pick_slot(&free, &lru).unwrap();
+            assert_eq!(pick, expected, "unrelated request should not evict just-finished slot 0");
+            lru[pick] = lru.iter().copied().max().unwrap_or(0) + 1;
+        }
+        // Only the 6th unrelated request finally evicts slot 0.
+        assert_eq!(lru_pick_slot(&free, &lru), Some(0));
     }
 }

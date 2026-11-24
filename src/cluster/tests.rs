@@ -163,3 +163,149 @@
         let all: Vec<&str> = logicals.iter().copied().filter(|rel| include_for_rank(rel, 2, false)).collect();
         assert_eq!(all.len(), logicals.len());
     }
+
+    #[test]
+    fn bulk_negotiate_loopback_tcp_fallback_and_warm_cache_roundtrip() {
+        let _g = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("vf_ship_rt_{}", std::process::id()));
+        let src_dir = base.join("src");
+        let cache_dir = base.join("cache");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        crate::opts::set(crate::opt!("tp-cache"), &cache_dir.to_string_lossy());
+
+        // One small blob (< BULK_MIN_BYTES) and one 5 MiB blob (>= BULK_MIN_BYTES) to exercise
+        // BulkOffer/BulkReply loopback TCP fallback and multi-blob framing.
+        let cfg_bytes = br#"{"model_type":"test"}"#;
+        let big_bytes: Vec<u8> = (0..(5 * 1024 * 1024)).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+        std::fs::write(src_dir.join("config.json"), cfg_bytes).unwrap();
+        std::fs::write(src_dir.join("weights.safetensors"), &big_bytes).unwrap();
+
+        let mk_art = |logical: &str, data: &[u8]| -> Artifact {
+            let mut h = Sha256::new();
+            h.update(data);
+            Artifact { logical: logical.into(), hash: hex(&h.finalize()), size: data.len() as u64 }
+        };
+        let arts = vec![
+            mk_art("config.json", cfg_bytes),
+            mk_art("weights.safetensors", &big_bytes),
+        ];
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = NodeInfo { hostname: "loopback-node".into(), addr };
+        let mut cfg = crate::tp::TpConfig::from_opts();
+        cfg.world = 2;
+        let topo = vec!["127.0.0.1".to_string(), "127.0.0.1".to_string()];
+
+        // Round 1: cold cache -> BulkOffer(enabled=false on loopback) -> TCP ship -> exact SHA-256 assemble.
+        let srv1 = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let res = node_handle(stream).unwrap();
+            (listener, res)
+        });
+        let offer1 = head_sync_one(&peer, "vf-test-model", &arts, None).unwrap();
+        assert_eq!(offer1.missing.len(), 2, "cold cache must request both blobs");
+        let _head_s1 = head_ship(&peer, 1, offer1, &src_dir, &arts, &topo, &cfg, None, None).unwrap();
+        let (listener, (assembled1, draft1, cfg1, _node_s1)) = srv1.join().unwrap();
+        assert!(draft1.is_none());
+        assert_eq!(cfg1.node_rank, 1);
+        assert_eq!(std::fs::read(assembled1.join("config.json")).unwrap(), cfg_bytes);
+        assert_eq!(std::fs::read(assembled1.join("weights.safetensors")).unwrap(), big_bytes);
+
+        // Round 2: warm cache -> missing is empty -> zero BulkOffer/BulkReply messages, instant Ready.
+        let srv2 = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            node_handle(stream).unwrap()
+        });
+        let offer2 = head_sync_one(&peer, "vf-test-model", &arts, None).unwrap();
+        assert!(offer2.missing.is_empty(), "warm cache must need 0 blobs");
+        let _head_s2 = head_ship(&peer, 1, offer2, &src_dir, &arts, &topo, &cfg, None, None).unwrap();
+        let (assembled2, _, _, _node_s2) = srv2.join().unwrap();
+        assert_eq!(assembled2, assembled1);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pack_shard_hashes_validates_index_and_file_sizes() {
+        let base = std::env::temp_dir().join(format!("pack_hashes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let idx = br#"{"weight_map":{}}"#;
+        let idx_sha = hex(&Sha256::digest(idx));
+        std::fs::write(base.join("model.safetensors.index.json"), idx).unwrap();
+        std::fs::write(base.join("w.safetensors"), &[1u8; 64]).unwrap();
+
+        let good = serde_json::json!({
+            "format": "velogb10-shard-hashes",
+            "version": 1,
+            "plan_version": crate::shard_plan::PLAN_VERSION,
+            "index_sha256": idx_sha,
+            "files": { "w.safetensors": { "size": 64, "sha256": "aa".repeat(32) } },
+            "segments": { "inner|w8|r1|seg/L00.safetensors": { "size": 128, "sha256": "bb".repeat(32) } }
+        });
+        std::fs::write(base.join("shard_hashes.json"), serde_json::to_vec(&good).unwrap()).unwrap();
+        let loaded = load_pack_shard_hashes(&base).expect("valid shard_hashes.json must load");
+        assert_eq!(loaded.segments["inner|w8|r1|seg/L00.safetensors"].size, 128);
+
+        // Wrong file size must reject cleanly.
+        let bad_sz = serde_json::json!({
+            "format": "velogb10-shard-hashes",
+            "version": 1,
+            "plan_version": crate::shard_plan::PLAN_VERSION,
+            "index_sha256": idx_sha,
+            "files": { "w.safetensors": { "size": 65, "sha256": "aa".repeat(32) } }
+        });
+        std::fs::write(base.join("shard_hashes.json"), serde_json::to_vec(&bad_sz).unwrap()).unwrap();
+        assert!(load_pack_shard_hashes(&base).is_none());
+
+        // Wrong index sha must reject cleanly.
+        let bad_idx = serde_json::json!({
+            "format": "velogb10-shard-hashes",
+            "version": 1,
+            "plan_version": crate::shard_plan::PLAN_VERSION,
+            "index_sha256": "00".repeat(32),
+            "files": {}
+        });
+        std::fs::write(base.join("shard_hashes.json"), serde_json::to_vec(&bad_idx).unwrap()).unwrap();
+        assert!(load_pack_shard_hashes(&base).is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[ignore]
+    fn emit_dsv41_exl3_segment_hashes() {
+        let model_dir = Path::new("/models/DeepSeek-V4.1-Flash-EXL3");
+        let c = crate::dsv41::load::ship::census_of(model_dir).unwrap();
+        let deal = "inner";
+        let mut cache = hash_cache_load();
+        let mut out = serde_json::Map::new();
+        for world in [2usize, 4, 8] {
+            let o = crate::dsv41::load::ship::plan_opts(&c, world, deal).unwrap();
+            for rank in 1..world {
+                let sel = crate::dsv41::load::plan::select(&c, &o, rank).unwrap();
+                let (files, _) = crate::dsv41::load::ship::rank_files(&c, model_dir, &o, &sel).unwrap();
+                for f in &files {
+                    if let crate::shard_plan::PlanSrc::Segment(_) = &f.src {
+                        let sz = crate::shard_plan::RankPlan::file_size(f).unwrap();
+                        let k = plan_src_key(&f.src).unwrap().unwrap();
+                        let sha = match cache.get(&k) {
+                            Some(h) => h.clone(),
+                            None => {
+                                let h = hash_plan_src(&f.src, None).unwrap();
+                                cache.insert(k, h.clone());
+                                h
+                            }
+                        };
+                        let sk = format!("{deal}|w{world}|r{rank}|{}", f.logical);
+                        out.insert(sk, serde_json::json!({ "size": sz, "sha256": sha }));
+                    }
+                }
+            }
+        }
+        hash_cache_save(&cache);
+        std::fs::write("/tmp/dsv41_segments.json", serde_json::to_vec_pretty(&out).unwrap()).unwrap();
+    }

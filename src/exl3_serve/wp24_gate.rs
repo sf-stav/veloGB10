@@ -187,11 +187,11 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
         mtp_k, spec_policy: SpecLanes::Never, lane_order: LaneOrder::Rr, lane_quantum: 256, admit_ctr: 0, fcfs_rots: 0,
         lane_pack: crate::lane_pack::LanePack::Off, scp: None, pack_ready: [false, false], pack_sampled: false, pack_rot: 0, pack_logs: 0, in_prefill: false, pack_stats: PackStats::default(), tr: SchedTrace::default(),
         reprobe_on, reprobe_cfg, shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, spec_win_tok: [0.0; 2], spec_win_ms: [0.0; 2], spec_win_n: [0; 2], spec_win_acc: [0; 2], spec_arm_rate: [0.0; 2], spec_arm_n: [0; 2], spec_arm_fold: [0; 2], spec_rate_n: vec![[(0.0, 0); 2]; SPEC_RATE_NMAX + 1], spec_rate_folds: vec![[0; 2]; SPEC_RATE_NMAX + 1], meter_settle: 0, meter_last_n: 0, probe_fold: [false; 2], spec_probe: None, spec_probe_ctr: 0, spec_est_pick: None, spec_margin: 0.0, spec_margin_n: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
-        reserve: None, reserve_st: crate::lane_reserve::State::new(), rel: (0..width).map(|_| None).collect(),
+        reserve: None, reserve_st: crate::lane_reserve::State::new(), rel: (0..width).map(|_| None).collect(), lru: vec![0; width],
         prefix_on: true, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: None, pen_range: 1024, spec_ratio: false, draft_temp, gate: None, tok: tok.clone(), tp: None,
-        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), pf_done: Default::default(), pf_jobs: Vec::new(), mrope_section: None, vis_seam: None, kv_pf: None, turn: None,
+        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), pf_done: Default::default(), pf_jobs: Vec::new(), vmm_wait: None, mrope_section: None, vis_seam: None, kv_pf: None, turn: None,
     };
     let quick = args.iter().any(|a| a == "--quick");
     wp24_gate_conditions(&mut sched, &prompt, &text, trials, positions, n_seeds, top_k, draft_conf, draft_temp, quick)

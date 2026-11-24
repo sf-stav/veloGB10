@@ -259,6 +259,24 @@ pub struct RecurCkpt {
     hist: [i32; 2],
 }
 
+impl RecurCkpt {
+    /// SPILLTRUNC: the checkpoint's device byte span — spill_capture D2Hs it exactly like a region (the
+    /// spill file's carried state), spill_trunc_restore H2Ds a carried one back into a fresh buffer.
+    pub(crate) fn spill_span(&self) -> (u64, usize) {
+        (*self.buf.device_ptr() as u64, self.buf.len() * 4)
+    }
+    pub(crate) fn hist(&self) -> [i32; 2] {
+        self.hist
+    }
+    pub(crate) fn set_hist(&mut self, h: [i32; 2]) {
+        self.hist = h;
+    }
+    /// SPILLTRUNC: bytes the spill section carries per checkpoint (= ckpt_layout().bytes(); one value, both sides).
+    pub(crate) fn spill_bytes(&self) -> usize {
+        self.buf.len() * 4
+    }
+}
+
 /// Bitwise comparison of two checkpoints, per component (mismatching f32 words / total).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CkptDiff {
@@ -416,6 +434,7 @@ impl FwdModel {
         if !(pfx1_on(PFX1_HEADKV) && head_fill_on() && pfx1_headkv_poison()) { return Ok(()); }
         let Some(head) = self.mtp.as_ref() else { return Ok(()) };
         if q >= self.max_pos { return Ok(()); }
+        if self.vmm_lazy() { return Ok(()); } // KVPOOL: the gate writes rows [q, max_pos) — most are not mapped
         let (nkv, hd) = (self.cfg.num_kv_heads, self.cfg.head_dim);
         let rb = kv_rowbytes(self.kv_fmt, hd);
         let base = *head.kv.device_ptr() as u64;

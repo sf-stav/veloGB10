@@ -570,3 +570,37 @@
         }
         eprintln!("wp01: {path}: ids={n} piece={n_piece} special={n_special} random+text pushes={pushes} — identical");
     }
+
+    // ---- ink2-t1: generation tags and the `tojson` kwargs (expected strings are Python's `json.dumps` / jinja2 output) ----
+
+    fn render_str(src: &str) -> String {
+        let mut env = minijinja::Environment::new();
+        super::jinja::register_pycompat(&mut env);
+        let s = super::jinja::strip_generation_tags(src);
+        env.add_template("t", Box::leak(s.into_boxed_str())).unwrap();
+        env.get_template("t").unwrap().render(serde_json::json!({"v": {"b": [1, 2.5, {"z": null, "a": true}], "a": "é中😀", "c": {"y": 1, "x": []}}})).unwrap()
+    }
+
+    #[test]
+    fn tojson_honours_sort_keys_separators_and_ensure_ascii() {
+        // python: json.dumps(v, ensure_ascii=False) and friends
+        assert_eq!(render_str("{{ v | tojson }}"), r#"{"b": [1, 2.5, {"z": null, "a": true}], "a": "é中😀", "c": {"y": 1, "x": []}}"#);
+        assert_eq!(render_str("{{ v | tojson(sort_keys=true) }}"), r#"{"a": "é中😀", "b": [1, 2.5, {"a": true, "z": null}], "c": {"x": [], "y": 1}}"#);
+        assert_eq!(render_str(r#"{{ v | tojson(separators=(",", ":")) }}"#), r#"{"b":[1,2.5,{"z":null,"a":true}],"a":"é中😀","c":{"y":1,"x":[]}}"#);
+        assert_eq!(render_str(r#"{{ v | tojson(sort_keys=true, separators=(",", ":")) }}"#), r#"{"a":"é中😀","b":[1,2.5,{"a":true,"z":null}],"c":{"x":[],"y":1}}"#);
+        assert_eq!(render_str("{{ v | tojson(ensure_ascii=True) }}"), "{\"b\": [1, 2.5, {\"z\": null, \"a\": true}], \"a\": \"\\u00e9\\u4e2d\\ud83d\\ude00\", \"c\": {\"y\": 1, \"x\": []}}");
+        assert_eq!(render_str("{{ v | tojson(ensure_ascii=False) }}"), render_str("{{ v | tojson }}"));
+    }
+
+    #[test]
+    fn generation_tags_keep_their_whitespace_controls_in_every_spelling() {
+        // jinja2 + the HF generation extension: `{%- generation -%}` trims both sides like any block tag
+        let t = |s: &str| render_str(s);
+        assert_eq!(t("A  {%- generation -%}  B  {%- endgeneration -%}  C"), "ABC");
+        assert_eq!(t("A  {% generation %}  B  {% endgeneration %}  C"), "A    B    C");
+        assert_eq!(t("A  {%- generation %}  B  {%- endgeneration %}  C"), "A  B  C");
+        assert_eq!(t("A  {% generation -%}  B  {% endgeneration -%}  C"), "A  B  C");
+        assert_eq!(t("{%-generation-%}x{%-endgeneration-%}"), "x");
+        // a block that merely mentions the word is untouched
+        assert_eq!(t("{% set generation = 1 %}{{ generation }}"), "1");
+    }

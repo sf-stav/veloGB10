@@ -1,3 +1,83 @@
+# Changelog
+
+## v0.8.0 — Velo-Fabric, DeepSeek-V4.1-Flash, Inkling-2-Mini, TP=2→8
+
+A major release: veloGB10 gains a purpose-built multi-node fabric layer, two new model
+families, arbitrary-width TP topologies (TP=3 and TP=6), a shared KV page pool, a
+vision-embed cache, and six community-reported fixes and contributions.
+
+### Velo-Fabric — the multi-node fabric layer
+
+- **Velo-Fabric**: built-in, NCCL-free / MPI-free collective transport for DGX Spark (GB10)
+  clusters over 200GbE ConnectX-7 RoCEv2 — GPU-validated direct-NIC-tail receives, Blackwell
+  PDL overlap, lock-free dual-rail verbs, full CUDA-Graph capture. Median all-reduce:
+  **15.9 µs (TP=2), 21.5 µs (TP=3), 22.8 µs (TP=4), 28.5 µs (TP=6), 31.4 µs (TP=8)**,
+  bit-identical FP32 canonical reduction order on every rank.
+- **TP=3 and TP=6 arbitrary-W topologies** alongside TP=2/4/8 — non-power-of-two clusters
+  are first-class.
+- **DeepSpeed-Ulysses** 1-RTT All-to-All sequence-parallel attention at arbitrary world size
+  (`arXiv:2309.14509`), with localized `gate_attn` (bit-exact FP32 default; −35.4% A2A wire).
+- **LAGA** BF16 attention-output All-to-All for DeepSeek-V4.1 (−18.8–19.3% SP prefill wire),
+  generalized to uneven o_groups on TP=3/TP=6.
+- **Opt-in BF16 Ulysses wire** (`--inkling2-ulysses-wire bf16`, −47% wire).
+- **Fused dual-rail stage & collect** for world-2 (TP=2).
+- **Automatic RoCEv2 bulk weight shipping** — parallel fan-out, ARMv8 hardware SHA-256
+  caching; peers need zero manual model copying. Auto-detect of bundled `engram_source/` +
+  `shard_hashes.json`.
+- **Pre-handshake PTX preload**, `[velo-fabric]` boot logs, and `/metrics` fabric gauges.
+- Fixes: division-by-zero in `nway_recv_slot_at` on TP=3/6; EngramWkv cut alignment with
+  `heads_of_rank`.
+
+### New model support
+
+- **DeepSeek-V4.1-Flash-1017** end-to-end on TP=2/3/4/6/8 — P7SP sequence-parallel prefill
+  with mirror-zigzag causal indexer sharding, native FP8 **Engram** tables (~190 GiB,
+  auto-detected), **1M-token context**, prefix caching, lockstep DSpark speculative decoding,
+  full vision support (Rank-0 ViT + 3×3 aligner), and opt-in `--dsv41-wire-bf16` (+5–6%
+  single-user decode). Credit and thanks to [@MiaAI-Lab](https://github.com/MiaAI-Lab) for the DeepSeek-V4.1-Flash-1017 release and reference work. Setup guide: [DEEPSEEK_V41_FLASH_SETUP.md](DEEPSEEK_V41_FLASH_SETUP.md).
+- **Inkling-2-Mini** (Thinking Machines) on TP=1 through TP=8 — 64-channel balanced MoE inner
+  sharding, vocab-parallel MTP speculation (exact accept, native actq), Ulysses SP attention,
+  opt-in `--inkling2-expert-act native` FP4/FP8 tensor-core activations. Up to **5,086 tok/s**
+  cold prefill and **89.1 tok/s** 1-user decode at TP=8. Setup guide:
+  [INKLING_2_MINI_SETUP.md](INKLING_2_MINI_SETUP.md).
+
+### Serving, caching & memory
+
+- **Shared KV page pool across lanes** on CUDA virtual memory (`--kv-pool off|full|lazy`,
+  `--kv-pool-gb`, `--fit-floor-gb`), with `/metrics` wait counters and design notes in
+  [docs/KV_POOL.md](docs/KV_POOL.md).
+- **VISCACHE: content-keyed vision-tower embed cache** (`--vision-embed-cache-mb`, default
+  512 MiB), plus a cache-tier hardening follow-up (spill durability join, image-pool capture,
+  cost-weighted retention, boot GC, truncated-restore handling).
+- **ANSI colored logging** with `--color auto|always|never` and datetime after the `[tag]`.
+
+### Community fixes & contributions — thank you
+
+- **[PR #42](https://github.com/sf-stav/veloGB10/pull/42) — VISCACHE: content-keyed
+  vision-tower embed cache.** **Thanks to @rusty-dev.**
+- **[#43](https://github.com/sf-stav/veloGB10/issues/43) — Shared KV page pool across lanes**
+  on CUDA virtual memory, with bench tools and design notes. **Thanks to @AbsolomBane.**
+- **[#44](https://github.com/sf-stav/veloGB10/issues/44) — TP fix: a failed spill capture
+  still votes** in the agree instead of stalling the rank; admission engine faults are fatal
+  on every rank. **Thanks to @AbsolomBane.**
+- **[#45](https://github.com/sf-stav/veloGB10/issues/45) — TP=2 fix: pairwise rendezvous
+  before back-to-back agrees**, removing the `--spec-arm-meter v2` agree stall.
+  **Thanks to @ablake4427.**
+- **[#46](https://github.com/sf-stav/veloGB10/issues/46) — Admission fix: pick the
+  least-recently-released free lane** on unscoped fallback instead of wedging a busy lane.
+  **Thanks to @ablake4427.**
+- **[PR #47](https://github.com/sf-stav/veloGB10/pull/47) — gpu-wait covers the DFlash2 /
+  DSpark draft rounds** so early-draft GPU waits report correctly. **Thanks to @jetnet.**
+
+### New public docs
+
+- [VELO_FABRIC.md](VELO_FABRIC.md) — fabric architecture and operation.
+- [docs/VELO_FABRIC_BENCHMARKS.md](docs/VELO_FABRIC_BENCHMARKS.md) — micro-benchmarks,
+  including TP=8 results.
+- [DEEPSEEK_V41_FLASH_SETUP.md](DEEPSEEK_V41_FLASH_SETUP.md) and
+  [INKLING_2_MINI_SETUP.md](INKLING_2_MINI_SETUP.md) — step-by-step setup guides.
+- [docs/KV_POOL.md](docs/KV_POOL.md) — shared KV pool design.
+
 ## v0.7.10 — source-tree split, Qwen3.6 vision-tower fix, template compatibility
 
 A maintenance release. The large source files that had grown monolithic over the

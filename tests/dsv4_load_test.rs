@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 const BUNDLE: &str = "/mnt/models/DeepSeek-V4-Flash-DSpark";
+
+fn bundle_present() -> bool { Path::new(BUNDLE).join("inference/config.json").exists() }
+
 // 0731-native fixture (regenerated 2026-08-01 from the DeepSeek-V4-Flash-0731 bundle).
 // SKIP when absent (NOT a hard panic) — the gate is a cross-check against convert.py's dequant,
 // not the load-bearing contract; an absent fixture means "regenerate, don't fail the suite".
@@ -45,6 +48,7 @@ fn assert_bf16(t: &HostTensor, shape: &[usize], key: &str) {
 // ---------------------------------------------------------------------------
 #[test]
 fn config_real_values() {
+    if !bundle_present() { return; } // lab-model-bundle gate: skipped where the DSV4 bundle is absent (dev box)
     let cfg = load_config(&bundle()).expect("load_config");
 
     assert_eq!(cfg.vocab_size, 129280);
@@ -163,6 +167,7 @@ fn npy_roundtrip() {
 // ---------------------------------------------------------------------------
 #[test]
 fn strict_load_all_46_moe_blocks() {
+    if !bundle_present() { return; } // lab-model-bundle gate: skipped where the DSV4 bundle is absent (dev box)
     let _g = gate();
     let cfg = load_config(&bundle()).unwrap();
     let bundle = bundle();
@@ -316,6 +321,7 @@ fn strict_load_all_46_moe_blocks() {
 // ---------------------------------------------------------------------------
 #[test]
 fn expert_repack_ab_bitwise() {
+    if !bundle_present() { return; } // lab-model-bundle gate: skipped where the DSV4 bundle is absent (dev box)
     let _g = gate();
     let bundle = bundle();
 
@@ -373,6 +379,7 @@ fn expert_repack_ab_bitwise() {
 // ---------------------------------------------------------------------------
 #[test]
 fn trunk_top_load() {
+    if !bundle_present() { return; } // lab-model-bundle gate: skipped where the DSV4 bundle is absent (dev box)
     let _g = gate();
     let cfg = load_config(&bundle()).unwrap();
     let top = load_trunk_top(&bundle(), &cfg).unwrap();

@@ -50,6 +50,7 @@ fn cmp_f32(label: &str, art: &Art, dev: &cudarc::driver::CudaSlice<f32>) {
 
 #[test]
 fn prepare_layer_matches_upload_layer_layer2_csa() {
+    if !Path::new(BUNDLE).join("inference/config.json").exists() { return; }
     let _g = gate();
     let cfg = dsv4_load::load_config(Path::new(BUNDLE)).unwrap();
     let dev = Arc::new(CudaDevice::new(0).unwrap());
@@ -105,6 +106,7 @@ fn prepare_layer_matches_upload_layer_layer2_csa() {
 
 #[test]
 fn prepare_layer_matches_upload_layer_layer3_hca() {
+    if !Path::new(BUNDLE).join("inference/config.json").exists() { return; }
     let _g = gate();
     let cfg = dsv4_load::load_config(Path::new(BUNDLE)).unwrap();
     let dev = Arc::new(CudaDevice::new(0).unwrap());
@@ -128,6 +130,7 @@ fn prepare_layer_matches_upload_layer_layer3_hca() {
 /// proof that `load_converted` produces the same GPU state as the streaming `load`.
 #[test]
 fn load_converted_matches_streaming_forward() {
+    if !Path::new(BUNDLE).join("inference/config.json").exists() { return; }
     let _g = gate();
     let bundle = Path::new(BUNDLE);
     let cfg = dsv4_load::load_config(bundle).unwrap();
@@ -173,6 +176,7 @@ fn argmax(x: &[f32]) -> usize {
 /// the load-speed lane's TP=2 design: each node loads only ~84 GB (its pre-sliced shard).
 #[test]
 fn sharded_artifact_tp_load_matches_streaming() {
+    if !Path::new(BUNDLE).join("inference/config.json").exists() { return; }
     let _g = gate();
     let bundle = Path::new(BUNDLE);
     let cfg = dsv4_load::load_config(bundle).unwrap();

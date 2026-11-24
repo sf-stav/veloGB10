@@ -290,6 +290,10 @@ impl Exl3Scheduler {
                     Some(_) => {}
                 }
             }
+            // TPPOOL (design v3 step 4): lanes this step's Cancels free before its admits apply, and the pages charged to
+            // the admits it ships (the head's capacity gate; inert unless a lazy pool runs under TP)
+            let pending_free: Vec<usize> = events.iter().filter_map(|e| match e { TpEvent::Cancel { lane } => Some(*lane), _ => None }).collect();
+            let mut gate_reserved = 0usize;
             // COPYREC1: DELETE /v1/copy-record is a step event (after this step's cancels, before its admits) so every
             // rank empties its record at the same point
             if crate::copy_record::take_clear_request() && self.record.is_some() {
@@ -325,9 +329,15 @@ impl Exl3Scheduler {
                                 if let Some(mut req) = waiting.remove(waiting_index) {
                                     if !req.tx.is_closed() {
                                         exl3_tp_strip(&mut req, self.tp.as_ref().map_or(1, |t| t.world)); // before the Admit ships: head and node agree
+                                        let gate = self.tp_pool_gate(&req, Some(allowed.as_slice()), &pending_free, gate_reserved);
                                         if let Some(why) = exl3_reject(&req) {
                                             let _ = req.tx.send(TokEvent::Finish { reason: why });
+                                        } else if gate == super::tp_pool_gate::GateDecision::Hold {
+                                            waiting.insert(waiting_index.min(waiting.len()), req); // TPPOOL: same place, next step re-plans
+                                        } else if let super::tp_pool_gate::GateDecision::Refuse(why) = gate {
+                                            let _ = req.tx.send(TokEvent::Finish { reason: why });
                                         } else {
+                                            if let super::tp_pool_gate::GateDecision::Ship { pages } = gate { gate_reserved += pages; }
                                             if req.seed.is_none() {
                                                 req.seed = Some(entropy_seed()); // head-resolved: every rank samples one stream
                                             }
@@ -387,6 +397,13 @@ impl Exl3Scheduler {
                     let _ = req.tx.send(TokEvent::Finish { reason: why });
                     continue;
                 }
+                // TPPOOL (design v3 step 4): never ship an Admit the shared pool cannot hold (the apply would be a fatal on
+                // every rank). Hold keeps FIFO order. Gated, the head ships one Admit per iteration (`tp_pool_gated`).
+                match self.tp_pool_gate(&req, None, &pending_free, gate_reserved) {
+                    super::tp_pool_gate::GateDecision::Ship { pages } => gate_reserved += pages,
+                    super::tp_pool_gate::GateDecision::Hold => { waiting.push_front(req); break; }
+                    super::tp_pool_gate::GateDecision::Refuse(why) => { let _ = req.tx.send(TokEvent::Finish { reason: why }); continue; }
+                }
                 if req.seed.is_none() {
                     req.seed = Some(entropy_seed()); // head-resolved: every rank samples one stream
                 }
@@ -401,6 +418,7 @@ impl Exl3Scheduler {
                 events.push(TpEvent::Admit(w));
                 admits.push_back(req);
                 free -= 1;
+                if self.tp_pool_gated() { break; } // TPPOOL: one Admit per iteration while the gate decides
             }
             }
             if !waiting.is_empty() {

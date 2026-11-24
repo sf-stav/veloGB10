@@ -123,13 +123,14 @@ impl Pipe {
 }
 
 /// The epochs in flight per rail for a requested `lookahead`: G <= R/2 (recv-slot rule) and a multiple of
-/// `rounds` (world>2: round(x+R-G) == round(x)); also `rounds` must divide R, or epoch x and x+R (the same ring
-/// slot) would sit on different rounds (world 8: rounds 3 does not divide R = 8, refused here). A pure function so the
-/// CPU model tests run the real clamp.
+/// `rounds` (world>2: round(x+R*rounds-G) == round(x)). Phase 2: per-round recv slot indexing `(e / rounds) % R`
+/// makes every round ring bijective with reuse period `R * rounds`, lifting the old `R % rounds == 0` restriction
+/// so world 8 (`rounds = 3`, `G = 3`) is supported cleanly alongside world 2 (`rounds = 1`), 4 (`rounds = 2`),
+/// and 16 (`rounds = 4`). A pure function so the CPU model tests run the real clamp.
 pub fn effective_lookahead(lookahead: usize, rounds: usize) -> Result<usize> {
-    anyhow::ensure!(rounds >= 1 && RING_SLOTS % rounds == 0,
-        "rounds {rounds} does not divide the {RING_SLOTS}-slot recv ring: epoch x and x + {RING_SLOTS} share a slot but not a round \
-         (world 8 has rounds 3), so the pipelined transport refuses it");
+    anyhow::ensure!(rounds >= 1 && rounds <= RING_SLOTS / 2,
+        "rounds {rounds} out of range 1..={} for the {RING_SLOTS}-slot recv ring (no lookahead satisfies G <= R/2 with G % rounds == 0)",
+        RING_SLOTS / 2);
     let mut g = lookahead.clamp(1, RING_SLOTS / 2);
     g = (g / rounds).max(1) * rounds;
     anyhow::ensure!(g <= RING_SLOTS / 2, "no lookahead satisfies G <= R/2 with G % rounds == 0 (rounds {rounds})");
@@ -295,6 +296,43 @@ pub fn single_tree_reference(parts: &[Vec<f32>]) -> Result<Vec<f32>> {
     anyhow::ensure!(parts.len() == 4 && parts.iter().all(|p| p.len() == parts[0].len()),
                     "single_tree_reference: {} partials (world 4 needs exactly 4, equal length)", parts.len());
     Ok((0..parts[0].len()).map(|i| (parts[0][i] + parts[2][i]) + (parts[1][i] + parts[3][i])).collect())
+}
+
+/// Phase 2 (TP=8 readiness): 2-stage `2x4` hierarchical world-8 collective plan for `rank` (`0..8`).
+/// Stage 1 runs a 4-way all-peers push inside the rank's parity quad (`{0,2,4,6}` or `{1,3,5,7}`), summing
+/// `(q[0] + q[1]) + (q[2] + q[3])` = `(p0+p2)+(p4+p6)` on even ranks and `(p1+p3)+(p5+p7)` on odd ranks.
+/// Stage 2 runs a single 2-way pair exchange with `pair_peer = rank ^ 1`, summing `even_quad + odd_quad`
+/// = `((p0+p2)+(p4+p6)) + ((p1+p3)+(p5+p7))` — bit-identical to `rd_tree_reference(8, 0, parts)` in 2 RTTs
+/// and 4 active peers per rank (vs 3 RTTs in recursive doubling or 7 peers in a flat 8-way push).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hier8Plan {
+    /// Ordered 4 ranks of this rank's stage-1 quad: `[base+0, base+2, base+4, base+6]`.
+    pub quad: [usize; 4],
+    /// Position of `rank` inside `quad` (`0..4`).
+    pub quad_pos: usize,
+    /// Stage-2 inter-quad partner (`rank ^ 1`).
+    pub pair_peer: usize,
+    /// True iff this rank belongs to the lower (even) quad (`rank & 1 == 0`, left operand of stage-2 add).
+    pub lower_quad: bool,
+}
+
+pub fn hier8_plan(rank: usize) -> Result<Hier8Plan> {
+    anyhow::ensure!(rank < 8, "hier8_plan: rank {rank} out of range 0..8");
+    let parity = rank & 1;
+    let quad = [parity, parity + 2, parity + 4, parity + 6];
+    Ok(Hier8Plan { quad, quad_pos: rank >> 1, pair_peer: rank ^ 1, lower_quad: parity == 0 })
+}
+
+/// Pure host reference of the 2-stage `2x4` hierarchical world-8 collective:
+/// `((p0 + p2) + (p4 + p6)) + ((p1 + p3) + (p5 + p7))`, bitwise equal to `rd_tree_reference(8, 0, parts)`.
+pub fn hier8_tree_reference(parts: &[Vec<f32>]) -> Result<Vec<f32>> {
+    anyhow::ensure!(parts.len() == 8 && parts.iter().all(|p| p.len() == parts[0].len()),
+                    "hier8_tree_reference: {} partials (world 8 needs exactly 8, equal length)", parts.len());
+    Ok((0..parts[0].len()).map(|i| {
+        let q0 = (parts[0][i] + parts[2][i]) + (parts[4][i] + parts[6][i]);
+        let q1 = (parts[1][i] + parts[3][i]) + (parts[5][i] + parts[7][i]);
+        q0 + q1
+    }).collect())
 }
 
 /// True when `reduce_pipe` can carry this payload (every epoch a 16 B multiple).
@@ -1152,6 +1190,323 @@ pub fn all_gather_rows_multi_w4(k: &Kernels, stream: &CudaStream, x: &Pipe, bufs
     anyhow::ensure!(x.rounds == 2, "TP-4S all-gather: world 4 only (rounds {})", x.rounds);
     let bub = *x.bubble.device_ptr() as u64;
     let prog = sp4_ag_program(bufs, blocks, rank, x.rails.len(), x.lookahead, bub, EPOCH_FLOATS * 4)?;
+    exec_sp4(k, stream, x, &prog, None)
+}
+
+// =================================================================================================
+// Phase A (TP-8S): sequence-parallel prefill at WORLD 8. Exact 3-round extension of TP-4S on the
+// same doorbell protocol and phase-aligned Pipe (rounds = 3, lookahead G = 3, 1 or 2 rails):
+// on a phase-aligned rail (e0 % 3 == 0), device epochs 1, 2, 3, ... pair with partners:
+//   slot % 3 == 0 -> Phase A: partner rank ^ 2 (bit 1)
+//   slot % 3 == 1 -> Phase B: partner rank ^ 4 (bit 2)
+//   slot % 3 == 2 -> Phase C: partner rank ^ 1 (bit 0)
+//   reduce-scatter: A halves 8 -> 4 blocks (same bit 1 as rank), B halves 4 -> 2 blocks (same bit 1 & 2),
+//                   C halves 2 -> 1 block (rank's own eighth). Per element:
+//                   ((p0 + p2) + (p4 + p6)) + ((p1 + p3) + (p5 + p7)) — bitwise the canonical world-8 tree.
+//   all-gather:     A doubles 1 -> 2 ({r, r^2}), B doubles 2 -> 4 ({r, r^2, r^4, r^6}),
+//                   C doubles 4 -> 8 (all 8 blocks), every receive via tp_wait_copy_mb (bytes verbatim).
+// =================================================================================================
+
+/// The eight ranks' row blocks of a `c`-row chunk.
+pub type Blocks8 = [(usize, usize); 8];
+pub fn row_blocks8(c: usize) -> Blocks8 { std::array::from_fn(|r| row_block(c, r, 8)) }
+
+#[derive(Clone, Debug)]
+struct PEp8 { x: XEp, deps_a: Vec<usize>, deps_b: Vec<usize> }
+
+/// The world-8 reduce-scatter's A, B, and C epoch lists for `rank`. Every piece fits in ONE FP32 slot
+/// (`rpe = payload / (row_len * 4)`), so A, B, and C use the exact same piece boundaries without sub-splits.
+fn rs8_epochs(io: &Io, row_len: usize, blocks: &Blocks8, rank: usize, stage: u64, payload: usize)
+              -> Result<(Vec<PEp8>, Vec<PEp8>, Vec<PEp8>)> {
+    anyhow::ensure!(rank < 8 && row_len % 8 == 0 && blocks.iter().all(|b| b.1 > b.0),
+                    "TP-8S reduce-scatter: row_len {row_len} rank {rank} blocks {blocks:?}");
+    let (se, oe, wb) = (if io.src_f16 { 2usize } else { 4 }, if io.out_f16 { 2usize } else { 4 }, if io.wire16() { 2usize } else { 4 });
+    let rpe = payload / (row_len * 4).max(1);
+    anyhow::ensure!(rpe >= 1, "TP-8S reduce-scatter: a {row_len}-element fp32 row exceeds one ring slot ({payload} B)");
+    let e = pieces_count(blocks, rpe);
+    let pcs: Vec<Vec<(usize, usize)>> = blocks.iter().map(|&(a, b)| row_pieces(a, b, e)).collect();
+    let (mut a, mut b, mut c) = (Vec::with_capacity(4 * e), Vec::with_capacity(2 * e), Vec::with_capacity(e));
+    // Phase A (partner rank ^ 2): keep the 4 blocks matching rank's bit 1, send the other 4.
+    for p in 0..e {
+        for k in 0..4 {
+            let dst_blk = ((k & 2) << 1) | (rank & 2) | (k & 1);
+            let src_blk = dst_blk ^ 2;
+            let ((s0, s1), (r0, r1)) = (pcs[src_blk][p], pcs[dst_blk][p]);
+            anyhow::ensure!(s1 > s0 && r1 > r0, "TP-8S reduce-scatter: empty A piece {p}.{k}");
+            a.push(PEp8 { x: XEp {
+                src: io.src + (s0 * row_len * se) as u64,
+                bytes: (s1 - s0) * row_len * wb,
+                k1bits: io.bits() & 5,
+                rx: Rx::Add { out: stage + (r0 * row_len * 4) as u64, local: io.src + (r0 * row_len * se) as u64,
+                              n: (r1 - r0) * row_len, bits: io.bits() & 5 },
+                rows: 0,
+            }, deps_a: vec![], deps_b: vec![] });
+        }
+    }
+    // Phase B (partner rank ^ 4): keep the 2 blocks matching rank's (bit 1, bit 2), send the other 2 from stage.
+    for p in 0..e {
+        for k in 0..2 {
+            let dst_blk = (rank & 6) | k;
+            let src_blk = dst_blk ^ 4;
+            let ((s0, s1), (r0, r1)) = (pcs[src_blk][p], pcs[dst_blk][p]);
+            anyhow::ensure!(s1 > s0 && r1 > r0, "TP-8S reduce-scatter: empty B piece {p}.{k}");
+            let ka_dst = ((dst_blk & 4) >> 1) | (dst_blk & 1);
+            let ka_src = ((src_blk & 4) >> 1) | (src_blk & 1);
+            b.push(PEp8 { x: XEp {
+                src: stage + (s0 * row_len * 4) as u64,
+                bytes: (s1 - s0) * row_len * 4,
+                k1bits: 0,
+                rx: Rx::Add { out: stage + (r0 * row_len * 4) as u64, local: stage + (r0 * row_len * 4) as u64,
+                              n: (r1 - r0) * row_len, bits: 0 },
+                rows: 0,
+            }, deps_a: vec![4 * p + ka_dst, 4 * p + ka_src], deps_b: vec![] });
+        }
+    }
+    // Phase C (partner rank ^ 1): keep rank's own eighth into io.out, send rank ^ 1 from stage.
+    for p in 0..e {
+        let ((s0, s1), (r0, r1)) = (pcs[rank ^ 1][p], pcs[rank][p]);
+        anyhow::ensure!(s1 > s0 && r1 > r0, "TP-8S reduce-scatter: empty C piece {p}");
+        c.push(PEp8 { x: XEp {
+            src: stage + (s0 * row_len * 4) as u64,
+            bytes: (s1 - s0) * row_len * 4,
+            k1bits: 0,
+            rx: Rx::Add { out: io.out + (r0 * row_len * oe) as u64, local: stage + (r0 * row_len * 4) as u64,
+                          n: (r1 - r0) * row_len, bits: io.bits() & 2 },
+            rows: r1 - r0,
+        }, deps_a: vec![], deps_b: vec![2 * p, 2 * p + 1] });
+    }
+    Ok((a, b, c))
+}
+
+/// The world-8 all-gather's A, B, and C epoch lists of ONE row buffer for `rank`.
+fn ag8_epochs(base: u64, row_bytes: usize, blocks: &Blocks8, rank: usize, payload: usize)
+              -> Result<(Vec<PEp8>, Vec<PEp8>, Vec<PEp8>)> {
+    anyhow::ensure!(rank < 8 && row_bytes % 16 == 0 && blocks.iter().all(|b| b.1 > b.0),
+                    "TP-8S all-gather: row_bytes {row_bytes} rank {rank} blocks {blocks:?}");
+    let rpe = payload / row_bytes.max(1);
+    anyhow::ensure!(rpe >= 1, "TP-8S all-gather: a {row_bytes}-byte row exceeds one ring slot");
+    let e = pieces_count(blocks, rpe);
+    let pcs: Vec<Vec<(usize, usize)>> = blocks.iter().map(|&(a, b)| row_pieces(a, b, e)).collect();
+    let ep = |send: (usize, usize), land: (usize, usize), deps_a: Vec<usize>, deps_b: Vec<usize>| -> Result<PEp8> {
+        anyhow::ensure!(send.1 > send.0 && land.1 > land.0, "TP-8S all-gather: empty piece (chunk too small for {e} pieces)");
+        Ok(PEp8 { x: XEp {
+            src: base + (send.0 * row_bytes) as u64,
+            bytes: (send.1 - send.0) * row_bytes,
+            k1bits: 0,
+            rx: Rx::Copy { out: base + (land.0 * row_bytes) as u64, bytes: (land.1 - land.0) * row_bytes },
+            rows: 0,
+        }, deps_a, deps_b })
+    };
+    let (mut a, mut b, mut c) = (Vec::with_capacity(e), Vec::with_capacity(2 * e), Vec::with_capacity(4 * e));
+    for p in 0..e { a.push(ep(pcs[rank][p], pcs[rank ^ 2][p], vec![], vec![])?); }
+    for p in 0..e {
+        b.push(ep(pcs[rank][p], pcs[rank ^ 4][p], vec![], vec![])?);
+        b.push(ep(pcs[rank ^ 2][p], pcs[rank ^ 6][p], vec![p], vec![])?);
+    }
+    for p in 0..e {
+        c.push(ep(pcs[rank][p], pcs[rank ^ 1][p], vec![], vec![])?);
+        c.push(ep(pcs[rank ^ 2][p], pcs[rank ^ 3][p], vec![p], vec![])?);
+        c.push(ep(pcs[rank ^ 4][p], pcs[rank ^ 5][p], vec![], vec![2 * p])?);
+        c.push(ep(pcs[rank ^ 6][p], pcs[rank ^ 7][p], vec![], vec![2 * p + 1])?);
+    }
+    Ok((a, b, c))
+}
+
+fn concat_sp8(parts: Vec<(Vec<PEp8>, Vec<PEp8>, Vec<PEp8>)>) -> (Vec<PEp8>, Vec<PEp8>, Vec<PEp8>) {
+    let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+    for (pa, pb, pc) in parts {
+        let (oa, ob) = (a.len(), b.len());
+        a.extend(pa);
+        b.extend(pb.into_iter().map(|mut e| { for d in e.deps_a.iter_mut() { *d += oa; } e }));
+        c.extend(pc.into_iter().map(|mut e| {
+            for d in e.deps_a.iter_mut() { *d += oa; }
+            for d in e.deps_b.iter_mut() { *d += ob; }
+            e
+        }));
+    }
+    (a, b, c)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cell8 { A(usize), B(usize), C(usize), Bubble }
+
+/// 3-phase slot placer for world 8: A at slot % 3 == 0, B at slot % 3 == 1, C at slot % 3 == 2.
+/// Every rail length is padded to a multiple of 3 (R10 round-phase preservation). Pure function of
+/// (#A, B deps, C deps, nr, g): identical on every rank.
+fn place_sp8(a: &[PEp8], b: &[PEp8], c: &[PEp8], nr: usize, g: usize) -> Result<Vec<Vec<Cell8>>> {
+    anyhow::ensure!(nr >= 1 && g >= 3 && g % 3 == 0, "TP-8S placer: nr {nr} g {g}");
+    let slot_a = |i: usize| 3 * (i / nr);
+    let mut rails: Vec<Vec<Cell8>> = (0..nr)
+        .map(|r| (0..a.len()).filter(|i| i % nr == r).flat_map(|i| [Cell8::A(i), Cell8::Bubble, Cell8::Bubble]).collect())
+        .collect();
+    let mut cursor_b = vec![1usize; nr];
+    let mut slot_b = vec![0usize; b.len()];
+    for (j, eb) in b.iter().enumerate() {
+        let r = j % nr;
+        let mut s = cursor_b[r];
+        for &d in &eb.deps_a {
+            anyhow::ensure!(d < a.len(), "TP-8S placer: B epoch {j} depends on A epoch {d} of {}", a.len());
+            s = s.max(slot_a(d) + g + 1);
+        }
+        let rem = s % 3;
+        if rem == 0 { s += 1; } else if rem == 2 { s += 2; }
+        while rails[r].len() <= s { rails[r].push(Cell8::Bubble); }
+        rails[r][s] = Cell8::B(j);
+        slot_b[j] = s;
+        cursor_b[r] = s + 3;
+    }
+    let mut cursor_c = vec![2usize; nr];
+    for (k, ec) in c.iter().enumerate() {
+        let r = k % nr;
+        let mut s = cursor_c[r];
+        for &d in &ec.deps_a {
+            anyhow::ensure!(d < a.len(), "TP-8S placer: C epoch {k} depends on A epoch {d} of {}", a.len());
+            s = s.max(slot_a(d) + g + 1);
+        }
+        for &d in &ec.deps_b {
+            anyhow::ensure!(d < b.len(), "TP-8S placer: C epoch {k} depends on B epoch {d} of {}", b.len());
+            s = s.max(slot_b[d] + g + 1);
+        }
+        let rem = s % 3;
+        if rem == 0 { s += 2; } else if rem == 1 { s += 1; }
+        while rails[r].len() <= s { rails[r].push(Cell8::Bubble); }
+        rails[r][s] = Cell8::C(k);
+        cursor_c[r] = s + 3;
+    }
+    for rl in rails.iter_mut() { while rl.len() % 3 != 0 { rl.push(Cell8::Bubble); } }
+    Ok(rails)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sp8_program(a: &[PEp8], b: &[PEp8], c: &[PEp8], nr: usize, g: usize, bub: u64, hook_min: Option<usize>, payload: usize)
+                     -> Result<Vec<Step>> {
+    for e in a.iter().chain(b.iter()).chain(c.iter()) {
+        anyhow::ensure!(e.x.bytes % 16 == 0 && e.x.bytes > 0 && e.x.bytes <= payload,
+                        "TP-8S epoch of {} bytes: not a 16 B multiple within one ring slot payload ({payload})", e.x.bytes);
+    }
+    let rails = place_sp8(a, b, c, nr, g)?;
+    emit_sp8_program(&rails, a, b, c, g, bub, hook_min)
+}
+
+fn emit_sp8_program(rails: &[Vec<Cell8>], a: &[PEp8], b: &[PEp8], c: &[PEp8], g: usize, bub: u64, hook_min: Option<usize>)
+                    -> Result<Vec<Step>> {
+    anyhow::ensure!(rails.iter().all(|r| r.len() % 3 == 0), "TP-8S: a rail would break the round phase");
+    let ep_of = |cell: Cell8| -> Option<&XEp> {
+        match cell { Cell8::A(i) => Some(&a[i].x), Cell8::B(j) => Some(&b[j].x), Cell8::C(k) => Some(&c[k].x), Cell8::Bubble => None }
+    };
+    let mut k2_tick = vec![usize::MAX; c.len()];
+    for sq in rails { for (s, cell) in sq.iter().enumerate() { if let Cell8::C(k) = *cell { k2_tick[k] = s + g; } } }
+    anyhow::ensure!(k2_tick.iter().all(|&t| t != usize::MAX), "TP-8S: a C epoch was never placed");
+    let total_rows: usize = c.iter().map(|e| e.x.rows).sum();
+    let longest = rails.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut prog: Vec<Step> = Vec::new();
+    let (mut pos_k2a, mut pos_k1b, mut pos_k2b) = (vec![usize::MAX; a.len()], vec![usize::MAX; b.len()], vec![usize::MAX; b.len()]);
+    let (mut pos_k1c, mut pos_k2c) = (vec![usize::MAX; c.len()], vec![usize::MAX; c.len()]);
+    let (mut m, mut rows_fin, mut rows_done) = (0usize, 0usize, 0usize);
+    for t in 0..longest + g {
+        for (r, sq) in rails.iter().enumerate() {
+            if t >= g && t - g < sq.len() {
+                let j = t - g;
+                let lag = (t.min(sq.len()) - 1 - j) as u32;
+                match ep_of(sq[j]) {
+                    Some(xe) => prog.push(match xe.rx {
+                        Rx::Add { out, local, n, bits } => Step::K2m { rail: r, out, local, n: n as i32, lag, bits },
+                        Rx::Copy { out, bytes } => Step::K2c { rail: r, out, bytes: bytes as u32, lag },
+                    }),
+                    None => prog.push(Step::K2m { rail: r, out: bub, local: bub, n: 4, lag, bits: 0 }),
+                }
+                match sq[j] {
+                    Cell8::A(i) => pos_k2a[i] = prog.len() - 1,
+                    Cell8::B(jj) => pos_k2b[jj] = prog.len() - 1,
+                    Cell8::C(kk) => pos_k2c[kk] = prog.len() - 1,
+                    Cell8::Bubble => {}
+                }
+            }
+            if t < sq.len() {
+                match ep_of(sq[t]) {
+                    Some(xe) => prog.push(Step::K1m { rail: r, src: xe.src, nbytes: xe.bytes as u32, bits: xe.k1bits }),
+                    None => prog.push(Step::K1m { rail: r, src: bub, nbytes: 16, bits: 0 }),
+                }
+                match sq[t] {
+                    Cell8::B(jj) => pos_k1b[jj] = prog.len() - 1,
+                    Cell8::C(kk) => pos_k1c[kk] = prog.len() - 1,
+                    _ => {}
+                }
+            }
+        }
+        if let (true, Some(min_rows)) = (t >= g, hook_min) {
+            while m < c.len() && k2_tick[m] <= t { rows_fin += c[m].x.rows; m += 1; }
+            if rows_fin > rows_done && (rows_fin - rows_done >= min_rows || rows_fin == total_rows) {
+                prog.push(Step::Hook { r0: rows_done, r1: rows_fin, tail: false });
+                rows_done = rows_fin;
+            }
+        }
+    }
+    if hook_min.is_some() && total_rows > rows_done { prog.push(Step::Hook { r0: rows_done, r1: total_rows, tail: true }); }
+    for (j, eb) in b.iter().enumerate() {
+        for &d in &eb.deps_a {
+            anyhow::ensure!(pos_k2a[d] != usize::MAX && pos_k2a[d] < pos_k1b[j] && pos_k2a[d] < pos_k2b[j],
+                            "TP-8S: B epoch {j} would run before A epoch {d} has landed");
+        }
+    }
+    for (k, ec) in c.iter().enumerate() {
+        for &d in &ec.deps_a {
+            anyhow::ensure!(pos_k2a[d] != usize::MAX && pos_k2a[d] < pos_k1c[k] && pos_k2a[d] < pos_k2c[k],
+                            "TP-8S: C epoch {k} would run before A epoch {d} has landed");
+        }
+        for &d in &ec.deps_b {
+            anyhow::ensure!(pos_k2b[d] != usize::MAX && pos_k2b[d] < pos_k1c[k] && pos_k2b[d] < pos_k2c[k],
+                            "TP-8S: C epoch {k} would run before B epoch {d} has landed");
+        }
+    }
+    Ok(prog)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sp8_rs_program(io: &Io, row_len: usize, blocks: &Blocks8, rank: usize, nr: usize, g: usize, bub: u64,
+                  hook_min: Option<usize>, payload: usize) -> Result<Vec<Step>> {
+    let c = blocks[7].1;
+    let stage = stage_for(io, c * row_len)?;
+    let (a, b, ch) = rs8_epochs(io, row_len, blocks, rank, stage, payload)?;
+    let mut prog = build_sp8_program(&a, &b, &ch, nr, g, bub, hook_min, payload)?;
+    for st in prog.iter_mut() {
+        if let Step::Hook { r0, r1, .. } = st { *r0 += blocks[rank].0; *r1 += blocks[rank].0; }
+    }
+    Ok(prog)
+}
+
+fn sp8_ag_program(bufs: &[(u64, usize)], blocks: &Blocks8, rank: usize, nr: usize, g: usize, bub: u64, payload: usize)
+                  -> Result<Vec<Step>> {
+    anyhow::ensure!(!bufs.is_empty(), "TP-8S all-gather: no buffers");
+    let parts = bufs.iter().map(|&(base, rb)| ag8_epochs(base, rb, blocks, rank, payload)).collect::<Result<Vec<_>>>()?;
+    let (a, b, c) = concat_sp8(parts);
+    build_sp8_program(&a, &b, &c, nr, g, bub, None, payload)
+}
+
+/// TP-8S world-8 REDUCE-SCATTER of a `c`-row partial: this rank ends with the canonical sum in its own EIGHTH
+/// of io.out only, bitwise the canonical world-8 all-reduce tree on those rows.
+#[allow(clippy::too_many_arguments)]
+pub fn reduce_scatter_rows_w8(k: &Kernels, stream: &CudaStream, x: &Pipe, io: Io, row_len: usize, blocks: &Blocks8,
+                              rank: usize, hook: Option<SpHook<'_>>) -> Result<()> {
+    anyhow::ensure!(x.rounds == 3, "TP-8S reduce-scatter: world 8 only (rounds {})", x.rounds);
+    let bub = *x.bubble.device_ptr() as u64;
+    let prog = sp8_rs_program(&io, row_len, blocks, rank, x.rails.len(), x.lookahead, bub,
+                              hook.as_ref().map(|h| h.min_rows), EPOCH_FLOATS * 4)?;
+    exec_sp4(k, stream, x, &prog, hook)
+}
+
+/// TP-8S world-8 ALL-GATHER of `row_bytes`-byte rows at `base`.
+pub fn all_gather_rows_w8(k: &Kernels, stream: &CudaStream, x: &Pipe, base: u64, row_bytes: usize, blocks: &Blocks8,
+                          rank: usize) -> Result<()> {
+    all_gather_rows_multi_w8(k, stream, x, &[(base, row_bytes)], blocks, rank)
+}
+
+/// TP-8S: the world-8 all-gather of several row buffers as ONE exchange program.
+pub fn all_gather_rows_multi_w8(k: &Kernels, stream: &CudaStream, x: &Pipe, bufs: &[(u64, usize)], blocks: &Blocks8,
+                                rank: usize) -> Result<()> {
+    anyhow::ensure!(x.rounds == 3, "TP-8S all-gather: world 8 only (rounds {})", x.rounds);
+    let bub = *x.bubble.device_ptr() as u64;
+    let prog = sp8_ag_program(bufs, blocks, rank, x.rails.len(), x.lookahead, bub, EPOCH_FLOATS * 4)?;
     exec_sp4(k, stream, x, &prog, None)
 }
 

@@ -298,6 +298,7 @@ pub(super) fn draft_regions(model: &FwdModel, sc: &Scratch, head: &DraftHead, s:
 /// Zero `slot`'s positional planes over positions [0, n): trunk + head K/V rows, indexer raw keys,
 /// pooled blocks (compute-stream memsets), so every self-test pass starts from the same state.
 pub(super) fn zero_positional(model: &FwdModel, slot: usize, n: usize) -> Result<()> {
+    anyhow::ensure!(!model.vmm_lazy(), "KVPOOL: {} needs --kv-pool off or full (lazy maps rows on demand)", "autotune self-test");
     let l = Launcher { dev: &model.dev, stream: &model.stream };
     let n = n.min(model.max_pos);
     if n == 0 { return Ok(()); }

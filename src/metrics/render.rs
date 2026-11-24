@@ -36,6 +36,19 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str("# HELP velogb10_tp_proxy_parked_seconds_total CPUIDLE: seconds TP proxies on this process spent in the idle tier instead of spinning a core.\n# TYPE velogb10_tp_proxy_parked_seconds_total counter\n");
     o.push_str(&format!("velogb10_tp_proxy_parked_seconds_total {:.3}\n", crate::net::proxy_parked_secs()));
     {
+        let (vf_world, vf_dual, vf_gpu, vf_sp) = crate::dsv41::tp::rdma::fabric_telemetry();
+        if vf_world >= 2 {
+            o.push_str("# HELP velogb10_velo_fabric_world Active velo-fabric TP world size (2 / 4 / 8).\n# TYPE velogb10_velo_fabric_world gauge\n");
+            o.push_str(&format!("velogb10_velo_fabric_world {vf_world}\n"));
+            o.push_str("# HELP velogb10_velo_fabric_dual_rail 1 when dual-rail RoCEv2 (400 Gb/s) is active on velo-fabric.\n# TYPE velogb10_velo_fabric_dual_rail gauge\n");
+            o.push_str(&format!("velogb10_velo_fabric_dual_rail {vf_dual}\n"));
+            o.push_str("# HELP velogb10_velo_fabric_gpu_recv 1 when zero-CPU-bounce GPU-validated direct NIC tail receive is active.\n# TYPE velogb10_velo_fabric_gpu_recv gauge\n");
+            o.push_str(&format!("velogb10_velo_fabric_gpu_recv {vf_gpu}\n"));
+            o.push_str("# HELP velogb10_velo_fabric_sp_ready 1 when sequence-parallel prefill collectives are active.\n# TYPE velogb10_velo_fabric_sp_ready gauge\n");
+            o.push_str(&format!("velogb10_velo_fabric_sp_ready {vf_sp}\n"));
+        }
+    }
+    {
         let (w, slept, early) = crate::host_wait::counters();
         o.push_str("# HELP velogb10_gpu_wait_hybrid_waits_total CPUIDLE --gpu-wait hybrid: GPU waits that slept part of the wait instead of spinning (0 with requests served = the hybrid wait never ran: --gpu-wait spin, or no wait was long enough).\n# TYPE velogb10_gpu_wait_hybrid_waits_total counter\n");
         o.push_str(&format!("velogb10_gpu_wait_hybrid_waits_total {w}\n"));
@@ -396,6 +409,9 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str(&format!("velogb10_prefix_pool_restore_us_total {}\n", PFX_POOL_RESTORE_US.load(Relaxed)));
     o.push_str(&format!("velogb10_prefix_pool_misses_total {}\n", PFX_POOL_MISSES.load(Relaxed)));
     crate::turn_resume::render_metrics(&mut o); // TURNRESUME: velogb10_turn_*
+    crate::dsv41::engram::io_metrics::render(&mut o); // DSV41 EIO: velogb10_dsv41_engram_* (nothing unless an Engram runtime opened)
+    crate::dsv41::fwd::receipts::render(&mut o); // DSV41 SL: velogb10_dsv41_fwd_calls_total (nothing unless a dsv41 forward ran)
+    crate::dsv41::gpu::dspark::metrics::render(&mut o); // DSV41 DS: velogb10_dsv41_spec_* (nothing unless a DSpark round ran or a source was announced)
     o.push_str("# HELP velogb10_kv_spill SSD spill tier for evicted lane snapshots (--kv-spill)\n");
     o.push_str(&format!("velogb10_kv_spill_writes_total {}\n", KV_SPILL_WRITES.load(Relaxed)));
     o.push_str("# HELP velogb10_prefill_pack_passes_total Prefill passes run by the packed admission (--prefill-pack); packed = passes carrying 2+ prompts\n");
@@ -413,10 +429,37 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str(&format!("velogb10_prefill_interleave_points_total {}\n", PREFILL_INTERLEAVE_POINTS.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_hits_total {}\n", KV_SPILL_HITS.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_misses_recompute_total {}\n", KV_SPILL_MISSES.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_durability_waits_total {}\n", KV_SPILL_DURABILITY_WAITS.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_durability_joins_total {}\n", KV_SPILL_DURABILITY_JOINS.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_durability_wait_us_total {}\n", KV_SPILL_DURABILITY_WAIT_US.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_truncated_restores_total {}\n", KV_SPILL_TRUNCATED_RESTORES.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_capture_peer_drop_total {}\n", KV_SPILL_CAPTURE_PEER_DROPS.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_restore_peer_miss_total {}\n", KV_SPILL_RESTORE_PEER_MISSES.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_bytes {}\n", KV_SPILL_BYTES.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_tokens_recompute_saved_total {}\n", KV_SPILL_SAVED.load(Relaxed)));
+    {
+        // KVPOOL (veloGB10 #43): the shared KV page pool behind the EXL3 position planes (--kv-pool).
+        use std::sync::atomic::Ordering::Relaxed as R;
+        o.push_str("# HELP velogb10_kv_vmm_mode what backs the EXL3 position planes: 0 = the standard per-lane allocation, 1 = --kv-pool full, 2 = --kv-pool lazy\n");
+        o.push_str(&format!("velogb10_kv_vmm_mode {}\n", crate::kv_vmm::engaged()));
+        o.push_str("# HELP velogb10_kv_vmm_fallback an asked-for --kv-pool that does not run here: 1 with the reason (tp = a TP rank, model = the model is not served by pool-backed planes)\n");
+        for (i, why) in [(1u64, "tp"), (2, "model")] {
+            o.push_str(&format!("velogb10_kv_vmm_fallback{{reason=\"{why}\"}} {}\n", (crate::kv_vmm::fallback_reason() == i) as u8));
+        }
+        o.push_str("# HELP velogb10_kv_vmm_bytes the shared KV pool: pool = physical pages, mapped = pages under lane rows now, reserved = address space\n");
+        o.push_str(&format!("velogb10_kv_vmm_pool_bytes {}\n", crate::kv_vmm::POOL_BYTES.load(R)));
+        o.push_str(&format!("velogb10_kv_vmm_mapped_bytes {}\n", crate::kv_vmm::MAPPED_BYTES.load(R)));
+        o.push_str(&format!("velogb10_kv_vmm_reserved_bytes {}\n", crate::kv_vmm::RESERVED_BYTES.load(R)));
+        o.push_str("# HELP velogb10_kv_vmm_events_total pool full: idle lanes evicted, requests ended finish=length (the pool could not grow them), prompts that waited for room\n");
+        o.push_str(&format!("velogb10_kv_vmm_evictions_total {}\n", crate::kv_vmm::EVICTIONS.load(R)));
+        o.push_str(&format!("velogb10_kv_vmm_length_ends_total {}\n", crate::kv_vmm::LENGTH_ENDS.load(R)));
+        o.push_str(&format!("velogb10_kv_vmm_waits_total {}\n", crate::kv_vmm::WAITS.load(R)));
+    }
+    o.push_str("# HELP velogb10_vision_cache vision-tower embed cache (--vision-embed-cache-mb): bytes = merged embeddings held now; hits = images served from the cache (the tower never ran for them); misses = images that ran the tower and were inserted; evictions = images shifted out by the LRU cap\n");
+    o.push_str(&format!("velogb10_vision_cache_bytes {}\n", VISION_CACHE_BYTES.load(Relaxed)));
+    o.push_str(&format!("velogb10_vision_cache_hits_total {}\n", VISION_CACHE_HITS.load(Relaxed)));
+    o.push_str(&format!("velogb10_vision_cache_misses_total {}\n", VISION_CACHE_MISSES.load(Relaxed)));
+    o.push_str(&format!("velogb10_vision_cache_evictions_total {}\n", VISION_CACHE_EVICTIONS.load(Relaxed)));
     let (steps, drafts, accepted, emitted) = crate::tel::spec_totals();
     o.push_str("# HELP velogb10_spec_draft_tokens_total Speculative draft tokens proposed (MTP / DFlash2 / DFlash).\n# TYPE velogb10_spec_draft_tokens_total counter\n");
     o.push_str(&format!("velogb10_spec_draft_tokens_total {drafts}\n"));
@@ -436,5 +479,7 @@ pub fn render(engine_alive: bool) -> String {
     crate::exl3_serve::df2_metrics_append(&mut o);
     crate::exl3_serve::copy_span_metrics_append(&mut o); // WIDEVERIFY1: velogb10_copy_span_*
     render_toolcall(&mut o);
+    crate::dsv41::load::metrics_rows::append(&mut o); // DSV4.1 loader rows (nothing unless a dsv41 load ran)
+    crate::dsv41::tp::metrics::append(&mut o); // DSV4.1 TP comm rows (nothing unless a dsv41 TP comm attached)
     o
 }

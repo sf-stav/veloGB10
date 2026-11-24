@@ -50,8 +50,10 @@ __device__ __forceinline__ unsigned char* xtp_send_slot(tp_dev_ctx* c, unsigned 
 }
 __device__ __forceinline__ const unsigned char* xtp_recv_slot(tp_dev_ctx* c, unsigned long long e) {
     if (c->world > 2) {
-        const unsigned long long round = e % (unsigned long long)c->rounds;
-        return c->nway_recv + (round * (unsigned long long)TP_RING_SLOTS + (e & (TP_RING_SLOTS - 1)))
+        const unsigned long long r = (unsigned long long)c->rounds;
+        const unsigned long long round = e % r;
+        const unsigned long long slot = (e / r) & (TP_RING_SLOTS - 1);
+        return c->nway_recv + (round * (unsigned long long)TP_RING_SLOTS + slot)
                               * (unsigned long long)c->slot_stride;
     }
     return c->recv_ring + (size_t)(e & (TP_RING_SLOTS - 1)) * c->slot_stride;

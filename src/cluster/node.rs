@@ -9,7 +9,7 @@ use super::*;
 
 pub(super) fn send_blob(w: &mut impl Write, path: &Path) -> Result<()> {
     let mut f = std::fs::File::open(path)?;
-    let mut buf = vec![0u8; 1 << 20];
+    let mut buf = vec![0u8; 4 << 20];
     loop {
         let n = f.read(&mut buf)?;
         if n == 0 { break; }
@@ -19,14 +19,49 @@ pub(super) fn send_blob(w: &mut impl Write, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Node half of Velo-Fabric bulk RDMA negotiation: if head offered RDMA, try opening/connecting a
+/// `BulkLink` on the primary RoCEv2 device; any failure cleanly replies `ok: false` to fall back to TCP.
+fn node_negotiate_bulk(s: &mut TcpStream) -> Result<Option<crate::net::bulk::BulkLink>> {
+    use crate::net::bulk::{BulkEndpoint, BulkLink};
+    match recv_msg(s)? {
+        Msg::BulkOffer { enabled: true, ep: head_ep } => {
+            match BulkLink::open_default().and_then(|(mut l, ep)| { l.connect(&head_ep)?; Ok((l, ep)) }) {
+                Ok((link, local_ep)) => {
+                    send_msg(s, &Msg::BulkReply { ok: true, ep: local_ep })?;
+                    crate::deprintln!("  [node] bulk RDMA active (RoCEv2 8x4 MiB ring + parallel HW SHA-256/write)");
+                    Ok(Some(link))
+                }
+                Err(e) => {
+                    crate::deprintln!("  [node] bulk RDMA unavailable ({e:#}) — falling back to TCP");
+                    send_msg(s, &Msg::BulkReply { ok: false, ep: BulkEndpoint::default() })?;
+                    Ok(None)
+                }
+            }
+        }
+        Msg::BulkOffer { enabled: false, .. } => {
+            send_msg(s, &Msg::BulkReply { ok: false, ep: BulkEndpoint::default() })?;
+            Ok(None)
+        }
+        Msg::Error { msg } => bail!("the head stopped the sync: {msg}"),
+        other => bail!("expected BulkOffer, got {other:?}"),
+    }
+}
+
+/// Receive one blob over RDMA into the exact same `blobs/tmp.<pid>.<hash>` staging path used by `recv_blob`.
+fn recv_blob_rdma(bulk: &mut crate::net::bulk::BulkLink, hash: &str, size: u64, prog: &Progress) -> Result<PathBuf> {
+    let tmp = cache_root().join("blobs").join(format!("tmp.{}.{}", std::process::id(), hash));
+    bulk.recv_blob_to_file(&tmp, size, hash, |n| prog.add(n as u64))?;
+    Ok(tmp)
+}
+
 /// Receive `size` bytes into a temp file, hashing as we go; verify against `hash`; return the temp path.
 fn recv_blob(r: &mut impl Read, hash: &str, size: u64) -> Result<PathBuf> {
     let tmp = cache_root().join("blobs").join(format!("tmp.{}.{}", std::process::id(), hash));
     std::fs::create_dir_all(tmp.parent().unwrap())?;
     let mut f = std::fs::File::create(&tmp)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = crate::net::bulk::FastSha256::new();
     let mut left = size;
-    let mut buf = vec![0u8; 1 << 20];
+    let mut buf = vec![0u8; 4 << 20];
     while left > 0 {
         let want = left.min(buf.len() as u64) as usize;
         r.read_exact(&mut buf[..want])?;
@@ -35,7 +70,7 @@ fn recv_blob(r: &mut impl Read, hash: &str, size: u64) -> Result<PathBuf> {
         left -= want as u64;
     }
     f.flush()?;
-    let got = hex(&hasher.finalize());
+    let got = hasher.finalize_hex();
     if got != hash {
         let _ = std::fs::remove_file(&tmp);
         bail!("blob hash mismatch: expected {hash}, got {got}");
@@ -79,6 +114,22 @@ pub(super) fn assemble_model_dir(model_id: &str, artifacts: &[Artifact]) -> Resu
     Ok(dir)
 }
 
+/// DSV4.1 (leg LS2): an Engram head file this box already holds (pre-staged in an Engram dir, manifest sha256 and
+/// size equal to the artifact's) becomes the blob by a hard link (a symlink across drives), so the head ships nothing
+/// for it. Only artifacts named `engram/engram_head<h>.bin` are looked at; every other family's sync is unchanged.
+fn adopt_staged(artifacts: &[Artifact]) -> usize {
+    let mut n = 0;
+    for a in artifacts {
+        if !a.logical.starts_with("engram/engram_head") || !a.logical.ends_with(".bin") || have_blob(&a.hash) { continue; }
+        let Some(p) = crate::dsv41::load::engram::find_staged(&a.logical, &a.hash, a.size) else { continue };
+        let dst = blob_path(&a.hash);
+        if let Some(parent) = dst.parent() { let _ = std::fs::create_dir_all(parent); }
+        let _ = std::fs::remove_file(&dst); // a dangling link from an earlier adoption
+        if std::fs::hard_link(&p, &dst).or_else(|_| std::os::unix::fs::symlink(&p, &dst)).is_ok() { n += 1; }
+    }
+    n
+}
+
 /// Handle one head connection: Hello -> Manifest -> Missing -> blobs -> assemble -> Ready ->
 /// Config -> DraftManifest -> (draft blobs) -> DraftReady. Returns the assembled model dir +
 /// the assembled DRAFT cache dir (None when the head shipped no drafter) + the head's TP config
@@ -101,6 +152,8 @@ pub(super) fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>,
         Msg::Manifest { model_id, artifacts, draft } => (model_id, artifacts, draft),
         _ => bail!("expected Manifest"),
     };
+    let adopted = adopt_staged(&artifacts);
+    if adopted > 0 { crate::deprintln!("  [node] {adopted} Engram head file(s) already staged on this box (manifest sha256 and size match): adopted into the cache, not received"); }
     let missing: Vec<String> = artifacts.iter().map(|a| a.hash.clone())
         .filter(|h| !have_blob(h)).collect();
     let have = artifacts.len() - missing.len();
@@ -116,11 +169,16 @@ pub(super) fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>,
     let t_fetch = std::time::Instant::now();
     send_msg(&mut s, &Msg::Missing { hashes: missing.clone(), space })?;
 
+    let mut bulk = if !missing.is_empty() { node_negotiate_bulk(&mut s)? } else { None };
     let prog = Progress::new("receiving the model from the head", fetch_bytes, Unit::Bytes);
     for _ in 0..missing.len() {
         match recv_msg(&mut s)? {
             Msg::BlobHeader { hash, size } => {
-                let tmp = recv_blob(&mut Counted { inner: &mut s, prog: &prog }, &hash, size)?;
+                let tmp = if let Some(b) = bulk.as_mut() {
+                    recv_blob_rdma(b, &hash, size, &prog)?
+                } else {
+                    recv_blob(&mut Counted { inner: &mut s, prog: &prog }, &hash, size)?
+                };
                 publish_blob(&hash, &tmp)?;
                 crate::deprintln!("  [node] cached {} ({:.1} MB)", &hash[..12], size as f64 / 1e6);
             }
@@ -128,6 +186,7 @@ pub(super) fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>,
             _ => bail!("expected BlobHeader"),
         }
     }
+    drop(bulk);
     prog.finish();
     let dir = assemble_model_dir(&model_id, &artifacts)?;
     send_msg(&mut s, &Msg::Ready { model_dir: dir.to_string_lossy().to_string() })?;
@@ -157,18 +216,24 @@ pub(super) fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>,
             crate::deprintln!("  [node] draft manifest '{model_id}': {} artifacts, {have} cached, {} to fetch",
                       artifacts.len(), missing.len());
             send_msg(&mut s, &Msg::Missing { hashes: missing.clone(), space: None })?;
+            let mut dbulk = if !missing.is_empty() { node_negotiate_bulk(&mut s)? } else { None };
             let dbytes: u64 = artifacts.iter().filter(|a| missing.contains(&a.hash)).map(|a| a.size).sum();
             let dprog = Progress::new("receiving the drafter from the head", dbytes, Unit::Bytes);
             for _ in 0..missing.len() {
                 match recv_msg(&mut s)? {
                     Msg::BlobHeader { hash, size } => {
-                        let tmp = recv_blob(&mut Counted { inner: &mut s, prog: &dprog }, &hash, size)?;
+                        let tmp = if let Some(b) = dbulk.as_mut() {
+                            recv_blob_rdma(b, &hash, size, &dprog)?
+                        } else {
+                            recv_blob(&mut Counted { inner: &mut s, prog: &dprog }, &hash, size)?
+                        };
                         publish_blob(&hash, &tmp)?;
                         crate::deprintln!("  [node] cached draft blob {} ({:.1} MB)", &hash[..12], size as f64 / 1e6);
                     }
                     _ => bail!("expected draft BlobHeader"),
                 }
             }
+            drop(dbulk);
             dprog.finish();
             let ddir = assemble_model_dir(&model_id, &artifacts)?;
             send_msg(&mut s, &Msg::DraftReady { model_dir: ddir.to_string_lossy().to_string() })?;

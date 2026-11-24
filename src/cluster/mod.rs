@@ -81,6 +81,10 @@ enum Msg {
     Manifest { model_id: String, artifacts: Vec<Artifact>, #[serde(default)] draft: Vec<Artifact> },
     /// `space`: the node's drive-space report, sent with the MODEL round's reply (None on the drafter round).
     Missing { hashes: Vec<String>, #[serde(default)] space: Option<SpaceReport> },
+    /// Velo-Fabric bulk RDMA negotiation (sent once before the blob loop whenever `missing` is non-empty).
+    /// `enabled == false` (or `BulkReply { ok: false, .. }`) falls back cleanly to TCP `send_blob`/`recv_blob`.
+    BulkOffer { enabled: bool, ep: crate::net::bulk::BulkEndpoint },
+    BulkReply { ok: bool, ep: crate::net::bulk::BulkEndpoint },
     BlobHeader { hash: String, size: u64 },
     Ready { model_dir: String },
     Config(crate::tp::TpConfig),
@@ -192,8 +196,8 @@ fn publish_blob(hash: &str, tmp: &Path) -> Result<()> {
 /// A file's sha256 and size; `prog` counts every chunk into a boot progress line (BASICS, owner 2026-11-02).
 fn sha256_file_with(path: &Path, prog: Option<&Progress>) -> Result<(String, u64)> {
     let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
+    let mut h = crate::net::bulk::FastSha256::new();
+    let mut buf = vec![0u8; 4 << 20];
     let mut total = 0u64;
     loop {
         let n = f.read(&mut buf)?;
@@ -202,7 +206,7 @@ fn sha256_file_with(path: &Path, prog: Option<&Progress>) -> Result<(String, u64
         total += n as u64;
         if let Some(p) = prog { p.add(n as u64); }
     }
-    Ok((hex(&h.finalize()), total))
+    Ok((h.finalize_hex(), total))
 }
 
 /// BASICS: the bytes `files` would hash now (the cache answers the rest), for the hashing percentage.
@@ -332,7 +336,7 @@ pub struct RankShip {
 }
 
 /// A `Write` that only hashes (and counts) — a synthesized segment's sha256 without a copy on disk.
-struct HashWriter<'a> { h: Sha256, n: u64, prog: Option<&'a Progress> }
+struct HashWriter<'a> { h: crate::net::bulk::FastSha256, n: u64, prog: Option<&'a Progress> }
 impl Write for HashWriter<'_> {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
         self.h.update(b);
@@ -348,13 +352,18 @@ fn hash_plan_src(src: &crate::shard_plan::PlanSrc, prog: Option<&Progress>) -> R
     Ok(match src {
         PlanSrc::Whole(p) => sha256_file_with(p, prog)?.0,
         PlanSrc::Segment(ps) => {
-            let mut w = HashWriter { h: Sha256::new(), n: 0, prog };
+            let mut w = HashWriter { h: crate::net::bulk::FastSha256::new(), n: 0, prog };
             crate::shard_plan::write_segment(ps, &mut w)?;
-            hex(&w.h.finalize())
+            w.h.finalize_hex()
         }
         PlanSrc::Bytes(b) => {
             if let Some(p) = prog { p.add(b.len() as u64); }
             let mut h = Sha256::new(); h.update(b); hex(&h.finalize())
+        }
+        PlanSrc::Generated(g) => {
+            let h = match g.known_hash() { Some(h) => h, None => g.hash()? };
+            if let Some(p) = prog { p.add(g.size()); }
+            h
         }
     })
 }
@@ -372,63 +381,223 @@ fn plan_src_key(src: &crate::shard_plan::PlanSrc) -> Result<Option<String>> {
             Some(format!("synth|{}", hex(&h.finalize())))
         }
         PlanSrc::Bytes(_) => None,
+        PlanSrc::Generated(g) => Some(g.key()),
     })
+}
+
+/// Optional pack-bundled `shard_hashes.json` (format `"velogb10-shard-hashes"`, v1): lets a published
+/// model pack ship precomputed file and per-rank segment SHA-256s so first-time cluster boots skip the
+/// multi-hundred-GB local hashing pass. Verified against `model.safetensors.index.json`'s SHA-256 and
+/// every listed shard's byte size; receiving nodes still verify every received blob's SHA-256 on wire.
+/// Packs without `shard_hashes.json` (or with mismatched metadata) fall back silently to local hashing.
+#[derive(serde::Deserialize)]
+struct PackHashEntry {
+    size: u64,
+    sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PackShardHashes {
+    format: String,
+    version: u32,
+    plan_version: u32,
+    index_sha256: String,
+    #[serde(default)]
+    files: HashMap<String, PackHashEntry>,
+    #[serde(default)]
+    segments: HashMap<String, PackHashEntry>,
+}
+
+fn load_pack_shard_hashes(model_dir: &Path) -> Option<PackShardHashes> {
+    let raw = std::fs::read(model_dir.join("shard_hashes.json")).ok()?;
+    let h: PackShardHashes = serde_json::from_slice(&raw).ok()?;
+    if h.format != "velogb10-shard-hashes" || h.version != 1 || h.plan_version != crate::shard_plan::PLAN_VERSION {
+        return None;
+    }
+    let idx_bytes = std::fs::read(model_dir.join("model.safetensors.index.json")).ok()?;
+    let got_idx = hex(&Sha256::digest(&idx_bytes));
+    if got_idx != h.index_sha256 {
+        return None;
+    }
+    for (rel, ent) in &h.files {
+        let p = model_dir.join(rel);
+        if p.exists() {
+            let Ok(md) = std::fs::metadata(&p) else { return None };
+            if md.len() != ent.size {
+                return None;
+            }
+        }
+    }
+    Some(h)
 }
 
 /// B32: the shipments of ranks 1..world (index 0 = the head, empty) from `shard_plan`, hashed through the
 /// shared hash cache (uncached files in parallel, largest first). Returns per-rank artifacts and sources.
 pub fn ship_plans(model_dir: &Path, world: u32) -> Result<Vec<RankShip>> {
+    ship_plans_for(model_dir, world, &(1..world as usize).collect::<Vec<_>>())
+}
+
+/// `ship_plans` for a chosen set of node ranks (DSV4.1 `--dsv41-ship` syncs one node): the other ranks' entries are
+/// empty placeholders, so `ships[rank]` indexes the same way.
+pub fn ship_plans_for(model_dir: &Path, world: u32, ranks: &[usize]) -> Result<Vec<RankShip>> {
     use crate::shard_plan::{detect_format, shard_plan, RankPlan, ShardFormat};
     let world = world as usize;
     let fmt = detect_format(model_dir).with_context(|| format!(
         "shard shipping: {} is neither an EXL3 pack nor a qwen4_exp NVFP4 model — no shard plan", model_dir.display()))?;
     let deal = match fmt { ShardFormat::Exl3 | ShardFormat::Fp4l => crate::exl3_forward::xtp::ep_deal_kind(), ShardFormat::Nvfp4 => "contig".to_string(),
-                           ShardFormat::Naive => crate::naive::shipplan::deal(world) };
+                           ShardFormat::Naive => crate::naive::shipplan::deal(world), ShardFormat::Dsv41 => crate::dsv41::load::ship::deal() };
     let base = model_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "model".into());
     let mut plans = Vec::new();
-    for r in 1..world { plans.push(shard_plan(model_dir, fmt, world, r, &deal)?); }
+    for &r in ranks { plans.push(shard_plan(model_dir, fmt, world, r, &deal)?); }
+    let pack_hashes = load_pack_shard_hashes(model_dir);
+    let canon_dir = std::fs::canonicalize(model_dir).unwrap_or_else(|_| model_dir.to_path_buf());
     // distinct cacheable sources, hashed once
     let mut cache = hash_cache_load();
-    let mut todo: Vec<(String, crate::shard_plan::PlanSrc, u64)> = Vec::new();
+    let mut todo: Vec<(String, String, crate::shard_plan::PlanSrc, u64)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut pack_hits = 0usize;
     for p in &plans {
         for f in &p.files {
             if let Some(k) = plan_src_key(&f.src)? {
-                if !cache.contains_key(&k) && seen.insert(k.clone()) {
-                    todo.push((k, f.src.clone(), RankPlan::file_size(f)?));
+                if !cache.contains_key(&k) {
+                    let sz = RankPlan::file_size(f)?;
+                    if let Some(ref ph) = pack_hashes {
+                        let pre = match &f.src {
+                            crate::shard_plan::PlanSrc::Segment(_) => {
+                                let sk = format!("{}|w{}|r{}|{}", deal, p.world, p.rank, f.logical);
+                                ph.segments.get(&sk).filter(|e| e.size == sz && e.sha256.len() == 64)
+                            }
+                            crate::shard_plan::PlanSrc::Whole(path) => {
+                                let cp = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                                cp.strip_prefix(&canon_dir).ok()
+                                    .and_then(|rel| ph.files.get(rel.to_string_lossy().as_ref()))
+                                    .filter(|e| e.size == sz && e.sha256.len() == 64)
+                            }
+                            _ => None,
+                        };
+                        if let Some(ent) = pre {
+                            cache.insert(k.clone(), ent.sha256.clone());
+                            pack_hits += 1;
+                            continue;
+                        }
+                    }
+                    if seen.insert(k.clone()) {
+                        todo.push((f.logical.clone(), k, f.src.clone(), sz));
+                    }
                 }
             }
         }
     }
-    let hashed: u64 = todo.iter().map(|t| t.2).sum();
-    if !todo.is_empty() {
-        crate::deprintln!("[head] B32: hashing {} new shard file(s), {:.2} GB (first ship only; cached afterwards) ...",
-                  todo.len(), hashed as f64 / 1e9);
-        let t0 = std::time::Instant::now();
-        todo.sort_by(|a, b| b.2.cmp(&a.2));
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let next = AtomicUsize::new(0);
-        let out: std::sync::Mutex<Vec<(usize, Result<String>)>> = std::sync::Mutex::new(Vec::new());
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
-        let prog = Progress::new("hashing the shard files (first ship; cached afterwards)", hashed, Unit::Bytes);
-        std::thread::scope(|sc| {
-            for _ in 0..threads.min(todo.len()) {
-                sc.spawn(|| loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= todo.len() { break; }
-                    let r = hash_plan_src(&todo[i].1, Some(&prog));
-                    out.lock().unwrap().push((i, r));
-                });
-            }
-        });
-        prog.finish();
-        for (i, r) in out.into_inner().unwrap() {
-            cache.insert(todo[i].0.clone(), r?);
-        }
+    if pack_hits > 0 {
         hash_cache_save(&cache);
-        crate::deprintln!("[head] B32: hashed in {:.1} s", t0.elapsed().as_secs_f64());
     }
-    let mut ships = vec![RankShip { model_id: base.clone(), artifacts: Vec::new(), srcs: HashMap::new() }];
+    if !todo.is_empty() {
+        // Resolve pre-known hashes (e.g. Engram manifest sha256s) first so they don't skew the hashing progress bar.
+        let mut work_todo: Vec<(String, String, crate::shard_plan::PlanSrc, u64)> = Vec::with_capacity(todo.len());
+        let mut known_count = 0usize;
+        for item in todo {
+            if let crate::shard_plan::PlanSrc::Generated(g) = &item.2 {
+                if let Some(h) = g.known_hash() {
+                    cache.insert(item.1, h);
+                    known_count += 1;
+                    continue;
+                }
+            }
+            work_todo.push(item);
+        }
+        let hashed: u64 = work_todo.iter().map(|t| t.3).sum();
+        if !work_todo.is_empty() {
+            crate::deprintln!("[head] B32: hashing {} new shard file(s), {:.2} GB (first ship only; cached afterwards) ...",
+                      work_todo.len(), hashed as f64 / 1e9);
+            let t0 = std::time::Instant::now();
+
+            // Group co-located segments across ranks by logical name (e.g. `seg/L00.safetensors` for ranks 1..W-1)
+            // so each layer's source tensors are read ONCE sequentially from NVMe instead of W-1 times.
+            enum HashJob {
+                SegBatch {
+                    sort_key: (PathBuf, u64),
+                    items: Vec<(String, Vec<crate::shard_plan::Piece>)>,
+                },
+                Single {
+                    sort_key: (PathBuf, u64),
+                    key: String,
+                    src: crate::shard_plan::PlanSrc,
+                },
+            }
+            let mut seg_groups: std::collections::BTreeMap<String, Vec<(String, Vec<crate::shard_plan::Piece>)>> =
+                std::collections::BTreeMap::new();
+            let mut jobs: Vec<HashJob> = Vec::new();
+            for (logical, key, src, _sz) in work_todo {
+                match src {
+                    crate::shard_plan::PlanSrc::Segment(pieces) => {
+                        seg_groups.entry(logical).or_default().push((key, pieces));
+                    }
+                    other => {
+                        let sk = match &other {
+                            crate::shard_plan::PlanSrc::Whole(p) => (p.clone(), 0),
+                            _ => (PathBuf::new(), u64::MAX),
+                        };
+                        jobs.push(HashJob::Single { sort_key: sk, key, src: other });
+                    }
+                }
+            }
+            for (_logical, items) in seg_groups {
+                let mut sk: Option<(PathBuf, u64)> = None;
+                for (_, ps) in &items {
+                    if let Some(p0) = ps.first() {
+                        let cand = (p0.src.clone(), p0.off);
+                        if sk.as_ref().map_or(true, |cur| &cand < cur) { sk = Some(cand); }
+                    }
+                }
+                jobs.push(HashJob::SegBatch { sort_key: sk.unwrap_or_else(|| (PathBuf::new(), u64::MAX)), items });
+            }
+            // Walk source files strictly sequentially (file 00001 -> N) to maximize NVMe sequential bandwidth
+            // and avoid random cross-file page-cache thrashing on packs larger than RAM.
+            jobs.sort_by(|a, b| {
+                let ka = match a { HashJob::SegBatch { sort_key, .. } | HashJob::Single { sort_key, .. } => sort_key };
+                let kb = match b { HashJob::SegBatch { sort_key, .. } | HashJob::Single { sort_key, .. } => sort_key };
+                ka.cmp(kb)
+            });
+
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let next = AtomicUsize::new(0);
+            let out: std::sync::Mutex<Vec<Result<Vec<(String, String)>>>> = std::sync::Mutex::new(Vec::new());
+            // 3 workers = ~7.3 GB/s ARMv8 HW SHA-256 capacity, saturating NVMe without 8-thread seek thrashing.
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(3).min(3);
+            let prog = Progress::new("hashing the shard files (first ship; cached afterwards)", hashed, Unit::Bytes);
+            std::thread::scope(|sc| {
+                for _ in 0..threads.min(jobs.len()) {
+                    sc.spawn(|| loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= jobs.len() { break; }
+                        let res: Result<Vec<(String, String)>> = match &jobs[i] {
+                            HashJob::SegBatch { items, .. } => {
+                                let refs: Vec<&[crate::shard_plan::Piece]> = items.iter().map(|(_, ps)| ps.as_slice()).collect();
+                                crate::shard_plan::hash_segments_single_pass(&refs, |n| prog.add(n)).map(|hs| {
+                                    items.iter().zip(hs).map(|((k, _), h)| (k.clone(), h)).collect()
+                                })
+                            }
+                            HashJob::Single { key, src, .. } => {
+                                hash_plan_src(src, Some(&prog)).map(|h| vec![(key.clone(), h)])
+                            }
+                        };
+                        out.lock().unwrap().push(res);
+                    });
+                }
+            });
+            prog.finish();
+            for r in out.into_inner().unwrap() {
+                for (k, h) in r? {
+                    cache.insert(k, h);
+                }
+            }
+            crate::deprintln!("[head] B32: hashed in {:.1} s", t0.elapsed().as_secs_f64());
+        }
+        if known_count > 0 || hashed > 0 {
+            hash_cache_save(&cache);
+        }
+    }
+    let mut ships: Vec<RankShip> = (0..world.max(1)).map(|_| RankShip { model_id: base.clone(), artifacts: Vec::new(), srcs: HashMap::new() }).collect();
     for p in plans {
         let mut arts = Vec::new();
         let mut srcs = HashMap::new();
@@ -444,7 +613,8 @@ pub fn ship_plans(model_dir: &Path, world: u32) -> Result<Vec<RankShip>> {
         let total: u64 = arts.iter().map(|a| a.size).sum();
         crate::deprintln!("[head] B32 plan rank {}/{} ({}, deal {}): {} files, {:.2} GiB",
                   p.rank, world, fmt.name(), p.deal, arts.len(), total as f64 / (1u64 << 30) as f64);
-        ships.push(RankShip { model_id: format!("{base}@{}-w{world}-r{}-{}", fmt.name(), p.rank, p.deal), artifacts: arts, srcs });
+        let rank = p.rank;
+        ships[rank] = RankShip { model_id: format!("{base}@{}-w{world}-r{}-{}", fmt.name(), p.rank, p.deal), artifacts: arts, srcs };
     }
     Ok(ships)
 }
@@ -462,6 +632,12 @@ fn send_artifact(s: &mut impl Write, model_dir: &Path, a: &Artifact,
             Ok(())
         }
         Some(PlanSrc::Bytes(b)) => { s.write_all(b)?; s.flush()?; Ok(()) }
+        Some(PlanSrc::Generated(g)) => {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *s);
+            g.write_to(&mut w)?;
+            w.flush()?;
+            Ok(())
+        }
         None => send_blob(s, &model_dir.join(&a.logical)),
     }
 }

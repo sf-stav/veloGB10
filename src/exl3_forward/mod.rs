@@ -620,6 +620,13 @@ pub struct FwdModel {
     // K1 (PLAN/KV_CACHE_FORMATS.md): row-strided BYTES [W][K|V][nkv][max_pos] rows of
     // kv_rowbytes(fmt, hd); the format rides the top 4 bits of the kernels' max_pos (mpf()).
     k_cache: Vec<CudaSlice<u8>>,
+    /// KVPOOL (fork): the shared physical pool behind the position planes (None = stock slabs), and per slot the
+    /// rows currently mapped (the `vmm_ensure` fast path).
+    vmm: Option<std::sync::Mutex<crate::kv_vmm::KvVmm>>,
+    vmm_rows: Vec<std::sync::atomic::AtomicUsize>,
+    /// KVPOOL: per slot, the rows of the POOLED-key planes mapped (>= vmm_rows: a multi-lane scorer reads a short
+    /// lane's pooled blocks out to the longest lane of its group — `vmm_ensure_pooled`).
+    vmm_pool_rows: Vec<std::sync::atomic::AtomicUsize>,
     kv_fmt: u32,
     max_pos: usize,
     pub bytes_per_round: u64,
@@ -740,6 +747,37 @@ impl Drop for FwdModel {
         // segfaulted at shutdown (observed 2026-09-21). Fields drop AFTER this body.
         self.graphs.lock().unwrap().clear();
         self.dump_esel_hist();
+        // KVPOOL: the position planes are VMM ranges, not cuMemAlloc blocks — CudaSlice::drop would cuMemFree them.
+        // Leak the slices; KvVmm::drop (a later field) unmaps, frees the ranges and releases the pool.
+        if self.vmm.is_some() {
+            let _ = self.dev.synchronize();
+            let _ = unsafe { cudarc::driver::result::stream::synchronize(self.stream.stream) };
+            for s in std::mem::take(&mut self.k_cache) { let _ = s.leak(); }
+            for s in std::mem::take(&mut self.qsa_keys) { let _ = s.leak(); }
+            for s in std::mem::take(&mut self.qsa_pool) { let _ = s.leak(); }
+            if let Some(head) = self.mtp.as_mut() {
+                if let Ok(z) = self.dev.null::<u8>() { let _ = std::mem::replace(&mut head.kv, z).leak(); }
+                if let Some(k) = head.qsa_keys.take() { let _ = k.leak(); }
+                if let Some(k) = head.qsa_pool.take() { let _ = k.leak(); }
+            }
+        }
+    }
+}
+
+/// KVPOOL: one u8 position plane — a VMM range when the pool is on, else the stock allocation (not zeroed either way:
+/// `alloc_zeros` is cuMemAllocAsync here, and the KV planes are write-before-read per position).
+fn vmm_plane_u8(dev: &Arc<CudaDevice>, vmm: &mut Option<crate::kv_vmm::KvVmm>, len: usize) -> Result<CudaSlice<u8>> {
+    match vmm {
+        Some(v) if len > 0 => { let base = v.reserve(len, false)?; Ok(unsafe { dev.upgrade_device_ptr::<u8>(base, len) }) }
+        _ => Ok(dev.alloc_zeros::<u8>(len)?),
+    }
+}
+/// KVPOOL: one bf16 indexer-key plane, really zero (the stock boot uploads zeros: `qsa_pool_update_b` reads a whole
+/// `ratio`-row block, rows past the lane's position included). Under VMM every freshly mapped page is zero-filled.
+fn vmm_plane_u16z(dev: &Arc<CudaDevice>, vmm: &mut Option<crate::kv_vmm::KvVmm>, len: usize) -> Result<CudaSlice<u16>> {
+    match vmm {
+        Some(v) if len > 0 => { let base = v.reserve(len * 2, true)?; Ok(unsafe { dev.upgrade_device_ptr::<u16>(base, len) }) }
+        _ => Ok(dev.htod_sync_copy(&vec![0u16; len])?),
     }
 }
 const ESEL_HIST_W: usize = 161;

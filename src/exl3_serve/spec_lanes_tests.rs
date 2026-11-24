@@ -164,6 +164,29 @@
                 "the gate is lockstep state only");
     }
 
+    /// Issue #45: every lockstep point that can follow another agree with no collective in between (`arm-meter`,
+    /// `wide-policy`, `copy-prefill-pre`, `map-ahead`) drains and runs `t.rendezvous(...)` before its agree so the
+    /// first rank through never overwrites `net_agree`'s single mirrored token slot before the peer reads it.
+    #[test]
+    fn the_meter_points_rendezvous_before_their_agree() {
+        let src = src_text!("exl3_serve");
+        for (what, call) in [
+            ("arm-meter", "Self::tp_round_with(t, &self.model, None, \"arm-meter\", 0, 0, &w, ms, 0.0, false)"),
+            ("wide-policy", "Self::tp_round_with(t, &self.model, None, \"wide-policy\", 0, 0, &w, ms, 0.0, false)"),
+            ("copy-prefill-pre", "self.tp_round(\"copy-prefill-pre\", 0, 0, &w, 0.0, 0.0, false, false)"),
+            ("map-ahead", "Self::tp_round_with(t, model, None, \"map-ahead\", 0, slots.len(), &agree, 0.0, 0.0, false)"),
+        ] {
+            let agree = src.find(call).expect(what);
+            let rdv = src.find(&format!("t.rendezvous(\"{what}\")?;")).expect(what);
+            let drain = src[..rdv].rfind("self.model.tp_drain_before_exchange()?;").expect(what);
+            assert!(drain < rdv && rdv < agree && agree - rdv < 500, "{what}: drain, then rendezvous, then agree");
+        }
+        let f = &src[src.find("fn rendezvous(&mut self").unwrap()..];
+        let f = &f[..f.find("\n    }\n").unwrap()];
+        assert!(f.contains("if self.world > 2 { return Ok(()); }") && f.contains("crate::net::exchange_u32s(&[tag], 1 + 4)?"),
+                "world 2 only, one pairwise exchange");
+    }
+
     /// ULTRA v2 fixes: settle steps after a busy-count change / prefill are neither metered nor probed; the speculation
     /// arm folds (and is probed) over SPEC_V2_FOLD_SPEC steps, the shared arm over SPEC_V2_FOLD; a probe's contradicting
     /// fold replaces the stored rate; close / young estimates are re-probed after SPEC_V2_REFRESH_FAST steps. v1 paths

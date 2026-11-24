@@ -38,7 +38,7 @@ impl Df2Round {
                     anyhow::bail!("df2 sync staging D2D failed: {r:?}");
                 }
             }
-            self.dev.synchronize()?;
+            self.dsync()?;
         }
         Ok(())
     }

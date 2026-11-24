@@ -116,6 +116,65 @@ pub(super) fn prompt_hash(p: &[u32]) -> u64 {
 }
 
 impl Exl3Scheduler {
+    /// KVPOOL: free the position pages of ONE idle lane (no request on it): the SMALLEST first, the longest last. Its cached
+    /// conversation goes to the SSD spill tier first (when on) — the same capture an admission takeover does — and its
+    /// prefix bookkeeping is dropped, so a later prompt of that conversation restores from disk or prefills again.
+    /// `keep`: lanes that must not be picked. Ok(false) = nothing to free. Single box only (TP ranks would have to agree).
+    pub(super) fn vmm_evict_idle(&mut self, keep: &[usize]) -> Result<bool> {
+        if !self.model.vmm_lazy() || self.tp.is_some() { return Ok(false); }
+        let Some(&(rows, v)) = self.vmm_idle_victims(keep).first() else { return Ok(false) };
+        let t0 = std::time::Instant::now();
+        let cached = self.cache[v].take();
+        if let Some(old) = cached.as_ref() {
+            if self.spill.is_some() { self.spill_capture_slot(v, old)?; }
+        }
+        if let Some(st) = self.wp16.as_mut() { st.clear_slot(v); }
+        self.segs_set(v, None, 0);
+        self.pf_done.remove(&v); // PACKPF: a finished packed pass claims this lane's rows 0..d.end
+        if let Some(a) = self.turn.as_mut() { a.toks[v] = None; a.pending[v] = None; } // TURNRESUME: ditto for the kept next-turn state
+        self.model.vmm_truncate(v, 0)?;
+        crate::kv_vmm::EVICTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::drprintln!("[kv-vmm] pool full: evicted idle slot {v} ({rows} rows mapped, {} cached tokens{}) in {:.2} s",
+                          cached.as_ref().map_or(0, |c| c.len()),
+                          if cached.is_some() && self.spill.is_some() { ", offered to the SSD spill tier" } else { "" },
+                          t0.elapsed().as_secs_f64());
+        self.publish_kv();
+        Ok(true)
+    }
+
+    /// KVPOOL: the idle lanes `vmm_evict_idle` may take, in the order it takes them: (rows mapped, slot). Read-only,
+    /// so TPPOOL's capacity gate (design v3 step 4) credits victims in exactly the eviction's order.
+    /// PRIORITY (owner 2026-11-17): the longest idle session goes LAST. One long main conversation and short
+    /// agent / sub-agent sessions share the pool; evicting the long one costs a multi-GB SSD round trip when its
+    /// user comes back. So: smallest idle lane first, and the largest idle lane is kept while anything else
+    /// idle can be freed. When it is the only idle lane left, it goes too (the alternative is failing a request).
+    pub(super) fn vmm_idle_victims(&self, keep: &[usize]) -> Vec<(usize, usize)> {
+        let base = crate::kv_vmm::rows_grid(crate::exl3_forward::VMM_FLOOR_ROWS + crate::exl3_forward::VMM_MARGIN_ROWS,
+                                            self.model.max_pos());
+        let pf = self.kv_pf.map(|p| p.0);
+        let mut idle: Vec<(usize, usize)> = (0..self.lanes.len())
+            .filter(|s| self.lanes[*s].is_none() && !keep.contains(s) && pf != Some(*s) && !self.pf_busy(*s))
+            .map(|s| (self.model.vmm_rows_mapped(s), s))
+            .filter(|x| x.0 > base)
+            .collect();
+        idle.sort();
+        if idle.len() > 1 { idle.pop(); }
+        idle
+    }
+
+    /// KVPOOL: make sure lane `slot` has its position rows `< rows` mapped, evicting idle lanes while the pool is full.
+    /// Err = the pool is exhausted and nothing idle is left (the request fails; the engine and the other lanes go on).
+    fn vmm_room(&mut self, slot: usize, rows: usize) -> Result<()> {
+        if !self.model.vmm_lazy() { return Ok(()); }
+        loop {
+            match self.model.vmm_ensure(slot, rows) {
+                Ok(()) => return Ok(()),
+                Err(e) if crate::kv_vmm::is_exhausted(&e) => { if !self.vmm_evict_idle(&[slot])? { return Err(e); } }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Prefill one lane's prompt into its slot, chunked (S-A3-f-b): C tokens per
     /// forward sweep through the wide-M path. The final sweep's last token is
     /// NOT processed here — see the S-A3-h seam contract below.
@@ -158,6 +217,7 @@ impl Exl3Scheduler {
             self.publish_kv();
         }
         if pos >= n { return Ok(true); }
+        self.vmm_room(slot, n + 1)?; // KVPOOL: the whole prompt's rows up front (idle lanes give way)
         let mut taken: Vec<usize> = Vec::new();
         let (mut il_points, mut il_steps, mut il_ms) = (0usize, 0usize, 0.0f64);
         // C1 v2 (knob on == realign): merge away the chunk the split / realign would add (psc holds
@@ -453,6 +513,7 @@ impl Exl3Scheduler {
         // PFXPOOL2: agree the pool back into one state (entries a rank freed under memory pressure) and give memory
         // back while any rank is under the floor — before the capture and the lookup below
         self.pool_upkeep()?;
+        self.vmm_room(slot, plen)?; // KVPOOL: before any restore writes this lane's rows
         if self.pool.on() || self.spill.is_some() {
             if let Some(old) = self.cache[slot].clone() {
                 let own = old.len() <= end && key[..old.len()] == old[..];
@@ -485,15 +546,20 @@ impl Exl3Scheduler {
                 None => {}
             }
         }
-        // LANERES2: own-snapshot miss — try the SSD spill tier; a hit restores rows 0..n + the
-        // snapshot state and the normal `reuse > 0` branch below runs unchanged. Cost-model
-        // gated; every miss/drop/error falls back to the plain prefill and is counted.
+        // LANERES2 / SPILLTRUNC: own-snapshot miss — try the SSD spill tier. A Full hit restores
+        // rows 0..n + snapshot state (`reuse > 0` branch below); a Trunc hit restores rows 0..q and
+        // installs the carried WP16 checkpoint into `self.wp16` (leaving `reuse = 0` so the WP16
+        // resume branch runs `ckpt_restore`, identical to `PoolHit::Ckpt`).
         if reuse == 0 && self.spill.is_some() {
-            if let Some(n) = self.spill_restore_slot(slot, key, end)? {
-                reuse = n;
-                external = true;
-                adopted = false;
-                self.segs_set(slot, None, n); // PFXPOOL2: rows from disk: a lineage of their own
+            match self.spill_restore_slot(slot, key, end)? {
+                Some(SpillHit::Full(n)) => {
+                    reuse = n;
+                    external = true;
+                    adopted = false;
+                    self.segs_set(slot, None, n); // PFXPOOL2: rows from disk: a lineage of their own
+                }
+                Some(SpillHit::Trunc(_)) => {} // installed as the lane's WP16 checkpoint: the WP16 resume below takes it
+                None => {}
             }
         }
         if self.psc.is_none() {

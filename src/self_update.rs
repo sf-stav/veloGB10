@@ -22,14 +22,8 @@ const ASSET: &str = "velogb10-{TAG}-gb10-sm121.tar.gz";
 
 // ---------- ANSI ----------
 pub fn tty_colors() -> bool {
-    // TTY-gated only (§7: NO env reads, not even the NO_COLOR convention).
-    unsafe { libc_isatty() }
-}
-// std has no isatty; avoid a libc dep: probe via /proc/self/fd/2 symlink target.
-fn libc_isatty() -> bool {
-    std::fs::read_link("/proc/self/fd/2")
-        .map(|p| p.to_string_lossy().starts_with('/'))
-        .unwrap_or(false)
+    // TTY-gated / `--color`-controlled (§7: NO env reads, not even the NO_COLOR convention).
+    crate::logq::color_enabled(true)
 }
 fn c(code: &str, s: &str) -> String {
     if tty_colors() { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }

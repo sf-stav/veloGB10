@@ -229,6 +229,26 @@ impl TpSync {
         Ok((hs, hn))
     }
 
+    /// Issue #45: pairwise rendezvous in front of a lockstep point that FOLLOWS another agree with no collective
+    /// between them (`arm-meter` / `wide-policy` after a round's fence B; `copy-prefill-pre` / `map-ahead` after
+    /// `step_go`'s GO agree). `net_agree` is ONE mirrored token slot: without an exchange between back-to-back agrees,
+    /// the first rank through overwrites its previous token before the peer (sleeping past its 20 ms spin or with a
+    /// parked proxy shipping only the latest word) has read it, causing a 10 s abort code 7. Same shape as
+    /// `pre_verify`: exchange (rendezvous), then the agree. World > 2 uses the request/response head hub (no slot to
+    /// overwrite).
+    pub(super) fn rendezvous(&mut self, what: &str) -> Result<()> {
+        if self.world > 2 { return Ok(()); }
+        let tag = 0xA700_0000u32 | (self.step as u32 & 0xFFFF);
+        let (t0, s0) = (std::time::Instant::now(), crate::net::wait_sleeps());
+        let peer = crate::net::exchange_u32s(&[tag], 1 + 4)?; // + the 8-byte tail tag (as tp_round)
+        self.wp.rec(1, t0, s0);
+        if peer[0] != tag {
+            crate::net::abort_link();
+            anyhow::bail!("TP rendezvous FAILED at {what} (lockstep step {}): peer at {:#x}, this rank at {tag:#x}", self.step, peer[0]);
+        }
+        Ok(())
+    }
+
     /// S-B9-CF-PACK5: the PACKED round's pre-verify lockstep point — ONE exchange + ONE agree for a
     /// pair (the serial arm does one per lane), after BOTH lanes drafted and before the packed verify
     /// graph (whose R-keyed barrier sequence every rank must run alike) launches.

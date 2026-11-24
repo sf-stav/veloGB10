@@ -8,6 +8,10 @@ impl Df2Round {
     /// round): block RoPE positions = ABSOLUTE `[nprev, nprev+8)`; the linear-control rows
     /// = `[nprev, nprev+8)`.
     pub fn refresh_block_pos(&mut self) -> Result<()> {
+        // NIGHT1 follow-up (PR #47): `inject_dev` returns with the inject still queued on this round's (blocking)
+        // stream. `htod_sync_copy_into` (cudarc 0.9: a copy on the legacy NULL stream, then cuStreamSynchronize of it)
+        // would wait for that inject inside the driver. Wait for it through `host_wait` first; GPU order is unchanged.
+        crate::host_wait::stream_wait(self.stream.stream)?;
         self.pos_at = None;
         let n = self.nprev;
         let pos: Vec<i32> = (0..block()).map(|b| (n + b) as i32).collect();
@@ -15,7 +19,7 @@ impl Df2Round {
         let ctl: Vec<i32> = (0..block()).map(|b| (n + b) as i32).collect();
         self.dev.htod_sync_copy_into(&ctl, &mut self.wrow_ctl)?;
         self.gather_rope(&self.blk.cos8, &self.blk.sin8, d(&self.pos_blk), block());
-        self.dev.synchronize()?;
+        self.dsync()?;
         self.pos_at = Some(n);
         Ok(())
     }

@@ -46,6 +46,39 @@ inference binary, the required PTX kernels, SHA-256 checksums, and build provena
 run an NVIDIA DGX Spark or a compatible OEM GB10 machine, you can use a release binary without
 compiling anything.
 
+## What's New: Velo-Fabric, DeepSeek-V4.1-Flash, and Inkling-2-Mini
+
+### Velo-Fabric
+
+**Velo-Fabric** is veloGB10's built-in, **NCCL-free and MPI-free** multi-node collective transport and distributed execution layer engineered specifically for **NVIDIA DGX Spark (GB10)** clusters over commodity dual-port 200GbE ConnectX-7 RoCEv2 Ethernet. Rather than bouncing activations through host memory or stalling decode loops on CPU syncs, Velo-Fabric combines GPU-validated direct-NIC-tail receives, Blackwell Programmatic Dependent Launch (PDL) overlap, lock-free dual-rail verbs, and full CUDA Graph capture to achieve **15.9 µs (TP=2)**, **21.5 µs (TP=3)**, **22.8 µs (TP=4)**, **28.5 µs (TP=6)**, and **31.4 µs (TP=8)** median all-reduce latencies—while enforcing bit-identical canonical FP32 reduction order across every rank. It supports arbitrary cluster sizes (**TP=2, TP=3, TP=4, TP=6, and TP=8**), 1-RTT dual-rail All-to-All primitives for sequence-parallel attention (**DeepSpeed-Ulysses** and **LAGA**), vocab-parallel speculative decoding (`≤ 1 KiB` acceptance exchanges), and automatic RoCEv2 bulk weight shipping with hardware SHA-256 caching so peer nodes need zero manual model copying. See [VELO_FABRIC.md](VELO_FABRIC.md) and [docs/VELO_FABRIC_BENCHMARKS.md](docs/VELO_FABRIC_BENCHMARKS.md) for architecture details and full micro-benchmarks.
+
+### DeepSeek-V4.1-Flash Support
+
+veloGB10 now serves **DeepSeek-V4.1-Flash-1017** end-to-end across **TP=2, TP=3, TP=4, TP=6, and TP=8** using the self-contained **[doth4580/DeepSeek-V4.1-Flash-1017-Mia-EXL3-2.9bpw-Engram](https://huggingface.co/doth4580/DeepSeek-V4.1-Flash-1017-Mia-EXL3-2.9bpw-Engram)** bundle—combining **Mia-AiLab's** EXL3 2.9 bpw EAQ weights (`210.6 GB`, 40 trunk layers + 3-stage DSpark drafter + 32-layer BF16 vision tower) with **DeepSeek-AI's** native FP8 Engram tables (`~190 GiB`, auto-detected with no extra flags) and up to **1M context** (`1,048,576` tokens). Across all multi-node topologies, the engine runs P7SP sequence-parallel prefill with mirror-zigzag causal indexer sharding, **LAGA** BF16 attention-output All-to-All (`--dsv41-sp-laga auto`, cutting total cluster collective bytes by **18.8–19.3%**), prefix caching, and lockstep DSpark speculative decoding (plus opt-in `--dsv41-wire-bf16 on` for +5–6% single-user decode speed). See [DEEPSEEK_V41_FLASH_SETUP.md](DEEPSEEK_V41_FLASH_SETUP.md) for full setup and launch instructions.
+
+| Topology | Mode | Warm Boot | 4.4K–5.2K Cold Prefill (`tok/s` / TTFT) | 8.0K–14.9K Cold Prefill (`tok/s`) | Turn-2 Prefix Hit TTFT | 1-User Decode (`tok/s`) | 4-User Batch (`agg tok/s` / per-user) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **TP=2** (2 Sparks) | FP32 (default) | `129 s` | `1,886` (`2.44 s`) | — | *(RAM-bound)* | `48.9` | `91.2` (`22.8`/u) |
+| **TP=3** (3 Sparks) | FP32 + P7SP + LAGA (default) | `152 s` | **`2,261 – 2,275`** (`1.94 s`) | **`2,518 – 2,547`** (@ 8.0K) | **`157 – 220 ms`** | **`64.4`** | **`146.6`** (`36.7`/u) |
+| **TP=3** (3 Sparks) | `--dsv41-wire-bf16 on` | `152 s` | `1,794 – 1,890` *(pre-SP/LAGA)* | **`2,177`** (@ 14.9K) | **`113 – 225 ms`** | **`68.1 – 70.6`** | **`145.0 – 183.7`** (`36.3–45.9`/u) |
+| **TP=4** (4 Sparks) | FP32 + P7SP + LAGA (default) | `72 s` | **`2,764`** (`1.66 s`) | **`3,169 – 3,231`** (@ 8.0K) | **`142 ms`** | `58.5` | `135.1` (`33.8`/u) |
+| **TP=6** (6 Sparks) | FP32 + P7SP *(pre-LAGA)* | `~95 s` | `2,147` (@ 4.4K) | **`2,873`** (@ 8.0K) | — | **`70.5 – 71.6`** | — |
+| **TP=8** (8 Sparks) | FP32 + P7SP + LAGA (default) | **`61 s`** | **`3,094`** (`1.47 s`) | — | **`108 – 155 ms`** | **`87.6 – 92.6`** | **`219.9`** (`55.0`/u) |
+
+### Inkling-2-Mini Support
+
+veloGB10 now supports **[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**—Thinking Machines Lab's stock NVFP4/MXFP8 looped MoE (`24` layers / `48` looped visits, `128` experts top-8, `256K` context, bundled 3-layer MTP speculative drafter, and 23-layer BF16 vision tower)—from a single DGX Spark (**TP=1**) up through **TP=2, TP=3, TP=4, TP=6, and TP=8** over Velo-Fabric. Multi-node runs use balanced 64-channel MoE inner sharding, vocab-parallel MTP speculation, and arbitrary-W **DeepSpeed-Ulysses** 1-RTT All-to-All sequence-parallel attention (`TP=3/4/6/8`, adapted from [arXiv:2309.14509](https://arxiv.org/abs/2309.14509)) with localized `gate_attn` (bit-exact FP32 default, or opt-in `--inkling2-ulysses-wire bf16` for −47% Ulysses wire and up to **5,086 tok/s** cold prefill), alongside opt-in `--inkling2-expert-act native` Blackwell FP4/FP8 tensor-core expert activations. Single-user interactive decode scales to **2.07× TP=1** (**89.1 tok/s** at TP=8) and 4-user aggregate throughput reaches **194.0 tok/s (+225% vs TP=1)** over pure 200GbE Ethernet, with warm 8-node boot in **13 seconds**. See [INKLING_2_MINI_SETUP.md](INKLING_2_MINI_SETUP.md) for full setup and launch instructions.
+
+| Topology | 4.87K–5.5K Cold SP Prefill (`tok/s`, FP32 / BF16 wire) | 16K Cold SP Prefill (`tok/s`, FP32 / BF16 wire) | Turn-2 Prefix Hit TTFT | 1-User Decode (`tok/s`) | 4-User Batch (`agg tok/s` / per-user) |
+| --- | --- | --- | --- | --- | --- |
+| **TP=1** (1 Spark, `--mtp on`) | `2,429` (`2.01 s`) | — | — | `43.0` | `59.7` (`14.9`/u) |
+| **TP=2** (2 Sparks, fused dual-rail AG+RS) | **`3,759 – 3,766`** (`1.45 s`) | — | — | `62.6` (+46%) | `83.2` (`20.8`/u) |
+| **TP=3** (3 Sparks, Ulysses) | **`3,781 – 3,810`** / **`4,133 – 4,178`** | — | `112.5 ms` | `62.4` (+45%) | `167.2` (`41.8`/u) |
+| **TP=4** (4 Sparks, Ulysses) | **`4,287 – 4,330`** (`1.27 s`) | **`4,254 – 4,285`** (`3.71 s`) | **`73.0 ms`** | **`64.7 – 76.1`** | `175.7` (`43.9`/u) |
+| **TP=6** (6 Sparks, Ulysses) | **`4,617 – 4,637`** / **`5,008 – 5,086`** | **`4,450 – 4,475`** / **`4,881 – 4,887`** | `108.9 ms` | `70.6` (+64%) | `193.8` (`48.5`/u) |
+| **TP=8** (8 Sparks, Ulysses) | **`4,436 – 4,496`** / **`4,738 – 4,805`** | **`4,478 – 4,505`** / **`4,723 – 4,737`** | **`70.0 ms`** | **`64.3 – 89.1`** (`2.07×` TP1) | **`194.0`** (`48.5`/u, `+225%`) |
+| **TP=8** (8 Sparks, `--mtp off`) | `3,603` *(pre-Ulysses)* | — | `105.0 ms` | `85.7` (`1.99×` TP1) | `120.9` (`30.2`/u) |
+
 ## Update — Qwen3.8-Flash-Next support (veloGB10 v0.7.1)
 
 **New in v0.7.5 — the Naive-N0.5-Flash family is served too:** TP=2/TP=4 on GB10s with

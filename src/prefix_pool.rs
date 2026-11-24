@@ -11,7 +11,7 @@
 //! tokens is restored from it with one device copy instead of being read again.
 //!
 //! This module is the host-side policy, generic over the buffer so it is unit-tested without a GPU:
-//! longest-prefix lookup, exact-key dedupe, an LRU byte cap. Under TP every rank holds the same policy
+//! longest-prefix lookup, exact-key dedupe, a COST-WEIGHTED byte cap (PFXPOOL3). Under TP every rank holds the same policy
 //! state: every input to it (keys, token counts, the per-entry cost, the agreed capture outcome) is
 //! replicated, so lookups and evictions come out identically on every rank.
 //!
@@ -22,7 +22,16 @@
 //! entry's keeps only the rows after that point (`share` rows come from its PARENT, recursively) plus its own
 //! recurrent snapshot. Equal lineage = the same bytes (rows sharing a generation id were copied, never recomputed),
 //! so a restore through the chain is exactly the restore its own full copy would have been. Evicting an entry
-//! evicts its descendants; touching an entry touches its ancestors, so LRU never strands a descendant.
+//! evicts its descendants; touching an entry touches its ancestors, so no victim order strands a descendant.
+//!
+//! PFXPOOL3 (2026-11-22, the 215k-token session in server.log): `make_room` no longer evicts by pure LRU. A
+//! 551-token helper capture shifted out a 215k-token session's entry purely by age, and the session's next request
+//! re-prefilled 162 s (1326 tok/s measured). Victim order is now ASCENDING re-prefill cost — a family's cost is its
+//! deepest entry's token count (the whole family goes together, so that is the re-prefill its loss actually costs),
+//! bytes only as the tiebreak, then the LRU stamp, then the id — and a capture whose room can only be made by
+//! evicting a family DEEPER than the entrant is REFUSED outright: `make_room` returns None and the pool stays
+//! untouched (the entrant is cheaper to re-read than anything it would displace, by definition). The memory-floor
+//! paths (`pop_lru`, upkeep, emergency) stay LRU: they free memory to survive, not to admit one entrant.
 
 /// Row lineage: ascending (end, generation) pairs covering rows 0..last end; rows [prev end, end) were written by
 /// prefill computation `generation`. Two row sets agree on 0..n exactly when their lineages clipped at n are equal.
@@ -209,14 +218,61 @@ impl<B> Pool<B> {
     /// Would an entry of `bytes` ever fit under the cap?
     pub fn fits(&self, bytes: u64) -> bool { bytes > 0 && bytes <= self.cap }
 
-    /// Evict least-recently-used entries until `bytes` more fit under the cap; the evicted entries are
-    /// returned (the caller frees their buffers, or hands them to the SSD tier). Deterministic.
-    pub fn make_room(&mut self, bytes: u64) -> Vec<Entry<B>> {
-        let mut out = Vec::new();
-        while self.bytes + bytes > self.cap && !self.entries.is_empty() {
-            out.extend(self.evict_lru());
+    /// PFXPOOL3: free room for `bytes` under the cap by re-prefill cost: victim families come out in ASCENDING
+    /// cost order — a family's cost is its DEEPEST entry's token count (the family goes together, so that is the
+    /// re-prefill losing it actually costs), then total family bytes, then the family's oldest LRU stamp, then the
+    /// root id — and never a family deeper than the entrant (`entrant_toks` = the tokens of the capture being
+    /// admitted). Returns Some(evicted) (the caller frees the buffers or hands them to the SSD tier), or None =
+    /// REFUSED: the families shallow enough to be evictable cannot free enough, so the newcomer is not kept and
+    /// the pool is untouched (refusal moves nothing — the plan is built before any removal). Deterministic:
+    /// entries, ids and stamps are replicated state, so every rank computes the same victim set or the same
+    /// refusal from the same inputs. The byte cap of the memory-FLOOR paths stays LRU (`pop_lru`): that pressure
+    /// is not caused by an entrant, so cost-weighting has no entrant to compare against. A family's cost counts
+    /// only members not already claimed by an EARLIER (cheaper) pick — the descendant family chosen first frees
+    /// its bytes, and the ancestor root then costs only what remains of its subtree.
+    pub fn make_room(&mut self, bytes: u64, entrant_toks: usize) -> Option<Vec<Entry<B>>> {
+        if self.bytes.saturating_add(bytes) <= self.cap {
+            return Some(Vec::new());
         }
-        out
+        let mut need = self.bytes + bytes - self.cap;
+        // the plan runs on the untouched pool: each entry as a candidate subtree root -> (root id, members
+        // (tokens, bytes, used, id)); a member already claimed by a chosen victim contributes no cost again
+        let fams: Vec<(u64, Vec<(usize, u64, u64, u64)>)> = self.entries.iter().map(|e| {
+            (e.id, self.family(e.id).into_iter().filter_map(|fid| self.entries.iter().find(|x| x.id == fid)
+                .map(|x| (x.toks.len(), x.bytes, x.used, x.id))).collect())
+        }).collect();
+        let mut gone: Vec<u64> = Vec::new(); // ids claimed by a family already chosen
+        let mut roots: Vec<u64> = Vec::new();
+        loop {
+            let best = fams.iter().filter_map(|(rid, f)| {
+                let (mut d, mut b, mut u) = (0usize, 0u64, u64::MAX);
+                for (tk, by, us, id) in f {
+                    if gone.contains(id) {
+                        continue; // already freed by a cheaper descendant family
+                    }
+                    d = d.max(*tk);
+                    b += *by;
+                    u = u.min(*us);
+                }
+                (b > 0 && d <= entrant_toks).then_some((d, b, u, *rid))
+            }).min_by_key(|(d, b, u, rid)| (*d, *b, *u, *rid));
+            let Some((_, b, _, rid)) = best else { return None }; // nothing eligible frees enough: refuse
+            need = need.saturating_sub(b);
+            roots.push(rid);
+            if let Some((_, f)) = fams.iter().find(|(r, _)| *r == rid) {
+                gone.extend(f.iter().map(|(_, _, _, id)| *id));
+            }
+            if need == 0 {
+                break;
+            }
+        }
+        let mut out = Vec::new();
+        for rid in roots {
+            if let Some(i) = self.index_of(rid) {
+                out.extend(self.remove_at(i));
+            }
+        }
+        Some(out)
     }
 
     /// Evict the least recently used entry, with its children when it is a root (empty when the pool is).
@@ -354,7 +410,8 @@ mod tests {
         p.insert(t(1, 0), 40, 1);
         p.insert(t(1, 10), 40, 2);
         p.touch(0); // entry 0 used again: entry 1 is now the LRU
-        let ev = p.make_room(40);
+        // PFXPOOL3: equal cost (1 token, 40 bytes each) — the LRU-stamp tiebreak shifts out the older one first
+        let ev = p.make_room(40, 1).unwrap();
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].buf, 2);
         p.insert(t(1, 20), 40, 3);
@@ -362,6 +419,51 @@ mod tests {
         assert!(p.bytes() <= p.cap_bytes());
         assert!(!p.fits(101));
         assert!(p.fits(100));
+    }
+
+    #[test]
+    fn cost_weighted_make_room_refuses_the_cheaper_entrant() {
+        // PFXPOOL3 acceptance (b): a shallower entry can NEVER evict a deeper one; a deeper entrant evicts the
+        // shallower first; equal depth may displace equal depth; a refusal leaves the pool untouched.
+        let mut p: Pool<u8> = Pool::new(100);
+        p.insert(t(50, 0), 40, 1);   // the session: 50 tokens
+        p.insert(t(60, 100), 40, 2); // its longer turn: 60 tokens
+        assert_eq!(p.bytes(), 80);
+        // a 10-token entrant needs 20 bytes of room — everything here is deeper than it: refused, untouched
+        assert!(p.make_room(40, 10).is_none());
+        assert_eq!(p.len(), 2);
+        assert_eq!(p.bytes(), 80);
+        // equal depth is not deeper: a 60-token entrant takes the SHALLOWEST eligible family first (the 50 one)
+        let ev = p.make_room(40, 60).unwrap();
+        assert_eq!(ev.iter().map(|e| e.buf).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn cost_weighted_make_room_evicts_ascending_and_takes_families_together() {
+        // PFXPOOL3: a family's cost is its deepest token count; a child alone is the cheaper family; taking the
+        // root takes the descendants; a chain deeper than the entrant is untouchable (refusal, pool untouched).
+        let mut p: Pool<u8> = Pool::new(8000);
+        let (a, _) = p.insert_marked(t(4000, 0), 4000, 10, vec![], None, vec![(4000, 1)]);
+        p.insert_marked(t(8000, 0), 3900, 20, vec![], Some((a, 4000)), vec![(4000, 1), (8000, 2)]);
+        assert_eq!(p.bytes(), 7900);
+        // a deeper entrant: the child alone (8000 tok / 3900 B) is cheaper than the root's family
+        // (8000 tok / 7900 B) — the child goes, the parent stays
+        let ev = p.make_room(4000, 9000).unwrap();
+        assert_eq!(ev.iter().map(|e| e.buf).collect::<Vec<_>>(), vec![20]);
+        assert_eq!(p.len(), 1);
+        assert!(p.index_of(a).is_some());
+        // the same chain against a 5000-token entrant: both families are deeper than it -> refused untouched
+        let mut q: Pool<u8> = Pool::new(8000);
+        let (qa, _) = q.insert_marked(t(4000, 0), 4000, 10, vec![], None, vec![(4000, 1)]);
+        q.insert_marked(t(8000, 0), 3900, 20, vec![], Some((qa, 4000)), vec![(4000, 1), (8000, 2)]);
+        assert!(q.make_room(4000, 5000).is_none());
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.bytes(), 7900);
+        // a deep entrant under real pressure: leaves go ascending — the child first, then the root's family
+        let ev = q.make_room(7000, 9000).unwrap(); // free 6900: child (3900) then the root (4000)
+        assert_eq!(ev.iter().map(|e| e.buf).collect::<Vec<_>>(), vec![20, 10]);
+        assert!(q.is_empty());
     }
 
     #[test]
@@ -406,7 +508,10 @@ mod tests {
             let mut log = Vec::new();
             for k in 0..20u32 {
                 let toks = t(1 + (k as usize % 7), k * 3);
-                for e in p.make_room(17 + (k as u64 % 5)) { log.push(e.buf); }
+                // PFXPOOL3: the entrant's token count joins the victim order; a refusal (None) is replicated too
+                if let Some(ev) = p.make_room(17 + (k as u64 % 5), toks.len()) {
+                    for e in ev { log.push(e.buf); }
+                }
                 p.insert(toks, 17 + (k as u64 % 5), k);
                 if k % 3 == 0 { p.touch(0); }
             }

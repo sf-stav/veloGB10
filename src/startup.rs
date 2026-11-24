@@ -27,20 +27,51 @@ pub fn is_info_only(args: &[String]) -> bool {
     args.iter().skip(1).any(|a| matches!(a.as_str(), "--help" | "-h" | "--help-advanced" | "--help-diag" | "--print-config"))
 }
 
+/// Style line 1 (banner) with ANSI color when `color` is true (plain `version_line()` stays untouched).
+pub fn style_banner(line: &str, color: bool) -> String {
+    if !color { return line.to_string(); }
+    match line.split_once(" — ") {
+        Some((head, meta)) => format!("\x1b[1;36m{head}\x1b[0m \x1b[2m— {meta}\x1b[0m"),
+        None => format!("\x1b[1;36m{line}\x1b[0m"),
+    }
+}
+
+/// Style the `configuration:` block with ANSI color when `color` is true (plain `config_lines()` stays untouched).
+pub fn style_config_lines(lines: &[String], color: bool) -> String {
+    if !color { return lines.join("\n"); }
+    lines.iter().map(|line| {
+        if line == "configuration:" {
+            "\x1b[1;36mconfiguration:\x1b[0m".to_string()
+        } else if line.starts_with("  ") && line.len() > 17 && line.is_char_boundary(17) {
+            let (key, val) = line.split_at(17);
+            let styled_val = if val.contains("(NOT FOUND on this box)") {
+                val.replace("(NOT FOUND on this box)", "\x1b[1;31m(NOT FOUND on this box)\x1b[0m")
+            } else {
+                val.replace("(default)", "\x1b[2m(default)\x1b[0m")
+            };
+            format!("\x1b[36m{key}\x1b[0m{styled_val}")
+        } else {
+            line.clone()
+        }
+    }).collect::<Vec<_>>().join("\n")
+}
+
 /// Line 1 of every run. `--print-config` keeps its stdout byte-identical: the line goes to stderr there;
 /// `--help` / `--help-advanced` print it as the first line of the help text instead.
 pub fn print_banner(args: &[String]) {
+    let line = version_line();
     if args.iter().skip(1).any(|a| a == "--print-config") {
-        eprintln!("{}", version_line());
+        eprintln!("{}", style_banner(&line, crate::logq::color_enabled(true)));
     } else if !args.iter().skip(1).any(|a| matches!(a.as_str(), "--help" | "-h" | "--help-advanced")) {
-        println!("{}", version_line());
+        println!("{}", style_banner(&line, crate::logq::color_enabled(false)));
     }
 }
 
 /// The configuration block, after the banner (call once the option store is filled).
 pub fn print_config(args: &[String]) {
     if is_info_only(args) { return; }
-    println!("{}", config_lines(args).join("\n"));
+    let lines = config_lines(args);
+    println!("{}", style_config_lines(&lines, crate::logq::color_enabled(false)));
 }
 
 fn has(args: &[String], f: &str) -> bool { args.iter().skip(1).any(|a| a == f) }
@@ -59,7 +90,7 @@ pub fn mode(args: &[String]) -> String {
     if has(args, "--quantize") { return "quantizer (offline)".into(); }
     if has(args, "--perplexity") { return "perplexity tool".into(); }
     let tool = args.iter().skip(1).find(|a| {
-        ["--bench", "--probe", "--autotune", "--cached-models", "--dump-", "--capture-", "--sweep-", "--net-test", "--gen-", "--exl3-", "--pp-"]
+        ["--bench", "--probe", "--autotune", "--cached-models", "--dump-", "--capture-", "--sweep-", "--net-test", "--gen-", "--exl3-", "--pp-", "--dsv41-"]
             .iter().any(|p| a.starts_with(p))
     });
     match tool {
@@ -129,6 +160,7 @@ pub fn weights_desc(qc_file: Option<&Value>, cfg: &Value) -> String {
 enum Family { Exl3, Trunk, Other }
 
 fn family(dir: &str) -> Family {
+    if crate::dsv41::config::is_dsv41_dir(dir) { return Family::Other; } // DSV41: any format, its own defaults
     if crate::exl3_serve::is_exl3_pack(dir) { return Family::Exl3; }
     // a single-file EXL3 pack has no index until the boot synthesizes one (cli_opts_bridge, after this block)
     let qc = read_json(&std::path::Path::new(dir).join("quantization_config.json"));
@@ -167,7 +199,9 @@ pub fn config_lines(args: &[String]) -> Vec<String> {
                 match read_json(&p.join("config.json")) {
                     Some(cfg) => {
                         row("model params", model_params(&cfg));
-                        row("weights", weights_desc(read_json(&p.join("quantization_config.json")).as_ref(), &cfg));
+                        row("weights", crate::dsv41::boot::weights_row(p, weights_desc(read_json(&p.join("quantization_config.json")).as_ref(), &cfg)));
+                        // DSV41: model structure, per-pack formats from the census, the TP split (None for other families)
+                        for (k, v) in crate::dsv41::boot::config_rows(p, tp_world(args).and_then(|w| w.parse().ok())).unwrap_or_default() { row(&k, v); }
                     }
                     None => row("model params", "no readable config.json".into()),
                 }
@@ -198,13 +232,16 @@ pub fn config_lines(args: &[String]) -> Vec<String> {
         or_default(val(args, "--max-batch"), "8"), or_default(max_seq.as_deref(), "4096"),
         or_default(val(args, "--max-tokens"), &def("8192", "no cap, bounded by the context")),
         or_default(kv.as_deref(), "per model")));
-    row("prefix cache", or_default(val(args, "--prefix-cache"), &def("off", "on")));
+    let is41 = dir.as_deref().map_or(false, |d| crate::dsv41::config::is_dsv41_dir(d));
+    row("prefix cache", or_default(val(args, "--prefix-cache"), &if is41 { "on (default for DeepSeek-V4.1)".to_string() } else { def("off", "on") }));
     let mtp = crate::opts::get(crate::opt!("mtp"));
     let draft = crate::opts::get(crate::opt!("draft-dir"));
-    row("speculation", format!("mtp {}, depth {}, source {}, draft dir {}",
+    let spec41 = dir.as_deref().and_then(|d| crate::dsv41::boot::speculation_row(std::path::Path::new(d), mtp.as_deref(),
+        crate::opts::get(crate::opt!("dsv41-draft-len")).as_deref()));
+    row("speculation", if let Some(t) = spec41 { t } else { format!("mtp {}, depth {}, source {}, draft dir {}",
         or_default(mtp.as_deref(), "auto"), or_default(val(args, "--mtp-depth"), "auto"),
         or_default(val(args, "--spec-source"), "auto: a DFlash2 drafter when --draft-dir names one, else the model's MTP head"),
-        draft.as_deref().unwrap_or("none")));
+        draft.as_deref().unwrap_or("none")) });
     row("log level", crate::opts::get(crate::opt!("log-level")).unwrap_or_else(|| "normal (default)".into()));
     row("options set", crate::opts::set_summary());
     out

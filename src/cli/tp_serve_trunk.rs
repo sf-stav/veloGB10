@@ -286,6 +286,8 @@ pub(super) fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::
         TpBranch::Generate => {}
         TpBranch::Exl3Xtp => anyhow::bail!("the EXL3 xtp program runs through exl3_forward::xtp::run_tp_xtp, never tp_serve"),
         TpBranch::Naive => anyhow::bail!("the Naive-N0.5 program runs through naive::serve, never tp_serve"),
+        TpBranch::Dsv41 => anyhow::bail!("the DeepSeek-V4.1 programs run through dsv41::tp, never tp_serve"),
+        TpBranch::Inkling2 => anyhow::bail!("the Inkling-2 TP program runs through inkling2::tp, never tp_serve"),
     }
     let t0 = std::time::Instant::now();
     // E29-B2: the capture sink accumulates MTP-calibration steps at load (batch==1 too) — reset

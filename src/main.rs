@@ -28,6 +28,7 @@ fn main() {
         }
         std::process::exit(gb10_inference::self_update::update(false));
     }
+    gb10_inference::logq::set_color_from_args(&args);
     gb10_inference::startup::print_banner(&args);
     // Boot-time version notification (never a replacement): one colored line when a newer
     // GitHub release exists. SILENT on no-network / rate-limit / curl-missing; skip entirely
@@ -192,6 +193,8 @@ fn main() {
     if gb10_inference::opts::on(gb10_inference::opt!("probe-copy-span-replay")) {
         std::process::exit(gb10_inference::copy_span::probe_replay_cli());
     }
+    // DSV41 (leg I0): every --dsv41-* / --probe-dsv41-* mode through ONE hook (src/dsv41/cli.rs).
+    if let Some(code) = gb10_inference::dsv41::cli::dispatch(&args) { std::process::exit(code); }
 
     // TUNE T1 (PLAN/AUTOTUNE_DESIGN.md §5.7): the autotuner's measurement core + self-test.
     //   ./gb10_inference --autotune --selftest --model-dir <EXL3 pack> [--max-seq-len 8192]
@@ -322,6 +325,18 @@ fn main() {
     if args.iter().any(|a| a == "--probe-gemm") {
         run_probe_gemm(&args);
         return;
+    }
+    // DSV41 Engram packer / verifier / read benchmark (no GPU, no model load)
+    for (flag, name) in [("--dsv41-engram-pack", "pack"), ("--dsv41-engram-verify", "verify"), ("--dsv41-engram-iobench", "iobench")] {
+        if args.iter().any(|a| a == flag) {
+            let r = match name {
+                "pack" => gb10_inference::dsv41::engram::pack::run_cli(&args),
+                "verify" => gb10_inference::dsv41::engram::verify::run_cli(&args),
+                _ => gb10_inference::dsv41::engram::iobench::run_cli(&args),
+            };
+            if let Err(e) = r { eprintln!("{flag}: {e:#}"); std::process::exit(1); }
+            return;
+        }
     }
     // What IS the roofline? Every other number is measured against it.
     if args.iter().any(|a| a == "--probe-bandwidth") {
@@ -761,6 +776,148 @@ fn main() {
             std::process::exit(1);
         });
         return;
+    }
+    // INKLING2 S0: pack census + expert dequant vs the transformers reference dump (CPU).
+    //   ./gb10_inference --probe-inkling2-pack --model-dir <pack> [--oracle-dir <ref>]
+    if args.iter().any(|a| a == "--probe-inkling2-pack") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-inkling2-pack requires --model-dir <DIR>");
+        let ref_dir = parse_arg(&args, "--oracle-dir");
+        gb10_inference::inkling2::pack::probe_pack(std::path::Path::new(&dir), ref_dir.as_deref()).unwrap_or_else(|e| {
+            eprintln!("INK2_PACK_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // INKLING2 S1: the f32 CPU reference forward vs transformers taps / logits (CPU).
+    //   ./gb10_inference --probe-inkling2-cpu --model-dir <pack> --oracle-dir <ref>
+    if args.iter().any(|a| a == "--probe-inkling2-cpu") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-inkling2-cpu requires --model-dir <DIR>");
+        let ref_dir = parse_arg(&args, "--oracle-dir").expect("--probe-inkling2-cpu requires --oracle-dir <REF_DIR>");
+        gb10_inference::inkling2::cpu::probe_cpu(std::path::Path::new(&dir), &ref_dir, None).unwrap_or_else(|e| {
+            eprintln!("INK2_CPU_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // INKLING2 S2a (K1): the non-MoE kernels vs the cpu.rs oracle on real tensors (GPU, one box).
+    //   ./gb10_inference --probe-inkling2-kernels --model-dir <pack> [--inkling2-probe-hist N]
+    //                    [--inkling2-probe-long-hist N] [--inkling2-probe-reps N] [--inkling2-probe-only proj,attn,conv,attnres,msg,norm]
+    if args.iter().any(|a| a == "--probe-inkling2-kernels") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-inkling2-kernels requires --model-dir <DIR>");
+        let num = |f: &str, d: usize| parse_arg(&args, f).map(|v| v.parse::<usize>().expect("integer")).unwrap_or(d);
+        gb10_inference::inkling2::gpu::k1_probe::probe(std::path::Path::new(&dir), num("--inkling2-probe-hist", 1100),
+            num("--inkling2-probe-long-hist", 9000), num("--inkling2-probe-reps", 50),
+            &parse_arg(&args, "--inkling2-probe-only").unwrap_or_default()).unwrap_or_else(|e| {
+            eprintln!("INK2_K_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // INKLING2 S3: the full GPU model vs cpu.rs on real prompts (prefill + greedy decode), chunked-prefill path checks, timing.
+    //   ./gb10_inference --probe-inkling2-full --model-dir <stock pack> --oracle-dir <S1 real_ref> [--inkling2-probe-steps N]
+    //                    [--inkling2-probe-no-cpu] [--inkling2-decode-attn-tc]
+    if args.iter().any(|a| a == "--probe-inkling2-full") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-inkling2-full requires --model-dir <DIR>");
+        let steps = parse_arg(&args, "--inkling2-probe-steps").map(|v| v.parse::<usize>().expect("integer")).unwrap_or(16);
+        gb10_inference::inkling2::model::probe::probe_full(std::path::Path::new(&dir), parse_arg(&args, "--oracle-dir").as_deref(), steps,
+            args.iter().any(|a| a == "--inkling2-decode-attn-tc"), !args.iter().any(|a| a == "--inkling2-probe-no-cpu")).unwrap_or_else(|e| {
+            eprintln!("INK2_FULL_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // INKLING2 S6: the bundled drafter vs its CPU oracle, greedy speculative == plain, acceptance and speed (GPU, one box).
+    //   ./gb10_inference --probe-inkling2-mtp --model-dir <stock pack> [--inkling2-mtp-tokens N] [--inkling2-mtp-oracle]
+    //                    [--inkling2-mtp-dump DIR]
+    if args.iter().any(|a| a == "--probe-inkling2-mtp") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-inkling2-mtp requires --model-dir <DIR>");
+        let n = parse_arg(&args, "--inkling2-mtp-tokens").map(|v| v.parse::<usize>().expect("integer")).unwrap_or(400);
+        gb10_inference::inkling2::mtp::probe::probe(std::path::Path::new(&dir), n, args.iter().any(|a| a == "--inkling2-mtp-oracle"),
+            parse_arg(&args, "--inkling2-mtp-dump").as_deref(),
+            parse_arg(&args, "--inkling2-mtp-pos-shift").map(|v| v.parse::<i64>().expect("integer")).unwrap_or(0)).unwrap_or_else(|e| {
+            eprintln!("INK2_MTP_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // INKLING2 S5: the vision path (preprocessing, CPU oracle, GPU tower) vs transformers dumps (tools/inkling2/ref_vision.py).
+    //   ./gb10_inference --probe-inkling2-vision --model-dir <pack> --oracle-dir <ref> [--inkling2-vision-cpu-max-tokens N] [--inkling2-vision-no-gpu]
+    //                    [--inkling2-vision-text [--inkling2-vision-text-no-cpu]]  (image prompts through the text model)
+    if args.iter().any(|a| a == "--probe-inkling2-vision") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-inkling2-vision requires --model-dir <DIR>");
+        let ref_dir = parse_arg(&args, "--oracle-dir").unwrap_or_default();
+        let cmax = parse_arg(&args, "--inkling2-vision-cpu-max-tokens").map(|v| v.parse::<usize>().expect("integer")).unwrap_or(400);
+        let gpu = !args.iter().any(|a| a == "--inkling2-vision-no-gpu");
+        let r = if let Some(i) = args.iter().position(|a| a == "--inkling2-vision-time") {
+            let imgs: Vec<String> = args[i + 1..].iter().take_while(|a| !a.starts_with("--")).cloned().collect();
+            gb10_inference::inkling2::vision::probe::probe_time(std::path::Path::new(&dir), &imgs,
+                parse_arg(&args, "--inkling2-vision-cpu-max-tokens").map(|v| v.parse::<usize>().expect("integer")).unwrap_or(4096).max(1))
+        } else if args.iter().any(|a| a == "--inkling2-vision-text") {
+            gb10_inference::inkling2::vision::probe::probe_text(std::path::Path::new(&dir), &ref_dir, !args.iter().any(|a| a == "--inkling2-vision-text-no-cpu"), gpu)
+        } else {
+            gb10_inference::inkling2::vision::probe::probe_vision(std::path::Path::new(&dir), &ref_dir, cmax, gpu, !args.iter().any(|a| a == "--inkling2-vision-gemm-k1"))
+        };
+        r.unwrap_or_else(|e| {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-INK2-TP2: the TP exchange simulation on one GPU (W ranks as W threads, loopback exchanges) vs TP1, and the
+    // identity of the TP attention copies (NQ = 24) against the TP1 kernels.
+    //   ./gb10_inference --probe-inkling2-tp-sim --model-dir <stock pack> [--tp 2|4 (default both)] [--inkling2-probe-steps N] [--oracle-dir <S1 real_ref>]
+    if args.iter().any(|a| a == "--probe-inkling2-tp-sim") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-inkling2-tp-sim requires --model-dir <DIR>");
+        let _ = gb10_inference::inkling2::model::set_ulysses_wire_from_args(&args).expect("--inkling2-ulysses-wire");
+        let steps = parse_arg(&args, "--inkling2-probe-steps").map(|v| v.parse::<usize>().expect("integer")).unwrap_or(8);
+        let worlds: Vec<usize> = match parse_arg(&args, "--tp").as_deref() {
+            Some("2") => vec![2],
+            Some("3") => vec![3],
+            Some("4") => vec![4],
+            Some("6") => vec![6],
+            Some("8") => vec![8],
+            _ => vec![2, 4],
+        };
+        match gb10_inference::inkling2::tp::sim::probe(std::path::Path::new(&dir), &worlds, steps, parse_arg(&args, "--oracle-dir").as_deref()) {
+            Ok(true) => println!("INK2_TP_SIM_OK"),
+            Ok(false) => { println!("INK2_TP_SIM_FAIL"); std::process::exit(1); }
+            Err(e) => { eprintln!("INK2_TP_SIM_FAIL: {e:#}"); std::process::exit(1); }
+        }
+        return;
+    }
+    // INKLING2 S1 side check: our tokenizer + chat template vs transformers ids (report-only).
+    //   ./gb10_inference --probe-inkling2-tok --model-dir <pack> --oracle-dir <ref>
+    if args.iter().any(|a| a == "--probe-inkling2-tok") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-inkling2-tok requires --model-dir <DIR>");
+        let ref_dir = parse_arg(&args, "--oracle-dir").expect("--probe-inkling2-tok requires --oracle-dir <REF_DIR>");
+        gb10_inference::inkling2::tok::probe_tok(std::path::Path::new(&dir), &ref_dir).unwrap_or_else(|e| {
+            eprintln!("INK2_TOK_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // INKLING2 S2b: MoE (router, NVFP4 / MXFP8 experts, combine) + LM head kernels vs cpu.rs on real tensors (GPU).
+    //   ./gb10_inference --probe-inkling2-moe --model-dir <stock pack>
+    if args.iter().any(|a| a == "--probe-inkling2-moe") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-inkling2-moe requires --model-dir <DIR>");
+        gb10_inference::inkling2::gpu::probe::probe_moe(std::path::Path::new(&dir)).unwrap_or_else(|e| {
+            eprintln!("INK2_MOE_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // INKLING2 Q1: native expert activations (quantisers vs the external reference's fixture, native MoE vs CPU model,
+    // timings) and the teacher-forced logit dump of the fidelity study.
+    //   ./gb10_inference --probe-inkling2-actq --model-dir <stock pack> [--inkling2-actq-fixture <file>]
+    //   ./gb10_inference --probe-inkling2-logits --model-dir <pack> --inkling2-logits-tokens <ids.json> --inkling2-logits-out <dir> [--inkling2-expert-act native]
+    for (flag, which) in [("--probe-inkling2-actq", 0), ("--probe-inkling2-logits", 1)] {
+        if args.iter().any(|a| a == flag) {
+            let dir = parse_arg(&args, "--model-dir").unwrap_or_else(|| { eprintln!("{flag} requires --model-dir <DIR>"); std::process::exit(2) });
+            let p = std::path::Path::new(&dir);
+            let r = if which == 0 { gb10_inference::inkling2::actq::probe::probe_actq(p, &args) } else { gb10_inference::inkling2::actq::probe::probe_logits(p, &args) };
+            r.unwrap_or_else(|e| { eprintln!("INK2_ACTQ_FAIL: {e:#}"); std::process::exit(1); });
+            return;
+        }
     }
     // NAIVE S0 gate: our decode vs pinned ext.reconstruct dumps, bitwise (CPU; dumps from a GPU burst).
     //   ./gb10_inference --probe-naive-oracle --model-dir <pack> --oracle-dir <ref>

@@ -41,7 +41,20 @@
 #include <sys/auxv.h>   /* CPUIDLE: getauxval(AT_HWCAP) & HWCAP_EVTSTRM */
 #include <sys/prctl.h>  /* CPUIDLE: PR_SET_TIMERSLACK for the proxy's idle sleeps */
 
-#define LOGE(fmt, ...) fprintf(stderr, "[net_shim] " fmt "\n", ##__VA_ARGS__)
+static inline void net_shim_log_prefix(void) {
+    struct timespec ts;
+    struct tm tm_loc;
+    char tbuf[24];
+    clock_gettime(CLOCK_REALTIME, &ts);
+    localtime_r(&ts.tv_sec, &tm_loc);
+    strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm_loc);
+    if (isatty(STDERR_FILENO)) {
+        fprintf(stderr, "\x1b[1;35m[net_shim]\x1b[0m \x1b[2m%s\x1b[0m ", tbuf);
+    } else {
+        fprintf(stderr, "[net_shim] %s ", tbuf);
+    }
+}
+#define LOGE(fmt, ...) do { flockfile(stderr); net_shim_log_prefix(); fprintf(stderr, fmt "\n", ##__VA_ARGS__); funlockfile(stderr); } while (0)
 
 #define TP_CTS_STRIDE     5
 #define TP_CTS_READY      0   // proxy observed gpu_ready >= e
@@ -96,20 +109,24 @@
  * schedule selects a partner by `rank ^ (1<<round)`, so the array is the partner rank). The ring
  * (send/recv/len) stays SHARED across peers: one epoch is in flight against one partner at a time. */
 typedef struct PeerLink {
-    int              valid;
-    struct ibv_qp*   qp;
-    uint64_t         remote_addr;
-    uint32_t         remote_rkey;
-    char             peer_ip[64];
+    int               valid;
+    struct ibv_qp*    qp;
+    struct ibv_qp_ex* qpx;
+    uint64_t          remote_addr;
+    uint32_t          remote_rkey;
+    char              peer_ip[64];
 } PeerLink;
 
 typedef struct NetCtx {
     struct ibv_context* ctx;
     struct ibv_pd*      pd;
+    struct ibv_td*      td;          // Phase 1C: lock-free single-threaded domain for oneshot_uniform QPs
+    struct ibv_pd*      td_pd;       // parent domain binding pd + td (NULL when unused/unsupported)
     struct ibv_cq*      cq_send;     // hot path (R2b: separate from the startup CQ)
     struct ibv_cq*      cq_startup;  // retained WITH_IMM handshake / out-of-band channel
     struct ibv_qp*      qp;
     struct ibv_mr*      mr;
+    unsigned            max_inline;  // negotiated QP max_inline_data (512 -> 256 -> 64)
 
     void*    hbuf;            // cudaHostAlloc host ptr: [flags][len_local][len_peer][send_ring][recv_ring]
     void*    dbuf;            // matching CUDA device ptr
@@ -196,6 +213,7 @@ typedef struct NetCtx {
     uint64_t  len_waits;             // times the len-tag wait engaged (reordered tag, recovered)
     int       tail_drill;            // GB10_TP_TAIL_DRILL: invert commit/payload order every 4096th epoch
     uint64_t  posted_epochs, retired_epochs, released_epochs;
+    uint64_t  qp_posted[TP_NWAY_MAX_WORLD];  // Phase 1C: per-QP post counter for S=4 signaling on oneshot_uniform
     uint64_t  agree_last;            // last lockstep token shipped
     int       last_posted_peer;      // last QP's peer rank (world>2 self-clocking of the reuse gate)
     uint32_t  rng;
@@ -211,3 +229,4 @@ typedef struct NetCtx {
 #include "net_shim/02_init_accessors_bench.inc"
 #include "net_shim/03_hot_path.inc"
 #include "net_shim/04_startup_audit_channel.inc"
+#include "net_shim/05_bulk_rdma.inc"

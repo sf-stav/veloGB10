@@ -288,6 +288,20 @@ fn run_cluster_node_once(port: u16, udp: u16) {
     gb10_inference::tp::set_tp_config(tpc.clone());
     let node_rank = tpc.node_rank;
     let world = tpc.world as i32;
+    if tpc.exl3_mode.starts_with("dsv41-") {
+        // DSV4.1 (leg TPC): the dsv41 TP program on this rank's SHIPPED shard dir (Engram heads in <dir>/engram)
+        if let Err(e) = gb10_inference::dsv41::tp::launch::run_node(&tpc, &dir, head_ip, stream) {
+            eprintln!("node dsv41 tp error: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
+    if tpc.exl3_mode.starts_with("inkling2-") {
+        // S-INK2-TP2: the Inkling-2 TP serve program on the shipped pack
+        if let Err(e) = gb10_inference::inkling2::tp::launch::run_node(&tpc, &dir, head_ip, stream) {
+            eprintln!("node inkling2 tp error: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
     if tpc.exl3_mode.starts_with("naive-") {
         // NAIVE S5b: the Naive-N0.5 node loads the shipped shard dir
         if let Err(e) = run_naive_tp_node(&tpc, &dir, head_ip, stream) {

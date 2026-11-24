@@ -7,6 +7,7 @@
             expanded_tokens: vec![1, 2, 3],
             image_embeds: vec![0.25, -0.5, 1.0, 2.0],
             spans: vec![],
+            cache_hits: 0,
         })
     }
 

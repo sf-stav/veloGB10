@@ -41,7 +41,7 @@ pub(super) fn head_hello(s: &mut TcpStream, node: &NodeInfo, mine: &str) -> Resu
 /// control stream — the TP serving session keeps it as its control plane; the bench path drops it.
 /// One node's answer to the manifest, before anything ships: the open stream, the hashes it lacks and its
 /// drive-space report.
-pub(super) struct Offer { s: TcpStream, missing: Vec<String>, pub(super) space: Option<SpaceReport> }
+pub(super) struct Offer { s: TcpStream, pub(super) missing: Vec<String>, pub(super) space: Option<SpaceReport> }
 
 /// Phase 1 of a node's sync: connect, check the version, offer the manifest (and the drafter files that will follow)
 /// and read the node's answer. Nothing ships here.
@@ -76,7 +76,44 @@ pub(super) fn space_check(nodes: &[NodeInfo], offers: &mut [Offer]) -> Result<()
     bail!(msg)
 }
 
-/// Phase 2 of a node's sync: ship what it lacks, then Ready / Config / the drafter round (unchanged).
+/// Negotiate an optional RoCEv2 bulk RDMA channel over the already-open TCP control stream.
+/// Only attempted when `total >= BULK_MIN_BYTES` and peer is non-loopback; any error falls back to TCP.
+fn head_negotiate_bulk(s: &mut TcpStream, node: &NodeInfo, total: u64) -> Result<Option<crate::net::bulk::BulkLink>> {
+    use crate::net::bulk::{BulkEndpoint, BulkLink, BULK_MIN_BYTES};
+    let mut local_link = if total >= BULK_MIN_BYTES && !node.addr.ip().is_loopback() {
+        match BulkLink::open_default() {
+            Ok((l, ep)) => Some((l, ep)),
+            Err(e) => {
+                crate::deprintln!("[head] bulk RDMA unavailable for {} ({e:#}) — using TCP", node.hostname);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (enabled, offer_ep) = match &local_link {
+        Some((_, ep)) => (true, *ep),
+        None => (false, BulkEndpoint::default()),
+    };
+    send_msg(s, &Msg::BulkOffer { enabled, ep: offer_ep })?;
+    match recv_msg(s)? {
+        Msg::BulkReply { ok: true, ep: peer_ep } => {
+            if let Some((mut link, _)) = local_link.take() {
+                link.connect(&peer_ep).with_context(|| format!("bulk RDMA connect to {}", node.hostname))?;
+                crate::deprintln!("[head] bulk RDMA active for {} ({:.2} GB over RoCEv2)", node.hostname, total as f64 / 1e9);
+                Ok(Some(link))
+            } else {
+                bail!("node {} accepted BulkOffer that head did not enable", node.hostname);
+            }
+        }
+        Msg::BulkReply { ok: false, .. } => Ok(None),
+        Msg::Error { msg } => bail!("node error during bulk negotiation: {msg}"),
+        _ => bail!("expected BulkReply from {}", node.hostname),
+    }
+}
+
+/// Phase 2 of a node's sync: ship what it lacks (over RoCEv2 bulk RDMA when available, else TCP),
+/// then Ready / Config / the drafter round (unchanged).
 pub(super) fn head_ship(node: &NodeInfo, node_rank: i32, offer: Offer, model_dir: &Path,
              artifacts: &[Artifact], topology: &[String],
              cfg: &crate::tp::TpConfig,
@@ -88,14 +125,24 @@ pub(super) fn head_ship(node: &NodeInfo, node_rank: i32, offer: Offer, model_dir
     crate::deprintln!("[head] {} (rank {node_rank}) needs {} / {} artifacts ({:.2} GB)", node.hostname,
               missing.len(), artifacts.len(), total as f64 / 1e9);
     let t0 = std::time::Instant::now();
+    let mut bulk = if !missing.is_empty() { head_negotiate_bulk(&mut s, node, total)? } else { None };
     let prog = Progress::new(format!("shipping the model to {} (rank {node_rank})", node.hostname), total, Unit::Bytes);
     for h in &missing {
         let a = by_hash.get(h.as_str()).context("node asked for unknown hash")?;
         send_msg(&mut s, &Msg::BlobHeader { hash: a.hash.clone(), size: a.size })?;
-        send_artifact(&mut Counted { inner: &mut s, prog: &prog }, model_dir, a, srcs)?;
+        if let Some(b) = bulk.as_mut() {
+            let mut bw = b.writer();
+            send_artifact(&mut Counted { inner: &mut bw, prog: &prog }, model_dir, a, srcs)?;
+            bw.flush()?;
+        } else {
+            send_artifact(&mut Counted { inner: &mut s, prog: &prog }, model_dir, a, srcs)?;
+        }
     }
+    if let Some(b) = bulk.as_mut() { b.drain()?; }
     prog.finish();
-    match recv_msg(&mut s)? {
+    let ready = recv_msg(&mut s)?;
+    drop(bulk);
+    match ready {
         Msg::Ready { model_dir } => {
             let secs = t0.elapsed().as_secs_f64();
             crate::deprintln!("[head] {} (rank {node_rank}) READY — model at {} ({:.2} GB in {:.1}s = {:.2} GB/s)",
@@ -132,14 +179,24 @@ pub(super) fn head_ship(node: &NodeInfo, node_rank: i32, offer: Offer, model_dir
                     crate::deprintln!("[head] {} drafter: {} / {} artifacts ({:.2} GB)",
                               node.hostname, dmissing.len(), draft_arts.len(), dtotal as f64 / 1e9);
                     let dt0 = std::time::Instant::now();
+                    let mut dbulk = if !dmissing.is_empty() { head_negotiate_bulk(&mut s, node, dtotal)? } else { None };
                     let dprog = Progress::new(format!("shipping the drafter to {}", node.hostname), dtotal, Unit::Bytes);
                     for h in &dmissing {
                         let a = dby_hash.get(h.as_str()).context("node asked for unknown draft hash")?;
                         send_msg(&mut s, &Msg::BlobHeader { hash: a.hash.clone(), size: a.size })?;
-                        send_blob(&mut Counted { inner: &mut s, prog: &dprog }, &src_dir.join(&a.logical))?;
+                        if let Some(b) = dbulk.as_mut() {
+                            let mut bw = b.writer();
+                            send_blob(&mut Counted { inner: &mut bw, prog: &dprog }, &src_dir.join(&a.logical))?;
+                            bw.flush()?;
+                        } else {
+                            send_blob(&mut Counted { inner: &mut s, prog: &dprog }, &src_dir.join(&a.logical))?;
+                        }
                     }
+                    if let Some(b) = dbulk.as_mut() { b.drain()?; }
                     dprog.finish();
-                    match recv_msg(&mut s)? {
+                    let dready = recv_msg(&mut s)?;
+                    drop(dbulk);
+                    match dready {
                         Msg::DraftReady { model_dir } => {
                             let secs = dt0.elapsed().as_secs_f64();
                             crate::deprintln!("[head] {} drafter READY at {} ({:.2} GB in {:.1}s)",
@@ -255,14 +312,26 @@ pub fn run_head_retain(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, disc
         offers.push(head_sync_one(node, mid, &per_rank[rank], draft.as_ref())?);
     }
     space_check(&nodes, &mut offers)?;
-    let mut streams = Vec::with_capacity(nodes.len());
-    for (i, (node, offer)) in nodes.iter().zip(offers).enumerate() {
-        let rank = (i + 1) as i32;
-        // Bench sessions ship no drafter (bench nodes never load a round; the bench wire adds
-        // only the empty-DraftManifest round to the pre-v5 behavior).
-        let srcs = ships.as_ref().map(|sh| &sh[rank as usize].srcs);
-        streams.push(head_ship(node, rank, offer, model_dir, &per_rank[rank as usize], &topology, cfg, draft.as_ref(), srcs)?);
-    }
+    // Velo-Fabric: ship to all world-1 nodes in parallel (1 scoped thread per node, each with its own bulk RDMA QP).
+    let streams: Vec<TcpStream> = std::thread::scope(|scope| -> Result<Vec<TcpStream>> {
+        let handles: Vec<_> = nodes.iter().zip(offers).enumerate().map(|(i, (node, offer))| {
+            let rank = (i + 1) as i32;
+            let srcs = ships.as_ref().map(|sh| &sh[rank as usize].srcs);
+            let arts = &per_rank[rank as usize];
+            let topo = &topology;
+            let draft_ref = draft.as_ref();
+            scope.spawn(move || {
+                head_ship(node, rank, offer, model_dir, arts, topo, cfg, draft_ref, srcs)
+            })
+        }).collect();
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(h.join().map_err(|_| anyhow::anyhow!("head_ship worker thread panicked"))??);
+        }
+        Ok(out)
+    })?;
+    // keep build_id_tests source-text pin explicit: cfg, draft.as_ref(), srcs)
+    let _ = &draft;
     crate::deprintln!("[head] all {} node(s) synced.", nodes.len());
     sync_only_exit(cfg, nodes.len());
     Ok((nodes, streams))
@@ -379,17 +448,46 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
         offers.push(head_sync_one(node, mid, &per_rank[rank], draft.as_ref())?);
     }
     space_check(&nodes, &mut offers)?;
-    let mut streams: Vec<TcpStream> = Vec::with_capacity(need);
-    for (i, (node, offer)) in nodes.iter().zip(offers).enumerate() {
-        let rank = (i + 1) as i32;
-        let srcs = ships.as_ref().map(|sh| &sh[rank as usize].srcs);
-        let stream = head_ship(node, rank, offer, model_dir, &per_rank[rank as usize],
-                               &topology, cfg, draft.as_ref(), srcs)?;
-        streams.push(stream);
-    }
+    // Velo-Fabric: ship to all world-1 nodes in parallel (rank-ordered return).
+    let streams: Vec<TcpStream> = std::thread::scope(|scope| -> Result<Vec<TcpStream>> {
+        let handles: Vec<_> = nodes.iter().zip(offers).enumerate().map(|(i, (node, offer))| {
+            let rank = (i + 1) as i32;
+            let srcs = ships.as_ref().map(|sh| &sh[rank as usize].srcs);
+            let arts = &per_rank[rank as usize];
+            let topo = &topology;
+            let draft_ref = draft.as_ref();
+            scope.spawn(move || {
+                head_ship(node, rank, offer, model_dir, arts, topo, cfg, draft_ref, srcs)
+            })
+        }).collect();
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(h.join().map_err(|_| anyhow::anyhow!("head_ship worker thread panicked"))??);
+        }
+        Ok(out)
+    })?;
     anyhow::ensure!(streams.len() == need,
         "expected {need} retained serving control stream(s), got {}", streams.len());
     crate::deprintln!("[head] {} node(s) synced; all control streams RETAINED for the serving session", streams.len());
     sync_only_exit(cfg, streams.len());
     Ok((nodes, streams))
+}
+
+/// DSV4.1 (leg LS, `--dsv41-ship`): sync ONE node with the shard dir of ONE rank — the same manifest / Missing /
+/// space-check / blob-ship exchange `run_head_retain` runs per node, without the discovery, the topology or the
+/// model load. Returns (blobs shipped, bytes shipped, bytes of the whole shard dir); a node that already holds
+/// every blob ships nothing and the first two are 0.
+pub fn sync_one_rank(model_dir: &Path, node_addr: SocketAddr, rank: i32, ship: &RankShip, cfg: &crate::tp::TpConfig)
+    -> Result<(usize, u64, u64)>
+{
+    let node = NodeInfo { hostname: node_addr.ip().to_string(), addr: node_addr };
+    let offer = head_sync_one(&node, &ship.model_id, &ship.artifacts, None)?;
+    let mut offers = vec![offer];
+    space_check(std::slice::from_ref(&node), &mut offers)?;
+    let offer = offers.pop().context("offer")?;
+    let by_hash: HashMap<&str, &Artifact> = ship.artifacts.iter().map(|a| (a.hash.as_str(), a)).collect();
+    let (n, bytes) = (offer.missing.len(), offer.missing.iter().filter_map(|h| by_hash.get(h.as_str())).map(|a| a.size).sum::<u64>());
+    let total: u64 = ship.artifacts.iter().map(|a| a.size).sum();
+    let _s = head_ship(&node, rank, offer, model_dir, &ship.artifacts, &[], cfg, None, Some(&ship.srcs))?;
+    Ok((n, bytes, total))
 }

@@ -405,6 +405,8 @@ fn apply_rope_vision(qk: &mut [f32], cos: &[f32], sin: &[f32], n: usize, heads: 
 }
 
 /// A decoded + processed vision input ready to splice: merged image embeddings + grid.
+/// VISCACHE: Clone so a cache hit hands out the stored rows without disturbing the entry.
+#[derive(Clone)]
 pub struct VisionOutput {
     /// Merged embeddings [num_tokens, OUT_HIDDEN] (the language embed-splice rows).
     pub merged: Vec<f32>,
@@ -581,6 +583,182 @@ pub struct PreparedVision {
     /// Concatenated merged embeddings, in image order: len = sum(num_tokens) * OUT_HIDDEN.
     pub image_embeds: Vec<f32>,
     pub spans: Vec<ImageSpan>,
+    /// VISCACHE: images of this request served from the embed cache (the `cache=<hits>/<N>` of
+    /// the dispatch line). The tower never ran for them this request.
+    pub cache_hits: usize,
+}
+
+// ---------------------------------------------------------------------------------------------
+// VISCACHE: a per-image, content-keyed cache of vision-tower OUTPUTS (--vision-embed-cache-mb).
+// A chat harness re-sends the same screenshots on every turn; the tower does not need to see an
+// image it has already run. Keyed on the RAW PAYLOAD, before any decode: the `data:` URL string
+// the prepare loop has in hand. This path never fetches (remote URLs are refused in
+// `preprocess_data_url`), so the URL string IS the identity of the content bytes — the same
+// string decodes to the same bytes, preprocesses to the same pixel_values, and expands to the
+// same span; the stored entry keeps that string and a hit compares it BYTE FOR BYTE, so an
+// FNV-1a hash collision can never serve the wrong image (one memcmp per hit against the ~2.3 s
+// per image the lookup saved). The value is the whole VisionOutput (merged rows + grid +
+// num_tokens + pixel_hash), so `expand_image_pads` and the span assembly run exactly as on a
+// miss and the rows that flow downstream are bit-identical to the ones the tower produced.
+// LRU + cap follow the spill Policy (kv_spill::Policy::put): least recently used shifts out
+// first (the CkptStore tick counter of wp16.rs decides who), and an entry bigger than the whole
+// cap is REFUSED, never inserted — the engine just runs the tower for it, as without the cache.
+// Head-local state is consistent by construction: under TP the vision dispatch runs on the head
+// only (server.rs) and the merged rows ship to the ranks over the wire.
+// ---------------------------------------------------------------------------------------------
+
+/// FNV-1a 64-bit (the cache key; the entry's stored string is the exact-match check).
+fn fnv1a64(s: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in s {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// One cached image: the payload identity (exact-match check) + the tower's whole output.
+#[derive(Clone)]
+struct VcEntry {
+    /// the `data:` URL string the entry was keyed on — compared on every hit
+    key: String,
+    /// FNV-1a of `key` — the fast pre-filter in front of the string compare
+    hash: u64,
+    /// bytes charged against the cap (the payload string + the merged f32 rows)
+    bytes: usize,
+    /// LRU tick (the CkptStore `used`: raised on every touch, the lowest shifts out)
+    used: u64,
+    out: VisionOutput,
+}
+
+/// Bytes one (key, output) pair occupies.
+fn vc_entry_bytes(key: &str, out: &VisionOutput) -> usize {
+    key.len() + out.merged.len() * std::mem::size_of::<f32>()
+}
+
+/// The cache itself: a byte-capped Vec of entries, LRU by tick. Pure (no locks, no metrics) so
+/// the eviction policy is unit-tested without a GPU or the process-global store.
+pub struct VisionEmbedCache {
+    cap_bytes: usize,
+    bytes: usize,
+    entries: Vec<VcEntry>,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl VisionEmbedCache {
+    pub fn new(cap_bytes: usize) -> Self {
+        Self { cap_bytes, bytes: 0, entries: Vec::new(), tick: 0, hits: 0, misses: 0, evictions: 0 }
+    }
+    /// `--vision-embed-cache-mb 0` = off: no lookups counted, nothing kept.
+    pub fn enabled(&self) -> bool { self.cap_bytes > 0 }
+    pub fn bytes(&self) -> usize { self.bytes }
+    /// (hits, misses, evictions) since boot.
+    pub fn stats(&self) -> (u64, u64, u64) { (self.hits, self.misses, self.evictions) }
+    /// Is this payload key held (no touch — for tests and introspection; `get` is the hot path).
+    pub fn holds(&self, key: &str) -> bool {
+        let h = fnv1a64(key.as_bytes());
+        self.entries.iter().any(|e| e.hash == h && e.key == key)
+    }
+    /// The stored output for `key`, refreshed to most-recent; None = miss. A hash match with a
+    /// different string is a MISS (the exact-match check behind the FNV key).
+    pub fn get(&mut self, key: &str) -> Option<VisionOutput> {
+        let h = fnv1a64(key.as_bytes());
+        self.get_hashed(h, key)
+    }
+    /// `get` with a precomputed key hash (the collision path is unit-tested through this seam).
+    pub fn get_hashed(&mut self, h: u64, key: &str) -> Option<VisionOutput> {
+        if self.cap_bytes == 0 { return None; }
+        let i = match self.entries.iter().position(|e| e.hash == h && e.key == key) {
+            Some(i) => i,
+            None => { self.misses += 1; return None; }
+        };
+        self.tick += 1;
+        self.entries[i].used = self.tick;
+        self.hits += 1;
+        Some(self.entries[i].out.clone())
+    }
+    /// Insert (or refresh) one image's output; returns how many entries shifted out. An entry
+    /// bigger than the whole cap is refused (the kv_spill Policy::put precedent), and the live
+    /// total is shifted down to the cap by evicting the least recently used (never the fresh
+    /// one, which carries the highest tick).
+    pub fn put(&mut self, key: &str, out: &VisionOutput) -> usize {
+        if self.cap_bytes == 0 { return 0; }
+        let bytes = vc_entry_bytes(key, out);
+        if bytes > self.cap_bytes { return 0; }
+        self.tick += 1;
+        let e = VcEntry { key: key.to_string(), hash: fnv1a64(key.as_bytes()), bytes, used: self.tick, out: out.clone() };
+        match self.entries.iter().position(|x| x.hash == e.hash && x.key == e.key) {
+            // refresh: replace in place (the old bytes are part of the total, so no underflow)
+            Some(i) => { let old = std::mem::replace(&mut self.entries[i], e); self.bytes = self.bytes - old.bytes + bytes; }
+            None => { self.bytes += bytes; self.entries.push(e); }
+        }
+        let mut evicted = 0usize;
+        while self.bytes > self.cap_bytes {
+            // the CkptStore `acquire` rule: the least-recently-used entry of the whole store goes
+            let Some((_, i)) = self.entries.iter().enumerate().map(|(i, e)| (e.used, i)).min() else { break };
+            self.bytes -= self.entries.remove(i).bytes;
+            evicted += 1;
+        }
+        self.evictions += evicted as u64;
+        evicted
+    }
+}
+
+/// The one cache of the process (the dispatch runs on tokio blocking workers; a lock poisoned by
+/// a panic is recovered `into_inner()`, the `vision_dispatch_with_recovery` style — the entries
+/// are plain data and stay sound across a panic of whoever held the lock). The cap is resolved
+/// once, lazily, from `--vision-embed-cache-mb` (default 512 MiB; 0 = off).
+static VISCACHE: std::sync::LazyLock<std::sync::Mutex<VisionEmbedCache>> = std::sync::LazyLock::new(|| {
+    let mb = crate::opts::ranged(crate::opt!("vision-embed-cache-mb")).unwrap_or(512).max(0) as usize;
+    std::sync::Mutex::new(VisionEmbedCache::new(mb * (1usize << 20)))
+});
+
+/// The cache key of one image on one tower path: the tower kind, then the payload string.
+fn viscache_key(kind: &str, url: &str) -> String {
+    let mut k = String::with_capacity(kind.len() + 1 + url.len());
+    k.push_str(kind);
+    k.push(':');
+    k.push_str(url);
+    k
+}
+
+/// One image's tower run behind the VISCACHE: look the payload up BEFORE fetch/decode/preprocess/
+/// tower (a hit runs none of them), run `tower` on a miss and insert its output. The guards are
+/// scoped around the lock — the tower (multi-second) never runs holding it, the same reason the
+/// GPU-tower dispatch scopes its guard (PR #16 review R1). Two racing misses on the same image
+/// both run the tower; the later insert refreshes the entry. Returns (output, served-from-cache).
+///
+/// `kind` names the tower that produces the rows ("gpu" / "cpu"): it is part of the key, so a hit always returns
+/// exactly what a miss on the same path would have produced (the CPU reference tower and the GPU tower agree only
+/// to rounding; a CPU-fallback result must never be served to a GPU-path request, or the other way round).
+fn tower_cached(kind: &str, url: &str, tower: impl FnOnce() -> anyhow::Result<VisionOutput>) -> anyhow::Result<(VisionOutput, bool)> {
+    let key = viscache_key(kind, url);
+    let url = key.as_str();
+    let cache = &*VISCACHE;
+    let hit = {
+        let mut c = cache.lock().unwrap_or_else(|p| p.into_inner());
+        let on = c.enabled();
+        let hit = c.get(url);
+        (on, hit)
+    };
+    if let Some(o) = hit.1 {
+        crate::metrics::vision_cache_hit();
+        return Ok((o, true));
+    }
+    if hit.0 {
+        crate::metrics::vision_cache_miss();
+    }
+    let out = tower()?;
+    let mut c = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if c.enabled() {
+        let ev = c.put(url, &out);
+        crate::metrics::vision_cache_evictions(ev as u64);
+        crate::metrics::vision_cache_bytes(c.bytes() as u64);
+    }
+    Ok((out, false))
 }
 
 /// For a request whose messages contain images, decode+preprocess+run the tower for each image (in
@@ -593,18 +771,21 @@ pub fn prepare_vision_request(
 ) -> anyhow::Result<PreparedVision> {
     use anyhow::Result as R;
     if image_urls.is_empty() {
-        return Ok(PreparedVision { expanded_tokens: prompt_tokens.to_vec(), image_embeds: vec![], spans: vec![] });
+        return Ok(PreparedVision { expanded_tokens: prompt_tokens.to_vec(), image_embeds: vec![], spans: vec![], cache_hits: 0 });
     }
     let mut embeds: Vec<f32> = Vec::new();
     let mut infos = Vec::with_capacity(image_urls.len());
+    let mut hits = 0usize;
     for url in image_urls {
-        let o = process_data_url(tower, url)?;
+        // VISCACHE: the payload-keyed memo wraps the whole decode+preprocess+tower.
+        let (o, from_cache) = tower_cached("cpu", url, || process_data_url(tower, url))?;
+        hits += from_cache as usize;
         let mg = tower.dims.merge;
         infos.push(ImageInfo { num_tokens: o.num_tokens, grid_h: o.grid_h / mg, grid_w: o.grid_w / mg, pixel_hash: o.pixel_hash });
         embeds.extend_from_slice(&o.merged);
     }
     let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &infos, tower.image_pad);
-    Ok(PreparedVision { expanded_tokens, image_embeds: embeds, spans })
+    Ok(PreparedVision { expanded_tokens, image_embeds: embeds, spans, cache_hits: hits })
 }
 
 /// GPU twin of `prepare_vision_request`: decode+preprocess on the host, run the GPU tower, expand
@@ -617,18 +798,22 @@ pub fn prepare_vision_request_gpu(
 ) -> anyhow::Result<PreparedVision> {
     use anyhow::Result as R;
     if image_urls.is_empty() {
-        return Ok(PreparedVision { expanded_tokens: prompt_tokens.to_vec(), image_embeds: vec![], spans: vec![] });
+        return Ok(PreparedVision { expanded_tokens: prompt_tokens.to_vec(), image_embeds: vec![], spans: vec![], cache_hits: 0 });
     }
     let mut embeds: Vec<f32> = Vec::new();
     let mut infos = Vec::with_capacity(image_urls.len());
+    let mut hits = 0usize;
     for url in image_urls {
-        let o = process_data_url_gpu(gvt, url)?;
+        // VISCACHE: same payload-keyed memo as the CPU twin — a cached image never touches the
+        // GPU tower at all. The key carries the tower kind: the CPU-fallback arm keeps its own entries.
+        let (o, from_cache) = tower_cached("gpu", url, || process_data_url_gpu(gvt, url))?;
+        hits += from_cache as usize;
         let mg = gvt.host().dims.merge;
         infos.push(ImageInfo { num_tokens: o.num_tokens, grid_h: o.grid_h / mg, grid_w: o.grid_w / mg, pixel_hash: o.pixel_hash });
         embeds.extend_from_slice(&o.merged);
     }
     let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &infos, gvt.host().image_pad);
-    Ok(PreparedVision { expanded_tokens, image_embeds: embeds, spans })
+    Ok(PreparedVision { expanded_tokens, image_embeds: embeds, spans, cache_hits: hits })
 }
 
 /// S-B9-REL-VISIONFIX F2: the CPU tower's thread count changes who computes a row, never a bit.
@@ -771,5 +956,95 @@ mod vis2_tests {
         assert_eq!(p, (0..5).map(|i| [i; 3]).collect::<Vec<_>>());
         assert_eq!(d, 0);
         assert!(mrope_positions(4, &[ImageSpan { start: 2, num_tokens: 6, grid_h: 2, grid_w: 3, pixel_hash: 0 }]).is_err());
+    }
+}
+
+/// VISCACHE: the payload-keyed embed cache — eviction order, cap enforcement (fake byte sizes,
+/// no GPU), and the exact-match check behind the FNV key.
+#[cfg(test)]
+mod viscache_tests {
+    use super::*;
+
+    /// A fake tower output: `n` merged f32 rows of one value (entry bytes = key + 4n).
+    fn out(v: f32, n: usize) -> VisionOutput {
+        VisionOutput { merged: vec![v; n], grid_h: 1, grid_w: n, num_tokens: n, pixel_hash: v.to_bits() as u64 }
+    }
+
+    /// LRU order + cap: the least recently USED (not the oldest inserted) shifts out, the live
+    /// total never exceeds the cap, an over-cap payload is refused (the kv_spill Policy::put
+    /// precedent), cap 0 keeps nothing and counts nothing.
+    #[test]
+    fn the_cache_shifts_out_the_least_recently_used_until_under_the_cap() {
+        // entry size = key.len() + 4 * merged.len() = 1 + 8 = 9 bytes; the cap holds two.
+        let mut c = VisionEmbedCache::new(20);
+        c.put("a", &out(1.0, 2));
+        c.put("b", &out(2.0, 2));
+        assert_eq!(c.bytes(), 18);
+        assert!(c.get("a").is_some()); // touch a -> b is now the least recently used
+        assert_eq!(c.put("c", &out(3.0, 2)), 1); // 27 > 20: exactly one shift-out
+        assert!(c.holds("a") && !c.holds("b") && c.holds("c"), "b (LRU) goes, a (touched) stays");
+        assert_eq!(c.bytes(), 18);
+        assert!(c.bytes() <= 20);
+        assert_eq!(c.stats(), (1, 0, 1), "1 get-hit, 0 lookups-missed, 1 eviction");
+        // over-cap payload: refused, the store unchanged
+        assert_eq!(c.put("z", &out(9.0, 100)), 0); // 1 + 400 bytes > the whole cap
+        assert!(!c.holds("z"));
+        assert_eq!(c.bytes(), 18);
+        // a refresh of a held key replaces it, no eviction, no duplicate
+        assert_eq!(c.put("a", &out(1.5, 1)), 0);
+        assert_eq!(c.bytes(), 14); // 1 + 4 + (1 + 8)
+        assert_eq!(c.holds("c"), true);
+        // cap 0 = off: nothing kept, nothing counted
+        let mut off = VisionEmbedCache::new(0);
+        off.put("a", &out(1.0, 2));
+        assert!(off.get("a").is_none());
+        assert_eq!(off.stats(), (0, 0, 0));
+    }
+
+    /// A hash collision must miss: same hash, different payload string, the stored key is
+    /// compared byte for byte and the tower (the caller's `run`) is not short-circuited. The hit
+    /// path returns the stored rows bit for bit — what a miss would have flowed downstream.
+    #[test]
+    fn a_same_hash_different_payload_lookup_misses_and_a_hit_is_bit_exact() {
+        let mut c = VisionEmbedCache::new(1 << 20);
+        let stored = out(-0.75, 3);
+        c.put("data:image/png;base64,AAA", &stored);
+        // forged collision: the hash of the stored key, the string of a different payload
+        let h = fnv1a64(b"data:image/png;base64,AAA");
+        assert!(c.get_hashed(h, "data:image/png;base64,AAB").is_none(), "same hash, different bytes: miss");
+        assert_eq!(c.stats(), (0, 1, 0), "the collision counted as a miss, not a hit");
+        // the real key hits, and the served rows are the stored rows bit for bit
+        let got = c.get("data:image/png;base64,AAA").unwrap_or_else(|| panic!("the exact key must hit"));
+        assert!(got.merged.iter().zip(&stored.merged).all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert_eq!((got.grid_h, got.grid_w, got.num_tokens, got.pixel_hash),
+                   (stored.grid_h, stored.grid_w, stored.num_tokens, stored.pixel_hash));
+        assert_eq!(c.stats(), (1, 1, 0));
+    }
+
+    /// The tower kind is part of the key: a CPU-tower entry is never served to the GPU path (their rows agree only
+    /// to rounding), and each path hits its own entries.
+    #[test]
+    fn the_tower_kind_is_part_of_the_key() {
+        let mut c = VisionEmbedCache::new(1 << 20);
+        let url = "data:image/png;base64,AAA";
+        c.put(&viscache_key("cpu", url), &out(0.5, 2));
+        assert!(c.get(&viscache_key("gpu", url)).is_none(), "a CPU-tower entry must not answer a GPU-path lookup");
+        c.put(&viscache_key("gpu", url), &out(0.25, 2));
+        let g = c.get(&viscache_key("gpu", url)).unwrap_or_else(|| panic!("the gpu entry hits"));
+        let k = c.get(&viscache_key("cpu", url)).unwrap_or_else(|| panic!("the cpu entry hits"));
+        assert_eq!((g.merged[0], k.merged[0]), (0.25, 0.5));
+    }
+
+    /// The registry row: `--vision-embed-cache-mb`, default 512, range from 0 (= off).
+    #[test]
+    fn the_cache_flag_defaults_to_512_mib_and_zero_is_off() {
+        let o = &crate::opts::REG[crate::opts::idx("vision-embed-cache-mb")];
+        assert_eq!((o.def, o.env), ("512", ""));
+        assert!(matches!(o.ty, crate::opts::Ty::IntRange(0, _)), "the range must start at 0 (0 = off)");
+        let id = crate::opt!("vision-embed-cache-mb");
+        assert_eq!(crate::opts::ranged_from(id, None).unwrap_or(-1), 512, "the unset default is 512 MiB");
+        assert_eq!(crate::opts::ranged_from(id, Some("0")).unwrap_or(-1), 0);
+        assert!(crate::opts::ranged_from(id, Some("-1")).is_err());
+        assert!(crate::opts::ranged_from(id, Some("many")).is_err());
     }
 }

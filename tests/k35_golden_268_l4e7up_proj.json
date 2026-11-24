@@ -1,0 +1,19 @@
+{
+ "base": "model.language_model.layers.4.mlp.experts.7.up_proj",
+ "pack": "k35_268_shard1",
+ "K": 2.5,
+ "k2": 5,
+ "kb": 160,
+ "nb": 40,
+ "k": 2560,
+ "n": 640,
+ "n_trellis": 256000,
+ "n_inner": 1638400,
+ "n_suh": 2560,
+ "n_svh": 640,
+ "layout": "u16 LE: trellis[kb][nb][8*k2], inner_f16_bits[k][n], suh_f16_bits[k], svh_f16_bits[n]",
+ "sha256_u16le": "523ab785e930029b3331bb1b00ee7345856e30a85f942ea25dcc882b392addcf",
+ "reference": "exllamav3 1.6.3 wheel (py3-none-any, exllamav3_ext JIT-built with nvcc 13.0 on this box), LinearEXL3.get_inner_weight_tensor() = ext.reconstruct (the wheel's own CUDA decode)",
+ "inner_nonzero": 1638400,
+ "inner_nan": 0
+}

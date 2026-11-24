@@ -3,35 +3,29 @@
 // Section 3 of 4 of net_shim.c: included in order by net_shim.c, one translation unit; text is moved verbatim.
 // ---------------------------------------------------------------- hot path
 
+// Phase 1B: 16-byte inline commit landing on the peer's private 64 B peer_committed cache line:
+//   [0..8)  = epoch (bare u64 — preserves byte-identity for all v2 GPU kernels polling TP_F_PEER_COMMITTED / TP_NWAY_PEER_OFF)
+//   [8..16) = TP_LEN_TAG(epoch, wire) (eliminates WR0 and the N-way len_peer[e] cache-line collision).
+typedef struct { uint64_t epoch; uint64_t len_tag; } TpCommit16;
+
 // Post every currently-ready epoch as ONE linked WR list (round-3 R3a: drain what is ready, never wait
-// to form a batch). Per epoch, three chained WRs on the same QP:
-//   WR0: RDMA_WRITE 8 B INLINE length tag -> peer len_peer[e%TP_LEN_EPOCHS]     (unsignaled)
-//   WR1: RDMA_WRITE send_ring[s] -> peer recv_ring[s], length align8(len)+tail  (unsignaled)
-//   WR2: RDMA_WRITE 8 B INLINE epoch -> peer flags.peer_committed  (signaled iff e % S == 0)
-// The length tag comes from len_local[e%TP_LEN_EPOCHS], which K1 wrote BEFORE release-storing
-// gpu_ready = e — the proxy acquire-loads gpu_ready before posting, so the tag is visible with epoch
-// bits == e by construction (a mismatch is corruption/desync, never a race: abort code 9).
-// GB10_TP_TAIL_DRILL (test only, read once in net_init): every 4096th epoch INVERTS the triple —
-// the commit is posted FIRST, then the tag, then the payload (signaling moves to the payload WR, which
-// now posts last, so the CQE still retires the whole triple in order). The receiver's tail-epoch wait
-// must engage and recover; that is the end-to-end proof of the load-bearing tail guard. (The len-tag
-// wait may or may not engage — the tag follows the commit within the same post — but the payload,
-// posted last, is always behind the commit, exactly the bypass scenario the guard exists for.)
-// Returns 0 on success.
+// to form a batch). World-2 primary links can carry pipelined (G > 1) asymmetric sequence-parallel
+// exchanges (send_len != recv_len when prompt_len is odd), so ship WR0 (8 B inline len_tag -> len_peer[e])
+// alongside payload+tail and 16 B inline TpCommit16 (single-epoch fast path reads pcf[1] directly;
+// multi-epoch bursts fall back to len_peer[e], never assuming local_len == peer_len).
+// --tp-tail-drill (test only): every 4096th epoch INVERTS payload/commit — len_tag, commit, payload (signaled).
 static int post_range(NetCtx* c, uint64_t first, uint64_t last) {
     unsigned cnt = (unsigned)(last - first + 1);
     if (cnt > TP_MAX_POST_BATCH) cnt = TP_MAX_POST_BATCH;
 
     struct ibv_send_wr wr[3 * TP_MAX_POST_BATCH];
     struct ibv_sge     sg[3 * TP_MAX_POST_BATCH];
-    uint64_t           epv[TP_MAX_POST_BATCH];    // inline epoch source; copied into the WQE at post time
-    uint64_t           tagv[TP_MAX_POST_BATCH];   // inline len-tag source (same)
+    TpCommit16         cmv[TP_MAX_POST_BATCH];      // 16 B inline {epoch, len_tag}; copied into WQE at post time
 
     volatile uint64_t* len_local = (volatile uint64_t*)((char*)c->hbuf + TP_LEN_LOCAL_OFF);
 
     for (unsigned i = 0; i < cnt; i++) {
         uint64_t e = first + i;
-        epv[i] = e;
         // This epoch's wire length. K1 published it before gpu_ready; verify the generation.
         uint64_t tag = len_local[e & (TP_LEN_EPOCHS - 1)];
         uint64_t len = TP_LEN_TAG_BYTES(tag);
@@ -43,59 +37,47 @@ static int post_range(NetCtx* c, uint64_t first, uint64_t last) {
             tp_set_abort(c, 9);
             return -1;
         }
-        tagv[i] = tag;
+        cmv[i].epoch = e;
+        cmv[i].len_tag = tag;
         // Drill: does this epoch ship commit-before-payload?
         const int invert = c->tail_drill && (e % 4096 == 0);
-        const int li = invert ? 1 : 0;        // len-tag WR slot within the triple
+        const int li = 0;                     // len_tag WR always first
         const int pi = invert ? 2 : 1;        // payload WR slot within the triple
-        const int ci = invert ? 0 : 2;        // commit WR slot within the triple
+        const int ci = invert ? 1 : 2;        // commit WR slot within the triple
 
-        sg[3*i+li] = (struct ibv_sge){ .addr = (uint64_t)&tagv[i], .length = TP_TAIL_BYTES, .lkey = 0 };
+        sg[3*i+li] = (struct ibv_sge){ .addr = (uint64_t)&cmv[i].len_tag, .length = 8, .lkey = 0 };
         sg[3*i+pi] = (struct ibv_sge){ .addr   = (uint64_t)send_slot(c, e),
                                        .length = (unsigned)(len + TP_TAIL_BYTES),
                                        .lkey   = c->mr->lkey };
-        sg[3*i+ci] = (struct ibv_sge){ .addr = (uint64_t)&epv[i], .length = TP_TAIL_BYTES, .lkey = 0 };
+        sg[3*i+ci] = (struct ibv_sge){ .addr = (uint64_t)&cmv[i], .length = sizeof(TpCommit16), .lkey = 0 };
 
-        memset(&wr[3*i], 0, sizeof(wr[0])); memset(&wr[3*i+1], 0, sizeof(wr[0])); memset(&wr[3*i+2], 0, sizeof(wr[0]));
-        // len-tag WR (epoch's wire length -> peer len_peer ring)
+        memset(&wr[3*i], 0, 3 * sizeof(wr[0]));
+
+        // len_tag WR -> peer len_peer[e % TP_LEN_EPOCHS]
         wr[3*i+li].wr_id      = e;
         wr[3*i+li].opcode     = IBV_WR_RDMA_WRITE;
         wr[3*i+li].sg_list    = &sg[3*i+li]; wr[3*i+li].num_sge = 1;
-        wr[3*i+li].send_flags = IBV_SEND_INLINE;      // unsignaled
-        wr[3*i+li].wr.rdma.remote_addr = c->remote_addr + TP_LEN_PEER_OFF
-                                       + (uint64_t)(e & (TP_LEN_EPOCHS - 1)) * 8;
+        wr[3*i+li].send_flags = IBV_SEND_INLINE;
+        wr[3*i+li].wr.rdma.remote_addr = c->remote_addr + TP_LEN_PEER_OFF + (e & (TP_LEN_EPOCHS - 1)) * 8ull;
         wr[3*i+li].wr.rdma.rkey        = c->remote_rkey;
 
         // payload WR
         wr[3*i+pi].wr_id      = e;
         wr[3*i+pi].opcode     = IBV_WR_RDMA_WRITE;
         wr[3*i+pi].sg_list    = &sg[3*i+pi]; wr[3*i+pi].num_sge = 1;
-        // signaled iff e % S == 0; in drill mode the payload WR carries the signal (it posts last,
-        // so its CQE retires the commit WR that precedes it — same accounting as the normal path).
-        wr[3*i+pi].send_flags = invert ? ((e % TP_SIGNAL_EVERY == 0) ? IBV_SEND_SIGNALED : 0) : 0;
+        wr[3*i+pi].send_flags = invert ? IBV_SEND_SIGNALED : 0;
         wr[3*i+pi].wr.rdma.remote_addr = peer_recv_raddr(c, e);
         wr[3*i+pi].wr.rdma.rkey        = c->remote_rkey;
 
-        // commit WR (epoch -> peer_committed)
-        wr[3*i+ci].wr_id      = e;                                 // CQE carries the retired epoch
+        // commit WR (16 B inline {epoch, len_tag} -> peer_committed[0..16))
+        wr[3*i+ci].wr_id      = e;
         wr[3*i+ci].opcode     = IBV_WR_RDMA_WRITE;
         wr[3*i+ci].sg_list    = &sg[3*i+ci]; wr[3*i+ci].num_sge = 1;
-        // commit WR (epoch -> peer_committed). P3-1/expert: SIGNAL EVERY epoch's commit. The old
-        // e % S cadence is only safe when per-QP traffic is dense+uniform; the one-shot push makes
-        // a per-QP subsequence sparse/pattern-locked (the rank^3 QP carries one-shot ONLY), so its
-        // signaled-CQE supply — {e≡0 mod S} ∩ {this QP's epochs} — can be structurally empty and
-        // tx_retired[p] freezes while the sends physically retire invisibly. S=1 everywhere makes
-        // tx_retired[p] exact (1 CQE per posted epoch per QP). Cost is ~2 orders of magnitude under
-        // measurability at our barrier rates; the WR count is unchanged, only the flag flips.
-        wr[3*i+ci].send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+        wr[3*i+ci].send_flags = IBV_SEND_INLINE | (invert ? 0 : IBV_SEND_SIGNALED);
         wr[3*i+ci].wr.rdma.remote_addr = c->remote_addr + TP_F_PEER_COMMITTED;
         wr[3*i+ci].wr.rdma.rkey        = c->remote_rkey;
 
-        // The chain is ALWAYS physical (3i -> 3i+1 -> 3i+2 -> 3i+3): the triple order on the wire is
-        // decided by which WR sits in which slot, never by the links. (The first drill version linked
-        // by role, which under inversion skipped every payload WR entirely — the watchdog+abort+
-        // divergence path caught it loudly, exactly as designed, but the drill itself was invalid.)
-        wr[3*i].next   = &wr[3*i+1];
+        wr[3*i+0].next = &wr[3*i+1];
         wr[3*i+1].next = &wr[3*i+2];
         wr[3*i+2].next = (i + 1 < cnt) ? &wr[3*(i+1)] : NULL;
     }
@@ -155,51 +137,47 @@ static int post_range_nway(NetCtx* c, uint64_t e) {
 
     int p = partner_rank_of(c, e);
     PeerLink* pl = &c->peers[p];
-    uint64_t epv = e, tagv = tag;
+    TpCommit16 cm = { e, tag };
 
+    // Tree / Pipe epochs can be pipelined (G > 1) and carry asymmetric sequence-parallel lengths
+    // (send_len != recv_len when prompt_len % world != 0). Only partner(e) writes len_peer[e] for
+    // epoch e (zero multi-peer collision), so WR0 preserves every in-flight epoch's exact peer length.
     struct ibv_sge sg[3];
     struct ibv_send_wr wr[3];
     const int invert = c->tail_drill && (e % 4096 == 0);
-    const int li = invert ? 1 : 0;
+    const int li = 0;
     const int pi = invert ? 2 : 1;
-    const int ci = invert ? 0 : 2;
+    const int ci = invert ? 1 : 2;
 
-    sg[li] = (struct ibv_sge){ .addr = (uint64_t)&tagv, .length = TP_TAIL_BYTES, .lkey = 0 };
+    sg[li] = (struct ibv_sge){ .addr = (uint64_t)&cm.len_tag, .length = 8, .lkey = 0 };
     sg[pi] = (struct ibv_sge){ .addr   = (uint64_t)send_slot(c, e),
                                .length = (unsigned)(len + TP_TAIL_BYTES),
                                .lkey   = c->mr->lkey };
-    sg[ci] = (struct ibv_sge){ .addr = (uint64_t)&epv, .length = TP_TAIL_BYTES, .lkey = 0 };
+    sg[ci] = (struct ibv_sge){ .addr = (uint64_t)&cm, .length = sizeof(TpCommit16), .lkey = 0 };
 
-    memset(&wr[0], 0, sizeof(wr[0])); memset(&wr[1], 0, sizeof(wr[0])); memset(&wr[2], 0, sizeof(wr[0]));
+    memset(wr, 0, sizeof(wr));
 
     wr[li].wr_id      = e;
     wr[li].opcode     = IBV_WR_RDMA_WRITE;
     wr[li].sg_list    = &sg[li]; wr[li].num_sge = 1;
     wr[li].send_flags = IBV_SEND_INLINE;
-    wr[li].wr.rdma.remote_addr = pl->remote_addr + TP_LEN_PEER_OFF
-                               + (uint64_t)(e & (TP_LEN_EPOCHS - 1)) * 8;
+    wr[li].wr.rdma.remote_addr = pl->remote_addr + TP_LEN_PEER_OFF + (e & (TP_LEN_EPOCHS - 1)) * 8ull;
     wr[li].wr.rdma.rkey        = pl->remote_rkey;
 
     wr[pi].wr_id      = e;
     wr[pi].opcode     = IBV_WR_RDMA_WRITE;
     wr[pi].sg_list    = &sg[pi]; wr[pi].num_sge = 1;
-    wr[pi].send_flags = invert ? ((e % TP_SIGNAL_EVERY == 0) ? IBV_SEND_SIGNALED : 0) : 0;
-    // Round-keyed recv slot (world>2): epoch e lands in round(e)'s own recv ring on the partner,
-    // so a round's payload can never alias another round's slot (the cross-round staleness fix).
+    wr[pi].send_flags = invert ? IBV_SEND_SIGNALED : 0;
     wr[pi].wr.rdma.remote_addr = nway_peer_recv_raddr(c, p, e);
     wr[pi].wr.rdma.rkey        = pl->remote_rkey;
 
     wr[ci].wr_id      = e;
     wr[ci].opcode     = IBV_WR_RDMA_WRITE;
     wr[ci].sg_list    = &sg[ci]; wr[ci].num_sge = 1;
-    // P3-1/expert: SIGNAL EVERY epoch's commit (see post_range). The `first_on_qp` self-clock was a
-    // patch over the e % S cadence's blind spot at world>2; with S=1 it is redundant — every posted
-    // epoch produces a CQE on its QP, so tx_retired[p] is exact. Keep last_posted_peer updated for
-    // any other reader.
     int first_on_qp = (c->posted_epochs == 0) || (c->last_posted_peer != p) ? 1 : 0;
     if (first_on_qp) c->last_posted_peer = p;
     (void)first_on_qp;
-    wr[ci].send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+    wr[ci].send_flags = IBV_SEND_INLINE | (invert ? 0 : IBV_SEND_SIGNALED);
     wr[ci].wr.rdma.remote_addr = peer_committed_raddr(c, p);
     wr[ci].wr.rdma.rkey        = pl->remote_rkey;
 
@@ -247,65 +225,95 @@ static int post_range_oneshot(NetCtx* c, uint64_t e) {
     volatile uint64_t* len_local = (volatile uint64_t*)((char*)c->hbuf + TP_LEN_LOCAL_OFF);
     uint64_t tag = len_local[e & (TP_LEN_EPOCHS - 1)];
     uint64_t len = TP_LEN_TAG_BYTES(tag);
-    if (TP_LEN_TAG_EPOCH(tag) != e || len == 0 || len > c->slot_stride - TP_TAIL_BYTES) {
-        LOGE("LEN-RING DESYNC (oneshot) at epoch %llu", (unsigned long long)e);
+    const int is_a2a = TP_LEN_TAG_IS_A2A(tag);
+    const uint64_t a2a_stride = (len + TP_TAIL_BYTES + TP_CL - 1) & ~(uint64_t)(TP_CL - 1);
+    const int len_bad = is_a2a
+        ? (len == 0 || (uint64_t)c->world * a2a_stride > c->slot_stride)
+        : (len == 0 || len > c->slot_stride - TP_TAIL_BYTES);
+    if (TP_LEN_TAG_EPOCH(tag) != e || len_bad) {
+        LOGE("LEN-RING DESYNC (oneshot%s) at epoch %llu", is_a2a ? "/a2a" : "", (unsigned long long)e);
         tp_set_abort(c, 9);
         return -1;
     }
-    uint64_t epv = e, tagv = tag;
+    TpCommit16 cm = { e, tag & ~TP_LEN_FLAG_A2A };
     const int invert = c->tail_drill && (e % 4096 == 0);
+    const unsigned pay_len = (unsigned)(len + TP_TAIL_BYTES);
+    const int pay_inline = (pay_len <= c->max_inline);
 
     for (int p = 0; p < c->world; p++) {
         if (p == c->rank) continue;
         PeerLink* pl = &c->peers[p];
-
-        struct ibv_sge sg[3];
-        struct ibv_send_wr wr[3];
-        const int li = invert ? 1 : 0;
-        const int pi = invert ? 2 : 1;
-        const int ci = invert ? 0 : 2;
-
-        sg[li] = (struct ibv_sge){ .addr = (uint64_t)&tagv, .length = TP_TAIL_BYTES, .lkey = 0 };
-        sg[pi] = (struct ibv_sge){ .addr   = (uint64_t)send_slot(c, e),
-                                   .length = (unsigned)(len + TP_TAIL_BYTES),
-                                   .lkey   = c->mr->lkey };
-        sg[ci] = (struct ibv_sge){ .addr = (uint64_t)&epv, .length = TP_TAIL_BYTES, .lkey = 0 };
-
-        memset(&wr[0], 0, sizeof(wr[0])); memset(&wr[1], 0, sizeof(wr[0])); memset(&wr[2], 0, sizeof(wr[0]));
-
-        wr[li].wr_id = e; wr[li].opcode = IBV_WR_RDMA_WRITE;
-        wr[li].sg_list = &sg[li]; wr[li].num_sge = 1;
-        wr[li].send_flags = IBV_SEND_INLINE;
-        wr[li].wr.rdma.remote_addr = pl->remote_addr + TP_LEN_PEER_OFF
-                                   + (uint64_t)(e & (TP_LEN_EPOCHS - 1)) * 8;
-        wr[li].wr.rdma.rkey = pl->remote_rkey;
-
-        wr[pi].wr_id = e; wr[pi].opcode = IBV_WR_RDMA_WRITE;
-        wr[pi].sg_list = &sg[pi]; wr[pi].num_sge = 1;
-        wr[pi].send_flags = invert ? ((e % TP_SIGNAL_EVERY == 0) ? IBV_SEND_SIGNALED : 0) : 0;
-        wr[pi].wr.rdma.remote_addr = oneshot_peer_recv_raddr(c, p, e);   // SENDER-indexed ring
-        wr[pi].wr.rdma.rkey = pl->remote_rkey;
-
-        wr[ci].wr_id = TP_ONESHOT_TAG(e, p); wr[ci].opcode = IBV_WR_RDMA_WRITE;
-        wr[ci].sg_list = &sg[ci]; wr[ci].num_sge = 1;
+        void* sptr = is_a2a ? ((char*)send_slot(c, e) + (size_t)p * a2a_stride) : send_slot(c, e);
+        // Phase 1C: per-QP S=4 signaling on oneshot_uniform (R=8 >= S=4, so I3/I4 always hold and CQE DMA
+        // traffic drops 4x; keep S=1 on mixed primary links and under tail_drill).
+        const int sig = (c->oneshot_uniform && !invert)
+            ? (((++c->qp_posted[p]) & (TP_SIGNAL_EVERY - 1)) == 0)
+            : 1;
         int first_on_qp = (c->posted_epochs == 0) || (c->last_posted_peer != p) ? 1 : 0;
         if (first_on_qp) c->last_posted_peer = p;
         (void)first_on_qp;
-        // P3-1/expert: SIGNAL EVERY one-shot commit on every QP it touches (the whole point of the
-        // fix — the rank^3 QP carries ONLY one-shot traffic, so the e % S cadence can starve its
-        // tx_retired indefinitely). 1 CQE per (epoch, peer) => exact per-QP retirement.
-        wr[ci].send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
-        wr[ci].wr.rdma.remote_addr = peer_committed_raddr(c, p);
-        wr[ci].wr.rdma.rkey = pl->remote_rkey;
 
-        wr[0].next = &wr[1];
-        wr[1].next = &wr[2];
-        wr[2].next = NULL;
+        int rc;
+        if (pl->qpx) {
+            // Phase 1C fast path: lock-free IBV_THREAD_DOMAIN + ibv_wr_* (no memset, no QP spinlock, BlueFlame inline for <=max_inline).
+            struct ibv_qp_ex* qpx = pl->qpx;
+            uint64_t pay_raddr = oneshot_peer_recv_raddr(c, p, e);
+            uint64_t cm_raddr = peer_committed_raddr(c, p);
+            ibv_wr_start(qpx);
+            if (!invert) {
+                qpx->wr_id = e;
+                qpx->wr_flags = pay_inline ? IBV_SEND_INLINE : 0;
+                ibv_wr_rdma_write(qpx, pl->remote_rkey, pay_raddr);
+                if (pay_inline) ibv_wr_set_inline_data(qpx, sptr, pay_len);
+                else            ibv_wr_set_sge(qpx, c->mr->lkey, (uint64_t)sptr, pay_len);
 
-        struct ibv_send_wr* bad = NULL;
-        int rc = ibv_post_send(pl->qp, &wr[0], &bad);
+                qpx->wr_id = TP_ONESHOT_TAG(e, p);
+                qpx->wr_flags = IBV_SEND_INLINE | (sig ? IBV_SEND_SIGNALED : 0);
+                ibv_wr_rdma_write(qpx, pl->remote_rkey, cm_raddr);
+                ibv_wr_set_inline_data(qpx, &cm, sizeof(TpCommit16));
+            } else {
+                qpx->wr_id = TP_ONESHOT_TAG(e, p);
+                qpx->wr_flags = IBV_SEND_INLINE;
+                ibv_wr_rdma_write(qpx, pl->remote_rkey, cm_raddr);
+                ibv_wr_set_inline_data(qpx, &cm, sizeof(TpCommit16));
+
+                qpx->wr_id = TP_ONESHOT_TAG(e, p);
+                qpx->wr_flags = IBV_SEND_SIGNALED | (pay_inline ? IBV_SEND_INLINE : 0);
+                ibv_wr_rdma_write(qpx, pl->remote_rkey, pay_raddr);
+                if (pay_inline) ibv_wr_set_inline_data(qpx, sptr, pay_len);
+                else            ibv_wr_set_sge(qpx, c->mr->lkey, (uint64_t)sptr, pay_len);
+            }
+            rc = ibv_wr_complete(qpx);
+        } else {
+            struct ibv_sge sg[2];
+            struct ibv_send_wr wr[2];
+            const int pi = invert ? 1 : 0;
+            const int ci = invert ? 0 : 1;
+
+            sg[pi] = (struct ibv_sge){ .addr = (uint64_t)sptr, .length = pay_len, .lkey = pay_inline ? 0 : c->mr->lkey };
+            sg[ci] = (struct ibv_sge){ .addr = (uint64_t)&cm, .length = sizeof(TpCommit16), .lkey = 0 };
+            memset(&wr[0], 0, sizeof(wr[0])); memset(&wr[1], 0, sizeof(wr[0]));
+
+            wr[pi].wr_id = invert ? TP_ONESHOT_TAG(e, p) : e; wr[pi].opcode = IBV_WR_RDMA_WRITE;
+            wr[pi].sg_list = &sg[pi]; wr[pi].num_sge = 1;
+            wr[pi].send_flags = (invert ? IBV_SEND_SIGNALED : 0) | (pay_inline ? IBV_SEND_INLINE : 0);
+            wr[pi].wr.rdma.remote_addr = oneshot_peer_recv_raddr(c, p, e);
+            wr[pi].wr.rdma.rkey = pl->remote_rkey;
+
+            wr[ci].wr_id = TP_ONESHOT_TAG(e, p); wr[ci].opcode = IBV_WR_RDMA_WRITE;
+            wr[ci].sg_list = &sg[ci]; wr[ci].num_sge = 1;
+            wr[ci].send_flags = IBV_SEND_INLINE | ((!invert && sig) ? IBV_SEND_SIGNALED : 0);
+            wr[ci].wr.rdma.remote_addr = peer_committed_raddr(c, p);
+            wr[ci].wr.rdma.rkey = pl->remote_rkey;
+
+            wr[0].next = &wr[1];
+            wr[1].next = NULL;
+
+            struct ibv_send_wr* bad = NULL;
+            rc = ibv_post_send(pl->qp, &wr[0], &bad);
+        }
         if (rc) { LOGE("post_send(oneshot,p%d) rc=%d (%s)", p, rc, strerror(rc)); tp_set_abort(c, 3); return -1; }
-        tp_diag_log_send(c, e, p, send_slot(c, e), len);
+        tp_diag_log_send(c, e, p, sptr, len);
     }
     c->posted_epochs++;
     if (c->ts_on) { uint64_t t = now_ns(); stamp(c, e, TP_CTS_POSTED, t); }
@@ -356,6 +364,63 @@ static int drain_cq_nway(NetCtx* c) {
         if (c->ts_on) stamp(c, global_hi, TP_CTS_CQE, now_ns());
     }
     return n;
+}
+
+// Phase 1B: resolve epoch e's wire length from peer p's private 16 B peer_committed[p] cache line
+// (fast path: pcf[1] == TP_LEN_TAG(e, wire), zero extra cache-line read).
+// Fallback when pcf[1] moved past e (multi-epoch burst) or sub-16B split:
+//   - oneshot_uniform (always symmetric all_reduce/all_gather, 2-WR without WR0): len_local[e] (defer if local K1 hasn't written yet)
+//   - primary tree / world-2 (can be pipelined G>1 with asymmetric SP prefill lengths): len_peer[e] (shipped by WR0, exact peer length; NEVER len_local[e]!).
+// Returns: 1 = ok (*out_len set), 0 = defer, 2 = GPU already proved e (*rxd >= e), -1 = aborted.
+static int resolve_epoch_len(NetCtx* c, uint64_t e, int p, volatile uint64_t* rxd, uint64_t* out_len) {
+    volatile uint64_t* pcf = peer_committed_flagp(c, p);
+    const size_t ring_off = c->oneshot_uniform ? TP_LEN_LOCAL_OFF : TP_LEN_PEER_OFF;
+    volatile uint64_t* rp = (volatile uint64_t*)((char*)c->hbuf + ring_off) + (e & (TP_LEN_EPOCHS - 1));
+    uint64_t tag = pcf[1];
+    if (TP_LEN_TAG_EPOCH(tag) != e) {
+        uint64_t rtag = *rp;
+        if (TP_LEN_TAG_EPOCH(rtag) == e) {
+            tag = rtag;
+        } else if (c->oneshot_uniform && pcf[0] > e) {
+            return 0;   // oneshot_uniform: peer raced ahead of local K1(e); retry next poll
+        } else {
+            // Bounded wait for either pcf[1] (sub-16B split) or len_peer[e] / len_local[e].
+            uint64_t t0 = now_ns();
+            for (;;) {
+                if (c->aborted || *flagp(c, TP_F_ABORT)) return -1;
+                if (rxd && *rxd >= e) return 2;
+                tag = pcf[1];
+                if (TP_LEN_TAG_EPOCH(tag) == e) break;
+                rtag = *rp;
+                if (TP_LEN_TAG_EPOCH(rtag) == e) { tag = rtag; break; }
+                if (c->oneshot_uniform && pcf[0] > e) return 0;
+                uint64_t dt = now_ns() - t0;
+                if (dt > TP_TAIL_WAIT_NS) {
+                    LOGE("LEN-EPOCH GUARD FIRED: peer %d commit_tag=%016llx ring_tag=%016llx expected epoch %llu (pc=%llu, os=%d)",
+                         p, (unsigned long long)tag, (unsigned long long)rtag,
+                         (unsigned long long)e, (unsigned long long)pcf[0], c->oneshot_uniform);
+                    c->tail_fires++;
+                    tp_set_abort(c, 2);
+                    return -1;
+                }
+                tp_host_backoff(dt);
+            }
+            c->len_waits++;
+            if (c->len_waits <= 8 || (c->len_waits & (c->len_waits - 1)) == 0)
+                LOGE("len-epoch wait engaged for epoch %llu (%lluth) — tag landed after epoch (recovered)",
+                     (unsigned long long)e, (unsigned long long)c->len_waits);
+        }
+    }
+    uint64_t len = TP_LEN_TAG_BYTES(tag);
+    if (len == 0 || len > c->slot_stride - TP_TAIL_BYTES) {
+        LOGE("LEN-EPOCH GUARD FIRED: malformed len %llu for epoch %llu (peer %d, capacity %u) — aborting",
+             (unsigned long long)len, (unsigned long long)e, p, c->slot_stride - TP_TAIL_BYTES);
+        c->tail_fires++;
+        tp_set_abort(c, 2);
+        return -1;
+    }
+    *out_len = len;
+    return 1;
 }
 
 // Persistent CPU proxy loop, on its own pinned thread. The main decode thread never syncs: it queues
@@ -522,59 +587,18 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
             // genuinely never lands.
             int ok = 1;
             uint64_t e = next_release;
-            volatile uint64_t* len_peer = (volatile uint64_t*)((char*)c->hbuf + TP_LEN_PEER_OFF);
-            // TP-G: the EXL3 decode K2 (xq_tp_wait_add_dec, GPU-side receive) validates an epoch's
-            // payload tail itself and RELEASE-publishes RX_DONE = e once it passed; the GPU then runs
-            // ahead of this loop, so by the time we look the slot may already hold generation e+R (the
-            // peer may reuse it once our K2(e) completed). An epoch the GPU proved needs no CPU proof:
-            // skip it. (RX_DONE is written in world-2 v1 mode ONLY by that kernel; every earlier epoch
-            // was consumed by a cpu_done-gated K2 first — stream order — so no skipped epoch is
-            // unvalidated. NVFP4 v1 never writes it: inert there.)
+            uint64_t validated = 0;
             volatile uint64_t* rxd = flagp(c, TP_F_RX_DONE);
             for (; e <= pc; e++) {
-                if (*rxd >= e) { c->gpu_rx_skips++; continue; }
-                volatile uint64_t* lp = len_peer + (e & (TP_LEN_EPOCHS - 1));
-                uint64_t tag = *lp;
+                if (*rxd >= e) { c->gpu_rx_skips++; validated = e; continue; }
+                uint64_t len = 0;
+                int lrc = resolve_epoch_len(c, e, 1 - c->rank, rxd, &len);
+                if (lrc < 0) { ok = 0; break; }
+                if (lrc == 0) break;                                 // defer until local K1 writes len_local[e]
+                if (lrc == 2) { c->gpu_rx_skips++; validated = e; continue; }
                 int gpu_done = 0;
-                if (TP_LEN_TAG_EPOCH(tag) != e) {
-                    uint64_t t0 = now_ns();
-                    for (;;) {
-                        if (c->aborted || *flagp(c, TP_F_ABORT)) { ok = 0; break; }
-                        if (*rxd >= e) { gpu_done = 1; break; }
-                        tag = *lp;
-                        if (TP_LEN_TAG_EPOCH(tag) == e) break;
-                        uint64_t dt = now_ns() - t0;
-                        if (dt > TP_TAIL_WAIT_NS) {
-                            LOGE("LEN-EPOCH GUARD FIRED: len_peer[%llu]=%016llx expected epoch %llu (peer_committed=%llu)"
-                                 " — length tag never landed (waited %llums)",
-                                 (unsigned long long)(e & (TP_LEN_EPOCHS - 1)), (unsigned long long)tag,
-                                 (unsigned long long)e, (unsigned long long)pc,
-                                 (unsigned long long)(TP_TAIL_WAIT_NS / 1000000ull));
-                            c->tail_fires++;
-                            tp_set_abort(c, 2);
-                            ok = 0;
-                            break;
-                        }
-                        tp_host_backoff(dt);
-                    }
-                    if (!ok) break;
-                    if (gpu_done) { c->gpu_rx_skips++; continue; }
-                    c->len_waits++;
-                    if (c->len_waits <= 8 || (c->len_waits & (c->len_waits - 1)) == 0)
-                        LOGE("len-epoch wait engaged for epoch %llu (%lluth) — tag landed after the commit (recovered)",
-                             (unsigned long long)e, (unsigned long long)c->len_waits);
-                }
-                uint64_t len = TP_LEN_TAG_BYTES(tag);
-                if (len == 0 || len > c->slot_stride - TP_TAIL_BYTES) {
-                    LOGE("LEN-EPOCH GUARD FIRED: malformed len %llu for epoch %llu (capacity %u) — aborting",
-                         (unsigned long long)len, (unsigned long long)e, c->slot_stride - TP_TAIL_BYTES);
-                    c->tail_fires++;
-                    tp_set_abort(c, 2);
-                    ok = 0;
-                    break;
-                }
                 volatile uint64_t* tailp = (volatile uint64_t*)(recv_slot(c, e) + len);
-                if (*tailp == e) continue;
+                if (*tailp == e) { validated = e; continue; }
                 uint64_t t0 = now_ns();
                 for (;;) {
                     if (c->aborted || *flagp(c, TP_F_ABORT)) { ok = 0; break; }
@@ -596,20 +620,17 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
                     tp_host_backoff(dt);
                 }
                 if (!ok) break;
-                if (gpu_done) { c->gpu_rx_skips++; continue; }
+                if (gpu_done) { c->gpu_rx_skips++; validated = e; continue; }
                 c->tail_waits++;
                 if (c->tail_waits <= 8 || (c->tail_waits & (c->tail_waits - 1)) == 0)
                     LOGE("tail-epoch wait engaged for epoch %llu (%lluth) — payload landed after the commit (recovered)",
                          (unsigned long long)e, (unsigned long long)c->tail_waits);
+                validated = e;
             }
             if (!ok) break;
-            // S-B9-REL-TP2RACE probe (--tp-race-probe, issue #10): rank 1 holds THIS release by
-            // probe_hold_ms. Nothing legitimate can write recv_slot(pc) while the epoch is withheld
-            // (the lockstep bounds both ranks' K1s behind this very release), so a hash change
-            // across the hold is a host exchange frame clobbering an unconsumed epoch payload —
-            // the race, caught at the transport layer regardless of what it does to the drafts.
+            if (validated) {
             if (c->probe_hold_ms && c->rank == 1) {
-                char* pslot = recv_slot(c, pc);
+                char* pslot = recv_slot(c, validated);
                 uint64_t h0 = tp_fnv64(pslot, 64);
                 uint64_t pt0 = now_ns();
                 while (now_ns() - pt0 < (uint64_t)c->probe_hold_ms * 1000000ull) {
@@ -623,7 +644,7 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
                     LOGE("[tp-race-probe] CLOBBER at epoch %llu slot %llu: the withheld payload changed "
                          "(hash %016llx -> %016llx, first word %016llx, tail-elem guard had passed) — a host "
                          "exchange frame landed on an unconsumed epoch payload (issue #10 race CONFIRMED)",
-                         (unsigned long long)pc, (unsigned long long)(pc & (TP_RING_SLOTS - 1)),
+                         (unsigned long long)validated, (unsigned long long)(validated & (TP_RING_SLOTS - 1)),
                          (unsigned long long)h0, (unsigned long long)h1,
                          (unsigned long long)*(volatile uint64_t*)pslot);
                 }
@@ -631,17 +652,24 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
             // Full fence, then RELEASE-store cpu_done: when the GPU acquire-loads it, this core's
             // coherent view of the NIC's payload writes is ordered behind the flag read (I5).
             __atomic_thread_fence(__ATOMIC_SEQ_CST);
-            __atomic_store_n(flagp(c, TP_F_CPU_DONE), pc, __ATOMIC_RELEASE);
-            c->released_epochs = pc;
-            if (c->ts_on) stamp(c, pc, TP_CTS_RELEASED, now_ns());
-            next_release = pc + 1;
+            __atomic_store_n(flagp(c, TP_F_CPU_DONE), validated, __ATOMIC_RELEASE);
+            c->released_epochs = validated;
+            if (c->ts_on) stamp(c, validated, TP_CTS_RELEASED, now_ns());
+            next_release = validated + 1;
             did_work = 1;
+            }
         }
         }
 
         // plain load + yield (I6) while work flows or a peer owes us an epoch; WFE once quiet (CPUIDLE)
         if (did_work) proxy_idle_step(&idle, 1, 0, NULL, 0);
         else {
+            // World-2 dual-rail abort mirror (parent -> child): checked only when idle every 1024 polls
+            // (0 loads when did_work == 1 or c->parent == NULL).
+            if (c->parent && ((idle.ticks & 0x3FF) == 0)) {
+                uint64_t pv = __atomic_load_n(flagp(c->parent, TP_F_ABORT), __ATOMIC_ACQUIRE);
+                if (pv || c->parent->aborted) { tp_set_abort(c, (pv ? pv : 1ull) | (1ull << 61)); break; }
+            }
             uint64_t rxd = c->recv_gpu ? *flagp(c, TP_F_RX_DONE) : 0;   // the watchdog's debt, recomputed
             uint64_t m = c->recv_gpu ? (next_release > rxd + 1 ? next_release : rxd + 1)
                                      : (next_release > rxd ? next_release : rxd);
@@ -649,6 +677,12 @@ static void net_proxy_loop_world2(NetCtx* c, int core) {
         }
     }
     if (idle.parked) __atomic_fetch_add(&g_proxy_park_ns, now_ns() - idle.park_t0, __ATOMIC_RELAXED);
+    // World-2 dual-rail abort mirror (child -> parent): post-loop only (0 hot-path cost).
+    if (c->parent) {
+        uint64_t ab = *flagp(c, TP_F_ABORT);
+        if (ab && !c->parent->aborted && !*flagp(c->parent, TP_F_ABORT))
+            tp_set_abort(c->parent, ab | (1ull << 60));
+    }
 }
 
 // N-way (world > 2) proxy: the SAME doorbell invariants as the world==2 loop, per QP, with the round
@@ -796,7 +830,7 @@ static void net_proxy_loop_nway(NetCtx* c, int core) {
                 int ok = 1;
                 for (int p = 0; p < c->world; p++) {
                     if (p == c->rank) continue;
-                    if (!nway_recv_slot_at(c, e, p, oneshot_recv_slot_ptr(c, p, e))) { ok = 0; break; }
+                    if (nway_recv_slot_at(c, e, p, oneshot_recv_slot_ptr(c, p, e)) <= 0) { ok = 0; break; }
                 }
                 if (!ok) break;
                 __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -804,6 +838,9 @@ static void net_proxy_loop_nway(NetCtx* c, int core) {
                     if (p == c->rank) continue;
                     __atomic_store_n(cpu_done_flagp(c, p), e, __ATOMIC_RELEASE);
                 }
+                // Phase 1A: publish one shared release watermark for oneshot_uniform (all world-1 peers
+                // were validated above under one fence) so GPU collects poll 1 C2C line instead of world-1.
+                __atomic_store_n(flagp(c, TP_F_CPU_DONE), e, __ATOMIC_RELEASE);
                 advanced = e;
                 e++;
             }
@@ -825,27 +862,16 @@ static void net_proxy_loop_nway(NetCtx* c, int core) {
                 uint64_t pc = *peer_committed_flagp(c, p);
                 if (pc < e) break;
                 // Tail-epoch guard (same discipline as world==2): the payload was posted before the
-                // commit on this QP; bounded-wait for the len tag + slot tail.
-                if (!nway_recv_slot(c, e, p)) break;
-                // Per-partner release ORDERING (the max-watermark read-before-write fix): the loop
-                // advances one epoch per iteration, but with rounds > 1 consecutive epochs map to
-                // DIFFERENT partners, so a single release-store would leave partner p's cpu_done line
-                // at e while the pending epochs e+1 .. up-to-peer_commit (this same partner's next
-                // round(s)) are not yet validated — and a K2 at one of those later epochs would see
-                // cpu_done[p] = e < its target and stall while its payload sits unvalidated (the
-                // max-watermark inversion, reversed). On reaching a NEW partner, drain the PREVIOUS
-                // partner's backlog: validate every pending epoch of that partner (peer_committed[p]
-                // is a per-QP monotone watermark, so its validated epochs are contiguous per QP) and
-                // release its cpu_done to the highest validated one BEFORE advancing `e`. Then a
-                // cpu_done[p] >= e observed by K2 always means epoch e's own slot was validated by
-                // this proxy — never a later epoch's stand-in. The watermark (`advanced`) still moves
-                // one epoch per iteration; only the cpu_done lines run ahead of it.
+                // commit on this QP; bounded-wait for the commit tag + slot tail.
+                if (nway_recv_slot(c, e, p) <= 0) break;
                 int prev_p = partner_rank_of(c, e - 1);
                 if (p != prev_p) {
                     uint64_t pc_prev = *peer_committed_flagp(c, prev_p);
                     uint64_t pp = e - 1 + (uint64_t)c->rounds;   // first pending epoch of prev partner
                     for (; pp <= pc_prev; pp += (uint64_t)c->rounds) {
-                        if (!nway_recv_slot(c, pp, prev_p)) { advanced = e - 1; goto recv_out; }
+                        int brc = nway_recv_slot(c, pp, prev_p);
+                        if (brc < 0) { advanced = e - 1; goto recv_out; }
+                        if (brc == 0) break;                      // defer backlog past local K1
                     }
                     uint64_t rel = pp - (uint64_t)c->rounds;     // highest validated epoch of prev_p
                     __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -911,36 +937,11 @@ static int nway_recv_slot(NetCtx* c, uint64_t e, int p) {
 }
 // `slot` = the receive slot's base: the round ring's (tree path) or the sender-indexed one-shot block's
 // (TP-4F2 uniform ctx). Everything else is the tree path's guard, unchanged.
+// Returns: 1 = slot ready, 0 = deferred (peer >1 epoch ahead of local K1), -1 = aborted.
 static int nway_recv_slot_at(NetCtx* c, uint64_t e, int p, char* slot) {
-    volatile uint64_t* len_peer = (volatile uint64_t*)((char*)c->hbuf + TP_LEN_PEER_OFF);
-    volatile uint64_t* lp = len_peer + (e & (TP_LEN_EPOCHS - 1));
-    uint64_t tag = *lp;
-    if (TP_LEN_TAG_EPOCH(tag) != e) {
-        uint64_t t0 = now_ns();
-        for (;;) {
-            if (c->aborted || *flagp(c, TP_F_ABORT)) return 0;
-            tag = *lp;
-            if (TP_LEN_TAG_EPOCH(tag) == e) break;
-            uint64_t dt = now_ns() - t0;
-            if (dt > TP_TAIL_WAIT_NS) {
-                LOGE("LEN-EPOCH GUARD FIRED (nway): len_peer[%llu]=%016llx expected epoch %llu (peer %d)",
-                     (unsigned long long)(e & (TP_LEN_EPOCHS - 1)), (unsigned long long)tag,
-                     (unsigned long long)e, p);
-                c->tail_fires++;
-                tp_set_abort(c, 2);
-                return 0;
-            }
-            tp_host_backoff(dt);
-        }
-    }
-    uint64_t len = TP_LEN_TAG_BYTES(tag);
-    if (len == 0 || len > c->slot_stride - TP_TAIL_BYTES) {
-        LOGE("LEN-EPOCH GUARD FIRED (nway): malformed len %llu for epoch %llu (peer %d)",
-             (unsigned long long)len, (unsigned long long)e, p);
-        c->tail_fires++;
-        tp_set_abort(c, 2);
-        return 0;
-    }
+    uint64_t len = 0;
+    int lrc = resolve_epoch_len(c, e, p, NULL, &len);
+    if (lrc <= 0) return lrc;
     volatile uint64_t* tailp = (volatile uint64_t*)(slot + len);
     if (*tailp == e) {
         // R9 DIAGNOSTIC: checksum the EXACT bytes this rank's GPU is about to consume for epoch e.
@@ -949,17 +950,21 @@ static int nway_recv_slot_at(NetCtx* c, uint64_t e, int p, char* slot) {
     }
     uint64_t t0 = now_ns();
     for (;;) {
-        if (c->aborted || *flagp(c, TP_F_ABORT)) return 0;
+        if (c->aborted || *flagp(c, TP_F_ABORT)) return -1;
         if (*tailp == e) break;
         uint64_t dt = now_ns() - t0;
         if (dt > TP_TAIL_WAIT_NS) {
             uint64_t tail = *tailp;
-            LOGE("TAIL-EPOCH GUARD FIRED (nway): slot %llu tail=%llu expected %llu (peer %d)",
-                 (unsigned long long)(e & (TP_RING_SLOTS-1)), (unsigned long long)tail,
-                 (unsigned long long)e, p);
+            uint64_t rslot = (c->oneshot_uniform || c->rounds == 0)
+                ? (e & (TP_RING_SLOTS - 1))
+                : ((e / (uint64_t)c->rounds) & (TP_RING_SLOTS - 1));
+            LOGE("TAIL-EPOCH GUARD FIRED (nway): %s %llu tail=%llu expected %llu (peer %d, len %llu)",
+                 (c->oneshot_uniform || c->rounds == 0) ? "oneshot_slot" : "round_slot",
+                 (unsigned long long)rslot, (unsigned long long)tail,
+                 (unsigned long long)e, p, (unsigned long long)len);
             c->tail_fires++;
             tp_set_abort(c, 2);
-            return 0;
+            return -1;
         }
         tp_host_backoff(dt);
     }

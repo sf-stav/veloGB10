@@ -256,11 +256,11 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
         mtp_k, spec_policy: SpecLanes::Never, lane_order: LaneOrder::Rr, lane_quantum: 256, admit_ctr: 0, fcfs_rots: 0,
         lane_pack: crate::lane_pack::LanePack::Off, scp: None, pack_ready: [false, false], pack_sampled: false, pack_rot: 0, pack_logs: 0, in_prefill: false, pack_stats: PackStats::default(), tr: SchedTrace::default(),
         reprobe_on, reprobe_cfg, shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, spec_win_tok: [0.0; 2], spec_win_ms: [0.0; 2], spec_win_n: [0; 2], spec_win_acc: [0; 2], spec_arm_rate: [0.0; 2], spec_arm_n: [0; 2], spec_arm_fold: [0; 2], spec_rate_n: vec![[(0.0, 0); 2]; SPEC_RATE_NMAX + 1], spec_rate_folds: vec![[0; 2]; SPEC_RATE_NMAX + 1], meter_settle: 0, meter_last_n: 0, probe_fold: [false; 2], spec_probe: None, spec_probe_ctr: 0, spec_est_pick: None, spec_margin: 0.0, spec_margin_n: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf: 0.4, cal: DraftCal::new(),
-        reserve: None, reserve_st: crate::lane_reserve::State::new(), rel: (0..width).map(|_| None).collect(),
+        reserve: None, reserve_st: crate::lane_reserve::State::new(), rel: (0..width).map(|_| None).collect(), lru: vec![0; width],
         prefix_on: o.prefix, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: Some((300, 3)), pen_range: 1024, spec_ratio: true, draft_temp: None, gate: None, tok: tok.clone(),
-        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), pf_done: Default::default(), pf_jobs: Vec::new(), mrope_section: None, vis_seam: None, kv_pf: None, turn: None,
+        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), pf_done: Default::default(), pf_jobs: Vec::new(), vmm_wait: None, mrope_section: None, vis_seam: None, kv_pf: None, turn: None,
         tp: if tp_on { Some(TpSync::new(rank, world)) } else { None },
     };
     let mut arms = vec![SpecArm::Plain];

@@ -112,8 +112,10 @@
  * The fix: give each recursive-doubling ROUND its own recv ring — `rounds` copies of the R-slot
  * ring, appended AFTER the shared [send_ring][recv_ring] block (which keeps its world==2 layout
  * byte-for-byte). The recv slot for epoch e on the world>2 arm is
- *     nway_recv_base + round(e) * R * slot_stride + (e % R) * slot_stride,   round(e) = e % rounds.
- * Both sides compute round(e) identically (SPMD, from the device epoch), so the sender's
+ *     nway_recv_base + round(e) * R * slot_stride + ((e / rounds) % R) * slot_stride,   round(e) = e % rounds.
+ * Phase 2: per-round quotient indexing `(e / rounds) % R` uses all R slots bijectively per round
+ * (reuse period = R * rounds epochs for ANY rounds >= 1, including world=8 / rounds=3 -> period 24).
+ * Both sides compute round(e) and slot(e) identically (SPMD, from the device epoch), so the sender's
  * post_range_nway remote address and the receiver's K2/proxy read address agree without any wire
  * change. rounds <= log2(TP_NWAY_MAX_WORLD) = 4. world==2 sets these to 0 and never uses them. */
 #define TP_NWAY_MAX_ROUNDS   4   /* log2(TP_NWAY_MAX_WORLD) */
@@ -142,9 +144,12 @@
  * The length itself is always an 8 B multiple (the wire length is rounded up; K2 reads exactly c elems,
  * so <= 4 pad bytes at the tail end of the payload are harmless). */
 #define TP_LEN_EPOCHS     4096   /* power of two; >> R so ring reuse is never close (see net_shim.c)  */
+/* Bit 19 inside the 20-bit tag carries the All-to-All mode flag (bits 0..18 encode wire_bytes>>3 up to 4 MiB). */
+#define TP_LEN_FLAG_A2A   (1ull << 19)
 #define TP_LEN_TAG(e, w)  (((unsigned long long)(e) << 20) | (((unsigned long long)(w)) >> 3))
 #define TP_LEN_TAG_EPOCH(t)  ((t) >> 20)
-#define TP_LEN_TAG_BYTES(t)  (((t) & ((1ull << 20) - 1)) << 3)
+#define TP_LEN_TAG_BYTES(t)  (((t) & ((1ull << 19) - 1)) << 3)
+#define TP_LEN_TAG_IS_A2A(t) (((t) & TP_LEN_FLAG_A2A) != 0)
 
 /* MR-registered region layout: [flags][len_local][len_peer][send_ring R*stride][recv_ring R*stride].
  * `stride` is a runtime value (align64(fp32_capacity + TP_TAIL_BYTES)) — slots are sized for the FP32

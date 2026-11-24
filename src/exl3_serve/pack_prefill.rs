@@ -32,6 +32,7 @@ impl Exl3Scheduler {
                     .filter(|&(q, _)| q > 0).max().map(|(_, i)| i)
             })
             .or_else(|| free.iter().copied().find(|&i| self.cache[i].is_none()))
+            .or_else(|| self.lru_free(&free)) // Issue #46 (LRUPICK): same rule as pick_lane
             .or_else(|| free.first().copied())
     }
 
@@ -234,7 +235,18 @@ counted in velogb10_prefill_pack_skipped_total", if why == "model" { format!(": 
                         st.extend(slot, &self.pf_jobs[ji].key[pos..end]);
                         if crate::exl3_forward::wp16_due(end, n_end, c) || tail == Some(end) {
                             let model = &self.model;
-                            if let Some(mut b) = st.acquire(|| model.ckpt_alloc()) {
+                            // veloGB10 #44 (latent note): the same world > 2 allocation agreement as prefill_range
+                            // (TP-4D, audit C2), so a rank-local failure can never desynchronise the checkpoint stores
+                            // if packing is ever enabled under TP (pf_skip_reason refuses packing under TP today).
+                            let n_before = st.n_alloc;
+                            let mut tp_alloc = self.tp.as_mut().filter(|t| t.world > 2);
+                            let mut hub_err: Option<anyhow::Error> = None;
+                            let got = st.acquire(|| {
+                                let r = model.ckpt_alloc();
+                                match tp_alloc.as_mut() { Some(t) => t.wp16_alloc(n_before, r, &mut hub_err), None => r }
+                            });
+                            if let Some(e) = hub_err { return Err(e); }
+                            if let Some(mut b) = got {
                                 let psc = self.psc.as_mut().unwrap();
                                 let r = model.pf_carry_from_slot(psc, slot).and_then(|_| model.ckpt_save(slot, psc, &mut b));
                                 match r {

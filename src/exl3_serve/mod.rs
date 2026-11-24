@@ -40,6 +40,7 @@ mod serve;
 mod spec_program;
 mod step;
 mod tp_serve;
+mod tp_pool_gate; // TPPOOL (design v3 step 4): the head's capacity gate
 mod wp24_gate;
 
 use crate::batch::{BatchRequest, TokEvent};
@@ -95,8 +96,24 @@ pub(crate) struct PoolBuf {
 /// (`Ckpt(q)`: rows 0..q restored, the ordinary WP16 resume at q follows).
 enum PoolHit { Full(usize, bool), Ckpt(usize) }
 
+/// SPILLTRUNC: what `spill_restore_slot` put in the lane — a full prompt-end snapshot (rows + snapshot state;
+/// the normal `reuse > 0` path) or a truncated row prefix + carried WP16 checkpoint installed into `self.wp16`
+/// (leaves `reuse = 0` so the WP16 resume path runs `ckpt_restore` on the carried checkpoint).
+pub(super) enum SpillHit { Full(usize), Trunc(usize) }
+
 /// PFXPOOL: prompts shorter than this are not kept in the pool (reading them again costs about what a copy does).
 const POOL_MIN_TOKENS: usize = 256;
+
+/// VIS-2: the cache-key id of an image row — pixel hash + intra-span index; ids >= 2^31 never collide with a
+/// vocabulary id (only the cache tiers compare them). Determinism is the contract ALL image-prompt cache tiers
+/// stand on — the own-lane snapshot, the spill tier and the prefix pool all compare these ids: the SAME image at
+/// the SAME span position re-renders the SAME ids across turns (a grown conversation keeps earlier spans put),
+/// and any different image id-mismatches at its first row, so a resume never lands deeper than it can prove.
+/// PFXPOOL4: kept as one function so the pool's unit tests prove exactly what `vision_setup` puts in the key.
+pub(crate) fn image_row_key(pixel_hash: u64, j: usize) -> u32 {
+    let hh = (pixel_hash as u32) ^ ((pixel_hash >> 32) as u32);
+    0x8000_0000 | (hh.wrapping_add((j as u32).wrapping_mul(0x9E37_79B1)) & 0x7FFF_FFFF)
+}
 
 /// PFXPOOL2: an entry reads its leading rows from an older entry when they share at least this many (fewer are
 /// cheaper to keep than to chain), through at most this many ancestors (each one is a copy per plane at restore).
@@ -393,6 +410,11 @@ struct Exl3Scheduler {
     /// Per-slot release stamps (released_at, normal finish) for the policy. Stamped only while
     /// the policy is on; read to build SlotViews and the forced-take log line.
     rel: Vec<Option<(std::time::Instant, bool)>>,
+    /// Issue #46 (LRUPICK): per-slot monotonic release order (0 = never released, else bumped at every
+    /// `release_lane` / `take_lane`). Rank-independent counter (never a wall clock), stamped on every topology
+    /// and policy setting so `pick_lane` / `pf_pick_slot` hand unrelated requests the least-recently-released
+    /// free lane instead of repeatedly evicting slot 0.
+    lru: Vec<u64>,
     /// S-B9-CF-PACK4 `--lane-pack` (see step_packed): the mode, the packed verify's own scratch
     /// (Some only with the flag on), which regime families are captured [dense, sparse], the
     /// rotation counter, the skip-line budget, "a prefill is in flight" and the idle-line stats.
@@ -492,6 +514,10 @@ struct Exl3Scheduler {
     pf_done: std::collections::HashMap<usize, PfDone>,
     /// PACKPF: prompts whose packed prefill is in flight (FIFO order; their lanes are reserved).
     pf_jobs: Vec<PfJob>,
+    /// KVPOOL (fork, --kv-pool lazy): a text request whose prefill found the shared pool full, with no idle lane to
+    /// evict, while other lanes still decode. The scheduler loop puts it back at the head of the queue and admits it
+    /// again after the next decode round (a lane that finishes becomes idle and evictable) instead of failing it.
+    vmm_wait: Option<BatchRequest>,
     // VIS-2: the text config's interleaved mrope_section (rope_parameters.mrope_section; None = the
     // model declares no interleaved mrope -> image requests are refused)
     mrope_section: Option<[usize; 3]>,
@@ -865,6 +891,9 @@ mod stop_info_tests;
 #[cfg(test)]
 mod lane_pack_wiring_tests;
 
+#[cfg(test)]
+mod tp_pool_gate_tests;
+
 /// S-B9-REL-SMALLFIXES 9a(iii) + 9a(iv): the scheduler side of the per-row attention regime.
 #[cfg(test)]
 mod regime_sched_tests;
@@ -911,6 +940,9 @@ mod df2_gate_tests;
 /// aborts its link either way. The shipped build failed this on every rank at the first TP=4 capture.
 #[cfg(test)]
 mod spill_agree_tests;
+/// veloGB10 #44: every staging / device failure in `admit_req` is fatal under TP (no one-rank lane skip). Source pins.
+#[cfg(test)]
+mod admit_tp_fatal_tests;
 
 /// ISSUES 127 / 128 (static review P0s): source pins for the DF2 width clamp and the draft slot staging (the ISSUES 126
 /// ring re-alignment was measured and NOT kept: archive/reviewfix1-issue126-attempt). The behaviour needs a GPU; these keep a later edit from quietly restoring the old code.
@@ -928,3 +960,9 @@ mod tp_preflight_tests;
 
 #[cfg(test)]
 mod copy_span_arm_tests;
+
+/// PFXPOOL4 (2026-11-22): the image-prompt cache-tier contract — image row-key stability across turns, mrope
+/// position/delta prefix-stability under prompt growth (what makes a restored image row byte-correct in another
+/// lane), and pool lookup/best depth on image keys (never deeper than the provable prefix).
+#[cfg(test)]
+mod image_pool_tests;

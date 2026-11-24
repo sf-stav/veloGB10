@@ -52,6 +52,24 @@ pub(crate) fn run_server(args: &[String]) {
         eprintln!("error: --model-dir {model_path} does not exist on this box (TP nodes do not need it; the head does)");
         std::process::exit(2);
     }
+    // INKLING2 (leg T1): an Inkling-2 pack of ANY weight format serves through its own shell, asked BEFORE `is_exl3_pack` can claim an
+    // EXL3 Inkling-2 pack for the Flash-Next trunk. Every other family's path below is untouched.
+    if gb10_inference::inkling2::serve::is_inkling2_pack(&model_path) {
+        if let Err(e) = gb10_inference::inkling2::serve::run(args, &model_path) {
+            gb10_inference::boot_report::error(&format!("inkling2 serve: {e:#}"));
+            gb10_inference::logq::flush_and_exit(std::time::Duration::from_millis(300), 1);
+        }
+        return;
+    }
+    // DSV41 (leg SV): a DeepSeek-V4.1 pack of ANY weight format serves through its own shell, asked BEFORE `is_exl3_pack` can claim
+    // an EXL3 dsv41 pack for the Flash-Next trunk. Every other family's path below is untouched.
+    if gb10_inference::dsv41::serve::is_dsv41_pack(&model_path) {
+        if let Err(e) = gb10_inference::dsv41::serve::run(args, &model_path) {
+            gb10_inference::boot_report::error(&format!("dsv41 serve: {e:#}"));
+            gb10_inference::logq::flush_and_exit(std::time::Duration::from_millis(300), 1);
+        }
+        return;
+    }
     // WIDEVERIFY1: --copy-span is built into the EXL3 speculative round only; any other pack's server runs
     // unchanged and says so once (velogb10_copy_span_state 3). Never a refusal (AGENTS 1b-bis item 8).
     // COPY27B: the trunk server (`BatchScheduler`, NVFP4/bf16 packs) resolves the flag itself when it is

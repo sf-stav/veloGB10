@@ -171,6 +171,40 @@
 
     fn bits(v: &[f32]) -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() }
 
+    /// Phase 2 (TP=8 readiness): the 2-stage 2x4 hierarchical collective reproduces the R10-aligned
+    /// 3-round recursive-doubling tree `rd_tree_reference(8, 0, &parts)` bit for bit on all 8 ranks.
+    #[test]
+    fn hier8_matches_rd_tree_reference_bitwise() {
+        let n = 1024;
+        let parts = parts_for(8, n);
+        let rd_ref = rd_tree_reference(8, 0, &parts).unwrap();
+        let h_ref = hier8_tree_reference(&parts).unwrap();
+        assert_eq!(bits(&h_ref), bits(&rd_ref), "hier8_tree_reference must equal rd_tree_reference(8, 0) bitwise");
+
+        // Explicit 2-stage per-rank simulation using hier8_plan:
+        let plans: Vec<Hier8Plan> = (0..8).map(|r| hier8_plan(r).unwrap()).collect();
+        // Stage 1: intra-quad 4-way reduce
+        let mut stage1: Vec<Vec<f32>> = vec![vec![0.0; n]; 8];
+        for r in 0..8 {
+            let q = plans[r].quad;
+            assert_eq!(q[plans[r].quad_pos], r);
+            for i in 0..n {
+                stage1[r][i] = (parts[q[0]][i] + parts[q[1]][i]) + (parts[q[2]][i] + parts[q[3]][i]);
+            }
+        }
+        // Stage 2: inter-quad 2-way pair exchange with pair_peer = r ^ 1
+        for r in 0..8 {
+            let p = plans[r].pair_peer;
+            assert_eq!(plans[p].pair_peer, r);
+            assert_ne!(plans[r].lower_quad, plans[p].lower_quad);
+            let out: Vec<f32> = (0..n).map(|i| {
+                if plans[r].lower_quad { stage1[r][i] + stage1[p][i] } else { stage1[p][i] + stage1[r][i] }
+            }).collect();
+            assert_eq!(bits(&out), bits(&rd_ref), "rank {r} 2-stage hier8 output != rd_tree_reference(8, 0)");
+        }
+        assert!(hier8_plan(8).is_err());
+    }
+
     #[test]
     fn rounds_of_powers_of_two_only() {
         assert_eq!(rounds_of(2).unwrap(), 1);
@@ -910,19 +944,18 @@
             }
         }
         for (req, rounds, want) in [(1usize, 1usize, 1usize), (2, 1, 2), (4, 1, 4), (9, 1, 4), (1, 2, 2), (3, 2, 2), (4, 2, 4), (8, 2, 4),
-                                    (4, 4, 4), (2, 4, 4)] {
+                                    (1, 3, 3), (3, 3, 3), (4, 3, 3), (8, 3, 3), (4, 4, 4), (2, 4, 4)] {
             assert_eq!(effective_lookahead(req, rounds).unwrap(), want, "lookahead {req} rounds {rounds}");
         }
-        assert!(effective_lookahead(4, 5).is_err() && effective_lookahead(4, 8).is_err(), "rounds > R/2 cannot be pipelined");
-        // W4P-1: rounds must divide the ring (epoch x and x + R share a slot): world 8 (rounds 3) and rounds 5, 6, 7 are refused
-        // for every requested lookahead, and the message names the ring; rounds 0 is an error, not a division by zero
-        for rounds in [0usize, 3, 5, 6, 7] {
+        // Phase 2: per-round quotient slot indexing `(e / rounds) % R` unlocks rounds 3 (world 8, G=3) and rounds 4 (world 16, G=4);
+        // rounds == 0 or rounds > R/2 (5, 6, 7, 8) are refused loudly.
+        for rounds in [0usize, 5, 6, 7, 8] {
             for req in [1usize, 2, 3, 4, 8] {
                 assert!(effective_lookahead(req, rounds).is_err(), "rounds {rounds} lookahead {req} must be refused");
             }
         }
-        let why = format!("{:#}", effective_lookahead(4, 3).unwrap_err());
-        assert!(why.contains("does not divide") && why.contains("recv ring"), "{why}");
+        let why = format!("{:#}", effective_lookahead(4, 5).unwrap_err());
+        assert!(why.contains("out of range") && why.contains("recv ring"), "{why}");
     }
 
     /// rounds > 1 needs somewhere to keep the running sum: the plain fp32 in-place IO stages in place; any f16
@@ -1073,8 +1106,11 @@
                 Step::K1m { rail, .. } => self.retired(r, rail, rk.ctr[rail] + 1),
                 Step::K2m { rail, lag, .. } | Step::K2c { rail, lag, .. } => match rk.ctr[rail].checked_sub(lag as u64) {
                     None => true,                  // exec reports it
-                    Some(e) => matches!(&rk.recv[rail][(e % self.rounds as u64) as usize][(e % RING_SLOTS as u64) as usize],
-                                        Some(s) if s.epoch == e),
+                    Some(e) => {
+                        let r = self.rounds as u64;
+                        let slot = ((e / r) % RING_SLOTS as u64) as usize;
+                        matches!(&rk.recv[rail][(e % r) as usize][slot], Some(s) if s.epoch == e)
+                    }
                 },
                 Step::Fold { .. } | Step::Hook { .. } => true,
             }
@@ -1106,9 +1142,10 @@
                     let e = rk.ctr[rail].checked_sub(lag as u64).filter(|&e| e > rk.base[rail])
                         .ok_or_else(|| format!("K2m lag {lag} reaches before the reduce (ctr {}, base {})", rk.ctr[rail], rk.base[rail]))?;
                     let round = (e % rounds) as usize;
+                    let slot_idx = ((e / rounds) % RING_SLOTS as u64) as usize;
                     let n = n as usize;
                     let (peer, slot_epoch) = {
-                        let s = rk.recv[rail][round][(e % RING_SLOTS as u64) as usize].as_ref().ok_or("K2m on an empty slot")?;
+                        let s = rk.recv[rail][round][slot_idx].as_ref().ok_or("K2m on an empty slot")?;
                         (s.wire.clone(), s.epoch)
                     };
                     if slot_epoch != e { return Err(format!("K2m epoch {e} found epoch {slot_epoch} in its slot")); }
@@ -1124,15 +1161,16 @@
                     let lower = r & (1usize << round) == 0;
                     let sum: Vec<f32> = (0..n).map(|i| if lower { loc[i] + peer_f32[i] } else { peer_f32[i] + loc[i] }).collect();
                     wr(&mut rk.regions, out, &sum, bits & 2 != 0)?;
-                    rk.recv[rail][round][(e % RING_SLOTS as u64) as usize].as_mut().unwrap().consumed = e;
+                    rk.recv[rail][round][slot_idx].as_mut().unwrap().consumed = e;
                 }
                 Step::K2c { rail, out, bytes, lag } => {
                     let rk = &mut self.ranks[r];
                     let e = rk.ctr[rail].checked_sub(lag as u64).filter(|&e| e > rk.base[rail])
                         .ok_or_else(|| format!("K2c lag {lag} reaches before the exchange (ctr {}, base {})", rk.ctr[rail], rk.base[rail]))?;
                     let round = (e % rounds) as usize;
+                    let slot_idx = ((e / rounds) % RING_SLOTS as u64) as usize;
                     let (peer, slot_epoch) = {
-                        let s = rk.recv[rail][round][(e % RING_SLOTS as u64) as usize].as_ref().ok_or("K2c on an empty slot")?;
+                        let s = rk.recv[rail][round][slot_idx].as_ref().ok_or("K2c on an empty slot")?;
                         (s.wire.clone(), s.epoch)
                     };
                     if slot_epoch != e { return Err(format!("K2c epoch {e} found epoch {slot_epoch} in its slot")); }
@@ -1142,7 +1180,7 @@
                         return Err(format!("K2c length mismatch at epoch {e}: sender {} B vs expected {bytes} B (tail timeout on hardware)", v.len() * 4));
                     }
                     wr(&mut rk.regions, out, v, false)?;
-                    rk.recv[rail][round][(e % RING_SLOTS as u64) as usize].as_mut().unwrap().consumed = e;
+                    rk.recv[rail][round][slot_idx].as_mut().unwrap().consumed = e;
                 }
                 Step::Fold { .. } => return Err("the model does not run fold programs".into()),
                 Step::Hook { r0, r1, tail } => {
@@ -1162,8 +1200,9 @@
         }
         fn deliver(&mut self, i: usize) -> Result<(), String> {
             let p = self.pend.remove(i);
-            let round = (p.epoch % self.rounds as u64) as usize;
-            let slot = &mut self.ranks[p.to].recv[p.rail][round][(p.epoch % RING_SLOTS as u64) as usize];
+            let r = self.rounds as u64;
+            let round = (p.epoch % r) as usize;
+            let slot = &mut self.ranks[p.to].recv[p.rail][round][((p.epoch / r) % RING_SLOTS as u64) as usize];
             if let Some(old) = slot {
                 if old.consumed < old.epoch {
                     return Err(format!("CLOBBER: epoch {} from rank {} overwrote rank {}'s recv slot (rail {}, round {round}) still holding \
@@ -1289,11 +1328,6 @@
         let (mut runs, mut hooked_runs, mut staged_runs, mut wire_f16_runs) = (0usize, 0usize, 0usize, 0usize);
         for &world in &[2usize, 4, 8] {
             let rounds = rounds_of(world).unwrap();
-            if world == 8 {
-                // W4P-1: world 8 (rounds 3) cannot be pipelined on the 8-slot ring: the real clamp refuses it, so no program exists to model
-                assert!((1..=4).all(|l| effective_lookahead(l, rounds).is_err()), "world 8 must be refused for every lookahead");
-                continue;
-            }
             let mut gs: Vec<usize> = (1..=4).map(|l| effective_lookahead(l, rounds).unwrap()).collect();
             gs.dedup();
             for (name, io) in sites() {
@@ -1484,12 +1518,13 @@
                 }
                 false
             };
-            let lcm = RING_SLOTS as u64 * rounds / gcd(RING_SLOTS as u64, rounds);
+            // Phase 2: per-round quotient indexing `(e / rounds) % R` gives reuse period `R * rounds` for every world.
+            let period = RING_SLOTS as u64 * rounds;
             let mut checked = 0usize;
             for r in 0..world {
-                for (&(_, q, e), &i) in k1.iter().filter(|(k, _)| k.0 == r && k.2 > lcm) {
+                for (&(_, q, e), &i) in k1.iter().filter(|(k, _)| k.0 == r && k.2 > period) {
                     let p = r ^ (1usize << (e % rounds));
-                    let prev = e - lcm;
+                    let prev = e - period;
                     let Some(&j) = k2.get(&(p, q, prev)) else { return (false, checked) };
                     checked += 1;
                     if !reaches(id(p, j), id(r, i)) { return (false, checked); }
@@ -1500,14 +1535,10 @@
         let mut total = 0usize;
         for &world in &[2usize, 4, 8] {
             let rounds = rounds_of(world).unwrap();
-            if world == 8 {
-                assert!((1..=4).all(|l| effective_lookahead(l, rounds).is_err()), "world 8 must be refused for every lookahead");
-                continue;
-            }
             for &nrails in &[1usize, 2] {
                 for l in 1..=4usize {
                     let g = effective_lookahead(l, rounds).unwrap();
-                    let n = 40 * 64;
+                    let n = 48 * 64;
                     let ep = epochs_of(n, 64);
                     let spec = ProgSpec { io: Io::f32_inplace(SRC), rounds, nrails, g, bub: BUB, hook: None, fold: false };
                     let prog = build_program(&spec, &ep, n).unwrap();
@@ -1519,12 +1550,12 @@
             }
         }
         assert!(total > 1000, "checked {total} slot reuses");
-        // CONTROL: G = 6 > R/2 at world 4
+        // CONTROL: G = 10 (> (R * rounds)/2 = 8 at world 4) exceeds the per-round ring reuse period
         let (n, world, rounds) = (40 * 64usize, 4usize, 2usize);
         let ep = epochs_of(n, 64);
-        let spec = ProgSpec { io: Io::f32_inplace(SRC), rounds, nrails: 1, g: 6, bub: BUB, hook: None, fold: false };
+        let spec = ProgSpec { io: Io::f32_inplace(SRC), rounds, nrails: 1, g: 10, bub: BUB, hook: None, fold: false };
         let prog = build_program(&spec, &ep, n).unwrap();
-        assert!(!safe(world, &prog, 1).0, "control: G=6 must fail the happens-before check");
+        assert!(!safe(world, &prog, 1).0, "control: G=10 must fail the happens-before check");
         let parts = model_parts(world, n, false);
         let io = Io::f32_inplace(SRC);
         let mut clobbered = false;
@@ -1534,16 +1565,15 @@
             let e0 = vec![vec![0u64]; world];
             if let Err(m) = simulate(world, &prog, regs, &e0, 1, seed, mode, None) { clobbered |= m.contains("CLOBBER"); }
         }
-        assert!(clobbered, "control: the model must catch a recv-slot clobber at G=6 on some schedule");
+        assert!(clobbered, "control: the model must catch a recv-slot clobber at G=10 on some schedule");
     }
 
-    /// The hook overlaps at world 4 (the row sub-chunk mechanism is world-general): with a many-chunk payload
-    /// the first non-tail hook comes BEFORE the last K1m (rows are handed over while later chunks are still
-    /// on the wire), at rounds 1 and 2 (rounds 3 is refused, W4P-1), and each handed range is whole rows >= min_rows.
+    /// The hook overlaps at world 4 AND world 8 (Phase 2: rounds 1, 2, 3 all pipelined): with a many-chunk payload
+    /// the first non-tail hook comes BEFORE the last K1m, and each handed range is whole rows >= min_rows.
     #[test]
     fn hook_overlaps_at_world_4() {
-        assert!(effective_lookahead(4, 3).is_err(), "rounds 3 (world 8) is refused by the real clamp (W4P-1)");
-        for rounds in [1usize, 2] {
+        assert_eq!(effective_lookahead(4, 3).unwrap(), 3, "Phase 2: rounds 3 (world 8) pipelines at G=3");
+        for rounds in [1usize, 2, 3] {
             let (row_len, c, per) = (16usize, 160usize, 64usize);
             let n = c * row_len;
             let ep = epochs_of(n, per);
@@ -2008,4 +2038,97 @@
         let regs: Vec<Vec<Region>> = (0..4).map(|r| regions_for(&ios, c * row_len, &parts[r])).collect();
         let err = simulate_ranks(4, &refs, regs, &vec![vec![0u64]; 4], 1, 1, 0, None).err().expect("a wrong-length epoch must be caught");
         assert!(err.contains("length mismatch") || err.contains("outside every region"), "{err}");
+    }
+
+    #[test]
+    fn sp8_reduce_scatter_and_all_gather_model_is_bitwise_the_all_reduce_tree() {
+        let row_len = 16usize;
+        let payload = small_payload(row_len, 4);
+        // 1. Reduce-scatter: 8 ranks, 1 & 2 rails, G = 3, ragged chunks, fp32 in-place + f16 io
+        for (name, io) in [
+            ("f32_inplace", Io::f32_inplace(0x1000)),
+            ("f16_io_f32_stage", Io { src: 0x1000, src_f16: true, out: 0x2000_0000, out_f16: true, wire_f16: true, mid: 0x7000_0000 }),
+        ] {
+            for &c in &[16usize, 29, 64, 131] {
+                let n = c * row_len;
+                let blocks = row_blocks8(c);
+                let parts = model_parts(8, n, io.src_f16);
+                let want: Vec<u32> = tree_reference(8, 0, &parts)
+                    .iter()
+                    .map(|&v| if io.out_f16 { H16::from_f32(v).to_bits() as u32 } else { v.to_bits() })
+                    .collect();
+                for &nrails in &[1usize, 2] {
+                    for hook_min in [None, Some(2usize)] {
+                        let progs: Vec<Vec<Step>> = (0..8)
+                            .map(|r| sp8_rs_program(&io, row_len, &blocks, r, nrails, 3, BUB, hook_min, payload).unwrap())
+                            .collect();
+                        let refs: Vec<&[Step]> = progs.iter().map(|p| p.as_slice()).collect();
+                        for &e0v in &[0u64, 9] {
+                            let e0 = vec![vec![e0v; nrails]; 8];
+                            let exp = Expect { out: io.out, f16: io.out_f16, bits: want.clone(), row_len };
+                            for (mode, seed) in [(0usize, 1u64), (1, 3), (2, 4), (3, 7)] {
+                                let regs: Vec<Vec<Region>> = (0..8).map(|r| regions_for(&io, n, &parts[r])).collect();
+                                let ranks = simulate_ranks(8, &refs, regs, &e0, nrails, seed, mode, hook_min.map(|_| &exp))
+                                    .unwrap_or_else(|m| panic!("sp8 rs {name} c {c} rails {nrails} e0 {e0v} mode {mode}: {m}"));
+                                for (r, rk) in ranks.iter().enumerate() {
+                                    let own = blocks[r];
+                                    let got = out_of(rk, &io, n);
+                                    assert_eq!(
+                                        &got[own.0 * row_len..own.1 * row_len],
+                                        &want[own.0 * row_len..own.1 * row_len],
+                                        "sp8 rs {name} c {c} rails {nrails} rank {r}: own eighth != canonical world-8 tree"
+                                    );
+                                    for rail in 0..nrails {
+                                        let len = progs[r].iter().filter(|s| matches!(s, Step::K1m { rail: q, .. } if *q == rail)).count();
+                                        assert_eq!(len % 3, 0, "sp8 rs must preserve mod-3 round phase");
+                                        assert_eq!(rk.ctr[rail], e0v + len as u64);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 2. Multi-buffer all-gather: 8 ranks, 1 & 2 rails, G = 3, ragged chunks, bytes verbatim
+        for &c in &[16usize, 29, 73] {
+            let blocks = row_blocks8(c);
+            let rowf: [usize; 2] = [16, 8];
+            let bases: [u64; 2] = [0x5000, 0x9000_0000];
+            let bufs: Vec<(u64, usize)> = (0..2).map(|b| (bases[b], rowf[b] * 4)).collect();
+            let truth: Vec<Vec<f32>> = (0..2).map(|b| (0..c * rowf[b]).map(|i| {
+                let row = i / rowf[b];
+                let owner = (0..8).find(|&r| row >= blocks[r].0 && row < blocks[r].1).unwrap();
+                ag_pattern(owner, i)
+            }).collect()).collect();
+            for &nrails in &[1usize, 2] {
+                let progs: Vec<Vec<Step>> = (0..8)
+                    .map(|r| sp8_ag_program(&bufs, &blocks, r, nrails, 3, BUB, payload).unwrap())
+                    .collect();
+                let refs: Vec<&[Step]> = progs.iter().map(|p| p.as_slice()).collect();
+                let e0 = vec![vec![6u64; nrails]; 8];
+                let regs: Vec<Vec<Region>> = (0..8).map(|r| {
+                    let mut v: Vec<Region> = (0..2).map(|b| Region { base: bases[b], buf: Buf::F32((0..c * rowf[b]).map(|i| {
+                        let row = i / rowf[b];
+                        if row >= blocks[r].0 && row < blocks[r].1 { truth[b][i] } else { f32::from_bits(NAN32) }
+                    }).collect()) }).collect();
+                    v.push(Region { base: BUB, buf: Buf::F32(vec![0.0; 4]) });
+                    v
+                }).collect();
+                let ranks = simulate_ranks(8, &refs, regs, &e0, nrails, 5, 3, None)
+                    .unwrap_or_else(|m| panic!("sp8 ag c {c} rails {nrails}: {m}"));
+                for (r, rk) in ranks.iter().enumerate() {
+                    for b in 0..2 {
+                        let got = rd_bits(&rk.regions, bases[b], c * rowf[b], false).unwrap();
+                        let want: Vec<u32> = truth[b].iter().map(|x| x.to_bits()).collect();
+                        assert_eq!(got, want, "sp8 ag c {c} rails {nrails} rank {r} buf {b} mismatch");
+                    }
+                    for rail in 0..nrails {
+                        let len = progs[r].iter().filter(|s| matches!(s, Step::K1m { rail: q, .. } if *q == rail)).count();
+                        assert_eq!(len % 3, 0);
+                        assert_eq!(rk.ctr[rail], 6 + len as u64);
+                    }
+                }
+            }
+        }
     }

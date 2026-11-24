@@ -192,14 +192,14 @@ __device__ __forceinline__ unsigned long long* tp_nway_flagp(tp_dev_ctx* c, int 
     return (unsigned long long*)((char*)c->nway_flags + (size_t)peer * TP_CL + sub_off);
 }
 // The recv-ring slot for epoch e. world==2: the LEGACY shared ring, recv_ring + (e%R)*stride
-// (byte-identical). world>2: round(e)'s OWN recv ring, nway_recv + (round(e)*R + e%R)*stride — so a
-// round's payload can never alias another round's slot (the cross-round staleness fix; round(e) =
-// e % c->rounds, computed identically on every rank from the device epoch).
+// (byte-identical). world>2: round(e)'s OWN recv ring, nway_recv + (round(e)*R + (e/rounds)%R)*stride
+// (Phase 2: bijective across all R slots per round for any rounds including world=8 / rounds=3).
 __device__ __forceinline__ unsigned char* tp_recv_slot_ptr(tp_dev_ctx* c, unsigned long long e) {
     if (c->world > 2) {
-        unsigned long long round = e % (unsigned long long)c->rounds;
-        return c->nway_recv + (round * (unsigned long long)TP_RING_SLOTS
-                               + (e & (TP_RING_SLOTS - 1))) * (unsigned long long)c->slot_stride;
+        const unsigned long long r = (unsigned long long)c->rounds;
+        const unsigned long long round = e % r;
+        const unsigned long long slot = (e / r) & (TP_RING_SLOTS - 1);
+        return c->nway_recv + (round * (unsigned long long)TP_RING_SLOTS + slot) * (unsigned long long)c->slot_stride;
     }
     return c->recv_ring + (size_t)(e & (TP_RING_SLOTS - 1)) * c->slot_stride;
 }
@@ -838,6 +838,54 @@ extern "C" __global__ void tp_wait_add_4way_f32(tp_dev_ctx* c, float* out, const
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float a0 = parts[0][i], a1 = parts[1][i], a2 = parts[2][i], a3 = parts[3][i];
         out[i] = (a0 + a2) + (a1 + a3);
+    }
+}
+
+// Phase 2 / TP=8: K2 one-shot, fp32 wire, world-8 single-stage collect on uniform one-shot ctx.
+// Polls the shared TP_F_CPU_DONE watermark (published by the proxy after validating all 7 peers' tails
+// under one fence), then sums in canonical 3-round world-8 tree order:
+//   ((p0 + p2) + (p4 + p6)) + ((p1 + p3) + (p5 + p7))
+// bit-identical to `tp_xport::reduce_pipe` / `rd_tree_reference(8, 0, parts)`.
+extern "C" __global__ void tp_wait_add_8way_f32(tp_dev_ctx* c, float* out, const float* local, int n) {
+    const unsigned long long e = c->epoch;
+    tp_stamp(c, e, TP_GTS_K2_IN);
+    asm volatile("griddepcontrol.launch_dependents;");
+
+    const unsigned long long* done = tp_flag(c, TP_F_CPU_DONE);
+    const unsigned long long* ab = tp_flag(c, TP_F_ABORT);
+
+    __shared__ int s_ab;
+    if (threadIdx.x == 0) {
+        s_ab = 0;
+        unsigned long long tight_until = tp_globaltimer() + 2000ull;
+        unsigned ns = 64, cap = 512u;
+        while (tp_ld_relaxed(done) < e) {
+            if (tp_ld_relaxed(ab)) { s_ab = 1; break; }
+            if (tp_globaltimer() < tight_until) continue;
+            __nanosleep(ns);
+            if (ns < cap) ns <<= 1;
+        }
+        if (!s_ab) tp_fence_acquire();
+    }
+    __syncthreads();
+    if (s_ab) return;
+    tp_stamp(c, e, TP_GTS_K2_GO);
+
+    const float* parts[8];
+    #pragma unroll
+    for (int p = 0; p < 8; p++) {
+        parts[p] = (p == (int)c->rank)
+            ? local
+            : (const float*)(c->oneshot_recv
+                + ((unsigned long long)p * (unsigned long long)TP_RING_SLOTS
+                   + (e & (TP_RING_SLOTS - 1))) * (unsigned long long)c->slot_stride);
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float s02 = parts[0][i] + parts[2][i];
+        const float s46 = parts[4][i] + parts[6][i];
+        const float s13 = parts[1][i] + parts[3][i];
+        const float s57 = parts[5][i] + parts[7][i];
+        out[i] = (s02 + s46) + (s13 + s57);
     }
 }
 

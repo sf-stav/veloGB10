@@ -130,6 +130,23 @@
         assert!(seen >= 30, "the scan resolved only {seen} include targets (40 when written): did it stop matching?");
     }
 
+    /// DSV41: `kernels/gpu_dsv41.cu` is include-split into `kernels/gpu_dsv41/*.cuh` bands; every band on disk
+    /// (and the head file) must be in the KERNEL stamp, or a head and a node that differ only in a band pair.
+    #[test]
+    fn the_kernel_stamp_covers_every_dsv41_band_file() {
+        let (kernel, root) = (kernel(), root());
+        assert!(kernel.contains("kernels/gpu_dsv41.cu"), "{kernel:?}");
+        let mut n = 0;
+        for e in std::fs::read_dir(root.join("kernels/gpu_dsv41")).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".cuh") { continue; }
+            let rel = format!("kernels/gpu_dsv41/{name}");
+            assert!(kernel.contains(rel.as_str()), "{rel} is on disk but outside the kernel build stamp");
+            n += 1;
+        }
+        assert!(n >= 2, "found only {n} band files under kernels/gpu_dsv41: is the walk right?");
+    }
+
     /// W2: the lockstep words of AGREE16 are a protocol change, named as one.
     #[test]
     fn the_version_token_names_protocol_kernels_and_sources() {
@@ -335,6 +352,7 @@
             let bytes: Vec<u8> = match src {
                 crate::shard_plan::PlanSrc::Whole(p) => std::fs::read(p).unwrap(),
                 crate::shard_plan::PlanSrc::Bytes(b) => b.clone(),
+                crate::shard_plan::PlanSrc::Generated(g) => { let mut v = Vec::new(); g.write_to(&mut v).unwrap(); v }
                 crate::shard_plan::PlanSrc::Segment(ps) => {
                     let mut v = Vec::new();
                     crate::shard_plan::write_segment(ps, &mut v).unwrap();

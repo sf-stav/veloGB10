@@ -627,12 +627,13 @@
         format!("--{flag} needs a value, but it is the last argument; to give a value that starts with \"--\" write --{flag}=<value>")
     }
 
-    /// Every Text/Path row (44 Text + 30 Path = 74; NIGHT1 added --probe-gpu-wait-mib; THINKBUDGET1 added --reasoning-config; WIDEVERIFY1 added the
-    /// --ids-file Path row; COPYREC1 --copy-span-record-dir; LANEWIDE --probe-lane-wide-rows; PACKPF --packpf-lens): the four cases of the addendum.
+    /// Every Text/Path row (52 Text + 40 Path = 92; DSV41 SQ1 added --dsv41-sq1-budget (Text); DSV41 SE added --dsv41-engram-dump (Path); DSV41 TP added --dsv41-tp-run / -tp-fixtures / -tp-prompt (Text); DSV41 Q1 --dsv41-q1-score-out (Path); DSV41 CE added --dsv41-ced-chunks and --dsv41-ced-parts (Text) and --dsv41-score-out (Path); DSV41 TPC added --dsv41-tp-rows (Text); DS added none (its flags are Bool/Int); DSV41 OD added --dsv41-oracle-trace (Path); DSV41 KA added --dsv41-kernel-fixture (Path) and --dsv41-kernel-timing; NIGHT1 added --probe-gpu-wait-mib; THINKBUDGET1 added --reasoning-config; WIDEVERIFY1 added the
+    /// --ids-file Path row; COPYREC1 --copy-span-record-dir; LANEWIDE --probe-lane-wide-rows; PACKPF --packpf-lens; DSV41 I0 the five Path rows
+    /// --dsv41-census-also / -census-out / -dump-ls / -dump-ref / -dump-demo): the four cases of the addendum.
     #[test]
     fn f7_text_path_rows_never_eat_a_flag_shaped_token() {
         let rows: Vec<&Opt> = REG.iter().filter(|o| matches!(o.ty, Ty::Text | Ty::Path)).collect();
-        assert_eq!(rows.len(), 74, "44 Text + 30 Path (fp4l-mtp-sidecar is a Choice since 2026-11-01; WIDEVERIFY1 --ids-file; COPYREC1 --copy-span-record-dir; LANEWIDE --probe-lane-wide-rows; PACKPF --packpf-lens; NIGHT1 --probe-gpu-wait-mib)");
+        assert_eq!(rows.len(), 98, "56 Text + 42 Path (DSV41 P6 --dsv41-markov-dyn-cache + --dsv41-engram-ram-gib (Text); DSV41 PH1 --dsv41-markov-tokens (Text); DSV41 PS3 --dsv41-spec-pit-log (Path); DSV41 PX1 --dsv41-xchg-trace (Path); DSV41 PD1 --dsv41-l2-prefetch-mib (Text); DSV41 SQ1 --dsv41-sq1-budget (Text); DSV41 SE --dsv41-engram-dump (Path); DSV41 TP --dsv41-tp-run/-tp-fixtures/-tp-prompt (Text); DSV41 Q1 --dsv41-q1-score-out (Path); DSV41 CE --dsv41-ced-chunks/-ced-parts/-score-out; DSV41 TPC --dsv41-tp-rows; DSV41 OD --dsv41-oracle-trace; fp4l-mtp-sidecar is a Choice since 2026-11-01; WIDEVERIFY1 --ids-file; COPYREC1 --copy-span-record-dir; LANEWIDE --probe-lane-wide-rows; PACKPF --packpf-lens; NIGHT1 --probe-gpu-wait-mib; DSV41 I0 five dsv41 Path rows; DSV41 KA --dsv41-kernel-fixture + --dsv41-kernel-timing)");
         let args = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
         for o in rows {
             let id = lookup(o.flag).unwrap();

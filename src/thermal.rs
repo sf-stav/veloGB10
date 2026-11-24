@@ -171,13 +171,67 @@ pub fn start() -> bool {
 
 thread_local! {
     static LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// DSV4.1 leg PS2: the work a caller closed with [`work_done`] (its GPU time, the moment it ended). The next pace call on
+    /// this thread bills that work and counts the time since its end (the GPU was idle) as duty cycle already paid. Only a
+    /// caller of [`work_done`] ever sets it: for every other caller `pace` is unchanged.
+    static OWED: std::cell::Cell<Option<(Duration, Instant)>> = const { std::cell::Cell::new(None) };
 }
+
+// DSV4.1 leg PS2: idle gaps that were not billed as GPU work (a caller of `work_done` only), their seconds, and the pacing
+// sleep they made unnecessary
+static IDLE_GAPS: AtomicU64 = AtomicU64::new(0);
+static IDLE_GAP_NS: AtomicU64 = AtomicU64::new(0);
+static IDLE_CREDIT_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Call once per unit of GPU work (a prefill pass, a scheduler step), on every rank, BEFORE the work is
 /// launched. Sleeps when the box is hot (see the module doc); returns at once otherwise.
 pub fn pace() {
-    if !on() { return; }
+    if !on_here() { return; }
     pace_core();
+}
+
+/// DSV4.1 leg PS2 (additive: only the DeepSeek-V4.1 TP serve path calls it): the unit of GPU work started by the last
+/// [`pace`] on this thread has ENDED (the caller waited for it). Without it, `pace` bills everything between two calls as
+/// GPU work, so on a server the idle time before a request (up to `WORK_GAP`, 2 s) was billed as work and a hot box slept up
+/// to ~1x that gap again before the request's first prefill (P1M: TTFT 0.45-1.37 s for requests arriving ~1 s after the
+/// previous one, 0.2 s otherwise). With it, the next `pace` bills only the work and subtracts the idle time since it ended
+/// from the sleep the work owes (an idle GPU already met the duty cycle).
+pub fn work_done() {
+    if !on_here() { return; }
+    let now = Instant::now();
+    let w = LAST.with(|c| c.take()).map(|t| now - t).filter(|d| *d <= WORK_GAP).unwrap_or(Duration::ZERO);
+    OWED.with(|o| { let prev = o.get().map_or(Duration::ZERO, |p| p.0); o.set(Some((prev + w, now))); });
+}
+
+/// The sleep a closed unit of work owes at the next `pace`: its pacing sleep less the idle time since it ended.
+pub fn owed_sleep(t_dc: u32, soft_dc: u32, hard_dc: u32, work: Duration, idle: Duration) -> Duration {
+    pacing_sleep(t_dc, soft_dc, hard_dc, work).saturating_sub(idle)
+}
+
+/// For /metrics (the DSV4.1 TP head): (idle gaps not billed as work, their seconds, pacing seconds they made unnecessary).
+pub fn idle_credit() -> (u64, f64, f64) {
+    (IDLE_GAPS.load(Relaxed), IDLE_GAP_NS.load(Relaxed) as f64 / 1e9, IDLE_CREDIT_NS.load(Relaxed) as f64 / 1e9)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests only: this thread's governor reads (temperature, soft, hard) in deci-degrees from here instead of the sampler
+    static TEST_TEMP: std::cell::Cell<Option<(u32, u32, u32)>> = const { std::cell::Cell::new(None) };
+}
+/// Tests only: pace this thread as if the box read `t` with limits `soft` / `hard` (deci-degrees C); None = the real sampler.
+#[cfg(test)]
+pub fn test_temp(v: Option<(u32, u32, u32)>) { TEST_TEMP.with(|c| c.set(v)); LAST.with(|c| c.set(None)); OWED.with(|c| c.set(None)); }
+
+fn on_here() -> bool {
+    #[cfg(test)]
+    if TEST_TEMP.with(|c| c.get()).is_some() { return true; }
+    on()
+}
+
+fn temps() -> (u32, u32, u32) {
+    #[cfg(test)]
+    if let Some(v) = TEST_TEMP.with(|c| c.get()) { return v; }
+    (EFF_DC.load(Relaxed), SOFT_DC.load(Relaxed), HARD_DC.load(Relaxed))
 }
 
 /// Inside a long GPU pass (every PASS_EVERY_LAYERS layers of a prefill chunk), on every rank. Cool box: returns
@@ -198,8 +252,11 @@ pub fn pace_pass(capturing: bool, sync: impl FnOnce() -> anyhow::Result<()>) -> 
 fn pace_core() {
     let now = Instant::now();
     let work = LAST.with(|c| c.replace(Some(now))).map(|t| now - t).filter(|d| *d <= WORK_GAP).unwrap_or(Duration::ZERO);
-    let (soft, hard) = (SOFT_DC.load(Relaxed), HARD_DC.load(Relaxed));
-    let t = EFF_DC.load(Relaxed);
+    // leg PS2: a unit closed by `work_done` is billed by its own length; the time since it ended was idle (None for every
+    // caller that never calls `work_done`: then nothing below changes)
+    let owed = OWED.with(|o| o.take());
+    let (work, idle) = match owed { Some((w, end)) => (work + w, now.saturating_duration_since(end)), None => (work, Duration::ZERO) };
+    let (t, soft, hard) = temps();
     if t < soft {
         // the transition lines use a 2 C hysteresis: a box hovering at the soft limit logs once, not every crossing
         if t + 20 <= soft && IN_BAND.swap(false, Relaxed) {
@@ -222,6 +279,13 @@ fn pace_core() {
         HELD_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     } else {
         let s = pacing_sleep(t, soft, hard, work);
+        let s = if owed.is_some() {
+            let paid = s.min(idle);
+            IDLE_GAPS.fetch_add(1, Relaxed);
+            IDLE_GAP_NS.fetch_add(idle.as_nanos() as u64, Relaxed);
+            IDLE_CREDIT_NS.fetch_add(paid.as_nanos() as u64, Relaxed);
+            s - paid
+        } else { s };
         if !s.is_zero() {
             std::thread::sleep(s);
             PACED_NS.fetch_add(s.as_nanos() as u64, Relaxed);
@@ -277,6 +341,44 @@ mod tests {
         assert_eq!(read_hottest(&paths), Some(912));
         assert_eq!(read_hottest(&[d.join("missing")]), None);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// DSV4.1 leg PS2: a unit closed by `work_done` is billed by its own length; the idle time after it pays its debt. Without
+    /// `work_done` (every other family) the old rule holds: everything between two calls under 2 s is billed as work.
+    #[test]
+    fn work_done_bills_the_work_not_the_idle_gap() {
+        // 88 C against 85 / 90: duty 0.49, the sleep ~1.04x the billed work
+        let hot = (880u32, 850u32, 900u32);
+        let work = Duration::from_millis(40);
+        let gap = Duration::from_millis(300);
+        let (g0, _, c0) = idle_credit();
+        test_temp(Some(hot));
+        pace();
+        std::thread::sleep(work);
+        work_done();
+        std::thread::sleep(gap);
+        let t = Instant::now();
+        pace();
+        assert!(t.elapsed() < Duration::from_millis(15), "the idle gap paid the work's debt; slept {:?}", t.elapsed());
+        let (g1, _, c1) = idle_credit();
+        assert!(g1 > g0 && c1 > c0, "the credit is counted");
+        // the debt is still paid when the next unit comes at once (inside a request)
+        std::thread::sleep(work);
+        work_done();
+        let t = Instant::now();
+        pace();
+        let s = t.elapsed();
+        assert!(s >= Duration::from_millis(30) && s < Duration::from_millis(80), "back to back: the work's own debt (~42 ms), slept {s:?}");
+        // the old rule (no work_done): the gap is billed as work
+        test_temp(Some(hot));
+        pace();
+        std::thread::sleep(work + gap);
+        let t = Instant::now();
+        pace();
+        assert!(t.elapsed() >= Duration::from_millis(300), "the old rule bills the gap: slept {:?}", t.elapsed());
+        test_temp(None);
+        assert_eq!(owed_sleep(880, 850, 900, work, gap), Duration::ZERO);
+        assert!(owed_sleep(880, 850, 900, Duration::from_secs(1), Duration::from_millis(100)) > Duration::from_millis(900));
     }
 
     #[test]

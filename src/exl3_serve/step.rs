@@ -102,6 +102,39 @@ impl Exl3Scheduler {
                                                         cache.as_ref().map(|c| c.len()))));
     }
 
+    /// KVPOOL: the request on lane `s` ends at position `p` because the shared pool cannot grow it ("length": out of
+    /// context memory). Every rank calls it at the same program point (the map-ahead), so TP ranks drop the same lane.
+    fn vmm_end_lane(&mut self, s: usize, p: usize) {
+        crate::dreprintln!("[kv-vmm] slot {s}: the shared KV pool is full and no idle lane can be evicted — \
+                            request ended at position {p} (finish=length)");
+        crate::kv_vmm::LENGTH_ENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(lane) = self.take_lane(s, true) {
+            lane.log_stats(s, "length");
+            let _ = lane.tx.send(TokEvent::Finish { reason: "length".into() });
+        }
+        self.publish_kv();
+    }
+
+    /// KVPOOL: map lane `s` up to position `p`, evicting idle lanes while the pool is full. Ok(true) = the lane
+    /// is mapped for this round; Ok(false) = the pool could not grow it and no idle lane was left to free, so
+    /// the request on it ENDS here (finish=length) and the lane leaves the round — the other lanes still
+    /// decode, and `step_rounds` keeps the one early return its touch pin allows. Errors go to the caller's `?`.
+    fn vmm_room_or_end(&mut self, s: usize, p: usize, keep: &[usize]) -> Result<bool> {
+        loop {
+            match self.model.vmm_ensure(s, p) {
+                Ok(()) => return Ok(true),
+                Err(e) if crate::kv_vmm::is_exhausted(&e) => {
+                    if self.vmm_evict_idle(keep)? { continue; }
+                    // Nothing idle left to free: this lane cannot grow. End IT ("length": out of context
+                    // memory) and it leaves this round; the other lanes still decode this step.
+                    self.vmm_end_lane(s, p);
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// The rounds of one `step` (every arm may return early; `step` does the per-step publication).
     fn step_rounds(&mut self) -> Result<()> {
         crate::metrics::sched_step(); // v0.7.3 gauge: rounds + busy
@@ -127,10 +160,59 @@ impl Exl3Scheduler {
                 }
             }
         }
-        let slots: Vec<usize> = self.lanes.iter().enumerate()
+        let mut slots: Vec<usize> = self.lanes.iter().enumerate()
             .filter(|(_, l)| l.is_some())
             .map(|(i, _)| i)
             .collect();
+        // KVPOOL: every round of every arm below writes at or just past a lane's position — map ahead of it here,
+        // the one place all decode rounds pass (the fast path is an atomic load per lane). A lane the pool cannot
+        // grow ends ITS request and drops out of this round; the empty check below is then what skips a round,
+        // with upstream's own return — the only one ahead of the round counter (benchfix_sse_tests pins it).
+        if self.model.vmm_lazy() {
+            // `all` shrinks as lanes end: a lane that just left the round must be evictable for the next
+            // one, or its pages sit idle to the end of the step and later lanes end for want of them.
+            let mut all = slots.clone();
+            let live: Vec<(usize, usize)> = slots.iter().filter_map(|&s| self.lanes[s].as_ref().map(|l| (s, l.pos + 1))).collect();
+            let mut kept: Vec<(usize, usize)> = Vec::with_capacity(live.len());
+            let mut ended: Vec<usize> = Vec::new();
+            for (s, p) in live {
+                if self.vmm_room_or_end(s, p, &all)? { kept.push((s, p)); }
+                else { ended.push(s); all.retain(|&x| x != s); }
+            }
+            slots.retain(|s| !ended.contains(s));
+            // + the pooled-key planes out to the longest lane (small). TPPOOL (design v3 step 4): this read-ahead can
+            // exhaust the pool too. It used to fail the whole step (and under TP that is a fatal on every rank); now it
+            // evicts an idle lane, else ends the SHORTEST kept lane (the longest session goes last, as for eviction) and
+            // retries. One lane left needs no read-ahead, so this ends; every rank takes the same lanes in the same order.
+            loop {
+                let r = self.model.vmm_ensure_group(&kept);
+                match r {
+                    Err(e) if crate::kv_vmm::is_exhausted(&e) && kept.len() > 1 => {
+                        if self.vmm_evict_idle(&all)? { continue; }
+                        let &(s, p) = kept.iter().min_by_key(|&&(s, p)| (p, s)).unwrap();
+                        self.vmm_end_lane(s, p);
+                        kept.retain(|&(x, _)| x != s);
+                        slots.retain(|&x| x != s);
+                        all.retain(|&x| x != s);
+                    }
+                    r => { r?; break; }
+                }
+            }
+        }
+
+        // TPPOOL (design v2 step 2): after map-ahead every rank must hold the same lanes. A rank that ended a lane
+        // the other did not would diverge on the next collective, so agree on the survivor count and the ordered slot
+        // IDs here, before any return or dispatch. Runs only with a lazy pool under TP (today a TP rank falls back to the stock allocation).
+        if self.model.vmm_lazy() && self.tp.is_some() {
+            let agree: Vec<u32> = std::iter::once(slots.len() as u32).chain(slots.iter().map(|&s| s as u32)).collect();
+            // width = the survivor count (compared in the agree token's width field); no scratch: nothing ran yet
+            self.model.tp_drain_before_exchange()?;
+            let (tp, model) = (&mut self.tp, &self.model);
+            if let Some(t) = tp.as_mut() {
+                t.rendezvous("map-ahead")?; // issue #45: follows step_go's AGREE_GO with no collective in between
+                Self::tp_round_with(t, model, None, "map-ahead", 0, slots.len(), &agree, 0.0, 0.0, false)?;
+            }
+        }
         if slots.is_empty() {
             return Ok(());
         }
@@ -214,6 +296,7 @@ impl Exl3Scheduler {
                 // them): one more lockstep point agrees the arm and the step's token count and takes the HEAD's step ms
                 if self.tp.is_some() { self.model.tp_drain_before_exchange()?; }
                 if let Some(t) = self.tp.as_mut() {
+                    t.rendezvous("wide-policy")?; // issue #45: fence B of the wide round is the last token written
                     let w = [pick.arm as u32, tok as u32, n as u32];
                     ms = Self::tp_round_with(t, &self.model, None, "wide-policy", 0, 0, &w, ms, 0.0, false)?.0;
                 }
@@ -253,6 +336,9 @@ impl Exl3Scheduler {
             // device collectives first (the ring-aliasing rule of the wide-policy point).
             if self.tp.is_some() { self.model.tp_drain_before_exchange()?; }
             if let Some(t) = self.tp.as_mut() {
+                // issue #45: the step's last round ended in fence B and nothing with a collective ran since: without
+                // the rendezvous the first rank here overwrites its B token before the peer has read it
+                t.rendezvous("arm-meter")?;
                 let w = [arm as u32, tok as u32, n as u32];
                 ms = Self::tp_round_with(t, &self.model, None, "arm-meter", 0, 0, &w, ms, 0.0, false)?.0;
                 crate::metrics::spec_meter_tp_sync();

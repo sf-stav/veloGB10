@@ -50,7 +50,10 @@ pub fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 pub mod quant;
 pub mod mxfp4;
 pub mod exl3;
+pub mod inkling2; // INKLING2: looped Inkling-2 family (PLAN/INKLING2_MINI_PORT.md) — own tree, one-line dispatches
 pub mod naive; // NAIVE: Naive-N0.5-Flash family (PLAN/NAIVE_N05_PORT.md) — own tree, copies + one-line dispatches
+pub mod dsv41; // DSV41: DeepSeek-V4.1-Flash family (PLAN/DSV41_PLAN_2026-11-18.md) — own tree src/dsv41/, kernels/gpu_dsv41*
+pub mod dist;  // VELO-FABRIC v2: GSPMD-style ShardedTensor + lazy PartialSum + declarative ShardPlan + reusable FabricXport
 pub mod shard_plan;
 pub mod exl3_bench;
 pub mod exl3_forward;
@@ -87,6 +90,7 @@ pub mod metrics;
 pub mod mtp_reprobe;
 pub mod lane_pack; // S-B9-CF-PACK4: --lane-pack (pure decision; the arm lives in exl3_serve)
 pub mod lane_reserve; // LANERES1: --lane-reserve (pure admission policy; the arm lives in exl3_serve)
+pub mod kv_vmm; // KVPOOL (fork): shared physical pool behind the position planes (--kv-pool)
 pub mod kv_spill; // LANERES2: --kv-spill (pure spill policy + disk store; the arm lives in exl3_serve/exl3_forward)
 pub mod turn_resume; // TURNRESUME: --turn-resume / --next-turn-prefill (hints, pick rules, counters; the arm lives in exl3_serve)
 pub mod prefix_pool; // PFXPOOL: prompt states kept in memory across lanes (policy; the arm lives in exl3_serve/exl3_forward)

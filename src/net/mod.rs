@@ -12,6 +12,8 @@
 //! `hub.rs` (the world>2 hub exchange: `exchange_u32s*`, `HubXport`, `CtxHub`); tests: `hub_mock.rs` (in-memory `HubXport`), `hub_tests.rs`, `tp2race_tests.rs`, `agree16b_tests.rs`, `nway_liveness_tests.rs`.
 
 
+pub mod bulk;
+
 use std::ffi::CString;
 use std::net::IpAddr;
 use std::os::raw::{c_char, c_int, c_void};
@@ -78,6 +80,7 @@ extern "C" {
     fn net_agree(c: *mut NetCtx, val: u64, step_mask: u64, step_val: u64) -> u64;
     fn net_exchange_one(c: *mut NetCtx, peer_rank: c_int, nbytes: c_int) -> c_int;
     fn net_exchange_one_dl(c: *mut NetCtx, peer_rank: c_int, nbytes: c_int, deadline_ns: u64) -> c_int;
+    fn net_exchange_all_peers(c: *mut NetCtx, nbytes: c_int, deadline_ns: u64) -> c_int;
     fn net_agree_dl(c: *mut NetCtx, val: u64, step_mask: u64, step_val: u64, deadline_ns: u64) -> u64;
     fn net_ctrl_recv_hptr(c: *mut NetCtx, src: c_int) -> *mut c_void;
     fn net_ctrl_send_hptr(c: *mut NetCtx) -> *mut c_void;
@@ -417,31 +420,30 @@ pub fn agree_ext(step: u64, accept_count: u8, k_verify: u8, hash: u32) -> Option
             // round-1 placement wait. Collect the failed peer, keep gathering, then fan round 2 (the
             // mismatch sentinel) so every node unblocks before we abort.
             let mut round1_failed = false;
-            for r in 1..world {
-                let rc = net_exchange_one(ctx, r, AGREE_NBYTES as c_int);
-                if rc != 0 {
-                    // B8 §1.5-1: echo the abort code + watermarks — rc=-2 means the abort flag was
-                    // ALREADY set (a checkpoint, not a fault); the code classifies the real cause.
-                    eprintln!("[tp-agree] head round-1 exchange_one({r}) rc={rc} abort_status={:#018x} device_epoch={} gpu_ready={} rx_done={} — fanning round 2 anyway",
-                              net_abort_status(ctx), net_device_epoch(ctx), net_gpu_ready(ctx), net_rx_done(ctx));
-                    round1_failed = true;
-                    continue;
-                }
-                let slot = net_ctrl_recv_hptr(ctx, r) as *const u64;
-                let peer_val = std::ptr::read_unaligned(slot);
-                let peer_sx = std::ptr::read_unaligned(slot.add(1));
-                let peer_epoch = std::ptr::read_unaligned(slot.add(2));
-                if peer_epoch != epoch {
-                    eprintln!("[tp-agree] EPOCH-PROBE: rank {r} device epoch {peer_epoch} != head {epoch} (delta {})",
-                              peer_epoch as i64 - epoch as i64);
-                }
-                if diag && peer_sx != my_sx {
-                    eprintln!("[tp-agree] DIAG-SCHED: rank {r} send-ring XOR {peer_sx:#018x} != head {my_sx:#018x} — barrier SCHEDULE diverged (not a content race)");
-                    diag_sched_ok = false;
-                }
-                if peer_val != val {
-                    eprintln!("[tp-agree] head MISMATCH: rank {r} val {peer_val:#018x} != head {val:#018x} (hash {peer_val:08x} vs {val:08x})");
-                    all_equal = false;
+            // Phase 2B: gather all peers in 1 parallel RTT instead of (world-1) serial RTTs.
+            let rc1 = net_exchange_all_peers(ctx, AGREE_NBYTES as c_int, 0);
+            if rc1 != 0 {
+                eprintln!("[tp-agree] head round-1 exchange_all_peers rc={rc1} abort_status={:#018x} device_epoch={} gpu_ready={} rx_done={} — fanning round 2 anyway",
+                          net_abort_status(ctx), net_device_epoch(ctx), net_gpu_ready(ctx), net_rx_done(ctx));
+                round1_failed = true;
+            } else {
+                for r in 1..world {
+                    let slot = net_ctrl_recv_hptr(ctx, r) as *const u64;
+                    let peer_val = std::ptr::read_unaligned(slot);
+                    let peer_sx = std::ptr::read_unaligned(slot.add(1));
+                    let peer_epoch = std::ptr::read_unaligned(slot.add(2));
+                    if peer_epoch != epoch {
+                        eprintln!("[tp-agree] EPOCH-PROBE: rank {r} device epoch {peer_epoch} != head {epoch} (delta {})",
+                                  peer_epoch as i64 - epoch as i64);
+                    }
+                    if diag && peer_sx != my_sx {
+                        eprintln!("[tp-agree] DIAG-SCHED: rank {r} send-ring XOR {peer_sx:#018x} != head {my_sx:#018x} — barrier SCHEDULE diverged (not a content race)");
+                        diag_sched_ok = false;
+                    }
+                    if peer_val != val {
+                        eprintln!("[tp-agree] head MISMATCH: rank {r} val {peer_val:#018x} != head {val:#018x} (hash {peer_val:08x} vs {val:08x})");
+                        all_equal = false;
+                    }
                 }
             }
             // R9 DIAGNOSTIC: on the FIRST mismatch, freeze and localize. Every rank dumps its own
@@ -470,13 +472,11 @@ pub fn agree_ext(step: u64, accept_count: u8, k_verify: u8, hash: u32) -> Option
                                         else { (0u64, STATUS_MISMATCH) };
             std::ptr::write_unaligned(send, out_val);
             std::ptr::write_unaligned(send.add(1), out_status);
-            for r in 1..world {
-                let rc = net_exchange_one(ctx, r, AGREE_NBYTES as c_int);
-                if rc != 0 {
-                    eprintln!("[tp-agree] head round-2 exchange_one({r}) rc={rc} abort_status={:#018x} device_epoch={} gpu_ready={} rx_done={}",
-                              net_abort_status(ctx), net_device_epoch(ctx), net_gpu_ready(ctx), net_rx_done(ctx));
-                    round1_failed = true;
-                }
+            let rc2 = net_exchange_all_peers(ctx, AGREE_NBYTES as c_int, 0);
+            if rc2 != 0 {
+                eprintln!("[tp-agree] head round-2 exchange_all_peers rc={rc2} abort_status={:#018x} device_epoch={} gpu_ready={} rx_done={}",
+                          net_abort_status(ctx), net_device_epoch(ctx), net_gpu_ready(ctx), net_rx_done(ctx));
+                round1_failed = true;
             }
             if round1_failed || !all_equal { return None; }
             Some(agree_token_reply(val))
@@ -788,7 +788,7 @@ impl TpLink {
     /// reduces only: XPORT_MIN_BYTES). World 4 only (the shim ignores the request elsewhere, which is refused here).
     pub fn connect_nway_uniform(rank: i32, world: i32, peer_ips: &[IpAddr], tcp_port: u16, dev: &str,
                                 gid_idx: i32, slot_bytes: usize) -> anyhow::Result<Self> {
-        anyhow::ensure!(world == 4, "the single-stage reduce ctx is world 4 only (got {world})");
+        anyhow::ensure!((3..=8).contains(&world), "the single-stage reduce ctx requires world in 3..=8 (got {world})");
         unsafe { net_set_oneshot_uniform_once(1) };
         let r = Self::connect_nway(rank, world, peer_ips, tcp_port, dev, gid_idx, slot_bytes);
         unsafe { net_set_oneshot_uniform_once(0) };     // never leak the request past this bring-up

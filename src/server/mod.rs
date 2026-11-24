@@ -267,6 +267,9 @@ pub async fn http_listen(port: u16) -> tokio::net::TcpListener {
         Ok(line) => { if crate::boot_report::debug() { println!("{line}"); } },
         Err(e) => fatal_option(&e),
     }
+    // KVPOOL (veloGB10 #43): an asked-for --kv-pool that does not run here (a TP rank, or a model the pool does not
+    // back) is one notice line and a /metrics gauge, never a refusal (AGENTS 1b-bis(8)).
+    crate::kv_vmm::bind_notice();
     let addr = match http_bind_addr(port) {
         Ok(a) => a,
         Err(e) => { eprintln!("error: {e}"); crate::logq::flush_and_exit(std::time::Duration::from_millis(300), 2); } // H7

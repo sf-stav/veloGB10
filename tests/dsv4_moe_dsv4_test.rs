@@ -469,6 +469,7 @@ fn dsv4_swiglu_clamp_unit() {
 
 #[test]
 fn dsv4_moe_pipeline_real_weights() {
+    if !bundle().exists() { return; } // lab-model-bundle gate
     let _g = gate();
     let dev = CudaDevice::new(0).expect("CUDA device 0");
     let (bk, df) = load_modules(&dev);
@@ -697,6 +698,7 @@ fn dispatch(
 
 #[test]
 fn dsv4_moe_streaming_bitwise_vs_original() {
+    if !bundle().exists() { return; } // lab-model-bundle gate
     let _g = gate();
     let dev = CudaDevice::new(0).expect("CUDA device 0");
     let (bk, df) = load_modules(&dev);
@@ -753,6 +755,7 @@ fn dsv4_moe_streaming_bitwise_vs_original() {
 /// the two serving shapes (N=1 decode dispatch; N=6 verify-width grouped dispatch).
 #[test]
 fn dsv4_moe_streaming_bench() {
+    if !bundle().exists() { return; } // lab-model-bundle gate
     let _g = gate();
     let dev = CudaDevice::new(0).expect("CUDA device 0");
     let (bk, df) = load_modules(&dev);

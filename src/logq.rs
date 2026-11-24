@@ -21,7 +21,7 @@
 //! Ordering caveat (accepted, documented): lines routed through the queue can interleave
 //! differently with DIRECT prints from other threads. Lines among themselves keep FIFO order.
 
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError, Receiver};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -32,6 +32,221 @@ pub const CAP: usize = 4096;
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static QUEUED: AtomicIsize = AtomicIsize::new(0);
 static TX: OnceLock<SyncSender<Line>> = OnceLock::new();
+
+/// ANSI color policy (`--color auto|always|never`, default `auto` = TTY-gated, zero env vars per §7).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum ColorMode { Auto = 0, Always = 1, Never = 2 }
+
+static COLOR_MODE: AtomicU8 = AtomicU8::new(ColorMode::Auto as u8);
+
+pub fn set_color_mode(m: ColorMode) { COLOR_MODE.store(m as u8, Ordering::Relaxed); }
+
+pub fn color_mode() -> ColorMode {
+    match COLOR_MODE.load(Ordering::Relaxed) {
+        1 => ColorMode::Always,
+        2 => ColorMode::Never,
+        _ => ColorMode::Auto,
+    }
+}
+
+fn parse_color_mode(v: &str) -> ColorMode {
+    match v.trim() {
+        "always" | "on" => ColorMode::Always,
+        "never" | "off" => ColorMode::Never,
+        _ => ColorMode::Auto,
+    }
+}
+
+/// Early scan of argv before `opts::parse_cli` so line 1 (banner) already honors `--color`.
+pub fn set_color_from_args(args: &[String]) {
+    if let Some(v) = crate::arg_value(args, "--color") {
+        set_color_mode(parse_color_mode(v));
+    }
+}
+
+/// Refresh `--color` from the parsed options store (also called on TP nodes after `install_head`).
+pub fn refresh_color_from_opts() {
+    if let Ok(v) = crate::opts::var(crate::opt!("color")) {
+        set_color_mode(parse_color_mode(&v));
+    }
+}
+
+/// Whether ANSI color should be emitted on stderr (`err = true`) or stdout (`err = false`).
+pub fn color_enabled(err: bool) -> bool {
+    match color_mode() {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => unsafe { libc::isatty(if err { 2 } else { 1 }) != 0 },
+    }
+}
+
+/// Current local wall-clock datetime (`YYYY-MM-DD HH:MM:SS`) placed after each message's `[tag]`.
+pub fn now_datetime() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Split a leading `[tag]` (e.g. `[boot]`, `[req]`, `[exl3-serve]`, `[dsv41]`) from the rest of the line.
+/// Rejects brackets containing spaces, commas, or non-tag payloads like `[1, 2, 3]`.
+pub fn split_bracket_tag(line: &str) -> Option<(&str, &str)> {
+    let bytes = line.as_bytes();
+    if bytes.first().copied() != Some(b'[') { return None; }
+    let limit = bytes.len().min(32);
+    let close = bytes[1..limit].iter().position(|&b| b == b']')? + 1;
+    if close <= 1 { return None; }
+    if !bytes[1..close].iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/')) {
+        return None;
+    }
+    let tag = &line[..=close];
+    let rest = &line[close + 1..];
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    Some((tag, rest))
+}
+
+fn ansi(code: &str, s: &str) -> String { format!("\x1b[{code}m{s}\x1b[0m") }
+
+fn is_error_body(rest: &str) -> bool {
+    rest.starts_with("error:") || rest.starts_with("ERROR") || rest.starts_with("FATAL")
+        || rest.starts_with("ABORT") || rest.contains(" failed after ") || rest.contains(" FAILED")
+}
+
+fn is_warn_body(rest: &str) -> bool {
+    rest.starts_with("warn:") || rest.starts_with("WARNING") || rest.starts_with("WARN ")
+}
+
+fn style_req_body(rest: &str) -> String {
+    if rest.starts_with("400 ") || rest.starts_with("500 ") || rest.starts_with("503 ") {
+        return ansi("33", rest);
+    }
+    let mut out = String::with_capacity(rest.len() + 32);
+    for (idx, tok) in rest.split(' ').enumerate() {
+        if idx > 0 { out.push(' '); }
+        if tok.ends_with("tok/s") || tok.ends_with("tok/s)") {
+            out.push_str(&ansi("1;32", tok));
+        } else if let Some(v) = tok.strip_prefix("ttft=") {
+            out.push_str(&ansi("2", "ttft="));
+            out.push_str(&ansi("36", v));
+        } else if let Some(v) = tok.strip_prefix("cached=") {
+            out.push_str(&ansi("2", "cached="));
+            if v != "0" { out.push_str(&ansi("32", v)); } else { out.push_str(v); }
+        } else if let Some((k, v)) = tok.split_once('=') {
+            out.push_str(&ansi("2", &format!("{k}=")));
+            out.push_str(v);
+        } else {
+            out.push_str(tok);
+        }
+    }
+    out
+}
+
+fn style_boot_body(rest: &str) -> String {
+    if let Some(after) = rest.strip_prefix("stage ") {
+        if let Some(done_idx) = after.find(" done ") {
+            let name = &after[..done_idx];
+            let tail = &after[done_idx + 1..];
+            return format!("stage {} {}", ansi("1", name), ansi("32", tail));
+        }
+        if let Some(name) = after.strip_suffix(" begin") {
+            return format!("stage {} {}", ansi("1", name), ansi("2", "begin"));
+        }
+    }
+    // Progress lines: `<what>:  45% (...)` or `100% (...)`
+    if let Some(pct_idx) = rest.find('%') {
+        if pct_idx >= 1 && rest[..pct_idx].ends_with(|c: char| c.is_ascii_digit()) {
+            let num_start = rest[..pct_idx].rfind(|c: char| !c.is_ascii_digit() && c != ' ').map_or(0, |i| i + 1);
+            let pct_slice = &rest[num_start..=pct_idx];
+            let code = if pct_slice.trim() == "100%" { "1;32" } else { "1;36" };
+            return format!("{}{}{}", &rest[..num_start], ansi(code, pct_slice), &rest[pct_idx + 1..]);
+        }
+    }
+    rest.to_string()
+}
+
+fn style_serving_line(first: &str) -> String {
+    let mut out = String::with_capacity(first.len() + 64);
+    for (idx, tok) in first.split(' ').enumerate() {
+        if idx > 0 { out.push(' '); }
+        if idx == 0 && tok == "SERVING" {
+            out.push_str(&ansi("1;32", "SERVING"));
+        } else if let Some((k, v)) = tok.split_once('=') {
+            out.push_str(&ansi("2", &format!("{k}=")));
+            match k {
+                "model" | "url" => out.push_str(&ansi("1;36", v)),
+                "boot" => out.push_str(&ansi("32", v)),
+                "tp" | "family" => out.push_str(&ansi("1", v)),
+                _ => out.push_str(v),
+            }
+        } else {
+            out.push_str(tok);
+        }
+    }
+    out
+}
+
+/// Pure formatter: inserts `ts` right after a leading `[tag]` and (when `color` is true) applies
+/// ANSI colors by severity and subsystem. Leaves untagged lines unchanged in plain mode.
+pub fn format_log_line(line: &str, ts: &str, color: bool) -> String {
+    let (first, tail) = match line.split_once('\n') {
+        Some((f, t)) => (f, Some(t)),
+        None => (line, None),
+    };
+    let head = if let Some((tag, rest)) = split_bracket_tag(first) {
+        if !color {
+            if rest.is_empty() { format!("{tag} {ts}") } else { format!("{tag} {ts} {rest}") }
+        } else {
+            let ts_styled = ansi("2", ts);
+            let (tag_code, body) = if is_error_body(rest) {
+                if let Some(after) = rest.strip_prefix("error:") {
+                    ("1;31", format!("{}{}", ansi("1;31", "error:"), ansi("31", after)))
+                } else {
+                    ("1;31", ansi("31", rest))
+                }
+            } else if is_warn_body(rest) {
+                if let Some(after) = rest.strip_prefix("warn:") {
+                    ("1;33", format!("{}{}", ansi("1;33", "warn:"), ansi("33", after)))
+                } else {
+                    ("1;33", ansi("33", rest))
+                }
+            } else if let Some(after) = rest.strip_prefix("notice:") {
+                ("1;33", format!("{}{}", ansi("33", "notice:"), after))
+            } else if tag == "[req]" {
+                let code = if rest.starts_with("400 ") || rest.starts_with("500 ") || rest.starts_with("503 ") { "1;33" } else { "1;32" };
+                (code, style_req_body(rest))
+            } else if tag == "[boot]" {
+                ("1;36", style_boot_body(rest))
+            } else if matches!(tag, "[tp]" | "[exl3-tp]" | "[head]" | "[node]" | "[net_shim]") {
+                ("1;35", rest.to_string())
+            } else if matches!(tag, "[thermal]" | "[gpu-wait]" | "[kv-spill]" | "[kv-vmm]" | "[opts]" | "[logq]") {
+                ("1;33", rest.to_string())
+            } else {
+                ("1;36", rest.to_string())
+            };
+            let tag_styled = ansi(tag_code, tag);
+            if body.is_empty() {
+                format!("{tag_styled} {ts_styled}")
+            } else {
+                format!("{tag_styled} {ts_styled} {body}")
+            }
+        }
+    } else if !color {
+        first.to_string()
+    } else if first.starts_with("SERVING ") {
+        style_serving_line(first)
+    } else if first.starts_with("FATAL:") {
+        ansi("1;31", first)
+    } else {
+        first.to_string()
+    };
+    match tail {
+        Some(t) => format!("{head}\n{t}"),
+        None => head,
+    }
+}
+
+/// Format a log line for stdout (`err = false`) or stderr (`err = true`) with local datetime + policy-gated ANSI color.
+pub fn format_for_stream(err: bool, text: &str) -> String {
+    format_log_line(text, &now_datetime(), color_enabled(err))
+}
 
 /// One routed log line. `err` = it was an `eprintln!` (stderr) rather than `println!` (stdout),
 /// so the writer emits to the same stream the original line went to (text unchanged).
@@ -59,7 +274,8 @@ pub fn try_line(tx: &SyncSender<Line>, dropped: &AtomicU64, err: bool, text: Str
         // Writer thread is gone (it only dies at process exit): fall back to a direct write so
         // the line is still not LOST — the stall risk returns only in that impossible window.
         Err(TrySendError::Disconnected(l)) => {
-            if l.err { eprintln!("{}", l.text); } else { println!("{}", l.text); }
+            let formatted = format_for_stream(l.err, &l.text);
+            if l.err { eprintln!("{formatted}"); } else { println!("{formatted}"); }
         }
     }
 }
@@ -71,12 +287,13 @@ pub fn try_line(tx: &SyncSender<Line>, dropped: &AtomicU64, err: bool, text: Str
 /// record. Same output bytes as println!/eprintln! (stdout is line-buffered; stderr raw).
 pub fn emit_line(l: &Line) {
     use std::io::Write;
+    let formatted = format_for_stream(l.err, &l.text);
     if l.err {
         let mut h = std::io::stderr().lock();
-        let _ = h.write_all(l.text.as_bytes()).and_then(|_| h.write_all(b"\n"));
+        let _ = h.write_all(formatted.as_bytes()).and_then(|_| h.write_all(b"\n"));
     } else {
         let mut h = std::io::stdout().lock();
-        let _ = h.write_all(l.text.as_bytes()).and_then(|_| h.write_all(b"\n"));
+        let _ = h.write_all(formatted.as_bytes()).and_then(|_| h.write_all(b"\n"));
     }
     QUEUED.fetch_sub(1, Ordering::Relaxed);
 }
@@ -92,7 +309,11 @@ fn sender() -> &'static SyncSender<Line> {
                     &DROPPED,
                     &emit_line,
                     &|n: u64| eprintln!(
-                        "[logq] recovered: {n} log lines were dropped while the log reader was stalled (velogb10_log_lines_dropped_total)"
+                        "{}",
+                        format_for_stream(
+                            true,
+                            &format!("[logq] warn: recovered: {n} log lines were dropped while the log reader was stalled (velogb10_log_lines_dropped_total)")
+                        )
                     ),
                 )
             })
@@ -239,6 +460,41 @@ mod tests {
         let got = seen.lock().unwrap().clone();
         assert_eq!(got, vec!["l0", "l1", "l2", "l3"], "FIFO order preserved for queued lines");
         assert_eq!(*reports.lock().unwrap(), vec![3u64], "one summary report of the exact count");
+    }
+
+    #[test]
+    fn format_log_line_inserts_datetime_after_tag_and_styles_with_ansi() {
+        let ts = "2026-11-24 20:28:35";
+        // Plain mode: datetime goes right after [tag], zero ANSI escapes
+        assert_eq!(
+            format_log_line("[boot] stage weights begin", ts, false),
+            "[boot] 2026-11-24 20:28:35 stage weights begin"
+        );
+        assert_eq!(
+            format_log_line("[exl3-serve] slot=0 ok", ts, false),
+            "[exl3-serve] 2026-11-24 20:28:35 slot=0 ok"
+        );
+        // Untagged lines stay untouched in plain mode (SERVING, arrays like [1, 2])
+        assert_eq!(format_log_line("SERVING family=dsv4 model=x", ts, false), "SERVING family=dsv4 model=x");
+        assert_eq!(format_log_line("[1, 2, 3]", ts, false), "[1, 2, 3]");
+        // Multi-line preserves continuation lines untouched
+        assert_eq!(
+            format_log_line("[boot] warn: line 1\n  line 2", ts, false),
+            "[boot] 2026-11-24 20:28:35 warn: line 1\n  line 2"
+        );
+        // Color mode: ANSI codes applied, datetime dimmed, tags & severities colored
+        let err = format_log_line("[boot] error: bad path", ts, true);
+        assert!(err.contains("\x1b[1;31m[boot]\x1b[0m \x1b[2m2026-11-24 20:28:35\x1b[0m"));
+        assert!(err.contains("\x1b[1;31merror:\x1b[0m"));
+        let done = format_log_line("[boot] stage weights done 3.2s", ts, true);
+        assert!(done.contains("\x1b[1;36m[boot]\x1b[0m \x1b[2m2026-11-24 20:28:35\x1b[0m"));
+        assert!(done.contains("\x1b[32mdone 3.2s\x1b[0m"));
+        let req = format_log_line("[req] prompt=100 cached=50 gen=20 ttft=42ms 87.6tok/s", ts, true);
+        assert!(req.contains("\x1b[1;32m[req]\x1b[0m \x1b[2m2026-11-24 20:28:35\x1b[0m"));
+        assert!(req.contains("\x1b[1;32m87.6tok/s\x1b[0m"));
+        let srv = format_log_line("SERVING family=dsv4 model=DSV4 url=http://0.0.0.0:9000 boot=61.0s", ts, true);
+        assert!(srv.starts_with("\x1b[1;32mSERVING\x1b[0m "));
+        assert!(srv.contains("\x1b[1;36mDSV4\x1b[0m"));
     }
 }
 
@@ -392,6 +648,7 @@ mod h5_direct_print_baseline_tests {
             ("src/bin/dsv4_convert.rs", 3),
             ("src/bin/dsv4_replay.rs", 10),
             ("src/bin/dsv4_stage_debug.rs", 2),
+            ("src/bin/chat_template_dump.rs", 4), // INKLING2 T1: a dev tool (chat-template dump), not a served path (conscious update)
             ("src/bin/vision_cross.rs", 6),
             // S-B9-REL-VISIONFIX: a new dev tool (GPU tower embedding hashes, gate 2), and two more
             // lines of the CPU-tower tool (forward time, embedding hash). Dev tools, not served paths.
@@ -404,9 +661,9 @@ mod h5_direct_print_baseline_tests {
             // OUT2 (2026-10-16): boot_report.rs = 2 — the dprintln!/deprintln! macro bodies
             // (direct println!/eprintln! behind the --log-level debug check; zero direct prints at normal).
             // SPLIT1 cluster.rs (57) -> per-file rows; the sum is 58 because pack_manifest_tests.rs (a moved test module, no cfg(test) wrapper in its own file) is counted raw (+1 print that sat inside the stripped module)
-            ("src/cluster/head.rs", 19), // NAIVE: +1, the one-time `[head] Naive drafter manifest` boot line (ISSUES 98 drafter shipping)
+            ("src/cluster/head.rs", 21), // VELO-FABRIC: +2 one-time boot deprintln! lines for RoCEv2 bulk RDMA active/fallback during weight sync. NAIVE: +1, the one-time `[head] Naive drafter manifest` boot line (ISSUES 98 drafter shipping)
             ("src/cluster/models.rs", 13),
-            ("src/cluster/node.rs", 12),
+            ("src/cluster/node.rs", 15), // VELO-FABRIC: +2 one-time boot deprintln! lines for RoCEv2 bulk RDMA active/fallback during weight sync. LS2: +1, the one-time `[node] N Engram head file(s) already staged` line at node boot (sync phase, once per session; the other node boot lines are direct too)
             ("src/cluster/mod.rs", 9),
             ("src/cluster/discovery.rs", 4),
             ("src/cluster/pack_manifest_tests.rs", 1),
@@ -424,6 +681,31 @@ mod h5_direct_print_baseline_tests {
             ("src/dsv4_graph.rs", 5),
             // SPLIT1: src/dsv4_model.rs split into src/dsv4_model/*.rs; the 13 prints are spread over the rows below.
             ("src/dsv4_model/forward.rs", 6),
+            // DSV41 INT1 (2026-11-18), conscious baseline rows for the merged I0 / ENGa / ENGb / ENC files (none is a served path):
+            ("src/dsv41/engram/pack.rs", 2), // ENGb --dsv41-engram-pack: per-head result line + "pack done" line (offline CLI tool, no GPU, no model load)
+            ("src/dsv41/engram/verify.rs", 4), // ENGb --dsv41-engram-verify: SKIP / sha256 / sampled-rows / PASS-FAIL verdict lines (offline CLI tool)
+            ("src/dsv41/engram/iobench.rs", 8), // ENGb --dsv41-engram-iobench: the markdown result table the benchmark exists to print (offline CLI tool)
+            ("src/dsv41/engram/golden_tests.rs", 8), // ENGa: a whole #[cfg(test)] file (declared `#[cfg(test)] mod golden_tests;`, so the counter sees no wrapper): test SKIP / receipt eprintln!s
+            ("src/dsv41/chat/tests.rs", 4), // ENC: a whole #[cfg(test)] file: test SKIP / NOTE / receipt eprintln!s
+            ("src/dsv41/cli.rs", 26), // DSV41 I0: the --dsv41-* / --probe-dsv41-* tool entry points (result lines and FAIL lines); no served path. 22 -> 26: the KN1 fp8, KN2 mxfp4, KC kv, KE and KI indexer probe-result print loops (+4 net of lines the merges folded together)
+            ("src/dsv41/weights/exl3/probe.rs", 2), // KE --probe-dsv41-kernel --dsv41-kernel-set trellis|plain: the result lines and DSV41_KE_OK (probe, no served path)
+            ("src/dsv41/serve/tests.rs", 1), // SV: whole #[cfg(test)] file: the SKIP eprintln! when the lab fixture is absent
+            ("src/dsv41/serve/engine.rs", 2), // SV: the FATAL banner when the lane loop panics + (SE) the one-line error when the forward's idle call fails; error/FATAL lines stay direct by the logq policy (the 503 state follows)
+            ("src/dsv41/gpu/mix_tests.rs", 15), // KM: whole #[cfg(test)] file: receipt lines of the GPU-vs-f64 mixer tests
+            ("src/dsv41/gpu/pp1_tests.rs", 3), // DSV41 PP1: whole #[cfg(test)] file: the GPU bit-identity / timing receipt lines
+            ("src/dsv41/gpu/pa1_tests.rs", 3), // PA1: whole #[cfg(test)] file: receipt lines of the GPU bit-identity tests
+            ("src/dsv41/engram/io_probe.rs", 22), // EIO --probe-dsv41-engram-io: the result / latency tables the probe exists to print (probe, no served path)
+            ("src/dsv41/load/cli.rs", 6), // LS --dsv41-shard-plan / --dsv41-ship tools: plan markdown, DSV41_SHARD_PLAN_OK, rank summary, sync + DSV41_SHIP_OK (offline tools). 5 -> 6: LS2 --dsv41-stage (the DSV41_STAGE_OK result line; offline tool)
+            ("src/dsv41/serve/mod.rs", 4), // VELO-FABRIC: +1 one-time boot dprintln! loop printing metrics::boot_receipt_lines() before serving. (SE2: +1 = the one-shot boot line describing --tool-scrub when it is off, dprintln!, before any request) (SE: +1 = the fatal "dsv41 http server stopped" line before exit(1), direct by the FATAL policy) LS2: the one-shot boot line `memory fit: ...` (dprintln!, once at serve boot, before any request; the cap notice itself goes through boot_report::notice)
+            ("src/dsv41/cpu/attn.rs", 2), // OA --probe-dsv41-oracle --dsv41-oracle-part attn: the per-layer result lines and DSV41_ORACLE_ATTN_OK (offline oracle tool, no served path)
+            ("src/dsv41/cpu/dspark.rs", 9), // OD --dsv41-oracle-part dspark: the header, per-step trace, markdown result table and DSV41_ORACLE_DSPARK_OK (offline oracle tool; the test-module eprintln!s are not counted)
+            ("src/dsv41/ced/mod.rs", 1), // DSV41 CE --probe-dsv41-ced: `say` prints each gate line as it is produced and keeps it (probe-only; no served path)
+            ("src/dsv41/gpu/dspark/gate.rs", 3), // DSV41 DS --probe-dsv41-dspark: `say`, the per-fixture result lines and the sampler real-rows line (probe-only; no served path)
+            ("src/dsv41/tp/serve.rs", 2), // SE: the FATAL banner when a TP op fails on the head (ranks can no longer be trusted; the server answers 503); FATAL stays direct by the logq policy. MEM1: +1 dprintln! (the per-rank memory ledger breakdown at boot, --log-level debug only)
+            ("src/dsv41/tp/launch.rs", 17), // DSV41 TPC/TP --probe-dsv41-tp smoke + model-program head/node launch: boot receipts, per-line program output and DSV41_TP_MODEL_OK/FAIL (probe-only). 13 -> 17 (SE): serve_head / serve_node boot receipts (the [head] pack and node-sync lines, the [node] rank receipt, once at boot; the per-round lines are the callback's, not counted)
+            ("src/dsv41/weights/exl3/q1_oracle.rs", 10), // DSV41 Q1 --probe-dsv41-q1: per-class result lines and DSV41_Q1_ORACLE_OK (offline decode oracle, no served path)
+            ("src/dsv41/weights/partials_probe.rs", 1), // DSV41 PK3 partials probe: `say` prints each result line as it is produced and keeps it (probe-only; no served path)
+            ("src/dsv41/fwd/mod.rs", 1), // DSV41 SL --probe-dsv41-slice-model: the gate's result lines, printed as they are produced (probe-only; no served path)
             ("src/dsv4_model/load.rs", 7),
             ("src/engine.rs", 1),
             ("src/exl3.rs", 20), // K35 (2026-10-31): master already read 20 vs this row's 18 (drifted, never re-pinned); K35 adds no direct print here: re-pinned consciously // was 18 // P7 B1: the honest load-time width-refusal line (+1)
@@ -586,6 +868,24 @@ mod h5_direct_print_baseline_tests {
             ("src/gpu/verify.rs", 4),
             ("src/gpu/w4a4.rs", 5),
             ("src/gpu/xchain.rs", 12),
+            ("src/inkling2/actq/probe.rs", 16), // INKLING2 Q1: --probe-inkling2-actq report lines (probe class)
+            ("src/inkling2/chat/tests.rs", 2), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/cpu.rs", 9), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/gpu/k1_probe.rs", 10), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/gpu/probe.rs", 12), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/model/mod.rs", 1), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/model/probe.rs", 17), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/model/probe_s7.rs", 12), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/model/serve.rs", 1), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/mtp/gpu.rs", 1), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/mtp/probe.rs", 17), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/pack.rs", 12), // INKLING2: --probe-inkling2-pack census lines (probe class)
+            ("src/inkling2/serve/http.rs", 1), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/serve/tests.rs", 1), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/tok.rs", 10), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/tp/launch.rs", 3), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/tp/sim.rs", 10), // INKLING2 (conscious update): probe / boot / fatal-exit lines of the new family
+            ("src/inkling2/vision/probe.rs", 16), // INKLING2 S5: --probe-inkling2-vision report lines (probe class)
             ("src/json_schema/mod.rs", 1),
             ("src/kernels.rs", 3),
             ("src/logq.rs", 3),
@@ -676,7 +976,7 @@ mod h5_direct_print_baseline_tests {
             // help lines above); re-pinned to the count of the MERGED tree (1547 + 33 + 15 = 1595, counted with this
             // module's counter on the merged main.rs before the build). The row below is OPERATIVE (find() takes the
             // first); naive-n05's original row is kept verbatim after it for the port's line-identity check.
-            ("src/main.rs", 142), // NIGHT1 (2026-11-17): 1644 -> 1645, the FAIL-path eprintln of the --probe-gpu-wait dispatch (probe-only). V0710 port (2026-11-14): 1644 counted by this test on the merged tree (master 1637 + the fork's probe-only FAIL-path eprintlns). SELFUPD: 1632 -> 1637 (--update/--no-update-check help + notices). Fork history: ULTRA merge of lanewide-tp (2026-11-13): 1623 -> 1624, LANEWIDE-EXACT the FAIL-path eprintln of --probe-lane-wide-pin (probe-only). ULTRA merge (2026-11-13): PACKPF +1 and LANEWIDE-MID / XCLASS +2 (the FAIL-path eprintlns of --probe-mid-gemm and --probe-lane-wide-xclass, probe-only) = 1623. PACKPF (2026-11-13): 1620 -> 1621, the FAIL-path eprintln of --probe-exl3-packpf (probe-only). LANEWIDE-DRES (2026-11-12): 1619 -> 1620, the FAIL-path eprintln of --probe-dense-resident (probe-only). LANEWIDE (2026-11-12): 1618 -> 1619, the FAIL-path eprintln of the --probe-lane-wide-cost dispatch (probe-only). COPYPF1 (2026-11-12): 1617 -> 1618, the FAIL-path eprintln of the --probe-copy-prefill dispatch (probe-only; the tree already read 1617 at cb891dbe, drift not re-pinned then: re-pinned consciously). BASICS (2026-11-02): 1607 -> 1616, the --version print, the help's version line (+1: the old first line split in two), the --version help entry and six --quantize recipe-example help lines (one-time banner/help class; conscious update). PR#27-D3 (2026-10-30): +4 - 3 help lines + the FAIL-path eprintln in the probe dispatch (probe-only) // TOPKM1 hygiene (2026-10-28): 1595 -> 1603, the --quantize recipe help text (b612145e: +9/-1 println! in the usage printer; conscious update). Earlier: OPERATIVE at the port merge: 1547 + 33 (naive) + 15 (master) = 1595 on the merged tree. (A second, stale `src/main.rs` row of 1580 sat below this one; `find` takes the first row, so it never applied — removed.)
+            ("src/main.rs", 156), // INKLING2 (2026-11-22): 143 -> 156, the --probe-inkling2-* dispatches' FAIL-path / result lines (probe-only; conscious update). DSV41 INT1: 142 -> 143, the FAIL-path eprintln of the --dsv41-engram-pack/-verify/-iobench dispatch (ENGb; CLI tool, no served path; conscious update). NIGHT1 (2026-11-17): 1644 -> 1645, the FAIL-path eprintln of the --probe-gpu-wait dispatch (probe-only). V0710 port (2026-11-14): 1644 counted by this test on the merged tree (master 1637 + the fork's probe-only FAIL-path eprintlns). SELFUPD: 1632 -> 1637 (--update/--no-update-check help + notices). Fork history: ULTRA merge of lanewide-tp (2026-11-13): 1623 -> 1624, LANEWIDE-EXACT the FAIL-path eprintln of --probe-lane-wide-pin (probe-only). ULTRA merge (2026-11-13): PACKPF +1 and LANEWIDE-MID / XCLASS +2 (the FAIL-path eprintlns of --probe-mid-gemm and --probe-lane-wide-xclass, probe-only) = 1623. PACKPF (2026-11-13): 1620 -> 1621, the FAIL-path eprintln of --probe-exl3-packpf (probe-only). LANEWIDE-DRES (2026-11-12): 1619 -> 1620, the FAIL-path eprintln of --probe-dense-resident (probe-only). LANEWIDE (2026-11-12): 1618 -> 1619, the FAIL-path eprintln of the --probe-lane-wide-cost dispatch (probe-only). COPYPF1 (2026-11-12): 1617 -> 1618, the FAIL-path eprintln of the --probe-copy-prefill dispatch (probe-only; the tree already read 1617 at cb891dbe, drift not re-pinned then: re-pinned consciously). BASICS (2026-11-02): 1607 -> 1616, the --version print, the help's version line (+1: the old first line split in two), the --version help entry and six --quantize recipe-example help lines (one-time banner/help class; conscious update). PR#27-D3 (2026-10-30): +4 - 3 help lines + the FAIL-path eprintln in the probe dispatch (probe-only) // TOPKM1 hygiene (2026-10-28): 1595 -> 1603, the --quantize recipe help text (b612145e: +9/-1 println! in the usage printer; conscious update). Earlier: OPERATIVE at the port merge: 1547 + 33 (naive) + 15 (master) = 1595 on the merged tree. (A second, stale `src/main.rs` row of 1580 sat below this one; `find` takes the first row, so it never applied — removed.)
             // SPLIT1 main: the old row "src/main.rs" (1645 outside cfg(test)) is split per file below (main.rs keeps `fn main`, the 142 above; the rest moved to src/cli/*, sum unchanged). The row comments here and below are the history of the whole former file.
             ("src/cli/args.rs", 21),
             ("src/cli/bench_basic.rs", 78),
@@ -698,7 +998,7 @@ mod h5_direct_print_baseline_tests {
             ("src/cli/replay.rs", 19),
             ("src/cli/serve.rs", 54),
             ("src/cli/stq.rs", 19),
-            ("src/cli/tp_cluster.rs", 50),
+            ("src/cli/tp_cluster.rs", 52), // INKLING2 TP2: +1 the node-side `inkling2 node` fatal line (exit path, like dsv41 above); // DSV41 TPC: the node-side `node dsv41 tp error` line (eprintln! then exit(1)) in the dsv41 node branch: a fatal path that stays direct by the logq policy
             ("src/cli/tp_heads.rs", 55),
             ("src/cli/tp_serve_trunk.rs", 30),
         ("src/self_update.rs", 23), // SELFUPD: updater is an offline-exit path (no serving), direct prints intended

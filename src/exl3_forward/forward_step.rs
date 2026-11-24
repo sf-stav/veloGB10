@@ -67,6 +67,10 @@ impl FwdModel {
     pub fn forward_step(&self, sc: &mut Scratch, toks: &[i32], pos_host: &[usize], slots: &[usize],
                         mut ladder: Option<&mut LadderCtx>) -> Result<Vec<i32>> {
         let m = toks.len();
+        if self.vmm.is_some() { // KVPOOL
+            let lanes: Vec<(usize, usize)> = slots.iter().zip(pos_host.iter()).map(|(s, p)| (*s, *p + 1)).collect();
+            self.vmm_ensure_group(&lanes)?;
+        }
         let l = Launcher { dev: &self.dev, stream: &self.stream };
         let cfg = &self.tc; // TP-B: the trunk's per-rank geometry
         let h = cfg.hidden_size;

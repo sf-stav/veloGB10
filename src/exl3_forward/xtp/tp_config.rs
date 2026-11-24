@@ -385,9 +385,17 @@ pub(super) fn tp_reduce_refusal(single: bool, world: i32, dec_xport: u8) -> Resu
 
 /// TP-4F2: the single-stage ctx's TCP base at `world` 4, verified disjoint from rail 1 (TP_PORT) and rail 2's
 /// N-way base so no handshake can mis-pair; a future change of any rail layout fails loudly here.
+/// Port-block stride per N-way link at `world > 2`: multiple of 10 clearing `2 + world^2` pair ports
+/// (world 4: 20 -> rail2 +20, single +40, dual-single +60; world 8: 70 -> rail2 +70, single +140, dual-single +210).
+fn nway_port_stride(world: i32) -> u32 {
+    let w = world as u32;
+    (2 + w * w).div_ceil(10) * 10
+}
+
 pub fn single_nway_base(world: i32) -> Result<u16> {
     let (b1, b2) = (crate::tp::TP_PORT, rail2_nway_base(world)?);
-    let b3 = b1 as u32 + TP_SINGLE_PORT_OFF as u32;
+    let off = if world == 4 { TP_SINGLE_PORT_OFF as u32 } else { 2 * nway_port_stride(world) };
+    let b3 = b1 as u32 + off;
     anyhow::ensure!(b3 + 2 + (world * world) as u32 <= u16::MAX as u32, "single-stage base port {b3} at world {world} is beyond 65535");
     let b3 = b3 as u16;
     let p3 = rail_ports(b3, world);
@@ -397,6 +405,21 @@ pub fn single_nway_base(world: i32) -> Result<u16> {
         }
     }
     Ok(b3)
+}
+
+/// Phase 2 / TP=8: rail-2 single-stage twin base port at `world > 2` (+60 at world 4, +210 at world 8),
+/// verified disjoint from rail-1 primary, rail-2 primary, and rail-1 single-stage port blocks.
+pub fn dual_single_nway_base(world: i32) -> Result<u16> {
+    let b1 = crate::tp::TP_PORT;
+    let b2 = rail2_nway_base(world)?;
+    let b3 = single_nway_base(world)?;
+    let b4 = b1 as u32 + 3 * nway_port_stride(world);
+    anyhow::ensure!(b4 + 2 + (world * world) as u32 <= u16::MAX as u32, "dual single-stage base port {b4} at world {world} is beyond 65535");
+    let b4 = b4 as u16;
+    for other in [b1, b2, b3] {
+        check_rail_ports(world, other, b4)?;
+    }
+    Ok(b4)
 }
 
 pub(super) fn rail2_dev() -> String {

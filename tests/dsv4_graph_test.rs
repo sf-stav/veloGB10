@@ -30,6 +30,10 @@ fn argmax(x: &[f32]) -> usize {
 #[test]
 fn graph_decode_matches_eager_bitwise() {
     let _g = gate();
+    if !Path::new(BUNDLE).join("inference/config.json").exists() {
+        // lab-model-bundle gate: skipped where the DSV4 bundle is absent (dev box)
+        return;
+    }
     // BOTH arms see the flag: the SEQ-arm idxs capacity allocs must match (size-only).
     // CLI-1: the options registry (no env); set before any GPU work.
     gb10_inference::opts::test_set(gb10_inference::opt!("graph"), Some("1"));

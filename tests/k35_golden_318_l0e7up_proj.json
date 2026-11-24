@@ -1,0 +1,19 @@
+{
+ "base": "model.language_model.layers.0.mlp.experts.7.up_proj",
+ "pack": "Qwen3.8-Flash-Next-EXL3-3.18bpw",
+ "K": 3.5,
+ "k2": 7,
+ "kb": 160,
+ "nb": 40,
+ "k": 2560,
+ "n": 640,
+ "n_trellis": 358400,
+ "n_inner": 1638400,
+ "n_suh": 2560,
+ "n_svh": 640,
+ "layout": "u16 LE: trellis[kb][nb][8*k2], inner_f16_bits[k][n], suh_f16_bits[k], svh_f16_bits[n]",
+ "sha256_u16le": "cf008f563ca702b27e1e397ba2e584cf7e6d7ba676be15cd9fc2eb135f14eb31",
+ "reference": "exllamav3 1.6.3 wheel (py3-none-any, exllamav3_ext JIT-built with nvcc 13.0 on this box), LinearEXL3.get_inner_weight_tensor() = ext.reconstruct (the wheel's own CUDA decode)",
+ "inner_nonzero": 1638400,
+ "inner_nan": 0
+}

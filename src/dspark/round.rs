@@ -500,7 +500,7 @@ impl DsparkRound {
                     anyhow::bail!("dspark sync staging D2D failed: {r:?}");
                 }
             }
-            self.dev.synchronize()?;
+            self.dsync()?;
         }
         Ok(())
     }
@@ -648,7 +648,7 @@ impl DsparkRound {
                  d(&wrow_dev), self.ring_stride as i32, NUM_KV_HEADS as i32, HEAD_DIM as i32,
                  n as i32, d(&slot_dev)));
         }
-        self.dev.synchronize()?;
+        self.dsync()?;
         self.nprev = pos_start + n;
         Ok(())
     }
@@ -686,12 +686,23 @@ impl DsparkRound {
                  d(&self.wrow_c), self.ring_stride as i32, NUM_KV_HEADS as i32, HEAD_DIM as i32,
                  m as i32, d(&self.slot_c)));
         }
-        self.dev.synchronize()?;
+        self.dsync()?;
         self.nprev = n0 + m;
         Ok(())
     }
 
     // ---- the draft round -----------------------------------------------------
+
+    /// NIGHT1 follow-up (PR #47): the DSpark twin of `FwdModel::dsync` — wait for this round's stream through
+    /// `host_wait` (`--gpu-wait`), THEN the original device synchronize, unchanged. The round's kernels run on
+    /// `self.stream`, so the driver call that follows only waits for whatever is still queued elsewhere. A stream
+    /// error is reported by the first wait instead of by the synchronize. `#[track_caller]`: each call site keeps
+    /// its own prediction.
+    #[track_caller]
+    pub(crate) fn dsync(&self) -> std::result::Result<(), cudarc::driver::DriverError> {
+        crate::host_wait::stream_wait(self.stream.stream)?;
+        self.dev.synchronize()
+    }
 
     /// Refresh the block position arrays for the current nprev (call before each round).
     /// F8/P3: the per-step scalars (anchor, nprev, c_ring, block-pos shift) go to the
@@ -985,7 +996,7 @@ impl DsparkRound {
         let t1 = std::time::Instant::now();
         self.draft_round_kernels(anchor)?;
         let t2 = std::time::Instant::now();
-        self.dev.synchronize()?;
+        self.dsync()?;
         let t3 = std::time::Instant::now();
         let toks: Vec<u32> = self.dev.dtoh_sync_copy(&self.walk_tokens)?.to_vec();
         let t4 = std::time::Instant::now();

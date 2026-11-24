@@ -360,6 +360,7 @@ impl Exl3Scheduler {
                                     continue;
                                 }
                                 self.admit_scoped(req, &allowed, kind);
+                                if let Some(r) = self.vmm_wait.take() { waiting.insert(waiting_index.min(waiting.len()), r); break; } // KVPOOL
                                 crate::metrics::lane_reserve_waiting(waiting.len() as u64);
                             }
                         }
@@ -400,6 +401,8 @@ impl Exl3Scheduler {
                     continue;
                 }
                 self.admit(req);
+                // KVPOOL: the shared pool was full; run a decode round first, then admit it again
+                if let Some(r) = self.vmm_wait.take() { waiting.push_front(r); break; }
             }
             if !waiting.is_empty() {
                 waiting.retain(|r| !r.tx.is_closed());

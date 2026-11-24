@@ -31,8 +31,8 @@ NetCtx* net_init(int rank, int world, const char* const* peer_ips, int n_peers,
         return NULL;
     }
     if (TP_SIGNAL_EVERY > TP_RING_SLOTS) { LOGE("I4 violated: S=%d > R=%d", TP_SIGNAL_EVERY, TP_RING_SLOTS); return NULL; }
-    if (world < 2 || world > TP_NWAY_MAX_WORLD || (world & (world - 1)) != 0) {
-        LOGE("world %d must be a power of two in [2,%d]", world, TP_NWAY_MAX_WORLD);
+    if (world < 2 || world > TP_NWAY_MAX_WORLD) {
+        LOGE("world %d must be in [2,%d]", world, TP_NWAY_MAX_WORLD);
         return NULL;
     }
     if (n_peers != world - 1 || !peer_ips) {
@@ -175,8 +175,13 @@ static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, cons
     struct ibv_qp_init_attr qia; memset(&qia,0,sizeof(qia));
     qia.send_cq=c->cq_send; qia.recv_cq=c->cq_startup; qia.qp_type=IBV_QPT_RC;
     qia.cap.max_send_wr=256; qia.cap.max_recv_wr=256; qia.cap.max_send_sge=1; qia.cap.max_recv_sge=1;
-    qia.cap.max_inline_data=64;            // I1: the 8 B epoch must fit inline
-    c->qp = ibv_create_qp(c->pd,&qia);
+    // Phase 1C: request 512 B inline (BlueFlame zero-DMA-read on tiny head/Markov/agree frames), fall back to 256/64.
+    const unsigned inl_try[3] = { 512u, 256u, 64u };
+    for (int t = 0; t < 3 && !c->qp; t++) {
+        qia.cap.max_inline_data = inl_try[t];
+        c->qp = ibv_create_qp(c->pd, &qia);
+        if (c->qp) c->max_inline = qia.cap.max_inline_data ? qia.cap.max_inline_data : inl_try[t];
+    }
     if (!c->qp){ LOGE("create_qp"); return NULL; }
 
     struct ibv_qp_attr a; memset(&a,0,sizeof(a));
@@ -235,15 +240,14 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
     NetCtx* c = (NetCtx*)calloc(1, sizeof(NetCtx));
     c->port_num = 1; c->gid_idx = gid_idx; c->rank = rank; c->rng = 0x9E3779B9u ^ (unsigned)rank;
     c->payload_bytes = (unsigned)payload_bytes;
-    c->world = world; c->rounds = 0; while ((1 << c->rounds) < world) c->rounds++;
-    // P3-1 one-shot push (--tp-oneshot, world==4 only, DEFAULT OFF): the nway recv region
-    // holds `world` SENDER-indexed rings instead of `rounds` per-round rings (world(4) > rounds(2)
-    // at world==4, so the region grows 2 slots — same allocation class). The option is the ONLY
-    // selector; every rank resolves the same value at init (the head's option rides TpConfig to the
-    // node before the link comes up; a mismatch aborts at the first barrier, loud by construction).
-    c->oneshot_uniform = (world == 4 && g_oneshot_uniform_once) ? 1 : 0;   // TP-4F2: a dedicated uniform ctx
-    g_oneshot_uniform_once = 0;                                              // consumed: never leaks to the next init
-    c->oneshot = (world == 4 && (g_opt_oneshot || c->oneshot_uniform)) ? 1u : 0u;
+    const int pow2 = (world & (world - 1)) == 0;
+    c->world = world; c->rounds = 0;
+    if (pow2) { while ((1 << c->rounds) < world) c->rounds++; }
+    // P3-1 / Velo-Fabric arbitrary-W (TP3/TP6): non-power-of-two worlds have no XOR doubling tree
+    // (rounds = 0) and always run in uniform all-peers one-shot / all-to-all mode.
+    c->oneshot_uniform = ((world >= 3 && g_oneshot_uniform_once) || (!pow2 && world > 2)) ? 1 : 0;
+    g_oneshot_uniform_once = 0;                                                            // consumed: never leaks to the next init
+    c->oneshot = ((world == 4 && g_opt_oneshot) || c->oneshot_uniform) ? 1u : 0u;
     if (c->oneshot_uniform) LOGE("TP-4F2 SINGLE-STAGE REDUCE CTX (world=%d): uniform one-shot all-peers push, "
                                  "sender-indexed recv rings, proxy releases all peers together", world);
     else if (c->oneshot) LOGE("P3-1 ONE-SHOT PUSH ACTIVE (world=%d): sender-indexed recv rings, "
@@ -356,6 +360,20 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
     if (get_valid_roce_gid(c->ctx, c->port_num, &gid_idx, &mygid) != 0){ LOGE("query_gid"); return NULL; }
     c->gid_idx = gid_idx;   // PR #15: record the index actually bound (the Rust-resolved one, unchanged here)
 
+    // Phase 1C: for oneshot_uniform (100% proxy-owned, no control-plane traffic on its QPs),
+    // allocate a lock-free IBV_THREAD_DOMAIN parent domain so ibv_wr_* posts skip per-QP spinlocks.
+    if (c->oneshot_uniform) {
+        struct ibv_td_init_attr tda; memset(&tda, 0, sizeof(tda));
+        c->td = ibv_alloc_td(c->ctx, &tda);
+        if (c->td) {
+            struct ibv_parent_domain_init_attr pda; memset(&pda, 0, sizeof(pda));
+            pda.pd = c->pd; pda.td = c->td;
+            c->td_pd = ibv_alloc_parent_domain(c->ctx, &pda);
+            if (!c->td_pd) { ibv_dealloc_td(c->td); c->td = NULL; }
+        }
+    }
+    struct ibv_pd* qp_pd = c->td_pd ? c->td_pd : c->pd;
+
     // One QP per peer. The lower rank listens, the higher connects (deterministic, matches tcp_exchange).
     for (int p = 0; p < world; p++) {
         if (p == rank) continue;
@@ -363,11 +381,38 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
         const char* pip = peer_ips[p];
         if (!pip || !pip[0]) { LOGE("rank %d: peer_ips[%d] empty", rank, p); return NULL; }
 
-        struct ibv_qp_init_attr qia; memset(&qia,0,sizeof(qia));
-        qia.send_cq=c->cq_send; qia.recv_cq=c->cq_startup; qia.qp_type=IBV_QPT_RC;
-        qia.cap.max_send_wr=256; qia.cap.max_recv_wr=256; qia.cap.max_send_sge=1; qia.cap.max_recv_sge=1;
-        qia.cap.max_inline_data=64;
-        pl->qp = ibv_create_qp(c->pd, &qia);
+        const unsigned inl_try[3] = { 512u, 256u, 64u };
+        if (c->oneshot_uniform) {
+            for (int t = 0; t < 3 && !pl->qp; t++) {
+                struct ibv_qp_init_attr_ex qex; memset(&qex, 0, sizeof(qex));
+                qex.send_cq = c->cq_send; qex.recv_cq = c->cq_startup; qex.qp_type = IBV_QPT_RC;
+                qex.cap.max_send_wr = 256; qex.cap.max_recv_wr = 256;
+                qex.cap.max_send_sge = 1; qex.cap.max_recv_sge = 1;
+                qex.cap.max_inline_data = inl_try[t];
+                qex.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
+                qex.pd = qp_pd;
+                qex.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE;
+                pl->qp = ibv_create_qp_ex(c->ctx, &qex);
+                if (pl->qp) {
+                    pl->qpx = ibv_qp_to_qp_ex(pl->qp);
+                    unsigned mi = qex.cap.max_inline_data ? qex.cap.max_inline_data : inl_try[t];
+                    if (c->max_inline == 0 || mi < c->max_inline) c->max_inline = mi;
+                }
+            }
+        }
+        if (!pl->qp) {
+            struct ibv_qp_init_attr qia; memset(&qia,0,sizeof(qia));
+            qia.send_cq=c->cq_send; qia.recv_cq=c->cq_startup; qia.qp_type=IBV_QPT_RC;
+            qia.cap.max_send_wr=256; qia.cap.max_recv_wr=256; qia.cap.max_send_sge=1; qia.cap.max_recv_sge=1;
+            for (int t = 0; t < 3 && !pl->qp; t++) {
+                qia.cap.max_inline_data = inl_try[t];
+                pl->qp = ibv_create_qp(c->pd, &qia);
+                if (pl->qp) {
+                    unsigned mi = qia.cap.max_inline_data ? qia.cap.max_inline_data : inl_try[t];
+                    if (c->max_inline == 0 || mi < c->max_inline) c->max_inline = mi;
+                }
+            }
+        }
         if (!pl->qp){ LOGE("create_qp(peer %d)", p); return NULL; }
 
         struct ibv_qp_attr a; memset(&a,0,sizeof(a));

@@ -38,6 +38,10 @@ fn argmax(row: &[f32]) -> usize {
 #[test]
 fn dspark_fp8_logits_quality_and_graph_bitwise() {
     let _g = gate();
+    if !Path::new(BUNDLE).join("inference/config.json").exists() {
+        // lab-model-bundle gate: skipped where the DSV4 bundle is absent (dev box)
+        return;
+    }
     // CLI-1: the options registry (no env); set before any GPU work.
     gb10_inference::opts::test_set(gb10_inference::opt!("dspark-fp8-logits"), Some("1"));
     gb10_inference::opts::test_set(gb10_inference::opt!("dspark-graph"), Some("1"));

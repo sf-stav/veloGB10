@@ -48,6 +48,7 @@ pub fn refresh_from_opts() {
         Err(_) => Level::Normal,
     };
     set_level(lvl);
+    crate::logq::refresh_color_from_opts();
     let _ = T0.get_or_init(Instant::now);
 }
 
@@ -206,13 +207,13 @@ pub fn notice(msg: &str) { crate::logq::send(true, notice_str(msg)); }
 /// Print to stdout only under `--log-level debug` (OUT2 re-leveling).
 #[macro_export]
 macro_rules! dprintln {
-    ($($arg:tt)*) => { if $crate::boot_report::debug() { println!($($arg)*) } };
+    ($($arg:tt)*) => { if $crate::boot_report::debug() { println!("{}", $crate::logq::format_for_stream(false, &format!($($arg)*))) } };
 }
 
 /// Print to stderr only under `--log-level debug`.
 #[macro_export]
 macro_rules! deprintln {
-    ($($arg:tt)*) => { if $crate::boot_report::debug() { eprintln!($($arg)*) } };
+    ($($arg:tt)*) => { if $crate::boot_report::debug() { eprintln!("{}", $crate::logq::format_for_stream(true, &format!($($arg)*))) } };
 }
 
 /// logq-routed stdout, debug-only (per-request technical lines keep the LR-1 routing).

@@ -776,6 +776,11 @@ impl Exl3Scheduler {
         // step-go's agree. The token's accept byte / width bits cannot name a 511-token stretch, so they carry 0 and
         // the stretch rides the words hash in full (a divergence fails the hash, never aliases). TP=1: no call.
         if self.tp.is_some() {
+            self.model.tp_drain_before_exchange()?;
+            if let Some(t) = self.tp.as_mut() {
+                // issue #45: may follow step_go's AGREE_GO (or an earlier round's fence B) with no collective in between
+                t.rendezvous("copy-prefill-pre")?;
+            }
             let mut w: Vec<u32> = vec![0xC9F0_0001, nn as u32, rung as u32, b as u32, p as u32, tap_row as u32];
             w.extend(offered.iter().map(|&x| x as u32));
             self.tp_round("copy-prefill-pre", 0, 0, &w, 0.0, 0.0, false, false)?;

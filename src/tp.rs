@@ -915,6 +915,10 @@ pub enum TpBranch {
     Exl3Xtp,
     /// NAIVE S5: the Naive-N0.5 TP program (fork naive-n05).
     Naive,
+    /// DSV4.1 (leg TPC): the DeepSeek-V4.1 TP programs (`dsv41::tp`).
+    Dsv41,
+    /// Inkling-2 (leg S-INK2-TP2): the Inkling-2 TP serve program (`inkling2::tp`).
+    Inkling2,
 }
 
 impl TpBranch {
@@ -933,6 +937,8 @@ impl TpBranch {
             TpBranch::StateTp => 0x71,
             TpBranch::Exl3Xtp => 0x80,
             TpBranch::Naive => 0x90,
+            TpBranch::Dsv41 => 0xA0,
+            TpBranch::Inkling2 => 0xB0,
         }
     }
 }
@@ -1032,7 +1038,7 @@ mod rail_detect_tests {
     use super::{detect_rdma_rails, RailPick};
     use std::path::PathBuf;
 
-    const V4: &str = "0000:0000:0000:0000:0000:ffff:c0a8:b110";
+    const V4: &str = "0000:0000:0000:0000:0000:ffff:c000:0210";
     const ZERO: &str = "0000:0000:0000:0000:0000:0000:0000:0000";
 
     /// devs: (name, pci address, active, has an IPv4 RoCE v2 GID)

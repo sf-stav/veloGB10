@@ -223,6 +223,10 @@ impl FwdModel {
         let per_s = cfg.lin_num_v_heads * cfg.lin_k_dim * cfg.lin_v_dim;
         let l = Launcher { dev: &self.dev, stream: &self.stream };
         let grid = |n: usize| (((n + 255) / 256) as u32, 1, 1);
+        // KVPOOL: a reset lane's position rows are dead (every caller prefills from row 0 next, write-before-read):
+        // hand their pages back to the pool before anything below touches the lane.
+        let lazy = self.vmm_lazy();
+        if lazy { self.vmm_truncate(slot, 0)?; }
         for cs in &self.conv_state {
             let n = per_conv as i64;
             xqlaunch!(l, "xq_memset_f32", grid(per_conv), (256, 1, 1), 0,
@@ -239,7 +243,20 @@ impl FwdModel {
         // losslessness — verify rejects — but they drift acceptance round to round).
         if let Some(head) = &self.mtp {
             let per = (head.kv.len() / self.width / 4) as i64; // f32 words (row bytes are % 16)
-            if !skip_head_kv {
+            if lazy {
+                // KVPOOL: only the mapped rows of each K|V segment exist — zero (or poison) those; rows mapped later
+                // are written before they are read (the PFX1 (b) invariant above) or zero/poisoned by the next reset.
+                if !skip_head_kv || pfx1_headkv_poison() {
+                    let rows = self.vmm_rows_mapped(slot).min(self.max_pos);
+                    let hrb = kv_rowbytes(self.kv_fmt, self.cfg.head_dim);
+                    let val = if skip_head_kv { 0x7FC0i32 } else { 0i32 };
+                    for (at, bytes) in spill_row_regions(*head.kv.device_ptr() as u64, head.kv.len(), self.width, slot,
+                                                         self.max_pos, hrb, rows)? {
+                        let n = (bytes / 2) as i64;
+                        xqlaunch!(l, "xq_memset_u16", grid(n as usize), (256, 1, 1), 0, (at, n, val))?;
+                    }
+                }
+            } else if !skip_head_kv {
                 xqlaunch!(l, "xq_memset_f32", grid(per as usize), (256, 1, 1), 0,
                           (&head.kv, (slot as i64) * per, per))?;
             } else if pfx1_headkv_poison() {
@@ -410,6 +427,145 @@ impl FwdModel {
         Ok(())
     }
 
+    // ---------------------------------------------------------- KVPOOL (fork): on-demand position rows
+    /// True when the position planes are VMM-backed and mapped on demand.
+    pub fn vmm_lazy(&self) -> bool {
+        self.vmm.as_ref().map_or(false, |v| v.lock().unwrap().mode() == crate::kv_vmm::Mode::Lazy)
+    }
+    /// KVPOOL: lane `slot` is about to touch position rows `< rows` (written or read). Maps what is missing, with
+    /// `VMM_MARGIN_ROWS` ahead (a round's draft chain, the dense-v3 last-tile prefetch and the pooled-key block all
+    /// reach a little past the lane's position). The fast path is one atomic load. Err = the pool is exhausted
+    /// (nothing unmapped; the caller frees a lane or fails the request).
+    pub fn vmm_ensure(&self, slot: usize, rows: usize) -> Result<()> {
+        let Some(v) = self.vmm.as_ref() else { return Ok(()) };
+        use std::sync::atomic::Ordering::Relaxed;
+        anyhow::ensure!(slot < self.width, "kv-vmm: slot {slot} >= width {}", self.width);
+        let want = crate::kv_vmm::rows_grid(rows + VMM_MARGIN_ROWS, self.max_pos);
+        if want <= self.vmm_rows[slot].load(Relaxed) { return Ok(()); }
+        let mut g = v.lock().unwrap();
+        if g.mode() == crate::kv_vmm::Mode::Full { self.vmm_rows[slot].store(self.max_pos, Relaxed); return Ok(()); }
+        self.dev.bind_to_thread()?;
+        let planes = self.pool_planes(slot)?;
+        for &(at, rb, div, cap) in &planes {
+            // pooled planes: one block of read-ahead, clamped to the lane's kernel extent (pool_planes IS the kernel geometry)
+            if let Err(e) = g.ensure(at, plane_units(want, div, cap) * rb) {
+                // pool exhausted part-way: give back what this call mapped, so the lane is exactly as before (its
+                // counters still describe it; eviction and vmm_truncate see every page it holds)
+                let (r, p) = (self.vmm_rows[slot].load(Relaxed), self.vmm_pool_rows[slot].load(Relaxed));
+                vmm_rollback(&mut g, &planes, r, r.max(p));
+                return Err(e);
+            }
+        }
+        self.vmm_rows[slot].store(want, Relaxed);
+        self.vmm_pool_rows[slot].fetch_max(want, Relaxed);
+        Ok(())
+    }
+    /// KVPOOL: the lanes of one multi-lane launch reach position rows `< rows` between them. The mixed-row pooled
+    /// scorer (`qsa_score_pooled_mr`, gpu_batch.cu) prefetches the FIRST row's lane out to the group's largest block
+    /// count before its per-row guard, and the plain step orders short lanes first: a short lane's pooled-key planes
+    /// must be mapped out to the longest lane of the launch. Pooled keys only (64 B a row on Flash-Next: 64 MiB a lane
+    /// at a 1M window) — never the KV or raw-key planes.
+    pub fn vmm_ensure_pooled(&self, slot: usize, rows: usize) -> Result<()> {
+        let Some(v) = self.vmm.as_ref() else { return Ok(()) };
+        use std::sync::atomic::Ordering::Relaxed;
+        anyhow::ensure!(slot < self.width, "kv-vmm: slot {slot} >= width {}", self.width);
+        let want = crate::kv_vmm::rows_grid(rows + VMM_MARGIN_ROWS, self.max_pos);
+        if want <= self.vmm_pool_rows[slot].load(Relaxed) { return Ok(()); }
+        let mut g = v.lock().unwrap();
+        if g.mode() == crate::kv_vmm::Mode::Full { self.vmm_pool_rows[slot].store(self.max_pos, Relaxed); return Ok(()); }
+        self.dev.bind_to_thread()?;
+        let planes = self.pool_planes(slot)?;
+        for &(at, rb, div, cap) in &planes {
+            if div <= 1 { continue; }
+            if let Err(e) = g.ensure(at, (want.div_ceil(div) + 1).min(cap) * rb) {
+                let (r, p) = (self.vmm_rows[slot].load(Relaxed), self.vmm_pool_rows[slot].load(Relaxed));
+                vmm_rollback(&mut g, &planes, r, r.max(p));
+                return Err(e);
+            }
+        }
+        self.vmm_pool_rows[slot].store(want, Relaxed);
+        Ok(())
+    }
+    /// KVPOOL: `vmm_ensure` for every lane of one launch at its own position + the pooled-key planes of all of them
+    /// out to the longest (see `vmm_ensure_pooled`). `lanes` = (slot, next position).
+    pub fn vmm_ensure_group(&self, lanes: &[(usize, usize)]) -> Result<()> {
+        if self.vmm.is_none() { return Ok(()); }
+        let top = lanes.iter().map(|l| l.1).max().unwrap_or(0);
+        for &(s, p) in lanes {
+            self.vmm_ensure(s, p)?;
+            if lanes.len() > 1 { self.vmm_ensure_pooled(s, top)?; }
+        }
+        Ok(())
+    }
+    /// KVPOOL: lane `slot` no longer needs rows `>= keep` (0 = the lane is empty): return their pages to the pool.
+    /// `VMM_FLOOR_ROWS` stay mapped on every lane (boot probes, diagnostics and the prime cross-checks touch the first
+    /// rows of a lane without a request). Synchronizes the device first: no queued kernel may still read those rows.
+    pub fn vmm_truncate(&self, slot: usize, keep: usize) -> Result<()> {
+        let Some(v) = self.vmm.as_ref() else { return Ok(()) };
+        use std::sync::atomic::Ordering::Relaxed;
+        let keep = crate::kv_vmm::rows_grid(keep.max(VMM_FLOOR_ROWS) + VMM_MARGIN_ROWS, self.max_pos);
+        if keep >= self.vmm_rows[slot].load(Relaxed) && keep >= self.vmm_pool_rows[slot].load(Relaxed) { return Ok(()); }
+        let mut g = v.lock().unwrap();
+        if g.mode() == crate::kv_vmm::Mode::Full { return Ok(()); }
+        self.dev.bind_to_thread()?;
+        self.dev.synchronize()?;
+        unsafe { cudarc::driver::result::stream::synchronize(self.stream.stream)?; }
+        // Publish the reduced counts BEFORE the first unmap: if an unmap fails part-way, the next ensure must not
+        // take its fast path over rows that are already gone (pages still mapped are simply skipped by it).
+        self.vmm_rows[slot].store(keep, Relaxed);
+        self.vmm_pool_rows[slot].store(keep, Relaxed);
+        for (at, rb, div, cap) in self.pool_planes(slot)? {
+            // pooled planes keep the partial-group block too (see vmm_ensure); `cap` is the lane's kernel extent
+            let k = plane_units(keep, div, cap);
+            g.drop_range(at + (k * rb) as u64, (cap - k) * rb)?;
+        }
+        Ok(())
+    }
+    /// TPPOOL (design v3 step 4): how many pool pages `vmm_ensure(slot, rows)` would map right now. Dry run over the
+    /// same planes, grid and unit math as the real call (`plane_units`), counted as the union the real call's sequence
+    /// of `ensure`s maps. 0 = the fast path (or no lazy pool). Changes nothing.
+    pub fn vmm_pages_needed(&self, slot: usize, rows: usize) -> Result<usize> {
+        let Some(v) = self.vmm.as_ref() else { return Ok(0) };
+        use std::sync::atomic::Ordering::Relaxed;
+        anyhow::ensure!(slot < self.width, "kv-vmm: slot {slot} >= width {}", self.width);
+        let want = crate::kv_vmm::rows_grid(rows + VMM_MARGIN_ROWS, self.max_pos);
+        if want <= self.vmm_rows[slot].load(Relaxed) { return Ok(0); }
+        let g = v.lock().unwrap();
+        if g.mode() == crate::kv_vmm::Mode::Full { return Ok(0); }
+        let ranges: Vec<(u64, usize)> = self.pool_planes(slot)?.into_iter()
+            .map(|(at, rb, div, cap)| (at, plane_units(want, div, cap) * rb)).collect();
+        g.pages_needed_union(&ranges)
+    }
+    /// TPPOOL (design v3 step 4): how many pool pages `vmm_truncate(slot, keep)` would return right now (only pages
+    /// wholly inside each dropped range, as `drop_range` frees them; a lane at its floor frees 0). Changes nothing.
+    pub fn vmm_pages_freed(&self, slot: usize, keep: usize) -> Result<usize> {
+        let Some(v) = self.vmm.as_ref() else { return Ok(0) };
+        use std::sync::atomic::Ordering::Relaxed;
+        let keep = crate::kv_vmm::rows_grid(keep.max(VMM_FLOOR_ROWS) + VMM_MARGIN_ROWS, self.max_pos);
+        if keep >= self.vmm_rows[slot].load(Relaxed) && keep >= self.vmm_pool_rows[slot].load(Relaxed) { return Ok(0); }
+        let g = v.lock().unwrap();
+        if g.mode() == crate::kv_vmm::Mode::Full { return Ok(0); }
+        let mut n = 0;
+        for (at, rb, div, cap) in self.pool_planes(slot)? {
+            let k = plane_units(keep, div, cap);
+            n += g.pages_freed(at + (k * rb) as u64, (cap - k) * rb)?;
+        }
+        Ok(n)
+    }
+    /// TPPOOL (design v3 step 4): unmapped pages left in the lazy pool (None = no lazy pool).
+    pub fn vmm_free_pages(&self) -> Option<usize> {
+        let g = self.vmm.as_ref()?.lock().unwrap();
+        (g.mode() == crate::kv_vmm::Mode::Lazy).then(|| g.free_pages())
+    }
+    /// KVPOOL: (pool bytes, mapped bytes, reserved bytes) — None when the pool is off.
+    pub fn vmm_stats(&self) -> Option<(usize, usize, usize)> {
+        self.vmm.as_ref().map(|v| { let g = v.lock().unwrap(); (g.pool_bytes(), g.mapped_bytes(), g.reserved_bytes()) })
+    }
+    /// KVPOOL: rows of `slot` currently mapped.
+    pub fn vmm_rows_mapped(&self, slot: usize) -> usize {
+        self.vmm_rows.get(slot).map_or(0, |a| a.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// PFXPOOL2: the positional planes of `slot`, in `spill_regions` order: (address of the slot's unit 0, bytes per
     /// unit, rows per unit, units in the plane). A unit is a row, or a pooled QSA block of `indexer_compress_ratio` rows.
     fn pool_planes(&self, slot: usize) -> Result<Vec<(u64, usize, usize, usize)>> {
@@ -479,6 +635,7 @@ impl FwdModel {
     /// (laid out by `pool_capture_rows`). a and e0 are on the row grid; e0 <= a <= b <= e1. Compute stream, no sync.
     pub fn pool_restore_rows_part(&self, slot: usize, a: usize, b: usize, e0: usize, e1: usize, src: u64) -> Result<()> {
         anyhow::ensure!(e0 <= a && a <= b && b <= e1, "pool: rows {a}..{b} outside the entry's {e0}..{e1}");
+        self.vmm_ensure(slot, b)?; // KVPOOL
         let mut off = 0u64;
         for (at, rb, div, cap) in self.pool_planes(slot)? {
             let (eu0, eu1) = Self::pool_units(e0, e1, div, cap);
@@ -500,14 +657,24 @@ impl FwdModel {
     /// LANERES2 (`--kv-spill`): serialize slot's prefix snapshot into `out` (GB10SPIL, payload version SPILL_PAYLOAD_VERSION):
     /// 8B magic, u32 version, u64 tokens, u64 region count, u64 payload bytes, the raw regions
     /// in spill_regions order, then the 2 host PLE ring ids. Bit-exact by construction: every
-    /// region is a memcpy of the exact device words the serving path reads. TEXT-ONLY: the
-    /// per-slot VIS rope rows are not spilled — an image-slot restore re-prefills (counted on
-    /// /metrics); agent traces are text. D2H runs on the NULL stream through a reused pinned
+    /// region is a memcpy of the exact device words the serving path reads. IMAGE PROMPTS INCLUDED (PFXPOOL4
+    /// note, 2026-11-22 — the old "TEXT-ONLY" claim was never enforced and is wrong about the engine): the
+    /// per-slot VIS rope rows are NOT part of any cache payload because they are per-REQUEST state — admit arms
+    /// them (vision_setup) for the full incoming prompt before any restore, and RoPE rotation is baked into the
+    /// K rows at write, so the row slab ports unchanged between lanes. D2H runs on the NULL stream through a reused pinned
     /// staging chunk (the PinnedHost pattern, WP05): the compute stream is synchronized first
     /// so the planes' writers retire, then chunked copies run (~5 GB/s on .13, ~0.1 s per
     /// 0.5-GiB snapshot). Evictions are rare and the admission round is dominated by the next
     /// conversation's prefill; the DISK write is the async part (kv_spill::Store writer thread).
-    pub fn spill_capture(&self, slot: usize, tokens: usize, out: &mut Vec<u8>) -> Result<()> {
+    /// SPILLTRUNC: `ck_c` + `cks` (ascending (position, prefix_key, checkpoint)) are the lane's WP16 checkpoints
+    /// for THIS conversation (Wp16::ckpts_under + kv_spill::prefix_keys); they ride the file in the section the
+    /// payload format gained at version 6, so a later prompt that is a TRUNCATED prefix of `tokens` can resume at
+    /// a carried boundary (spill_trunc_restore) instead of eating a full re-prefill — the checkpoint bytes are a
+    /// few tens of MB against GiB of rows, and they are D2H-copied through the same pinned staging as regions.
+    /// Returns `fixed`: the file bytes that do NOT scale with rows (both headers + the state planes + hist + the
+    /// checkpoint section) — kv_spill::Policy::trunc_read prices a truncated restore with it.
+    pub fn spill_capture(&self, slot: usize, tokens: usize, out: &mut Vec<u8>, ck_c: u32,
+                         cks: &[(u64, u64, &RecurCkpt)]) -> Result<u64> {
         let snap = self.snap.as_ref().context("prefix snapshots not allocated")?;
         anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
         let regions = self.spill_regions(slot, tokens)?;
@@ -523,7 +690,8 @@ impl FwdModel {
         // path is rare + dominated by the next prefill.
         self.dsync()?;
         const CHUNK: usize = 64 << 20;
-        let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(16)))?;
+        let ck_b = cks.first().map_or(self.ckpt_layout().bytes(), |(_, _, c)| c.spill_bytes());
+        let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(ck_b).max(16)))?;
         for (src, bytes) in &regions {
             let mut left = *bytes;
             let mut at = *src;
@@ -536,7 +704,7 @@ impl FwdModel {
                 left -= n;
             }
         }
-        // the inner body header the restore parses (magic, ver=1, tokens, nreg, total):
+        // the inner body header the restore parses (magic, ver, tokens, nreg, total):
         out[36..44].copy_from_slice(b"GB10SPIL");
         out[44..48].copy_from_slice(&SPILL_PAYLOAD_VERSION.to_le_bytes());
         out[48..56].copy_from_slice(&(tokens as u64).to_le_bytes());
@@ -545,7 +713,39 @@ impl FwdModel {
         let h = snap.hist.lock().unwrap();
         out.extend_from_slice(&h[slot * 2].to_le_bytes());
         out.extend_from_slice(&h[slot * 2 + 1].to_le_bytes());
-        Ok(())
+        // SPILLTRUNC section: trailer, table, then the checkpoint words (table order). The grid `ck_c` records
+        // the chunk width they were taken at: Wp16::resume_point only honors a checkpoint store built at THIS
+        // run's width, so a capture from a foreign grid is stored honestly and simply never offered (lookup_at).
+        let nck = cks.len() as u64;
+        let snap_bytes: u64 = {
+            let k = self.pool_n_snap()?;
+            regions[regions.len().saturating_sub(k)..].iter().map(|(_, b)| *b as u64).sum()
+        };
+        let fixed: u64 = 36 + 36 + snap_bytes + 8 + crate::kv_spill::CK_TRAILER_BYTES
+            + nck * (crate::kv_spill::CK_TABLE_ENTRY_BYTES + ck_b as u64); // leading 36 = the outer kv header
+        out.extend_from_slice(&(cks.len() as u32).to_le_bytes());
+        out.extend_from_slice(&ck_c.to_le_bytes());
+        out.extend_from_slice(&fixed.to_le_bytes());
+        for (pos, key, ck) in cks {
+            out.extend_from_slice(&pos.to_le_bytes());
+            out.extend_from_slice(&key.to_le_bytes());
+            out.extend_from_slice(&ck.hist()[0].to_le_bytes());
+            out.extend_from_slice(&ck.hist()[1].to_le_bytes());
+        }
+        for (_, _, ck) in cks {
+            let (at0, bytes) = ck.spill_span();
+            let mut left = bytes;
+            let mut at = at0;
+            while left > 0 {
+                let n = left.min(CHUNK);
+                pin.dtoh(0, at, n)?;
+                self.dsync()?;
+                out.extend_from_slice(pin.as_bytes(0, n));
+                at += n as u64;
+                left -= n;
+            }
+        }
+        Ok(fixed)
     }
 
     /// LANERES2: restore a spill_capture payload into `slot`. The position planes go to the
@@ -573,7 +773,14 @@ impl FwdModel {
         let tokens = u64::from_le_bytes(bytes[12..20].try_into()?) as usize;
         let nreg = u64::from_le_bytes(bytes[20..28].try_into()?) as usize;
         let total = u64::from_le_bytes(bytes[28..36].try_into()?) as usize;
-        anyhow::ensure!(bytes.len() == 36 + total + 8, "spill: payload length mismatch");
+        // SPILLTRUNC: the v6 checkpoint section after the hist tail must match THIS model's checkpoint size
+        anyhow::ensure!((total as u64).saturating_add(36 + 8 + 16) <= bytes.len() as u64,
+                        "spill: missing checkpoint-section trailer");
+        let nck = u32::from_le_bytes(bytes[36 + total + 8..36 + total + 12].try_into()?) as usize;
+        anyhow::ensure!(bytes.len() as u64
+            == 36u64 + total as u64 + 8 + 16
+            + (nck as u64) * (crate::kv_spill::CK_TABLE_ENTRY_BYTES + self.ckpt_bytes()),
+                        "spill: payload length mismatch");
         anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
         let regions = self.spill_regions(slot, tokens)?;
         anyhow::ensure!(regions.len() == nreg, "spill: region count {} != {nreg}", regions.len());
@@ -586,6 +793,7 @@ impl FwdModel {
         // payload = Store::get's payload: the capture body (its own 36B header: MAGIC, ver,
         // tokens, nreg, total), then the regions, then the 8B hist tail.
         let tokens = self.spill_restore_check(slot, payload)?;
+        self.vmm_ensure(slot, spill_rows(tokens, if self.cfg.has_indexer() { self.cfg.indexer_compress_ratio } else { 1 }, self.max_pos))?; // KVPOOL
         let bytes = payload;
         let total = u64::from_le_bytes(bytes[28..36].try_into()?) as usize;
         self.dsync()?;
@@ -613,6 +821,106 @@ impl FwdModel {
         h[slot * 2] = h0;
         h[slot * 2 + 1] = h1;
         Ok(tokens)
+    }
+
+    /// SPILLTRUNC: restore a snapshot DEEPER than the incoming prompt at the deepest carried checkpoint
+    /// `q <= want`. Payload bytes arrive through `read` (payload-relative spans — the pool wires them to
+    /// `kv_spill::Store::read_at`): only the inner header, each ROW region's 0..q prefix, the checkpoint table
+    /// and the ONE consumed checkpoint are ever read; the snapshot's state planes and hist describe depth n and
+    /// are NOT usable at q, so a truncated restore is rows + carried checkpoint — never the snapshot's own state
+    /// (which regions survive truncation, as demanded: every positional row plane YES; conv/S/PLE/carry/hist at
+    /// n NO — the checkpoint at q replaces them, installed via `ckpt_restore` by the WP16 resume that picks up
+    /// the caller's `Wp16::install`). `prompt` is the incoming prompt: the engine redoes the FULL proof itself
+    /// (`0 < pos <= prompt.len()` and `conv_key(prompt[..pos]) ==` the table's key — kv_spill::conv_key, the same
+    /// FNV the capture wrote), never trusting the caller's decision — and resumes at the deepest proven q. The
+    /// policy ran the identical proof on the identical tokens, so both land on the same q by construction.
+    /// Returns (q, checkpoint at q incl. its host PLE pair). Any Err = fall back to a plain miss (never a failed
+    /// round; under TP the Ok/Err outcome rides the SpillFlag agree BEFORE anything is installed, so the ranks
+    /// stay identical). The lane's rows 0..q are already written when Ok is returned.
+    pub fn spill_trunc_restore(&self, slot: usize, prompt: &[u32], c: usize,
+                               read: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>) -> Result<(usize, RecurCkpt)> {
+        let want = prompt.len();
+        let hdr = read(0, 36)?;
+        anyhow::ensure!(&hdr[0..8] == b"GB10SPIL", "spill-trunc: bad magic");
+        let ver = u32::from_le_bytes(hdr[8..12].try_into()?);
+        anyhow::ensure!(ver == SPILL_PAYLOAD_VERSION, "spill-trunc: payload version {ver}");
+        let tokens = u64::from_le_bytes(hdr[12..20].try_into()?) as usize;
+        let nreg = u64::from_le_bytes(hdr[20..28].try_into()?) as usize;
+        let total = u64::from_le_bytes(hdr[28..36].try_into()?) as usize;
+        anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill-trunc: tokens {tokens} out of range");
+        anyhow::ensure!(want < tokens, "spill-trunc: want {want} >= snapshot depth {tokens} (that is a full restore)");
+        let regions_n = self.spill_regions(slot, tokens)?;
+        anyhow::ensure!(regions_n.len() == nreg, "spill-trunc: region count {} != {nreg}", regions_n.len());
+        anyhow::ensure!(total as u64 == regions_n.iter().map(|(_, b)| *b as u64).sum::<u64>(),
+                        "spill-trunc: payload bytes {total} != this model's regions (flags/model changed)");
+        let ck_b = self.ckpt_bytes() as usize;
+        let troff = 36 + total + 8;
+        let tr = read(troff as u64, 16)?;
+        let nck = u32::from_le_bytes(tr[0..4].try_into()?) as usize;
+        let ck_c = u32::from_le_bytes(tr[4..8].try_into()?) as usize;
+        anyhow::ensure!(ck_c == c && ck_c > 0, "spill-trunc: carried grid C={ck_c}, this run uses C={c}");
+        const CKE: usize = crate::kv_spill::CK_TABLE_ENTRY_BYTES as usize; // (pos, prefix key, hist pair)
+        let tab = read((troff + 16) as u64, nck.checked_mul(CKE).ok_or_else(|| anyhow::anyhow!("spill-trunc: nck absurd"))?)?;
+        let mut q = 0usize;
+        let mut qi = usize::MAX;
+        let mut hist = [0i32; 2];
+        for i in 0..nck {
+            let e = &tab[i * CKE..i * CKE + CKE];
+            let pos = u64::from_le_bytes(e[0..8].try_into()?) as usize;
+            let key = u64::from_le_bytes(e[8..16].try_into()?);
+            if pos > 0 && pos <= want && pos > q && crate::kv_spill::conv_key(&prompt[..pos]) == key {
+                q = pos;
+                qi = i;
+                hist = [i32::from_le_bytes(e[16..20].try_into()?), i32::from_le_bytes(e[20..24].try_into()?)];
+            }
+        }
+        anyhow::ensure!(q > 0, "spill-trunc: no carried checkpoint at-or-below {want}");
+        self.vmm_ensure(slot, spill_rows(q, if self.cfg.has_indexer() { self.cfg.indexer_compress_ratio } else { 1 }, self.max_pos))?; // KVPOOL
+        let regions_q = self.spill_regions(slot, q)?;
+        anyhow::ensure!(regions_q.len() == regions_n.len(), "spill-trunc: region count changed with depth");
+        let nsnap = self.pool_n_snap()?;
+        self.dsync()?;
+        const CHUNK: usize = 64 << 20;
+        let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(ck_b).max(16)))?;
+        // rows only: every row region starts at its plane's row 0 at any depth, so the file's region-i span at
+        // its n-depth offset, cut to the q-depth size, is exactly rows 0..q of that plane
+        let mut off_n = 36usize;
+        for i in 0..regions_n.len().saturating_sub(nsnap) {
+            let (dst, bytes_n) = regions_n[i];
+            let bytes_q = regions_q[i].1;
+            anyhow::ensure!(bytes_q <= bytes_n && regions_q[i].0 == dst, "spill-trunc: region {i} changed with depth");
+            let (mut left, mut at, mut soff) = (bytes_q, dst, off_n);
+            while left > 0 {
+                let n = left.min(CHUNK);
+                let b = read(soff as u64, n)?;
+                anyhow::ensure!(b.len() == n, "spill-trunc: short span at {soff}");
+                pin.copy_from_slice(0, &b);
+                pin.htod(0, at, n)?;
+                self.dsync()?;
+                at += n as u64;
+                soff += n;
+                left -= n;
+            }
+            off_n += bytes_n;
+        }
+        // the consumed checkpoint: upload into a fresh buffer + carry its host PLE pair; the WP16 resume branch
+        // (prefill) installs it over the lane exactly like any other checkpoint resume
+        let mut ck = self.ckpt_alloc()?;
+        anyhow::ensure!(ck.spill_bytes() == ck_b, "spill-trunc: checkpoint size changed since capture");
+        let cb = read((troff + 16) as u64 + (nck as u64) * (CKE as u64) + (qi as u64) * (ck_b as u64), ck_b)?;
+        anyhow::ensure!(cb.len() == ck_b, "spill-trunc: short checkpoint span");
+        let (mut left, mut at, mut soff) = (ck_b, ck.spill_span().0, 0usize);
+        while left > 0 {
+            let n = left.min(CHUNK);
+            pin.copy_from_slice(0, &cb[soff..soff + n]);
+            pin.htod(0, at, n)?;
+            self.dsync()?;
+            at += n as u64;
+            soff += n;
+            left -= n;
+        }
+        ck.set_hist(hist);
+        Ok((q, ck))
     }
 
     fn copy_slot_state(&self, slot: usize, psc: &PrefillScratch, save: bool) -> Result<()> {
@@ -741,4 +1049,15 @@ impl FwdModel {
         mx
     }
 
+}
+
+/// KVPOOL: undo a failed `vmm_ensure` / `vmm_ensure_pooled`: unmap every page of the lane above the extent its counters
+/// already describe (`rows` for the KV / raw-key planes, `pooled` for the pooled-key planes), with the same per-plane
+/// formula as `vmm_truncate`. No device sync: the pages it can drop were mapped by the failed call itself, so no queued
+/// kernel references them. Best effort: an unmap error leaves the page registered (Drop still frees it).
+fn vmm_rollback(g: &mut crate::kv_vmm::KvVmm, planes: &[(u64, usize, usize, usize)], rows: usize, pooled: usize) {
+    for &(at, rb, div, cap) in planes {
+        let k = (if div > 1 { pooled.div_ceil(div) + 1 } else { rows }).min(cap);
+        let _ = g.drop_range(at + (k * rb) as u64, (cap - k) * rb);
+    }
 }

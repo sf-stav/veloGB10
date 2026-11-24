@@ -97,6 +97,7 @@ pub(super) type Caps = [(String, Vec<f32>)];
 
 /// Zero every QSA key/pool plane (the slot's positional side planes) + reset slot 0.
 fn fresh_slot(model: &FwdModel) -> Result<()> {
+    anyhow::ensure!(!model.vmm_lazy(), "KVPOOL: {} needs --kv-pool off or full (lazy maps rows on demand)", "xtp self-test");
     let l = Launcher { dev: &model.dev, stream: &model.stream };
     for k in model.qsa_keys.iter().chain(model.qsa_pool.iter()) {
         let n = k.len() as i64;

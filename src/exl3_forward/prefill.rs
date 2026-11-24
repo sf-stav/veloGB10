@@ -385,6 +385,12 @@ impl FwdModel {
                             "prefill_segs: a packed pass takes no trace / logits / image / perplexity / copy-span stash");
             if let Some(why) = self.pack_pf_unsupported() { anyhow::bail!("prefill_segs: packed passes unsupported here: {why}"); }
         }
+        // KVPOOL: every segment writes rows [pos0, pos0+n) of ITS OWN lane — map them before any launch
+        // below. Fork hunk H23 sat on prefill_chunk, which v0.7.10 turned into a one-segment wrapper that
+        // delegates here; a packed pass enters prefill_segs_inner directly and would otherwise write rows
+        // that were never mapped (PACKPF, --prefill-pack).
+        for sg in segs { self.vmm_ensure(sg.slot, sg.pos0 + sg.n)?; }
+
         // TP-A rung 3: the chunked prefill MoE (moe_prefill) has no EP filter/reduce site yet —
         // refuse loudly instead of silently mixing a rank's partial into its residual.
         // TP-B: prefill is TP-wired (EP experts + head-sharded mixers + row-parallel reduces).

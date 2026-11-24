@@ -38,6 +38,7 @@ pub fn probe_pack_pf(a: &FwdArgs) -> Result<bool> {
     let k = lens.len();
     let max_pos = a.max_pos.max(lens.iter().max().copied().unwrap_or(0) + 64);
     let model = FwdModel::load(&a.dir, k, max_pos)?;
+    anyhow::ensure!(!model.vmm_lazy(), "KVPOOL: --probe-exl3-packpf snapshots whole position planes and needs --kv-pool off or full");
     if let Some(why) = model.pack_pf_unsupported() {
         crate::rprintln!("[packpf] this model / option set does not pack: {why}");
         crate::rprintln!("RESULT: PACKPF_UNSUPPORTED");

@@ -15,6 +15,8 @@ pub(super) fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::ex
     // V0710: family/TP-scoped resolved defaults (--copy-span, --copy-span-max-w, --exl3-dense-resident, --exl3-mid-gemm,
     // --spec-arm-meter), BEFORE any of them is read. Pure in (family, world, set values): every TP rank resolves alike.
     crate::family_defaults::resolve_exl3(model_dir, tp_world as usize);
+    // KVPOOL (veloGB10 #43): a TP rank serves the stock per-lane KV allocation even when --kv-pool is asked (said at bind)
+    if tp_world > 1 { crate::kv_vmm::note_tp_role(); }
     // v0.7.3 ("tel"): --otel-* on the EXL3 server, the SAME shared parser as the NVFP4 path
     // (otel::config_from_args). Parsed + refused on EVERY rank BEFORE the model load (a bad
     // endpoint aborts the boot); the SINK is built later, only where the HTTP API lives.
@@ -728,7 +730,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         let d = if ks_mode == "auto" { "/tmp/gb10_kv_spill".to_string() } else { ks_mode.clone() };
         (true, d)
     };
-    let (spill_store, spill_pol) = if spill_on {
+    let (spill_store, mut spill_pol) = if spill_on {
         let st = crate::kv_spill::Store::spawn_with(std::path::PathBuf::from(&spill_dir),
             std::cmp::min(std::cmp::max((ks_gb << 30) / 4, 4 << 30), 6 << 30))
             .map_err(|e| anyhow::anyhow!("kv-spill: cannot create {spill_dir}: {e}"))?;
@@ -740,10 +742,30 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         let tp_note = if tp_rank.is_some() {
             "; TP: per-rank local shards, capture/restore agreed across ranks in-round"
         } else { "" };
-        format!("[exl3-serve] kv spill: on, cap {ks_gb} GiB, dir {spill_dir} (rank {}; text-only snapshots; restores when the NVMe read beats the re-prefill it replaces){tp_note}", tp_rank.unwrap_or(0))
+        format!("[exl3-serve] kv spill: on, cap {ks_gb} GiB, dir {spill_dir} (rank {}; text and image prompts; waits briefly for a capture still in the writer queue; restores when the NVMe read beats the re-prefill it replaces){tp_note}", tp_rank.unwrap_or(0))
     } else {
         "[exl3-serve] kv spill: off (the default; --kv-spill auto or a directory turns it on)".to_string()
     });
+    // SPILLGC: self-clean the spill directory at boot so snapshots from previous boots cannot accumulate past
+    // `--kv-spill-gb`. On single-box (TP=1), adopt valid v6 snapshots into the policy, sweep garbage/temps, and
+    // cap-evict in SPILLDUR2 order. Under TP, sweep all prior files for this rank without adopting: adopting local
+    // files independently per rank would fork the replicated policy if one node's `/tmp/gb10_kv_spill` was wiped
+    // on reboot while a peer's survived, causing a `spill_agree` deadlock on the first divergent lookup.
+    if let Some(st) = &spill_store {
+        const GIB: f64 = (1u64 << 30) as f64;
+        let rk = tp_rank.unwrap_or(0) as usize;
+        let rep = if tp_rank.is_some() {
+            st.boot_sweep_all(rk)
+        } else {
+            let scan = st.boot_scan(rk, model.max_pos() as u64, model.ckpt_bytes());
+            st.boot_finish(&mut spill_pol, rk, scan)
+        };
+        if rep.adopted + rep.swept + rep.evicted > 0 {
+            crate::rprintln!("[exl3-serve] kv spill: boot sweep (rank {rk}): adopted {} snapshots ({:.1} GiB), swept {} stale/garbage files ({:.1} GiB), cap-evicted {} ({:.1} GiB)",
+                rep.adopted, rep.adopted_bytes as f64 / GIB,
+                rep.swept, rep.swept_bytes as f64 / GIB, rep.evicted, rep.evicted_bytes as f64 / GIB);
+        }
+    }
     // PFXPOOL: --prefix-pool-gb N (Spmd: identical on every rank) — prompt states kept in device memory across lanes;
     // --prefix-pool-floor-gb F: the MemAvailable every rank keeps (a capture that would go below it evicts, then is
     // dropped). Off with --prefix-cache off (no snapshots to keep) or N = 0.
@@ -757,7 +779,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         let free = crate::memwatch::mem_available_bytes().map_or("?".to_string(), |b| format!("{:.1}", b as f64 / (1u64 << 30) as f64));
         let per_k = model.pool_entry_bytes(1024).map(|b| b as f64 / (1u64 << 20) as f64).unwrap_or(0.0);
         format!("[exl3-serve] prefix pool: on, up to {pool_gb} GiB of prompt states shared by all lanes (keeps {pool_floor_gb} GiB \
-                 free; {free} GiB free now; ~{per_k:.0} MiB per 1K-token prompt on this rank; text-only; --prefix-pool-gb 0 = off)")
+                 free; {free} GiB free now; ~{per_k:.0} MiB per 1K-token prompt on this rank; text and image prompts; --prefix-pool-gb 0 = off)")
     } else if !prefix_on {
         "[exl3-serve] prefix pool: off (--prefix-cache off)".to_string()
     } else {
@@ -811,7 +833,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         mtp_k, spec_policy, lane_order, lane_quantum, admit_ctr: 0, fcfs_rots: 0,
         lane_pack, scp, pack_ready, pack_sampled, pack_rot: 0, pack_logs: 0, in_prefill: false, pack_stats: PackStats::default(), tr: SchedTrace::default(),
         reprobe_on, reprobe_cfg,
-        reserve: reserve_cfg, reserve_st: crate::lane_reserve::State::new(), rel: (0..width).map(|_| None).collect(),
+        reserve: reserve_cfg, reserve_st: crate::lane_reserve::State::new(), rel: (0..width).map(|_| None).collect(), lru: vec![0; width],
         spill: spill_store, spill_pol, spill_rank: tp_rank.map(|r| r as usize).unwrap_or(0),
         pool, pool_floor, pool_spare: Vec::new(), slot_segs: Vec::new(), row_gen: 0, pool_emerg_at: None,
         shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, spec_win_tok: [0.0; 2], spec_win_ms: [0.0; 2], spec_win_n: [0; 2], spec_win_acc: [0; 2], spec_arm_rate: [0.0; 2], spec_arm_n: [0; 2], spec_arm_fold: [0; 2], spec_rate_n: vec![[(0.0, 0); 2]; SPEC_RATE_NMAX + 1], spec_rate_folds: vec![[0; 2]; SPEC_RATE_NMAX + 1], meter_settle: 0, meter_last_n: 0, probe_fold: [false; 2], spec_probe: None, spec_probe_ctr: 0, spec_est_pick: None, spec_margin: 0.0, spec_margin_n: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
@@ -819,7 +841,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         wp16, wp16_xcheck,
         loop_cfg, pen_range, spec_ratio, draft_temp, gate: None, tok: tok.clone(),
         tp: tp_rank.map(|r| TpSync::new(r, tp_world as i32)),
-        exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0), pf_done: Default::default(), pf_jobs: Vec::new(), mrope_section, vis_seam: None, kv_pf: None, turn: turn_arm,
+        exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0), pf_done: Default::default(), pf_jobs: Vec::new(), vmm_wait: None, mrope_section, vis_seam: None, kv_pf: None, turn: turn_arm,
     };
     if width > 1 && spec_live {
         crate::dprintln!("[exl3-serve] serial lane order (--lane-order): {}{}", lane_order.name(),

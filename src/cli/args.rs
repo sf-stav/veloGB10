@@ -252,14 +252,15 @@ pub(crate) fn resolve_draft_dir(args: &[String], src: Option<gb10_inference::bat
 /// `--tp N` → N, bare `--tp` → 2, `--tp=N` → N, no `--tp` → None (no TP run). A non-numeric
 /// value rejects loudly. `N` is expected to be a power of two (the dynamic-TP ladder).
 pub(crate) fn parse_tp_world(args: &[String]) -> Option<u32> {
+    let valid = |n: u32| matches!(n, 1 | 2 | 3 | 4 | 6 | 8 | 16);
     let reject = |s: &str| -> u32 {
-        eprintln!("--tp must be a power-of-two integer (got '{s}')");
+        eprintln!("--tp must be a supported topology size (1, 2, 3, 4, 6, 8; got '{s}')");
         std::process::exit(1);
     };
     for (i, a) in args.iter().enumerate() {
         if let Some(v) = a.strip_prefix("--tp=") {
             let n = v.parse::<u32>().unwrap_or_else(|_| reject(v));
-            if !n.is_power_of_two() { reject(v); }
+            if !valid(n) { reject(v); }
             return Some(n);
         }
         if a == "--tp" {
@@ -267,7 +268,7 @@ pub(crate) fn parse_tp_world(args: &[String]) -> Option<u32> {
             if let Some(next) = args.get(i + 1) {
                 if !next.starts_with('-') {
                     let n = next.parse::<u32>().unwrap_or_else(|_| reject(next));
-                    if !n.is_power_of_two() { reject(next); }
+                    if !valid(n) { reject(next); }
                     return Some(n);
                 }
             }

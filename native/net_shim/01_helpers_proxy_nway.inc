@@ -548,13 +548,14 @@ static inline uint64_t peer_recv_raddr_at(uint64_t remote_addr, unsigned slot_st
          + (uint64_t)(e & (TP_RING_SLOTS - 1)) * slot_stride;
 }
 // world>2 per-round recv ring (see TP_NWAY_MAX_ROUNDS in tp_doorbell.h): epoch e lands in
-// round(e)'s own R-slot ring at slot e % R, so a round's payload can never alias another round's
-// slot. Both sides compute round(e) = e % rounds identically from the (SPMD) epoch. world==2 never
-// calls these (its recv path keeps the shared recv_ring + (e%R)*stride, byte-identical).
+// round(e)'s own R-slot ring at per-round slot (e / rounds) % R (Phase 2: bijective across all R slots
+// for every round count including world=8 / rounds=3, reuse period R * rounds epochs). Both sides compute
+// round(e) and slot(e) identically from the (SPMD) epoch. world==2 never calls these.
 static inline uint64_t nway_recv_slot_off(NetCtx* c, uint64_t e) {
-    uint64_t round = e % (unsigned)c->rounds;
-    return c->nway_recv_off
-         + (round * (uint64_t)TP_RING_SLOTS + (e & (TP_RING_SLOTS - 1))) * c->slot_stride;
+    uint64_t r = (uint64_t)c->rounds;
+    uint64_t round = e % r;
+    uint64_t slot = (e / r) & (TP_RING_SLOTS - 1);
+    return c->nway_recv_off + (round * (uint64_t)TP_RING_SLOTS + slot) * c->slot_stride;
 }
 static inline char* nway_recv_slot_ptr(NetCtx* c, uint64_t e) {
     return (char*)c->hbuf + nway_recv_slot_off(c, e);

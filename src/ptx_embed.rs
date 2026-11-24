@@ -40,6 +40,8 @@ pub const GPU_VISION: &str = include_str!("ptx/gpu_vision.ptx");
 /// `gpu_fp4l.cu` (sm_121a): FP4L weight kernels (MXFP8 / f16 / NVFP4 experts) for the EXL3 trunk,
 /// loaded only for an nvidia/Qwen3.8-Flash-Next-FP4-Local pack (src/exl3_forward/fp4l_fwd.rs).
 pub const GPU_FP4L: &str = include_str!("ptx/gpu_fp4l.ptx");
+/// `gpu_inkling2.cu` (sm_121a): the Inkling-2 family kernels (src/inkling2/gpu/).
+pub const GPU_INKLING2: &str = include_str!("ptx/gpu_inkling2.ptx");
 /// `mxfp4_bench.cu` (sm_121a): standalone OMMA microbench (probe-only, lazy).
 pub const MXFP4_BENCH: &str = include_str!("ptx/mxfp4_bench.ptx");
 /// `gpu_mxfp4.cu` (sm_121a): NVFP4 native GEMV kernels.
@@ -56,3 +58,5 @@ pub const GPU_NAIVE: &str = include_str!("ptx/gpu_naive.ptx");
 /// `gpu_naive_draft.cu` (sm_121): the Naive DSpark drafter round (src/naive/drafter_gpu.rs).
 pub const GPU_NAIVE_DRAFT: &str = include_str!("ptx/gpu_naive_draft.ptx");
 
+/// `gpu_dsv41.cu` (sm_121a): the DeepSeek-V4.1-Flash family kernels (src/dsv41/gpu/mod.rs only).
+pub const GPU_DSV41: &str = include_str!("ptx/gpu_dsv41.ptx");
