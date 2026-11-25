@@ -46,13 +46,15 @@ inference binary, the required PTX kernels, SHA-256 checksums, and build provena
 run an NVIDIA DGX Spark or a compatible OEM GB10 machine, you can use a release binary without
 compiling anything.
 
-## What's New: Velo-Fabric, DeepSeek-V4.1-Flash, and Inkling-2-Mini
+## What's New (Preview): Velo-Fabric, DeepSeek-V4.1-Flash, and Inkling-2-Mini
 
-### Velo-Fabric
+> **Preview (v0.8.0):** **Velo-Fabric** and the new **DeepSeek-V4.1-Flash** and **Inkling-2-Mini** model families are currently in **preview** state. Expect evolving flags and rapid iteration across v0.8.x; existing Qwen3.5/3.6/3.8 and Hy3 paths remain stable.
+
+### Velo-Fabric (Preview)
 
 **Velo-Fabric** is veloGB10's built-in, **NCCL-free and MPI-free** multi-node collective transport and distributed execution layer engineered specifically for **NVIDIA DGX Spark (GB10)** clusters over commodity dual-port 200GbE ConnectX-7 RoCEv2 Ethernet. Rather than bouncing activations through host memory or stalling decode loops on CPU syncs, Velo-Fabric combines GPU-validated direct-NIC-tail receives, Blackwell Programmatic Dependent Launch (PDL) overlap, lock-free dual-rail verbs, and full CUDA Graph capture to achieve **15.9 µs (TP=2)**, **21.5 µs (TP=3)**, **22.8 µs (TP=4)**, **28.5 µs (TP=6)**, and **31.4 µs (TP=8)** median all-reduce latencies—while enforcing bit-identical canonical FP32 reduction order across every rank. It supports arbitrary cluster sizes (**TP=2, TP=3, TP=4, TP=6, and TP=8**), 1-RTT dual-rail All-to-All primitives for sequence-parallel attention (**DeepSpeed-Ulysses** and **LAGA**), vocab-parallel speculative decoding (`≤ 1 KiB` acceptance exchanges), and automatic RoCEv2 bulk weight shipping with hardware SHA-256 caching so peer nodes need zero manual model copying. See [VELO_FABRIC.md](VELO_FABRIC.md) and [docs/VELO_FABRIC_BENCHMARKS.md](docs/VELO_FABRIC_BENCHMARKS.md) for architecture details and full micro-benchmarks.
 
-### DeepSeek-V4.1-Flash Support
+### DeepSeek-V4.1-Flash Support (Preview)
 
 veloGB10 now serves **DeepSeek-V4.1-Flash-1017** end-to-end across **TP=2, TP=3, TP=4, TP=6, and TP=8** using the self-contained **[doth4580/DeepSeek-V4.1-Flash-1017-Mia-EXL3-2.9bpw-Engram](https://huggingface.co/doth4580/DeepSeek-V4.1-Flash-1017-Mia-EXL3-2.9bpw-Engram)** bundle—combining **Mia-AiLab's** EXL3 2.9 bpw EAQ weights (`210.6 GB`, 40 trunk layers + 3-stage DSpark drafter + 32-layer BF16 vision tower) with **DeepSeek-AI's** native FP8 Engram tables (`~190 GiB`, auto-detected with no extra flags) and up to **1M context** (`1,048,576` tokens). Across all multi-node topologies, the engine runs P7SP sequence-parallel prefill with mirror-zigzag causal indexer sharding, **LAGA** BF16 attention-output All-to-All (`--dsv41-sp-laga auto`, cutting total cluster collective bytes by **18.8–19.3%**), prefix caching, and lockstep DSpark speculative decoding (plus opt-in `--dsv41-wire-bf16 on` for +5–6% single-user decode speed). See [DEEPSEEK_V41_FLASH_SETUP.md](DEEPSEEK_V41_FLASH_SETUP.md) for full setup and launch instructions.
 
@@ -65,7 +67,7 @@ veloGB10 now serves **DeepSeek-V4.1-Flash-1017** end-to-end across **TP=2, TP=3,
 | **TP=6** (6 Sparks) | FP32 + P7SP *(pre-LAGA)* | `~95 s` | `2,147` (@ 4.4K) | **`2,873`** (@ 8.0K) | — | **`70.5 – 71.6`** | — |
 | **TP=8** (8 Sparks) | FP32 + P7SP + LAGA (default) | **`61 s`** | **`3,094`** (`1.47 s`) | — | **`108 – 155 ms`** | **`87.6 – 92.6`** | **`219.9`** (`55.0`/u) |
 
-### Inkling-2-Mini Support
+### Inkling-2-Mini Support (Preview)
 
 veloGB10 now supports **[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)**—Thinking Machines Lab's stock NVFP4/MXFP8 looped MoE (`24` layers / `48` looped visits, `128` experts top-8, `256K` context, bundled 3-layer MTP speculative drafter, and 23-layer BF16 vision tower)—from a single DGX Spark (**TP=1**) up through **TP=2, TP=3, TP=4, TP=6, and TP=8** over Velo-Fabric. Multi-node runs use balanced 64-channel MoE inner sharding, vocab-parallel MTP speculation, and arbitrary-W **DeepSpeed-Ulysses** 1-RTT All-to-All sequence-parallel attention (`TP=3/4/6/8`, adapted from [arXiv:2309.14509](https://arxiv.org/abs/2309.14509)) with localized `gate_attn` (bit-exact FP32 default, or opt-in `--inkling2-ulysses-wire bf16` for −47% Ulysses wire and up to **5,086 tok/s** cold prefill), alongside opt-in `--inkling2-expert-act native` Blackwell FP4/FP8 tensor-core expert activations. Single-user interactive decode scales to **2.07× TP=1** (**89.1 tok/s** at TP=8) and 4-user aggregate throughput reaches **194.0 tok/s (+225% vs TP=1)** over pure 200GbE Ethernet, with warm 8-node boot in **13 seconds**. See [INKLING_2_MINI_SETUP.md](INKLING_2_MINI_SETUP.md) for full setup and launch instructions.
 

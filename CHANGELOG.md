@@ -2,11 +2,17 @@
 
 ## v0.8.0 — Velo-Fabric, DeepSeek-V4.1-Flash, Inkling-2-Mini, TP=2→8
 
-A major release: veloGB10 gains a purpose-built multi-node fabric layer, two new model
-families, arbitrary-width TP topologies (TP=3 and TP=6), a shared KV page pool, a
-vision-embed cache, and six community-reported fixes and contributions.
+A major release: veloGB10 gains a purpose-built multi-node fabric layer (**preview**),
+two new model families (**preview**), arbitrary-width TP topologies (TP=3 and TP=6), a
+shared KV page pool, a vision-embed cache, and six community-reported fixes and
+contributions.
 
-### Velo-Fabric — the multi-node fabric layer
+> **Preview status (v0.8.0):** **Velo-Fabric** (including TP=3/6/8 topologies) and the
+> new model families (**DeepSeek-V4.1-Flash** and **Inkling-2-Mini**) ship in **preview**
+> state in v0.8.0. Expect rough edges, evolving flags, and rapid fixes across upcoming
+> v0.8.x releases. Existing Qwen3.5/3.6/3.8 and Hy3 serving paths are unaffected.
+
+### Velo-Fabric — the multi-node fabric layer (Preview)
 
 - **Velo-Fabric**: built-in, NCCL-free / MPI-free collective transport for DGX Spark (GB10)
   clusters over 200GbE ConnectX-7 RoCEv2 — GPU-validated direct-NIC-tail receives, Blackwell
@@ -28,7 +34,7 @@ vision-embed cache, and six community-reported fixes and contributions.
 - Fixes: division-by-zero in `nway_recv_slot_at` on TP=3/6; EngramWkv cut alignment with
   `heads_of_rank`.
 
-### New model support
+### New model support (Preview)
 
 - **DeepSeek-V4.1-Flash-1017** end-to-end on TP=2/3/4/6/8 — P7SP sequence-parallel prefill
   with mirror-zigzag causal indexer sharding, native FP8 **Engram** tables (~190 GiB,

@@ -1,5 +1,7 @@
 # Inkling-2-Mini NVFP4 — step-by-step setup
 
+> **Preview (v0.8.0):** Inkling-2-Mini support (and Velo-Fabric multi-node execution) is in **preview** state in veloGB10 v0.8.0. Expect rough edges and evolving flags across upcoming v0.8.x releases.
+
 This guide walks through bringing up **Inkling-2-Mini** (stock `NVFP4 / MXFP8` looped MoE + 3-layer MTP speculation) on **veloGB10** over **Velo-Fabric** (dual-rail 200GbE RoCEv2 Ethernet, no NCCL, no MPI), at **TP=1, TP=2, TP=3, TP=4, TP=6, and TP=8**. It covers the required files on each machine, the exact launch commands, expected log lines, measured performance, and operational notes.
 
 - **Target model:** **[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** — stock NVFP4 / MXFP8 checkpoint (~19 GB total on disk: `model-00001-of-00001.safetensors` ~19 GB + bundled `mtp.safetensors` 607 MB).

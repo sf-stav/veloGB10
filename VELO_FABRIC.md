@@ -1,5 +1,7 @@
 # Velo-Fabric: Low-Latency Multi-Node RDMA Collective & Distributed Execution Fabric for GB10 / DGX Spark
 
+> **Preview (v0.8.0):** Velo-Fabric is currently in **preview** state in veloGB10 v0.8.0. Flags, topologies, and transport details may evolve across upcoming v0.8.x releases.
+
 **Velo-Fabric** is the custom multi-node collective transport and distributed execution layer built into **veloGB10**. It turns **2, 3, 4, 6, or 8 NVIDIA DGX Spark (GB10)** systems connected over dual-port 200GbE RoCEv2 into a single, deterministic, CUDA-Graph-native inference engine—with **no NCCL, no MPI, and no host synchronization breaks in the decode loop**.
 
 On an 8-node DGX Spark cluster connected purely over Ethernet (RoCEv2), Velo-Fabric achieves:
