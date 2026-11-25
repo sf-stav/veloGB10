@@ -40,10 +40,16 @@ pub fn is_inkling2_pack(dir: &str) -> bool { Inkling2Config::is_inkling2_dir(Pat
 /// `--prefix-cache`: ON unless the operator says otherwise.
 pub fn prefix_cache_on(v: Option<&str>) -> bool { !matches!(v.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("off" | "0" | "false" | "no")) }
 
-/// The trained window: `max_position_embeddings` at the top of `config.json` or under `text_config`.
+/// The trained window: `max_position_embeddings` or `model_max_length` at the top of `config.json` or under `text_config`.
+/// Stock Inkling-2-Mini packs declare `text_config.model_max_length = 1048576` (1M context).
 pub fn trained_window(dir: &Path) -> Option<usize> {
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
-    v.get("max_position_embeddings").or_else(|| v.pointer("/text_config/max_position_embeddings")).and_then(|x| x.as_u64()).map(|x| x as usize)
+    v.get("max_position_embeddings")
+        .or_else(|| v.pointer("/text_config/max_position_embeddings"))
+        .or_else(|| v.get("model_max_length"))
+        .or_else(|| v.pointer("/text_config/model_max_length"))
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
 }
 
 /// Sampler defaults from the pack's `generation_config.json` (temperature 1.0 on the stock pack; top_p 1.0 / top_k 0 when absent).

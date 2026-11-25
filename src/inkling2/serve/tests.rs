@@ -11,7 +11,7 @@ use super::forward::{End, Forward, Job, NotBuilt};
 use super::http::{App, Settings};
 use crate::tokenizer::QwenTokenizer;
 
-const PACK: &str = "/models/Inkling-2-Mini";
+const PACK: &str = "/models/thinkingmachines/Inkling-2-Mini";
 
 struct Scripted(Vec<u32>);
 impl Forward for Scripted {
@@ -185,4 +185,74 @@ async fn a_reply_cut_by_the_budget_is_length_and_never_completes_a_call() {
     let v: Value = serde_json::from_str(&b).unwrap();
     assert_eq!(v["choices"][0]["finish_reason"], "length");
     assert!(v["choices"][0]["message"].get("tool_calls").is_none());
+}
+
+#[test]
+fn trained_window_reads_model_max_length_and_setup_honors_1m() {
+    let tmp = std::env::temp_dir().join(format!("ink2_win_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("config.json"), r#"{"text_config":{"model_max_length":1048576}}"#).unwrap();
+    assert_eq!(super::trained_window(&tmp), Some(1_048_576));
+    let dir_s = tmp.to_string_lossy().to_string();
+    // Omitted --max-seq-len stays at DEFAULT_CTX (262_144)
+    let su_def = super::setup(&[], &dir_s).unwrap();
+    assert_eq!(su_def.settings.max_seq_len, super::DEFAULT_CTX);
+    // Explicit --max-seq-len 1048576 is honored without clamping
+    let args_1m: Vec<String> = ["--max-seq-len", "1048576"].iter().map(|s| s.to_string()).collect();
+    let su_1m = super::setup(&args_1m, &dir_s).unwrap();
+    assert_eq!(su_1m.settings.max_seq_len, 1_048_576);
+    assert!(!su_1m.notices.iter().any(|n| n.contains("trained window")), "{:?}", su_1m.notices);
+    // Above trained window still clamps to 1048576
+    let args_2m: Vec<String> = ["--max-seq-len", "2097152"].iter().map(|s| s.to_string()).collect();
+    let su_2m = super::setup(&args_2m, &dir_s).unwrap();
+    assert_eq!(su_2m.settings.max_seq_len, 1_048_576);
+    assert!(su_2m.notices.iter().any(|n| n.contains("1048576")), "{:?}", su_2m.notices);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn tokenize_and_detokenize_match_shared_server_contract() {
+    let Some(tok) = tok() else { return };
+    let addr = server(reply(&tok, THINK_ANSWER), tok.clone()).await;
+    // prompt string -> tokens + count + max_model_len
+    let (s, _, b) = http(addr, "POST", "/v1/tokenize", Some(&json!({"model": "ink2-test", "prompt": "Hello world!"}))).await;
+    assert_eq!(s, 200, "{b}");
+    let v: Value = serde_json::from_str(&b).unwrap();
+    let ids: Vec<u64> = v["tokens"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect();
+    assert_eq!(v["count"].as_u64().unwrap() as usize, ids.len());
+    assert_eq!(v["max_model_len"].as_u64().unwrap(), 8192);
+    assert!(!ids.is_empty());
+    // detokenize round-trip
+    let (s, _, b) = http(addr, "POST", "/v1/detokenize", Some(&json!({"model": "ink2-test", "tokens": ids}))).await;
+    assert_eq!(s, 200, "{b}");
+    let dv: Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(dv["model"], "ink2-test");
+    assert_eq!(dv["prompt"], "Hello world!");
+    // empty prompt -> count 0
+    let (s, _, b) = http(addr, "POST", "/v1/tokenize", Some(&json!({"model": "ink2-test", "prompt": ""}))).await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(serde_json::from_str::<Value>(&b).unwrap()["count"], 0);
+    // messages mode matches /v1/chat/completions usage.prompt_tokens
+    let (s, _, tb) = http(addr, "POST", "/v1/tokenize", Some(&json!({"model": "ink2-test", "messages": user("hi")}))).await;
+    assert_eq!(s, 200, "{tb}");
+    let tok_n = serde_json::from_str::<Value>(&tb).unwrap()["count"].as_u64().unwrap();
+    let (s, _, cb) = http(addr, "POST", "/v1/chat/completions", Some(&json!({"messages": user("hi")}))).await;
+    assert_eq!(s, 200, "{cb}");
+    let chat_n = serde_json::from_str::<Value>(&cb).unwrap()["usage"]["prompt_tokens"].as_u64().unwrap();
+    assert_eq!(tok_n, chat_n);
+    // truncate_prompt_tokens keeps last n
+    let (s, _, b) = http(addr, "POST", "/v1/tokenize", Some(&json!({"model": "ink2-test", "prompt": "one two three four five", "truncate_prompt_tokens": 2}))).await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(serde_json::from_str::<Value>(&b).unwrap()["count"], 2);
+    // over-length -> 400 context_length_exceeded
+    let long = "hello ".repeat(9000);
+    let (s, _, b) = http(addr, "POST", "/v1/tokenize", Some(&json!({"model": "ink2-test", "prompt": long}))).await;
+    assert_eq!(s, 400, "{b}");
+    assert_eq!(serde_json::from_str::<Value>(&b).unwrap()["error"]["code"], "context_length_exceeded");
+    // wrong model -> 400
+    let (s, _, _) = http(addr, "POST", "/v1/tokenize", Some(&json!({"model": "other", "prompt": "hi"}))).await;
+    assert_eq!(s, 400);
+    let (s, _, _) = http(addr, "POST", "/v1/detokenize", Some(&json!({"model": "other", "tokens": [1]}))).await;
+    assert_eq!(s, 400);
 }

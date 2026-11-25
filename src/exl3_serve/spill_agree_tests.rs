@@ -91,3 +91,37 @@
             }
         }
     }
+
+    /// veloGB10 #52: pre-D2H budget agreement under TP >= 2 keeps all ranks in lockstep across
+    /// full-with-WP16, base-without-WP16, and pre-D2H skip when one rank has tighter MemAvailable.
+    #[test]
+    fn ranks_agree_on_pre_d2h_full_base_or_skip_mode() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Mode { Full, Base, Skip }
+        let (base, full) = (2_000_000_000u64, 3_400_000_000u64);
+        let scenarios: &[(&str, [u64; 3], Mode)] = &[
+            ("all_fit_full", [5_000_000_000, 4_000_000_000, 6_000_000_000], Mode::Full),
+            ("one_rank_fits_only_base", [5_000_000_000, 2_500_000_000, 6_000_000_000], Mode::Base),
+            ("one_rank_fits_neither", [5_000_000_000, 1_000_000_000, 6_000_000_000], Mode::Skip),
+        ];
+        for (name, budgets, expect) in scenarios {
+            let net = Net::new(3, true);
+            let outs = run_ranks(&net, None, |rank, hub| {
+                let mut t = TpSync::new(rank as i32, 3);
+                let b = budgets[rank];
+                let all_full = t.spill_agree_hub(hub, full <= b).unwrap();
+                if all_full {
+                    Mode::Full
+                } else if t.spill_agree_hub(hub, base <= b).unwrap() {
+                    Mode::Base
+                } else {
+                    Mode::Skip
+                }
+            });
+            for (rank, mode) in outs.iter().enumerate() {
+                assert_eq!(mode, expect, "{name}: rank {rank}");
+            }
+            assert!((0..3).all(|r| net.abort_code(r) == 0), "{name}: no aborts");
+            assert!(net.clobbers().is_empty(), "{name}: {:?}", net.clobbers());
+        }
+    }

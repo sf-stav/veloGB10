@@ -184,6 +184,7 @@ fn round(g: &GpuModel, ws: &mut Work, lanes: &mut [Lane], sp: &mut Spec, pol: &m
                 let r = unsafe { cudarc::driver::sys::cuMemcpyDtoH_v2(st.as_mut_ptr() as *mut std::ffi::c_void, sfull, c * v * 4) };
                 anyhow::ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "draft step rows to host: {r:?}");
             } else {
+                g.k.sync()?;
                 g.dev.dtoh_sync_copy_into(&sp.w[i].step.slice(0..c * v), &mut st)?;
             }
             let seed = mix(a.req.seed ^ mix(a.step ^ 0x7c0b));

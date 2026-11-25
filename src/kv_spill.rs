@@ -112,6 +112,29 @@ pub const SPILL_PAYLOAD_VERSION: u32 = 6;
 pub const CK_TABLE_ENTRY_BYTES: u64 = 8 + 8 + 8;
 /// Bytes of the checkpoint section trailer before the table: nck u32 + ck_c u32 + fixed u64.
 pub const CK_TRAILER_BYTES: u64 = 4 + 4 + 8;
+/// Host staging used one chunk at a time for the device-to-host copy.
+pub(crate) const CAPTURE_CHUNK_BYTES: usize = 64 << 20;
+/// Leave room above the watchdog for sampling, page cache writeback and concurrent host allocations.
+const CAPTURE_HEADROOM_BYTES: u64 = 512 << 20;
+
+/// Serialized v6 file length, including both headers, PLE history and the checkpoint section.
+pub(crate) fn capture_file_bytes(region_bytes: usize, checkpoint_bytes: usize, checkpoints: usize) -> usize {
+    HEADER_LEN as usize + 36 + region_bytes + 8 + CK_TRAILER_BYTES as usize
+        + checkpoint_bytes + checkpoints * CK_TABLE_ENTRY_BYTES as usize
+}
+
+/// Host memory room for a single spill capture above the watchdog floor, guard margin and pinned staging chunk.
+pub(crate) fn host_capture_budget(available: u64, watchdog_floor: u64) -> u64 {
+    available
+        .saturating_sub(watchdog_floor)
+        .saturating_sub(CAPTURE_HEADROOM_BYTES)
+        .saturating_sub(CAPTURE_CHUNK_BYTES as u64)
+}
+
+/// The smaller of async queue room and host room. Pending buffers are already reflected in MemAvailable.
+pub(crate) fn capture_byte_budget(pending: u64, max_pending: u64, available: u64, watchdog_floor: u64) -> u64 {
+    max_pending.saturating_sub(pending).min(host_capture_budget(available, watchdog_floor))
+}
 
 /// FNV-1a 64: payload integrity without pulling in a crate (std-only module).
 fn fnv1a64(data: &[u8]) -> u64 {
@@ -1463,5 +1486,34 @@ fn lookup_matches_prefix_of_full_prompt() {
     // An unrelated prompt must not match.
     let other: Vec<u32> = (100..164u32).collect();
     assert!(pol.lookup(&other, NVME_READ_BPS, PREFILL_TPS).is_none());
+}
+
+#[test]
+fn capture_file_bytes_and_budgets_enforce_host_and_queue_headroom() {
+    let region_bytes = 1_950_000_000usize;
+    let ck_bytes = 119_000_000usize;
+    let nck = 12usize;
+    let base = capture_file_bytes(region_bytes, 0, 0) as u64;
+    let full = capture_file_bytes(region_bytes, nck * ck_bytes, nck) as u64;
+    assert_eq!(base, HEADER_LEN + 36 + region_bytes as u64 + 8 + CK_TRAILER_BYTES);
+    assert_eq!(full, base + (nck as u64) * (CK_TABLE_ENTRY_BYTES + ck_bytes as u64));
+
+    let floor = 5_000_000_000u64;
+    let margin = CAPTURE_HEADROOM_BYTES + CAPTURE_CHUNK_BYTES as u64;
+    // Below floor + margin -> 0 budget (no underflow)
+    assert_eq!(host_capture_budget(floor, floor), 0);
+    assert_eq!(host_capture_budget(floor + margin - 1, floor), 0);
+    // 8.0 GB available with 5 GB floor -> ~2.40 GB host budget: base (~1.95 GB) fits, full (~3.38 GB) does not
+    let avail = 8_000_000_000u64;
+    let hb = host_capture_budget(avail, floor);
+    assert_eq!(hb, avail - floor - margin);
+    assert!(base <= hb && full > hb);
+
+    // Queue room caps the async budget when tighter than host room
+    let max_pending = 8u64 << 30;
+    assert_eq!(capture_byte_budget(max_pending - (1 << 30), max_pending, 20_000_000_000, floor), 1 << 30);
+    assert_eq!(capture_byte_budget(max_pending + 1, max_pending, 20_000_000_000, floor), 0);
+    // Host room caps the async budget when tighter than queue room
+    assert_eq!(capture_byte_budget(0, max_pending, avail, floor), hb);
 }
 }

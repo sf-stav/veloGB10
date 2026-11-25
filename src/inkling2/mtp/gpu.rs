@@ -359,6 +359,7 @@ impl MtpDev {
         let it = if t > 0.0 { 1.0 / t } else { 0.0 };
         let mut tk = [0i32; B];
         tk[0] = anchor as i32;
+        k.sync()?;
         dev.htod_sync_copy_into(&tk, &mut w.tok)?;
         let seeds: Vec<u64> = (0..16).map(|j| mix64(seed ^ mix64(0xd5a7_0000 + j as u64))).collect();
         dev.htod_sync_copy_into(&seeds, &mut w.seeds)?;
@@ -422,12 +423,14 @@ impl MtpDev {
             steps = j + 1;
             if j + 1 < max_steps {
                 let mut cj = [0f32; 1];
+                k.sync()?;
                 dev.dtoh_sync_copy_into(&w.conf.slice(j..j + 1), &mut cj)?;
                 conf_h.push(cj[0]);
                 if !more(j, &conf_h) { break; }
             }
         }
         let mut tok = [0i32; B];
+        k.sync()?;
         dev.dtoh_sync_copy_into(&w.tok, &mut tok)?;
         let mut conf = [0f32; B];
         dev.dtoh_sync_copy_into(&w.conf, &mut conf)?;
@@ -442,6 +445,7 @@ impl MtpDev {
         let k = g.k;
         let n = self.n;
         let it = if t > 0.0 { 1.0 / t } else { 0.0 };
+        k.sync()?;
         g.dev.htod_sync_copy_into(&[it; 16], &mut w.invt)?;
         let sa = mix64(seed ^ 0xacce_97ed);
         let sf = mix64(seed ^ 0xf1a1_70c3);
@@ -455,6 +459,7 @@ impl MtpDev {
                      KArgs::new().v(dp(&w.tok)).v(c as i32).v(dp(&w.tgt)).v(tl).v(n as i32).v(dp(&w.step)).v(n as i32).v(dp(&w.lse_p))
                          .v(dp(&w.lse_q)).v(0f32).v(sa).v(dp(&w.res)))?;
             let mut r = [0i32; 4];
+            k.sync()?;
             g.dev.dtoh_sync_copy_into(&w.res, &mut r)?;
             let a = r[0] as usize;
             let mut tg = [0i32; 16];
@@ -474,6 +479,7 @@ impl MtpDev {
         k.launch("ink3_gumbel_pick", (1, 1, 1), (256, 1, 1), 0,
                  KArgs::new().v(dp(&w.gpm)).v(dp(&w.gpi)).v(SMP_G as i32).v(dp(&w.res) + 4))?;
         let mut r = [0i32; 4];
+        k.sync()?;
         g.dev.dtoh_sync_copy_into(&w.res, &mut r)?;
         Ok((r[0] as usize, r[1] as u32))
     }
@@ -489,6 +495,7 @@ impl MtpDev {
         let voff = self.voff;
         let (rank, world) = (g.rank.rank, g.rank.world);
         let it = if t > 0.0 { 1.0 / t } else { 0.0 };
+        k.sync()?;
         g.dev.htod_sync_copy_into(&[it; 16], &mut w.invt)?;
         let sa = mix64(seed ^ 0xacce_97ed);
         let sf = mix64(seed ^ 0xf1a1_70c3);
@@ -501,6 +508,7 @@ impl MtpDev {
                      KArgs::new().v(dp(&w.tok)).v(c as i32).v(dp(&w.tgt)).v(tl).v(vn as i32).v(dp(&w.step)).v(vn as i32).v(dp(&w.lse_p))
                          .v(dp(&w.lse_q)).v(0f32).v(sa).v(dp(&w.res)))?;
             let mut r = [0i32; 4];
+            k.sync()?;
             g.dev.dtoh_sync_copy_into(&w.res, &mut r)?;
             tp.x.check("after vocab-parallel greedy accept")?;
             let a = r[0] as usize;
@@ -523,6 +531,7 @@ impl MtpDev {
         tp.x.all_reduce(&g.dev, dp(&tp.rec), world * 2)?;
         tpk::rank_pick(k, dp(&tp.rec), world, 1, dp(&w.res) + 4)?;
         let mut r = [0i32; 4];
+        k.sync()?;
         g.dev.dtoh_sync_copy_into(&w.res, &mut r)?;
         tp.x.check("after vocab-parallel sampled accept")?;
         Ok((r[0] as usize, r[1] as u32))
@@ -629,6 +638,7 @@ impl MtpDev {
         let n = self.n;
         let rows = nl * B;
         let (emb, embn, head) = g.shared_for_mtp();
+        k.sync()?;
         for (l, r) in reqs.iter().enumerate() {
             let w = &mut ws[r.lane];
             let it = if r.t > 0.0 { 1.0 / r.t } else { 0.0 };
@@ -752,6 +762,7 @@ impl MtpDev {
                     let mask = buf[0];
                     for &l in &act { if live[l] && (mask & (1u8 << l)) == 0 { live[l] = false; } }
                 } else {
+                    k.sync()?;
                     let mut mask = 0u8;
                     for &l in &act {
                         if !live[l] { continue; }
@@ -769,6 +780,7 @@ impl MtpDev {
         }
         if let Some(tp) = &g.tp { tp.x.check("after vocab-parallel draft_multi")?; }
         if node_stream.is_some() { return Ok(Vec::new()); }
+        k.sync()?;
         let mut out = Vec::with_capacity(nl);
         for (l, r) in reqs.iter().enumerate() {
             let w = &ws[r.lane];

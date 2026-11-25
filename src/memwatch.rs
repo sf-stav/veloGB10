@@ -64,13 +64,22 @@ pub fn trace_loop() {
     }).expect("memtrace thread");
 }
 
+/// Configured watchdog floor in bytes. Zero disables the watchdog.
+pub(crate) fn watchdog_floor_bytes() -> u64 {
+    let floor_gb: f64 = crate::opts::var(crate::opt!("mem-watchdog-gb")).ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(5.0);
+    if !floor_gb.is_finite() || floor_gb <= 0.0 {
+        return 0;
+    }
+    (floor_gb * 1e9) as u64
+}
+
 /// Start the watchdog thread once per process (idempotent).
 pub fn start() {
     STARTED.call_once(|| {
-        let floor_gb: f64 = crate::opts::var(crate::opt!("mem-watchdog-gb")).ok()
-            .and_then(|v| v.parse().ok()).unwrap_or(5.0);
-        if floor_gb <= 0.0 { return; }
-        let floor = (floor_gb * 1e9) as u64;
+        let floor = watchdog_floor_bytes();
+        if floor == 0 { return; }
+        let floor_gb = floor as f64 / 1e9;
         std::thread::Builder::new().name("memwatch".into()).spawn(move || {
             let mut strikes = 0u32;
             loop {

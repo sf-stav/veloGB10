@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.8.1 — `--gpu-wait` fixes, `--proxy-owed-wait`, KV-spill pre-D2H budgeting, Inkling-2 1M context
+
+A focused patch release on top of v0.8.0: adds exact pre-D2H KV-spill snapshot
+budgeting (TP=1 and TP>=2), finishes `--gpu-wait` coverage across EXL3 and
+Inkling-2-Mini, adds opt-in TP proxy WFET parking on owed collective waits, honors
+Inkling-2-Mini's 1M `model_max_length` with `/v1/tokenize` and `/v1/detokenize`, and hardens
+`--update` checksum lookup.
+
+### Fixes & community contributions
+
+- **[#52](https://github.com/sf-stav/veloGB10/issues/52) — KV-spill exact pre-D2H snapshot budgeting (TP=1 and TP>=2):**
+  Replaces the heuristic `tokens * 14_300` pre-check with exact serialized v6 snapshot
+  sizes (both full-with-WP16 and base) budgeted against live `MemAvailable`, the
+  watchdog floor, safety margin, and pinned staging chunk before any host allocation or
+  D2H copy. Reserves the final buffer size once via `try_reserve_exact()` (no peak-RAM
+  doubling on WP16 append) and degrades gracefully (`full` -> `base` -> `skip`) in
+  lockstep across all ranks under TP>=2 via `spill_agree`. Thanks to
+  [@AbsolomBane](https://github.com/AbsolomBane) for the report and design.
+- **[PR #50](https://github.com/sf-stav/veloGB10/pull/50) / [#49](https://github.com/sf-stav/veloGB10/issues/49) — TP proxy `--proxy-owed-wait` (opt-in WFET parking):**
+  Adds `--proxy-owed-wait spin|wfet` (default `spin`) in the RDMA `net_shim` proxy so
+  ARMv8.7 `FEAT_WFxT` systems can park the proxy thread with a 10 µs deadline on the owed
+  wait between collectives instead of spinning. Thanks to [@jetnet](https://github.com/jetnet)
+  for the report and PR.
+- **[PR #51](https://github.com/sf-stav/veloGB10/pull/51) — EXL3 `host_wait` coverage:**
+  Routes three remaining EXL3 stream waits (`lwv`, `prefill_moe`, `mtp_round`) through
+  `host_wait` so they honor `--gpu-wait` instead of spinning in the CUDA driver. Thanks to
+  [@jetnet](https://github.com/jetnet) for the PR.
+- **[#48](https://github.com/sf-stav/veloGB10/issues/48) — Inkling-2-Mini `host_wait` coverage:**
+  Routes Inkling-2-Mini serving, MTP, GPU, and TP launch waits through `host_wait` so
+  `--gpu-wait hybrid` works consistently on Inkling-2-Mini. Thanks to
+  [@jetnet](https://github.com/jetnet) for the report.
+
+### Inkling-2-Mini (Preview) & updater
+
+- **Inkling-2-Mini 1M `model_max_length` & tokenizer endpoints:** honors Inkling-2's
+  `1,048,576`-token `text_config.model_max_length` (while keeping the `--max-seq-len 262144`
+  default) and adds `/v1/tokenize` and `/v1/detokenize` endpoints.
+- **Self-update checksum fallback:** `gb10_inference --update` checks `SHA256SUMS` first and
+  falls back to `SHA256SUMS.txt`.
+
 ## v0.8.0 — Velo-Fabric, DeepSeek-V4.1-Flash, Inkling-2-Mini, TP=2→8
 
 A major release: veloGB10 gains a purpose-built multi-node fabric layer (**preview**),

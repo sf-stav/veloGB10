@@ -129,7 +129,7 @@ pub fn model_params(cfg: &Value) -> String {
         }
     }
     if let Some(n) = num("vocab_size") { parts.push(format!("vocab {n}")); }
-    if let Some(n) = num("max_position_embeddings") { parts.push(format!("trained context {n}")); }
+    if let Some(n) = num("max_position_embeddings").or_else(|| num("model_max_length")) { parts.push(format!("trained context {n}")); }
     if parts.is_empty() { "config.json has none of the usual fields".into() } else { parts.join(", ") }
 }
 

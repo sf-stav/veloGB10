@@ -7,7 +7,7 @@ This guide walks through bringing up **Inkling-2-Mini** (stock `NVFP4 / MXFP8` l
 - **Target model:** **[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** — stock NVFP4 / MXFP8 checkpoint (~19 GB total on disk: `model-00001-of-00001.safetensors` ~19 GB + bundled `mtp.safetensors` 607 MB).
 - **Architecture:** 24 layers (48 looped visits), `128` routed experts top-8 (`moe_inter 1152`), hidden `2304`, `24` Q heads / `8` KV heads, vocab `201,024`, 3-layer MTP speculative drafter, 23-layer BF16 vision tower (`0.64 GB`).
 - **Supported topologies:** **TP=1** (single DGX Spark) and multi-node **TP=2, TP=3, TP=4, TP=6, and TP=8**.
-- **Full context:** trained up to **262,144 tokens (256K)** (defaults to `--max-seq-len 262144` when omitted; smaller values like `32768` or `65536` reduce KV memory per lane for higher batch sizes).
+- **Full context:** trained up to **1,048,576 tokens (1M)** (`text_config.model_max_length`; defaults to `--max-seq-len 262144` when omitted; smaller values like `32768` or `65536` reduce KV memory per lane for higher batch sizes).
 
 > **The head ships only the shards each node needs — you do not copy the model to the node machines.**
 > On multi-node runs (`--tp 2|3|4|6|8`), the head plans every rank's shard (whole-KV-head attention + balanced 64-channel MoE inner splits + vocab-parallel LM head/MTP) and streams missing blobs over RoCEv2 bulk RDMA into each node's `~/.cache/gb10_tp` cache. Warm 8-node restarts boot in **~13 seconds**.
@@ -147,7 +147,7 @@ Replace the IP addresses and `--model-dir` path with your own. On **TP=3, TP=4, 
 
 > **Optional fast prefill wire (`--inkling2-ulysses-wire bf16`):** Add `--inkling2-ulysses-wire bf16` on **TP=3, TP=4, TP=6, or TP=8** to compress Q/K/V and ungated attention outputs to BF16 across the Ulysses All-to-All (while keeping `r`/`s`/`kd`/`vd` in FP32). This cuts Ulysses wire by **47%**, boosts prefill by **+7–12%** (up to **5,086 tok/s** at TP=6), and remains 100% deterministic across ranks.
 >
-> **Full 256K context:** Raise `--max-seq-len` up to `262144` (the model's trained window) whenever needed; adjust `--max-batch` accordingly for unified-memory headroom.
+> **Up to 1M context:** Raise `--max-seq-len` up to `1048576` (the model's trained window) whenever needed; adjust `--max-batch` accordingly for unified-memory headroom (at 1M context, each lane uses ~8.6 GB/rank at TP=8 or ~38.7 GB at TP=1 with MTP enabled).
 
 ### What you should see
 

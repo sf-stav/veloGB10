@@ -168,7 +168,15 @@ impl Ink2Kernels {
             .map_err(|e| anyhow!("launch {name} grid {grid:?} block {block:?} smem {smem}: {e}"))
     }
 
-    pub fn sync(&self) -> Result<()> { self.dev.synchronize().map_err(|e| anyhow!("sync: {e}")) }
+    /// Wait for all queued GPU work on the active stream through the `--gpu-wait` policy (`host_wait::stream_wait`),
+    /// then finish with `dev.synchronize()` (already drained, zero driver spin under `--gpu-wait hybrid`).
+    /// `#[track_caller]`: each call site keeps its own predictor and trace line.
+    #[track_caller]
+    pub fn sync(&self) -> Result<()> {
+        self.dev.bind_to_thread().map_err(|e| anyhow!("bind: {e}"))?;
+        crate::host_wait::stream_wait(self.stream.get()).map_err(|e| anyhow!("sync: {e}"))?;
+        self.dev.synchronize().map_err(|e| anyhow!("sync: {e}"))
+    }
 
     /// GPU time per call (µs) of `f`'s launches: `reps` calls captured into one CUDA graph on a private stream
     /// and replayed (no host launch cost in the number: kernel time + graph node gaps).

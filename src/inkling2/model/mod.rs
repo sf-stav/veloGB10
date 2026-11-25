@@ -548,6 +548,7 @@ impl GpuModel {
         if self.tp.as_ref().is_some_and(|t| t.ctl.is_some()) {
             // the head: image rows of this chunk go with the op (the tower runs on the head only)
             let mut img = Vec::new();
+            if !ws.img_chunk.is_empty() { self.k.sync()?; }
             for &(r0, src, n) in &ws.img_chunk {
                 let mut h = vec![0f32; n * D];
                 let r = unsafe { sys::cuMemcpyDtoH_v2(h.as_mut_ptr() as *mut std::ffi::c_void, src, n * D * 4) };
@@ -557,6 +558,7 @@ impl GpuModel {
             self.mirror(|| Op::Forward { segs: segs.iter().map(|s| (lanes[s.lane].id, s.p0, s.m)).collect(), ids: ids.to_vec(), out: out_rows.to_vec(), img })?;
         }
         let idv: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
+        self.k.sync()?;
         self.dev.htod_sync_copy_into(&idv, &mut ws.ids.slice_mut(0..m))?;
         let idp = dp(&ws.ids);
         self.run(ws, &Rows::Segs(lanes, segs), m, idp, out_rows)
@@ -1084,6 +1086,7 @@ impl GpuModel {
             }
         }
         self.mirror(|| Op::Verify { segs: segs.iter().map(|&(li, t)| (lanes[li].id, t.to_vec(), lanes[li].pos)).collect(), graph })?;
+        self.k.sync()?;
         self.dev.htod_sync_copy_into(&ri, &mut ws.rinfo)?;
         let outr: Vec<usize> = (0..n).collect();
         let idp = dp(&ws.rinfo);
@@ -1138,6 +1141,8 @@ impl GpuModel {
         ensure!(n >= 1 && n <= MAX_OUT && seeds.len() == n);
         self.mirror(|| Op::Sample { t: t.to_vec(), seeds: seeds.to_vec(), check: self.tp.as_ref().map(|x| x.last.borrow().clone()).unwrap_or_default() })?;
         let it: Vec<f32> = t.iter().map(|&x| if x > 0.0 { 1.0 / x } else { 0.0 }).collect();
+        // Wait for the preceding forward / prefill through --gpu-wait before the blocking NULL-stream uploads (issue #48).
+        self.k.sync()?;
         self.dev.htod_sync_copy_into(&it, &mut ws.smp_it.slice_mut(0..n))?;
         self.dev.htod_sync_copy_into(seeds, &mut ws.smp_seed.slice_mut(0..n))?;
         let v = self.head.n;
@@ -1149,6 +1154,7 @@ impl GpuModel {
             tp.x.all_reduce(&self.dev, dp(&tp.rec), n * w * 2)?;
             tpk::rank_pick(self.k, dp(&tp.rec), w, n, dp(&ws.smp_out))?;
             let mut o = vec![0i32; n];
+            self.k.sync()?;
             self.dev.dtoh_sync_copy_into(&ws.smp_out.slice(0..n), &mut o)?;
             tp.x.check("after a sampling exchange")?;
             let out: Vec<u32> = o.iter().map(|&x| x as u32).collect();
@@ -1160,6 +1166,7 @@ impl GpuModel {
         self.k.launch("ink3_gumbel_pick", (n as u32, 1, 1), (256, 1, 1), 0,
                       KArgs::new().v(dp(&ws.smp_max)).v(dp(&ws.smp_idx)).v(SMP_G as i32).v(dp(&ws.smp_out)))?;
         let mut o = vec![0i32; n];
+        self.k.sync()?;
         self.dev.dtoh_sync_copy_into(&ws.smp_out.slice(0..n), &mut o)?;
         Ok(o.iter().map(|&x| x as u32).collect())
     }

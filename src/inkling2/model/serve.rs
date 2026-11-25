@@ -435,7 +435,7 @@ fn splice_images(g: &GpuModel, vis: &mut Option<VisionGpu>, cache: &mut TowerCac
                 let t0 = std::time::Instant::now();
                 let buf = g.dev.alloc_zeros::<f32>(im.grid.tokens() * d)?;
                 v.forward(im, super::super::gpu::dp(&buf), None)?;
-                g.dev.synchronize()?;
+                g.k.sync()?;
                 mt::add(&mt::VIS_TOWER_US, t0.elapsed().as_micros() as u64);
                 mt::inc(&mt::VIS_TOWERS);
                 mt::add(&mt::VIS_TOWER_TOKENS, im.grid.tokens() as u64);

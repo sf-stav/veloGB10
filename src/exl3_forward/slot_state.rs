@@ -654,6 +654,18 @@ impl FwdModel {
     /// PFXPOOL: bytes of one WP16 checkpoint on this rank (pool entries carry copies).
     pub fn ckpt_bytes(&self) -> u64 { self.ckpt_layout().bytes() as u64 }
 
+    /// Serialized v6 file sizes `(base, full)` without and with the WP16 checkpoints,
+    /// computed before any device-to-host copy or host allocation.
+    pub(crate) fn spill_capture_sizes(&self, slot: usize, tokens: usize,
+                                      cks: &[(u64, u64, &RecurCkpt)]) -> Result<(u64, u64)> {
+        anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
+        let regions = self.spill_regions(slot, tokens)?;
+        let total = regions.iter().map(|(_, b)| *b).sum();
+        let checkpoints = cks.iter().map(|(_, _, ck)| ck.spill_bytes()).sum();
+        Ok((crate::kv_spill::capture_file_bytes(total, 0, 0) as u64,
+            crate::kv_spill::capture_file_bytes(total, checkpoints, cks.len()) as u64))
+    }
+
     /// LANERES2 (`--kv-spill`): serialize slot's prefix snapshot into `out` (GB10SPIL, payload version SPILL_PAYLOAD_VERSION):
     /// 8B magic, u32 version, u64 tokens, u64 region count, u64 payload bytes, the raw regions
     /// in spill_regions order, then the 2 host PLE ring ids. Bit-exact by construction: every
@@ -669,8 +681,8 @@ impl FwdModel {
     /// SPILLTRUNC: `ck_c` + `cks` (ascending (position, prefix_key, checkpoint)) are the lane's WP16 checkpoints
     /// for THIS conversation (Wp16::ckpts_under + kv_spill::prefix_keys); they ride the file in the section the
     /// payload format gained at version 6, so a later prompt that is a TRUNCATED prefix of `tokens` can resume at
-    /// a carried boundary (spill_trunc_restore) instead of eating a full re-prefill — the checkpoint bytes are a
-    /// few tens of MB against GiB of rows, and they are D2H-copied through the same pinned staging as regions.
+    /// a carried boundary (spill_trunc_restore) instead of eating a full re-prefill — the checkpoint bytes are
+    /// sized from the checkpoint layout and D2H-copied through the same pinned staging as regions.
     /// Returns `fixed`: the file bytes that do NOT scale with rows (both headers + the state planes + hist + the
     /// checkpoint section) — kv_spill::Policy::trunc_read prices a truncated restore with it.
     pub fn spill_capture(&self, slot: usize, tokens: usize, out: &mut Vec<u8>, ck_c: u32,
@@ -679,8 +691,12 @@ impl FwdModel {
         anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
         let regions = self.spill_regions(slot, tokens)?;
         let total: usize = regions.iter().map(|(_, b)| *b).sum();
+        let checkpoint_bytes = cks.iter().map(|(_, _, ck)| ck.spill_bytes()).sum();
+        let file_bytes = crate::kv_spill::capture_file_bytes(total, checkpoint_bytes, cks.len());
         out.clear();
-        out.reserve(72 + total + 8);
+        // Reserve the exact final size in one allocation so appending WP16 checkpoints never
+        // reallocates and transiently holds both old and new GiB-scale buffers in host RAM.
+        out.try_reserve_exact(file_bytes).context("spill: reserve capture buffer")?;
         out.resize(72, 0); // LANERES3: outer 36B (kv_spill::finalize_header) + inner 36B
         // body header (GB10SPIL) that spill_restore parses — LANERES2 shipped the capture
         // without it (restores never engaged on hardware, so every restore would have
@@ -689,9 +705,9 @@ impl FwdModel {
         // the NULL-stream DtoH reads them; device-wide is stronger than stream sync and this
         // path is rare + dominated by the next prefill.
         self.dsync()?;
-        const CHUNK: usize = 64 << 20;
-        let ck_b = cks.first().map_or(self.ckpt_layout().bytes(), |(_, _, c)| c.spill_bytes());
-        let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(ck_b).max(16)))?;
+        const CHUNK: usize = crate::kv_spill::CAPTURE_CHUNK_BYTES;
+        let largest_ckpt = cks.iter().map(|(_, _, ck)| ck.spill_bytes()).max().unwrap_or(0);
+        let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(largest_ckpt).max(16)))?;
         for (src, bytes) in &regions {
             let mut left = *bytes;
             let mut at = *src;
@@ -721,8 +737,7 @@ impl FwdModel {
             let k = self.pool_n_snap()?;
             regions[regions.len().saturating_sub(k)..].iter().map(|(_, b)| *b as u64).sum()
         };
-        let fixed: u64 = 36 + 36 + snap_bytes + 8 + crate::kv_spill::CK_TRAILER_BYTES
-            + nck * (crate::kv_spill::CK_TABLE_ENTRY_BYTES + ck_b as u64); // leading 36 = the outer kv header
+        let fixed = crate::kv_spill::capture_file_bytes(snap_bytes as usize, checkpoint_bytes, nck as usize) as u64;
         out.extend_from_slice(&(cks.len() as u32).to_le_bytes());
         out.extend_from_slice(&ck_c.to_le_bytes());
         out.extend_from_slice(&fixed.to_le_bytes());
@@ -745,6 +760,7 @@ impl FwdModel {
                 left -= n;
             }
         }
+        debug_assert_eq!(out.len(), file_bytes);
         Ok(fixed)
     }
 

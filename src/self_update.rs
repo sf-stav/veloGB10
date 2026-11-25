@@ -145,7 +145,7 @@ pub fn update(skip_dev_guard: bool) -> i32 {
         return 1;
     }
     // sha256 against SHA256SUMS when published
-    if let Ok(sums) = curl(&[&format!("{base}/SHA256SUMS")], 10) {
+    if let Ok(sums) = curl(&[&format!("{base}/SHA256SUMS")], 10).or_else(|_| curl(&[&format!("{base}/SHA256SUMS.txt")], 10)) {
         let want = sums.lines().find(|l| l.contains(&asset)).and_then(|l| l.split_whitespace().next()).map(str::to_string);
         if let Some(w) = want {
             match sha256_of(&tb) {

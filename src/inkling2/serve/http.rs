@@ -1,4 +1,4 @@
-//! The Inkling-2 HTTP surface: `/v1/chat/completions` (streamed and not), `/v1/models`, `/health`, `/metrics`.
+//! The Inkling-2 HTTP surface: `/v1/chat/completions` (streamed and not), `/v1/models`, `/v1/tokenize`, `/v1/detokenize`, `/health`, `/metrics`.
 //!
 //! Why not the shared `server::create_router` handler: that handler splits `<think>` text and finds `<tool_call` markup in the decoded
 //! string; this model frames reasoning and calls with control TOKENS (`<|content_thinking|>`, `<|content_invoke_tool_json|>`), which
@@ -50,10 +50,12 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/models", get(models))
         .route("/v1/models/*id", get(model_one))
+        .route("/v1/tokenize", post(tokenize))
+        .route("/v1/detokenize", post(detokenize))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .layer(tower_http::cors::CorsLayer::new().allow_origin(tower_http::cors::Any).allow_methods(tower_http::cors::Any).allow_headers(tower_http::cors::Any))
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
         .with_state(app)
 }
 
@@ -72,6 +74,120 @@ async fn model_one(State(a): State<Arc<App>>, axum::extract::Path(id): axum::ext
     let mut r = Response::new(Body::from(format!("Model '{}' not found. Available: {}", id, a.settings.model_name)));
     *r.status_mut() = StatusCode::NOT_FOUND;
     r
+}
+
+/// The shared server's error body for the tokenizer routes.
+fn tok_bad(msg: String) -> Response {
+    json_response(400, serde_json::json!({"error": {"message": msg, "type": "invalid_request_error", "code": "invalid_request_error"}}).to_string())
+}
+
+/// The `model` field the tokenizer routes require: it must name the served model.
+fn tok_model(a: &App, v: &Value) -> Result<String, Response> {
+    let Some(model) = v.get("model").and_then(|x| x.as_str()) else {
+        return Err(tok_bad("'model' is required and must name the served model (see GET /v1/models)".into()));
+    };
+    if model != a.settings.model_name {
+        return Err(tok_bad(format!("model '{model}' not found. Available: {}", a.settings.model_name)));
+    }
+    Ok(model.to_string())
+}
+
+/// `POST /v1/tokenize`, matching the shared server and DeepSeek-V4.1: `prompt` (text or token ids) or `messages`
+/// (rendered by Inkling-2's chat template, with `tools` / `reasoning_effort` / `chat_template_kwargs` and image
+/// expansion when vision is enabled, so `count` equals the `prompt_tokens` of the same chat request);
+/// `add_special_tokens` (default true), `truncate_prompt_tokens` (keeps the LAST n). Answers `{tokens, count, max_model_len}`.
+async fn tokenize(State(a): State<Arc<App>>, body: String) -> Response {
+    let v: Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return tok_bad(format!("body is not JSON: {e}")) };
+    if let Err(r) = tok_model(&a, &v) { return r; }
+    let add_special = match v.get("add_special_tokens") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return tok_bad("'add_special_tokens' must be a boolean".into()),
+    };
+    let truncate: Option<usize> = match v.get("truncate_prompt_tokens") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => match n.as_u64() { Some(x @ 1..) => Some(x as usize), _ => return tok_bad("'truncate_prompt_tokens' must be an integer >= 1".into()) },
+        Some(_) => return tok_bad("'truncate_prompt_tokens' must be an integer >= 1".into()),
+    };
+    let has_prompt = v.get("prompt").map_or(false, |x| !x.is_null());
+    let has_messages = v.get("messages").map_or(false, |x| !x.is_null());
+    if has_prompt && has_messages { return tok_bad("provide exactly one of 'prompt' or 'messages'".into()); }
+    let a2 = a.clone();
+    let mut tokens: Vec<u32> = if has_messages {
+        let r = tokio::task::spawn_blocking(move || -> Result<Vec<u32>, ApiError> {
+            // max_seq_len: 0 defers the context-length check until after truncate_prompt_tokens below.
+            let d = Defaults { effort: a2.settings.effort.clone(), max_seq_len: 0 };
+            let mut rendered = request::render(&v, &d, &a2.tok)?;
+            if rendered.n_images > 0 && a2.forward.vision() {
+                crate::inkling2::vision::serve::prepare(&mut rendered, a2.settings.image_max_tokens, 0)?;
+            }
+            Ok(rendered.prompt_ids)
+        }).await;
+        match r {
+            Ok(Ok(ids)) => ids,
+            Ok(Err(e)) => return api_error(&e),
+            Err(_) => return tok_bad("tokenization panicked".into()),
+        }
+    } else {
+        match v.get("prompt") {
+            Some(Value::String(t)) if t.is_empty() => Vec::new(),
+            Some(Value::String(t)) => {
+                let text = t.clone();
+                match tokio::task::spawn_blocking(move || a2.tok.encode(&text, add_special)).await {
+                    Ok(Ok(x)) => x,
+                    Ok(Err(e)) => return tok_bad(format!("tokenization failed: {e}")),
+                    Err(_) => return tok_bad("tokenization panicked".into()),
+                }
+            }
+            Some(Value::Array(items)) => {
+                let vocab = a.tok.vocab_size();
+                let mut ids = Vec::with_capacity(items.len());
+                for it in items {
+                    match it.as_u64() {
+                        Some(id) if (id as usize) < vocab => ids.push(id as u32),
+                        _ => return tok_bad(format!("'prompt' ids must be integers in [0, {vocab}) (got {it})")),
+                    }
+                }
+                ids
+            }
+            _ => return tok_bad("'prompt' must be a string or a list of token ids, or use 'messages'".into()),
+        }
+    };
+    if let Some(n) = truncate { if tokens.len() > n { tokens.drain(..tokens.len() - n); } }
+    if tokens.len() >= a.settings.max_seq_len {
+        return json_response(400, serde_json::json!({"error": {
+            "message": format!("This model's maximum context length is {} tokens, but the prompt came to {} tokens. Shorten the input, or pass truncate_prompt_tokens to keep the last n tokens.", a.settings.max_seq_len, tokens.len()),
+            "type": "invalid_request_error", "code": "context_length_exceeded"
+        }}).to_string());
+    }
+    let count = tokens.len();
+    json_response(200, serde_json::json!({"tokens": tokens, "count": count, "max_model_len": a.settings.max_seq_len}).to_string())
+}
+
+/// `POST /v1/detokenize`: `{model, tokens, skip_special_tokens?}` -> `{model, prompt}`.
+async fn detokenize(State(a): State<Arc<App>>, body: String) -> Response {
+    let v: Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return tok_bad(format!("body is not JSON: {e}")) };
+    let model = match tok_model(&a, &v) { Ok(m) => m, Err(r) => return r };
+    let Some(items) = v.get("tokens").and_then(|x| x.as_array()) else { return tok_bad("'tokens' is required and must be a list of token ids".into()) };
+    let vocab = a.tok.vocab_size();
+    let mut ids: Vec<u32> = Vec::with_capacity(items.len());
+    for it in items {
+        match it.as_u64() {
+            Some(id) if (id as usize) < vocab => ids.push(id as u32),
+            _ => return tok_bad(format!("'tokens' ids must be integers in [0, {vocab}) (got {it})")),
+        }
+    }
+    let skip = match v.get("skip_special_tokens") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return tok_bad("'skip_special_tokens' must be a boolean".into()),
+    };
+    let a2 = a.clone();
+    match tokio::task::spawn_blocking(move || a2.tok.decode(&ids, skip)).await {
+        Ok(Ok(p)) => json_response(200, serde_json::json!({"model": model, "prompt": p}).to_string()),
+        Ok(Err(e)) => tok_bad(format!("detokenization failed: {e}")),
+        Err(_) => tok_bad("detokenization panicked".into()),
+    }
 }
 async fn health() -> Response { json_response(200, "{\"status\":\"ok\"}".into()) }
 async fn metrics() -> Response {

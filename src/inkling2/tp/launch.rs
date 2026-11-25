@@ -157,7 +157,7 @@ pub fn node_loop(g: &GpuModel, ws: &mut crate::inkling2::model::Work, lanes: &mu
                 ws.set_img_chunk(&spl, 0, ids.len());
                 let refs: Vec<&Lane> = lanes.iter().collect();
                 g.forward(ws, &refs, &s, &ids, &out)?;
-                if !bufs.is_empty() { g.dev.synchronize()?; }
+                if !bufs.is_empty() { g.k.sync()?; }
                 drop(bufs);
             }
             Op::Verify { segs, graph } => {

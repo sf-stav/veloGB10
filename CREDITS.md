@@ -12,8 +12,8 @@ We would like to thank the following people for their contributions to this proj
 - [@adriangrassi](https://github.com/adriangrassi) — pull request [#23](https://github.com/sf-stav/veloGB10/pull/23) (`--prefill-interleave`). Ported; shipped in v0.7.4.
 - [@andersc](https://github.com/andersc) — pull request [#29](https://github.com/sf-stav/veloGB10/pull/29) (top_k client compatibility: negative values accepted as "no top-k truncation" on both endpoints, CPU-sampler edge cases fixed). Ported; shipped in v0.7.8.
 - [@rusty-dev](https://github.com/rusty-dev) — pull request [#42](https://github.com/sf-stav/veloGB10/pull/42) (VISCACHE: content-keyed vision encoder cache across multi-turn image conversations). Ported; shipped in v0.8.0.
-- [@AbsolomBane](https://github.com/AbsolomBane) — [#43](https://github.com/sf-stav/veloGB10/issues/43) (CUDA VMM shared KV page pool across lanes, `--kv-pool` / `--fit-floor-gb`) and [#44](https://github.com/sf-stav/veloGB10/issues/44) (TP fix: failed spill capture still votes in the agree). Ported; shipped in v0.8.0.
-- [@jetnet](https://github.com/jetnet) — pull request [#47](https://github.com/sf-stav/veloGB10/pull/47) (gpu-wait covers DFlash2 / DSpark draft rounds). Ported; shipped in v0.8.0.
+- [@AbsolomBane](https://github.com/AbsolomBane) — [#43](https://github.com/sf-stav/veloGB10/issues/43) (shared KV page pool, `--kv-pool`), [#44](https://github.com/sf-stav/veloGB10/issues/44) (spill-capture vote fix), and [#52](https://github.com/sf-stav/veloGB10/issues/52) (exact pre-D2H KV-spill snapshot budgeting).
+- [@jetnet](https://github.com/jetnet) — [PR #47](https://github.com/sf-stav/veloGB10/pull/47) (`--gpu-wait` on DFlash2 / DSpark draft rounds), [PR #50](https://github.com/sf-stav/veloGB10/pull/50) / [#49](https://github.com/sf-stav/veloGB10/issues/49) (`--proxy-owed-wait` WFET parking), [PR #51](https://github.com/sf-stav/veloGB10/pull/51) (EXL3 `host_wait`), and [#48](https://github.com/sf-stav/veloGB10/issues/48) (Inkling-2 `host_wait`).
 - [@MiaAI-Lab](https://github.com/MiaAI-Lab) — DeepSeek-V4.1-Flash-1017 model & reference work (supported end-to-end in v0.8.0).
 
 ## Reports, requests and benchmarks
